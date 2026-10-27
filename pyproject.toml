@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Tool configuration only. The modules are C++ libraries built with CMake; this
+# repository has no Python package.
+
+[tool.ruff]
+# The oldest Python the workflows and the SDK images use.
+target-version = "py312"
+# Match ClangFormat and cpplint.
+line-length = 100
+extend-exclude = ["build", "build-*", "install", "install-*", "Testing"]
+
+[tool.ruff.lint]
+# The defaults plus import ordering, Python upgrades and Bugbear.
+extend-select = ["I", "UP", "B"]
+
+[tool.codespell]
+skip = "*.mp4,./build*,./install*"

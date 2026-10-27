@@ -1,0 +1,20 @@
+# CMake, CTest and CI output
+build/
+build-*/
+install/
+install-*/
+Testing/
+CMakeUserPresets.json
+_CPack_Packages/
+*.deb
+
+# Python tooling
+.cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editor state
+.idea/
+.vscode/
+*.swp
