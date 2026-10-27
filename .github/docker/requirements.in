@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# The image's Python packages. requirements.txt is generated from this file, with the
+# SHA-256 of every file for linux/amd64 and linux/arm64; regenerate it with the
+# command at its top after changing this file.
+cmake==4.4.4
+holoscan-cli==5.0.0
+holoscan-core-cu13==5.0.0
+holoscan-inference-cu13==5.0.0
+holoscan-visualization-cu13==5.0.0
+# The pip Ubuntu 24.04 ships, which holoscan-core-cu13 requires and must not replace.
+pip==24.0

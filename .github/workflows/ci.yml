@@ -5,8 +5,9 @@
 #   Lint     GitHub-hosted: pre-commit, actionlint, the CI driver's tests and the
 #            SDK-free tests of every module and demo.
 #   x86 GPU  Self-hosted x86_64 runner with an NVIDIA GPU.
-#   Jetson   Self-hosted Jetson Thor (JetPack 7).
-# Both GPU jobs run .github/scripts/ci.py, which discovers modules/*/ and
+#   Jetson   Self-hosted Jetson Thor and Jetson Orin (JetPack 7).
+# All GPU jobs build the one CI image, .github/docker/Dockerfile, for their own
+# architecture, and run .github/scripts/ci.py in it, which discovers modules/*/ and
 # applications/*/, so adding one needs no change here. Runner setup and the repository
 # settings these jobs rely on are in .github/RUNNERS.md.
 
@@ -73,14 +74,14 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 180
     env:
-      CI_IMAGE: holoscan-modules-ci:x86_64
+      CI_IMAGE: holoscan-modules-ci:local
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-x86
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
       - name: Build the CI image
-        run: docker build -f .github/docker/x86_64.Dockerfile -t "$CI_IMAGE" .github/docker
+        run: docker build -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
       - name: Build, test, install and consume every module; build and run every demo
         shell: bash
         run: |
@@ -120,14 +121,14 @@ jobs:
     runs-on: [self-hosted, linux, arm64, jetson, "${{ matrix.board }}"]
     timeout-minutes: 240
     env:
-      CI_IMAGE: holoscan-modules-ci:jetson
+      CI_IMAGE: holoscan-modules-ci:local
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.board }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
       - name: Build the CI image
-        run: docker build -f .github/docker/jetson.Dockerfile -t "$CI_IMAGE" .github/docker
+        run: docker build -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
       # The PVA and the integrated GPU need the NVIDIA runtime and a privileged
       # container. DISPLAY must stay unset: with it, VPI fails with EGL_NOT_INITIALIZED.
       - name: Build, test, install and consume every module; build and run every demo
