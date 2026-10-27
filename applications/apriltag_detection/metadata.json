@@ -1,0 +1,57 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "AprilTag Detection",
+    "description": "Renders synthetic AprilTag scenes, detects the tags with holoscan-apriltag's AprilTagDetectorOp on every compiled backend, checks each detection against ground truth, and shows the first backend's detections on a HoloViz display.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": ["C++"],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-apriltag demo, with a synthetic source checked against ground truth and a HoloViz overlay."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": ["5.0.0"]
+    },
+    "platforms": ["x86_64", "aarch64"],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Pose Estimation",
+      "Fiducial Markers",
+      "CUDA",
+      "VPI"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Detect tags in a rendered scene with every compiled backend, check them against ground truth, and display the first backend's detections when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic frames (120 tags) through every compiled backend, verified against ground truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
