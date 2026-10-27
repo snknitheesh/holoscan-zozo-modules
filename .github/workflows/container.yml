@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Publishes the CI image, .github/docker/Dockerfile, to the GitHub Container Registry
+# as ghcr.io/snknitheesh/holoscan-zozo-modules, so anyone can pull it to build and
+# test the modules. Each architecture is built natively, without emulation: linux/amd64
+# on the self-hosted x86_64 runner and linux/arm64 on the self-hosted Jetson Thor. Each
+# is pushed by digest only; the last job joins them into one multi-arch image and tags
+# it `sha-<short commit>`, `latest` (from main and from release tags) and the version
+# (from `v*` tags). Never runs for a pull request. See .github/RUNNERS.md.
+
+name: Container
+
+on:
+  push:
+    branches: [main]
+    # Path filters apply to branch pushes only; every `v*` tag publishes.
+    tags: ["v*"]
+    paths:
+      - .github/docker/Dockerfile
+      - .github/workflows/container.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/snknitheesh/holoscan-zozo-modules
+  # The OCI description and licenses, also set in the Dockerfile. The repository is
+  # Apache-2.0, but the image also holds NVIDIA software under NVIDIA's own licenses.
+  OCI_LABELS: |
+    org.opencontainers.image.description=Build and test environment for Holoscan SDK 5.0 Modules: CUDA 13.0, Holoscan SDK 5.0.0, TensorRT, VPI 4 and CMake 4, for x86_64 and Jetson Thor and Orin.
+    org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-NVIDIA-Proprietary
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: [self-hosted, linux, x64, gpu]
+          - platform: linux/arm64
+            arch: arm64
+            runner: [self-hosted, linux, arm64, jetson, thor]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          labels: ${{ env.OCI_LABELS }}
+          annotations: ${{ env.OCI_LABELS }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .github/docker
+          file: .github/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          tags: ${{ env.IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish the multi-arch image
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
+          labels: ${{ env.OCI_LABELS }}
+          annotations: ${{ env.OCI_LABELS }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the manifest list and push its tags
+        shell: bash
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done \
+            < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          while IFS= read -r annotation; do args+=(--annotation "$annotation"); done \
+            < <(jq -r '.annotations[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do sources+=("$IMAGE@sha256:$digest"); done
+          test "${#sources[@]}" -eq 2
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+      - name: Inspect the image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
