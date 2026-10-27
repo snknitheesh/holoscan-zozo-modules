@@ -8,13 +8,16 @@
          step). Output also goes to a log file. Start it with `exec`, so that the
          runner's signals reach it rather than the step's shell.
   sweep  Remove every container with the CI label (a runner runs one job at a time,
-         so any of them is left over), this repository's untagged and per-run images,
-         and trim the daemon's BuildKit cache when the disk runs low.
+         so any of them is left over), every stopped container made from this
+         repository's image or its build steps (a failed legacy build leaves those),
+         this repository's untagged and per-run images, and trim the daemon's BuildKit
+         cache when the disk runs low.
 
-Only containers with the CI label, and images with this repository's
-org.opencontainers.image.source label, are ever removed. A runner job hook,
-.github/runner/job-hook.sh, removes left-over CI containers too, for when a job
-dies before its own cleanup runs.
+Only containers with the CI label, stopped containers and images with this
+repository's org.opencontainers.image.source label are ever removed: a running
+container from the image without the CI label is someone's, and is left alone. The
+runner job hook, .github/runner/job-hook.sh, removes the same containers, for when a
+job dies before its own cleanup runs.
 """
 
 from __future__ import annotations
@@ -69,11 +72,18 @@ def stale_targets(tags: list[str], image: str) -> list[str]:
 
 
 def remove_containers() -> None:
-    ids = docker("ps", "--all", "--quiet", "--filter", f"label={LABEL}", check=True).stdout.split()
+    def listed(*filters: str) -> list[str]:
+        args = [arg for value in filters for arg in ("--filter", value)]
+        return docker("ps", "--all", "--quiet", *args, check=True).stdout.split()
+
+    ids = listed(f"label={LABEL}")
+    # Several status filters match any of them.
+    stopped = listed(f"label={SOURCE_LABEL}", "status=created", "status=exited", "status=dead")
+    ids = list(dict.fromkeys(ids + stopped))
     if not ids:
-        log("No CI containers left over.")
+        log("No CI or build containers left over.")
         return
-    log(f"Removing left-over CI container(s): {' '.join(ids)}")
+    log(f"Removing left-over CI or build container(s): {' '.join(ids)}")
     docker("rm", "--force", *ids, check=True)
 
 
