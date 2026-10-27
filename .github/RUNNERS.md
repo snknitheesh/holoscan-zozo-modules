@@ -84,7 +84,9 @@ A job waits in the queue until a runner with its labels is online.
 ### x86_64 with an NVIDIA GPU
 
 1. An NVIDIA driver for CUDA 13 (R580 or newer).
-2. [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) with the Buildx plugin.
+2. [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) with the Buildx plugin
+   (`docker buildx version` must work): `docker-buildx-plugin` with Docker's packages, or
+   `sudo apt-get install docker-buildx` with Ubuntu's `docker.io`. The jobs fail without it.
 3. The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
    configured for Docker:
 
@@ -100,7 +102,8 @@ A job waits in the queue until a runner with its labels is online.
 
 1. JetPack 7 (L4T R38), which brings the CUDA 13.0 driver, the PVA firmware and the NVIDIA
    Container Toolkit with its `nvidia` runtime.
-2. Docker Engine with the Buildx plugin, and the `nvidia` runtime registered:
+2. Docker Engine with the Buildx plugin, as on x86_64 (Ubuntu's `docker.io` needs
+   `sudo apt-get install docker-buildx`), and the `nvidia` runtime registered:
 
    ```bash
    sudo nvidia-ctk runtime configure --runtime=docker
