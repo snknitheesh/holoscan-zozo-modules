@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 4.0)
 project(holoscan_point_cloud_consumer LANGUAGES CXX)
 enable_testing()
 
-find_package(holoscan-point-cloud 1.0 REQUIRED CONFIG)
+find_package(holoscan-point-cloud 1.1 REQUIRED CONFIG)
 message(
   STATUS
   "Found holoscan-point-cloud ${holoscan-point-cloud_VERSION} in ${holoscan-point-cloud_DIR}"
