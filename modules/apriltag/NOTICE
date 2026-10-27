@@ -1,0 +1,20 @@
+holoscan-apriltag
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-apriltag uses the following open source and NVIDIA software.
+
+AprilTag 3 (https://github.com/AprilRobotics/apriltag)
+Copyright (C) 2013-2016, The Regents of The University of Michigan.
+Licensed under BSD-2-Clause. Release 3.4.5 is downloaded at configure time when no
+installed copy is found, and is then linked into libholoscan_apriltag; its license is
+installed as share/doc/holoscan-apriltag/apriltag-LICENSE.md.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+NVIDIA VPI 4 (optional, for the vpi backend)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's license, installed with VPI as /opt/nvidia/vpi4/doc/VPI_EULA.txt. Linked
+from the installed VPI; not redistributed.
