@@ -28,7 +28,7 @@ modules/<name>/          One Holoscan Module: a standalone CMake project
   pkg/                   Debian packaging
 applications/<demo>/     A demo application, built against the installed module
   metadata.json          Application metadata with a finite, headless `ci` mode
-.github/                 CI workflow, CI images, scripts and runner setup
+.github/                 CI workflows, the CI image, scripts and runner setup
 ```
 
 [modules/README.md](modules/README.md) and [applications/README.md](applications/README.md) give
@@ -40,14 +40,47 @@ the rules a module or a demo follows so that CI picks it up without changes.
 - Holoscan SDK 5.0 with CUDA 13, CMake 4.0 or later and a C++20 compiler.
 - Module-specific dependencies, listed in each module's README.
 
-The CI images in [`.github/docker/`](.github/docker/) have all of these, and make good
-development containers:
+The CI container has all of these, for both architectures; see
+[Use the CI container](#use-the-ci-container).
+
+## Use the CI container
+
+Every CI job runs in one image, built from
+[`.github/docker/Dockerfile`](.github/docker/Dockerfile) for `linux/amd64` and `linux/arm64`
+and published to the GitHub Container Registry. It has CUDA 13.0, the Holoscan SDK 5.0.0,
+TensorRT, VPI 4, CMake 4 and the Holoscan CLI, and makes a good development container:
 
 ```bash
-docker build -f .github/docker/x86_64.Dockerfile -t holoscan-modules-ci:x86_64 .github/docker
-docker run --rm -it --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
-  -v "$PWD:$PWD" -w "$PWD" holoscan-modules-ci:x86_64 bash
+docker pull ghcr.io/snknitheesh/holoscan-zozo-modules:latest
 ```
+
+From a clone of this repository, build and test every module and demo the way CI does. On
+x86_64 with an NVIDIA GPU:
+
+```bash
+docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:$PWD" -w "$PWD" ghcr.io/snknitheesh/holoscan-zozo-modules:latest \
+  python3 .github/scripts/ci.py sdk --platform x86_64
+```
+
+On Jetson Thor or Orin with JetPack 7 (the PVA needs `--privileged`, and `DISPLAY` must stay
+unset):
+
+```bash
+docker run --rm --runtime nvidia --privileged --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:$PWD" -w "$PWD" ghcr.io/snknitheesh/holoscan-zozo-modules:latest \
+  python3 .github/scripts/ci.py sdk --platform jetson
+```
+
+To build the image yourself instead:
+
+```bash
+docker build -f .github/docker/Dockerfile -t holoscan-modules-ci:local .github/docker
+```
+
+**Notice:** the image contains NVIDIA CUDA, TensorRT, VPI and the Holoscan SDK, which are
+distributed under NVIDIA's own licenses, not this repository's. By pulling or using the image
+you accept those licenses.
 
 ## Build, test and install a module
 
@@ -96,12 +129,12 @@ then it builds every demo against the installed modules and runs its `ci` mode.
 
 ```bash
 python3 .github/scripts/ci.py list
-docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all -e HOME=/tmp \
-  --user "$(id -u):$(id -g)" -v "$PWD:$PWD" -w "$PWD" \
-  holoscan-modules-ci:x86_64 python3 .github/scripts/ci.py sdk
 ```
 
-The workflow, its runners and the repository settings are described in
+Running the whole of `ci.py sdk` in the CI container is shown in
+[Use the CI container](#use-the-ci-container).
+
+The workflows, their runners, the image's publishing and the repository settings are described in
 [.github/RUNNERS.md](.github/RUNNERS.md).
 
 ## Contributing
@@ -119,4 +152,5 @@ pre-commit run --all-files
 ## License
 
 Apache License 2.0; see [LICENSE](LICENSE). Each module's README lists the licenses of the
-third-party software it uses.
+third-party software it uses. The CI container image also holds NVIDIA software under NVIDIA's
+licenses; see the notice in [Use the CI container](#use-the-ci-container).
