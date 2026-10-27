@@ -1,0 +1,24 @@
+holoscan-yolo26
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-yolo26 uses the following NVIDIA software. It contains no YOLO26 weights and
+no Ultralytics code.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK, HoloInfer included; not
+redistributed.
+
+NVIDIA TensorRT and the CUDA Toolkit
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's licenses, installed with them. Used through the installed SDK and CUDA;
+not redistributed.
+
+YOLO26 models and the Ultralytics software (https://github.com/ultralytics/ultralytics)
+are licensed under AGPL-3.0 or an Ultralytics Enterprise License. They are NOT part of
+holoscan-yolo26. tools/prepare_model.py (installed as
+share/holoscan-yolo26/prepare_model.py) downloads pinned weights and runs a separately
+installed Ultralytics command to export them; it does not import or contain Ultralytics
+code. The terms that apply to a model you export, and to anything you build or
+distribute with it, are yours to review.
