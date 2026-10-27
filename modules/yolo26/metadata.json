@@ -1,0 +1,65 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-yolo26",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "End-to-end YOLO26 object detection on the GPU: a CUDA letterbox, TensorRT through the SDK's HoloInfer, and a GPU decode into boxes, scores, classes and a count; and a HoloViz overlay of the detections. The model is not included: a tool exports it with a separately installed Ultralytics (AGPL-3.0).",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": ["C++"],
+    "namespace": {
+      "cpp": "holoscan::yolo26"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": ["5.0.0"]
+    },
+    "platforms": ["x86_64", "aarch64"],
+    "tags": [
+      "Computer Vision and Perception",
+      "Object Detection",
+      "YOLO",
+      "TensorRT",
+      "CUDA",
+      "Robotics"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/yolo26",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": ["Yolo26DetectionOp", "DetectionOverlayOp"],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10."
+        }
+      ],
+      "data": [
+        {
+          "name": "YOLO26 (Ultralytics, AGPL-3.0)",
+          "description": "Not part of this module. Its tools/prepare_model.py downloads pinned weights and exports them to ONNX with the separately installed Ultralytics tool. The tests use a stub model that the module writes itself.",
+          "url": "https://github.com/ultralytics/assets/releases/tag/v8.4.0",
+          "version": "v8.4.0"
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-yolo26",
+      "install_commands": [
+        "sudo apt install ./holoscan-yolo26_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

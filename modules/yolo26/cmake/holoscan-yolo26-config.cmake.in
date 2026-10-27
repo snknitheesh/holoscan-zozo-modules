@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-yolo26 [COMPONENTS overlay]) defines:
+#   holoscan::yolo26                 Yolo26DetectionOp, prepare_engine(), the letterbox and
+#                                    decode kernels, and the stub model and synthetic scenes
+#   holoscan::yolo26_overlay         DetectionOverlayOp (when the overlay component was built)
+#   holoscan-yolo26_PREPARE_MODEL    The installed prepare_model.py, which exports YOLO26
+#                                    weights with a separately installed Ultralytics tool
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(holoscan 5.0 CONFIG COMPONENTS @HOLOSCAN_YOLO26_HOLOSCAN_COMPONENTS@)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-yolo26-targets.cmake")
+
+set(holoscan-yolo26_PREPARE_MODEL "@PACKAGE_HOLOSCAN_YOLO26_PREPARE_MODEL@")
+if(TARGET holoscan::yolo26_overlay)
+  set(holoscan-yolo26_overlay_FOUND TRUE)
+else()
+  set(holoscan-yolo26_overlay_FOUND FALSE)
+endif()
+check_required_components(holoscan-yolo26)
