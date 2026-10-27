@@ -6,17 +6,22 @@ requires:
 | Check | Runs on | What it does |
 | --- | --- | --- |
 | `Lint` | GitHub-hosted `ubuntu-24.04` | pre-commit, actionlint, the CI driver's unit tests, and every module's and demo's SDK-free tests (`tests/host/`) |
-| `x86 GPU` | Self-hosted, labels `self-hosted, linux, x64, gpu` | `ci.py sdk` in the x86_64 CI image |
-| `Jetson Thor` | Self-hosted, labels `self-hosted, linux, arm64, jetson, thor` | `ci.py sdk` in the Jetson CI image |
-| `Jetson Orin` | Self-hosted, labels `self-hosted, linux, arm64, jetson, orin` | `ci.py sdk` in the Jetson CI image |
+| `x86 GPU` | Self-hosted, labels `self-hosted, linux, x64, gpu` | `ci.py sdk --platform x86_64` in the CI image |
+| `Jetson Thor` | Self-hosted, labels `self-hosted, linux, arm64, jetson, thor` | `ci.py sdk --platform jetson` in the CI image |
+| `Jetson Orin` | Self-hosted, labels `self-hosted, linux, arm64, jetson, orin` | `ci.py sdk --platform jetson` in the CI image |
 
 `ci.py sdk` builds each module, runs its full test suite, installs it, and builds and runs a
 consumer project against the installed package; then it builds each demo against the installed
 modules, runs its tests and runs its finite `ci` mode. Any failure fails the job.
 
-The GPU jobs build their image from [`docker/`](docker/) on the runner (Docker's layer cache keeps
-this fast after the first run), run the build in a throwaway container as the runner's user, and
-remove the container afterwards even when a step fails.
+The GPU jobs all build the same image, [`docker/Dockerfile`](docker/Dockerfile), on the runner for
+its own architecture and tag it `holoscan-modules-ci:local` (Docker's layer cache keeps this fast
+after the first run). They run the build in a throwaway container as the runner's user, and
+remove the container afterwards even when a step fails. `--platform` tells `ci.py` which lane it
+is, for tests and demos that only hold on Jetson.
+
+[`workflows/container.yml`](workflows/container.yml) publishes that image; see
+[Publishing the image](#publishing-the-image).
 
 ## Security
 
@@ -26,9 +31,14 @@ The repository is public and the GPU runners are machines on a private network, 
   `main`, for manual runs, and for pull requests whose branch is in this repository. A fork's pull
   request gets only `Lint`; to test it on the GPUs, a maintainer reviews the code and pushes it to a
   branch of this repository.
-- The workflow has `permissions: contents: read`, never uses `pull_request_target`, and checks out
+- `ci.yml` has `permissions: contents: read`, never uses `pull_request_target`, and checks out
   with `persist-credentials: false`, so the build cannot push or read secrets.
-- Every action is pinned to a commit, and the base images to a digest.
+- `container.yml`, the only workflow that can write, never runs for a pull request: only for a
+  push to `main` that changes the image, a `v*` tag, or a manual run, all of which need write
+  access to the repository. Only its jobs get `packages: write`, and only for this repository's
+  package.
+- Every action is pinned to a commit, and the base images (and the BuildKit image the publishing
+  jobs build with) to a digest.
 
 Because a skipped job counts as passing for branch protection, review a fork's pull request
 yourself before merging it.
@@ -38,7 +48,7 @@ yourself before merging it.
 - **Settings > Actions > General > Fork pull request workflows from outside collaborators**:
   "Require approval for all external contributors".
 - **Settings > Actions > General > Workflow permissions**: "Read repository contents and packages
-  permissions".
+  permissions". `container.yml` asks for `packages: write` itself.
 - **Settings > Branches > Branch protection rule for `main`** (or a ruleset): require a pull
   request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin`; require branches to
   be up to date before merging; and do not allow bypassing these settings.
@@ -105,34 +115,50 @@ A job waits in the queue until a runner with its labels is online.
    `EGL_NOT_INITIALIZED`. Do not set `DISPLAY` in the runner service's environment.
 4. About 60 GB of free disk on the NVMe drive that holds Docker's data root.
 
-## CI images
+## The CI image
 
-### x86_64: [`docker/x86_64.Dockerfile`](docker/x86_64.Dockerfile)
+[`docker/Dockerfile`](docker/Dockerfile) builds the one image every lane uses, for `linux/amd64`
+and `linux/arm64`:
 
-The official `nvcr.io/nvidia/clara-holoscan/holoscan:v5.0.0-cuda13` image, pinned by digest, which
-already ships CMake 4; plus VPI 4.0.5 from NVIDIA's Jetson repository (`x86_64/noble`, release
-`r38.4`), accepted only with the repository key's pinned fingerprint; plus `holoscan-cli` 5.0.0.
+- `nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04`, pinned by its multi-arch index digest;
+- the Holoscan SDK 5.0.0 packages from NVIDIA's `ubuntu2404` CUDA repository (`x86_64` or
+  `sbsa`): `holoscan-core-cuda-13`, `libholoscan-visualization-cuda-13` and `-dev`, and
+  `libholoscan-inference-cuda-13` and `-dev`, each checked against its SHA-256;
+- TensorRT 10.14 for CUDA 13.0 (libraries, headers and `trtexec`), pinned;
+- VPI 4.0.5 from NVIDIA's Jetson repository, release `r38.4`: `x86_64/noble` on amd64, `common`
+  on arm64, whose PVA backend the `nvidia` runtime connects to the board's PVA; the repository
+  key is accepted only with its pinned fingerprint;
+- from PyPI, CMake 4.4.4, `holoscan-cli` 5.0.0 and the SDK's Python bindings
+  (`holoscan-*-cu13` 5.0.0), installed from [`docker/requirements.txt`](docker/requirements.txt),
+  which pins every package and dependency to the SHA-256 of its files. Regenerate it with the
+  command at its top after changing [`docker/requirements.in`](docker/requirements.in).
 
-### Jetson: [`docker/jetson.Dockerfile`](docker/jetson.Dockerfile)
+It is not the official `nvcr.io/nvidia/clara-holoscan/holoscan:v5.0.0-cuda13` image because that
+image's arm64 variant is the discrete-GPU (SBSA) build: CUDA 13.2 user-space libraries with a CUDA
+13.2 data-center forward-compatibility driver in `/usr/local/cuda/compat`, which the image puts
+first on the library path. JetPack 7 ships a CUDA 13.0 driver for the integrated GPU, and that
+forward-compatibility driver is not made for it. The image also has no VPI. A CUDA 13.0 user space
+runs on both JetPack 7 and a discrete-GPU driver for CUDA 13 (R580 or newer), so one image built
+from the CUDA 13.0 base serves every lane.
 
-`docker manifest inspect nvcr.io/nvidia/clara-holoscan/holoscan:v5.0.0-cuda13` shows an arm64
-variant, but it is the discrete-GPU (SBSA) build: CUDA 13.2 user-space libraries with a CUDA 13.2
-data-center forward-compatibility driver in `/usr/local/cuda/compat`, which the image puts first on
-the library path. JetPack 7 ships a CUDA 13.0 driver for the integrated GPU, and that
-forward-compatibility driver is not made for it. The image also has no VPI.
+## Publishing the image
 
-The Jetson image is therefore built the way the SDK was validated on Thor:
+[`workflows/container.yml`](workflows/container.yml) publishes the image as
+`ghcr.io/snknitheesh/holoscan-zozo-modules`. It runs on a push to `main` that changes
+`docker/Dockerfile` or the workflow, on every `v*` tag, and by hand (`workflow_dispatch`); never
+for a pull request.
 
-- `nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04` (arm64), pinned by digest, matching JetPack 7's
-  CUDA 13.0;
-- the Holoscan SDK 5.0.0 arm64 packages from NVIDIA's `ubuntu2404/sbsa` CUDA repository:
-  `holoscan-core-cuda-13`, `libholoscan-visualization-cuda-13` and `-dev`, and
-  `libholoscan-inference-cuda-13` and `-dev`, each checked against its SHA-256, with TensorRT
-  pinned to its CUDA 13.0 build;
-- VPI 4.0.5 from the Jetson repository (`common`, release `r38.4`), whose PVA backend the
-  `nvidia` runtime connects to the board's PVA, with the key fingerprint pinned;
-- CMake 4.4.4 and `holoscan-cli` 5.0.0 from PyPI.
+| Job | Runs on | What it does |
+| --- | --- | --- |
+| `Build linux/amd64` | The x86_64 runner | Builds the image natively and pushes it by digest, untagged |
+| `Build linux/arm64` | The Jetson Thor runner | The same for arm64, without emulation |
+| `Publish the multi-arch image` | GitHub-hosted `ubuntu-24.04` | Joins both digests into one multi-arch image and tags it |
 
-This choice is not yet proven on the runner: run the `Jetson Thor` and `Jetson Orin` jobs once by hand
-(`workflow_dispatch`) after registering the Thor. The job needs only `python3`, CMake 4, the SDK
-and VPI in its image, so switching images later touches only the Dockerfile.
+The tags are `sha-<short commit>` always, `latest` for `main` and for `v*` tags, and the version
+for a `v*` tag (`v1.2.3` gives `1.2.3`). The jobs log in with the workflow's own `GITHUB_TOKEN`;
+no secret is needed.
+
+The first push creates the package **private**. Make it public once: open the package from the
+repository's or the profile's **Packages**, then **Package settings > Danger Zone > Change
+visibility > Public**. The image's `org.opencontainers.image.source` label links the package to
+this repository, which gives the repository's workflows write access to it.
