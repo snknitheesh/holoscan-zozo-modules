@@ -1,0 +1,89 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "YOLO26 Detection",
+    "description": "Detects objects with holoscan-yolo26's Yolo26DetectionOp in synthetic frames, JPEG and PPM files or a live V4L2 webcam; checks, prints and times the detections, and can draw them over the frames in a HoloViz window.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": ["C++"],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-yolo26 demo, with synthetic, JPEG/PPM and V4L2 webcam image sources; a HoloViz display with boxes and labels; a report with ground truth, expected detections, latency and annotated PPM output; the module's stub model for model-free runs."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": ["5.0.0"]
+    },
+    "platforms": ["x86_64", "aarch64"],
+    "tags": [
+      "Computer Vision and Perception",
+      "Object Detection",
+      "YOLO",
+      "TensorRT",
+      "Robotics"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Webcam",
+          "description": "A V4L2 camera offering YUYV, for the camera mode, which also needs a display.",
+          "required": false
+        }
+      ],
+      "data": [
+        {
+          "name": "YOLO26n (Ultralytics, AGPL-3.0)",
+          "description": "Not part of this repository. The module's tools/prepare_model.py downloads the pinned weights and exports them to ONNX with the separately installed Ultralytics tool. Needed by the demo, files and camera modes only.",
+          "url": "https://github.com/ultralytics/assets/releases/tag/v8.4.0",
+          "version": "v8.4.0"
+        },
+        {
+          "name": "COCO val2017 image 000000039769",
+          "description": "A sample image that prepare_model.py downloads for the demo and the real-model tests.",
+          "url": "https://cocodataset.org/",
+          "version": "2017"
+        }
+      ]
+    },
+    "default_mode": "demo",
+    "modes": {
+      "demo": {
+        "description": "Detect objects in the prepared sample image with YOLO26n, 300 times, printing its detections once and the latency per frame.",
+        "run": {
+          "command": "\"<holohub_app_bin>/yolo26_detection\" --model \"<holohub_data_dir>/yolo26_detection/yolo26n.onnx\" --labels \"<holohub_data_dir>/yolo26_detection/yolo26n.labels.txt\" --source files --images \"<holohub_data_dir>/yolo26_detection/images\" --loop true --count 300 --period-ms 10",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "files": {
+        "description": "Detect objects in each JPEG and PPM image in the data directory once with YOLO26n, printing the detections and writing each image with its boxes drawn to the build directory.",
+        "run": {
+          "command": "\"<holohub_app_bin>/yolo26_detection\" --model \"<holohub_data_dir>/yolo26_detection/yolo26n.onnx\" --labels \"<holohub_data_dir>/yolo26_detection/yolo26n.labels.txt\" --source files --images \"<holohub_data_dir>/yolo26_detection/images\" --image-dir .",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "camera": {
+        "description": "Live webcam with detections drawn over it; needs /dev/video0, a display, and the prepared model.",
+        "run": {
+          "command": "\"<holohub_app_bin>/yolo26_detection\" --model \"<holohub_data_dir>/yolo26_detection/yolo26n.onnx\" --labels \"<holohub_data_dir>/yolo26_detection/yolo26n.labels.txt\" --source camera",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check without downloads: 30 synthetic BGR8 frames through TensorRT with the module's stub model, which stands in for YOLO26, every detection checked against the frame's known ones.",
+        "run": {
+          "command": "\"<holohub_app_bin>/yolo26_detection\" --model stub --count 30 --period-ms 5 --encoding bgr8",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
