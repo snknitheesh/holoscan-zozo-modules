@@ -81,6 +81,27 @@ sudo ./svc.sh start
 
 A job waits in the queue until a runner with its labels is online.
 
+### Install the job hook
+
+[`runner/job-hook.sh`](runner/job-hook.sh) removes left-over CI containers. Install it outside the
+runner's work folder, which jobs rewrite, and point both of the runner's job hooks at it:
+
+```bash
+cd <runner directory>
+mkdir -p hooks
+install -m 755 <checkout>/.github/runner/job-hook.sh hooks/job-hook.sh
+echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$PWD/hooks/job-hook.sh" >> .env
+echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$PWD/hooks/job-hook.sh" >> .env
+```
+
+The runner reads `.env` when it starts, so restart it, while it is idle (**Settings > Actions >
+Runners** shows it as Idle), for the hooks to take effect. Every job's log then shows "A job
+started hook has been configured by the self-hosted runner administrator" and, at the end, the
+completed hook. With `svc.sh` that is `sudo ./svc.sh stop && sudo ./svc.sh start`. If the runner
+runs as a systemd unit of your own with `KillSignal=SIGINT` and `KillMode=process`, `run.sh` does
+not pass the signal on and the stop hangs until the timeout; send SIGINT to the
+`bin/Runner.Listener` process instead, and the unit restarts it.
+
 ### x86_64 with an NVIDIA GPU
 
 1. An NVIDIA driver for CUDA 13 (R580 or newer).
