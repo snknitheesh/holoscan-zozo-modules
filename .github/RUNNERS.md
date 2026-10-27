@@ -15,10 +15,31 @@ consumer project against the installed package; then it builds each demo against
 modules, runs its tests and runs its finite `ci` mode. Any failure fails the job.
 
 The GPU jobs all build the same image, [`docker/Dockerfile`](docker/Dockerfile), on the runner for
-its own architecture and tag it `holoscan-modules-ci:local` (Docker's layer cache keeps this fast
-after the first run). They run the build in a throwaway container as the runner's user, and
-remove the container afterwards even when a step fails. `--platform` tells `ci.py` which lane it
-is, for tests and demos that only hold on Jetson.
+its own architecture with `docker buildx build`, and tag it `holoscan-modules-ci:local` (Docker's
+BuildKit cache keeps this fast after the first run). `--platform` tells `ci.py` which lane it is,
+for tests and demos that only hold on Jetson.
+
+## No container outlives its job
+
+[`scripts/ci_container.py`](scripts/ci_container.py) runs the tests as the runner's user in a
+container labeled `io.github.snknitheesh.holoscan-zozo-modules.ci` (plus `...ci.run` with the run
+ID), started with `--rm` and `--init`. Each GPU job:
+
+1. removes every container with that label (`ci_container.py sweep`). A runner runs one job at a
+   time, so any of them is left over;
+2. builds the image;
+3. runs the tests with `exec ci_container.py run`, so the runner's cancel signals (SIGINT, then
+   SIGTERM) reach it, and it removes the container with `docker rm -f` on any exit or signal;
+4. sweeps again in an `if: always()` step, and removes this repository's untagged images (earlier
+   builds of the image). It trims Docker's BuildKit cache, least recently used first, only when
+   the disk has less than 100 GB free (`CI_BUILD_CACHE_MIN_FREE_GB`), because that cache is shared
+   with everything else built on the machine.
+
+The job's `timeout-minutes` bounds a hung test. If the job dies before its own cleanup (a runner
+crash, a killed docker CLI), the runner's [job hook](#install-the-job-hook) removes the container
+before and after the next job. Containers without the label, and images without this
+repository's `org.opencontainers.image.source` label or with a tag of their own, are never
+touched.
 
 [`workflows/container.yml`](workflows/container.yml) publishes that image; see
 [Publishing the image](#publishing-the-image).
