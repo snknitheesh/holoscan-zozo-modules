@@ -104,16 +104,24 @@ jobs:
           retention-days: 7
 
   jetson:
-    name: Jetson
+    name: Jetson ${{ matrix.title }}
     needs: lint
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, arm64, jetson]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: thor
+            title: Thor
+          - board: orin
+            title: Orin
+    runs-on: [self-hosted, linux, arm64, jetson, "${{ matrix.board }}"]
     timeout-minutes: 240
     env:
       CI_IMAGE: holoscan-modules-ci:jetson
-      CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-jetson
+      CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.board }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -129,7 +137,7 @@ jobs:
             -e NVIDIA_DRIVER_CAPABILITIES=all -e HOME=/tmp -e PYTHONUNBUFFERED=1 \
             --user "$(id -u):$(id -g)" \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
-            "$CI_IMAGE" python3 .github/scripts/ci.py sdk --platform jetson 2>&1 | tee ci-jetson.log
+            "$CI_IMAGE" python3 .github/scripts/ci.py sdk --platform jetson 2>&1 | tee "ci-jetson-${{ matrix.board }}.log"
       - name: Remove the container
         if: always()
         run: docker rm -f "$CI_CONTAINER" > /dev/null 2>&1 || true
@@ -137,9 +145,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: ci-jetson
+          name: ci-jetson-${{ matrix.board }}
           path: |
-            ci-jetson.log
+            ci-jetson-${{ matrix.board }}.log
             build-ci/**/Testing/Temporary/*.log
           if-no-files-found: ignore
           retention-days: 7
