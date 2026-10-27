@@ -81,7 +81,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Build the CI image
-        run: docker build -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
+        run: |
+          if ! docker buildx version > /dev/null 2>&1; then
+            echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
+            exit 1
+          fi
+          docker buildx build --load -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
       - name: Build, test, install and consume every module; build and run every demo
         shell: bash
         run: |
@@ -128,7 +133,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Build the CI image
-        run: docker build -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
+        run: |
+          if ! docker buildx version > /dev/null 2>&1; then
+            echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
+            exit 1
+          fi
+          docker buildx build --load -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
       # The PVA and the integrated GPU need the NVIDIA runtime and a privileged
       # container. DISPLAY must stay unset: with it, VPI fails with EGL_NOT_INITIALIZED.
       - name: Build, test, install and consume every module; build and run every demo
