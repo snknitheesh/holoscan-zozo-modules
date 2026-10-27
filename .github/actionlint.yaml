@@ -6,3 +6,5 @@ self-hosted-runner:
   labels:
     - gpu
     - jetson
+    - thor
+    - orin

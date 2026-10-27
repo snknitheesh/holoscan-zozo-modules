@@ -1,19 +1,20 @@
 # CI runners
 
-[`workflows/ci.yml`](workflows/ci.yml) has three jobs. Their names are the checks branch protection
+[`workflows/ci.yml`](workflows/ci.yml) has four jobs. Their names are the checks branch protection
 requires:
 
 | Check | Runs on | What it does |
 | --- | --- | --- |
 | `Lint` | GitHub-hosted `ubuntu-24.04` | pre-commit, actionlint, the CI driver's unit tests, and every module's and demo's SDK-free tests (`tests/host/`) |
 | `x86 GPU` | Self-hosted, labels `self-hosted, linux, x64, gpu` | `ci.py sdk` in the x86_64 CI image |
-| `Jetson` | Self-hosted, labels `self-hosted, linux, arm64, jetson` | `ci.py sdk` in the Jetson CI image |
+| `Jetson Thor` | Self-hosted, labels `self-hosted, linux, arm64, jetson, thor` | `ci.py sdk` in the Jetson CI image |
+| `Jetson Orin` | Self-hosted, labels `self-hosted, linux, arm64, jetson, orin` | `ci.py sdk` in the Jetson CI image |
 
 `ci.py sdk` builds each module, runs its full test suite, installs it, and builds and runs a
 consumer project against the installed package; then it builds each demo against the installed
 modules, runs its tests and runs its finite `ci` mode. Any failure fails the job.
 
-Both GPU jobs build their image from [`docker/`](docker/) on the runner (Docker's layer cache keeps
+The GPU jobs build their image from [`docker/`](docker/) on the runner (Docker's layer cache keeps
 this fast after the first run), run the build in a throwaway container as the runner's user, and
 remove the container afterwards even when a step fails.
 
@@ -39,7 +40,7 @@ yourself before merging it.
 - **Settings > Actions > General > Workflow permissions**: "Read repository contents and packages
   permissions".
 - **Settings > Branches > Branch protection rule for `main`** (or a ruleset): require a pull
-  request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson`; require branches to
+  request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin`; require branches to
   be up to date before merging; and do not allow bypassing these settings.
 
 ## Registering a runner
@@ -52,13 +53,16 @@ when `config.sh` asks, or pass `--labels`:
 # x86_64 workstation with an NVIDIA GPU
 ./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
   --name x86-gpu --labels gpu --unattended
-# Jetson Thor
+# Jetson Thor (JetPack 7)
 ./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
-  --name jetson-thor --labels jetson --unattended
+  --name jetson-thor --labels jetson,thor --unattended
+# Jetson Orin (JetPack 7.2 or later, which brings CUDA 13 to Orin)
+./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
+  --name jetson-orin --labels jetson,orin --unattended
 ```
 
 The runner adds `self-hosted`, `linux` and `x64` or `arm64` itself. Install it as a service so it
-survives reboots, under a dedicated user that is in the `docker` group:
+starts at boot and restarts if it stops, under a user that is in the `docker` group:
 
 ```bash
 sudo ./svc.sh install <runner-user>
@@ -129,6 +133,6 @@ The Jetson image is therefore built the way the SDK was validated on Thor:
   `nvidia` runtime connects to the board's PVA, with the key fingerprint pinned;
 - CMake 4.4.4 and `holoscan-cli` 5.0.0 from PyPI.
 
-This choice is not yet proven on the runner: run the `Jetson` job once by hand
+This choice is not yet proven on the runner: run the `Jetson Thor` and `Jetson Orin` jobs once by hand
 (`workflow_dispatch`) after registering the Thor. The job needs only `python3`, CMake 4, the SDK
 and VPI in its image, so switching images later touches only the Dockerfile.
