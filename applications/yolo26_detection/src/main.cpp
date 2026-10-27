@@ -38,7 +38,7 @@
 #include <holoscan/time/realtime_clock.hpp>
 #if YOLO26_DETECTION_ENABLE_VISUALIZATION
 #include <holoscan/visualization/holoviz_op.hpp>
-#include <holoscan/yolo26/detection_overlay_op.hpp>
+#include <holoscan/yolo26/yolo26_overlay_op.hpp>
 #endif
 
 #include <holoscan/yolo26/stub_model.hpp>
@@ -517,11 +517,11 @@ int execute(const Options& opts, SignalDomain& signals) {
         "holoviz", std::move(layers),
         viz::WindowSinkDesc{.title = "YOLO26 Detection", .width = width, .height = height},
         viz::FrameTrigger{viz::LayerTrigger{1}}, max_input_age);
-    auto overlay = graph.op<y26::DetectionOverlayOp>(
-        "overlay", y26::DetectionOverlayConfig{.width = frame_width(opts),
-                                               .height = frame_height(opts),
-                                               .max_detections = opts.max_detections,
-                                               .labels = opts.labels});
+    auto overlay = graph.op<y26::Yolo26OverlayOp>(
+        "overlay", y26::Yolo26OverlayConfig{.width = frame_width(opts),
+                                            .height = frame_height(opts),
+                                            .max_detections = opts.max_detections,
+                                            .labels = opts.labels});
     // Best effort: the display keeps the newest sample and never holds back
     // the detector.
     const holoscan::ConnectionOptions latest{.queue_policy = holoscan::QueuePolicy::kDropOldest,

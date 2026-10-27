@@ -8,7 +8,7 @@
 // swaps the classes; the score threshold and the capacity; an image size
 // that changes; the capture time and frame id on every output; and images,
 // settings and models it must reject. And, when it is built,
-// DetectionOverlayOp: its boxes layer and its labels.
+// Yolo26OverlayOp: its boxes layer and its labels.
 //
 // Usage: yolo26_operator_test DIR (a folder for the stub models and engines)
 
@@ -44,7 +44,7 @@
 #include "test_support.hpp"
 #if HOLOSCAN_YOLO26_WITH_OVERLAY
 #include <holoscan/visualization/holoviz_op.hpp>
-#include <holoscan/yolo26/detection_overlay_op.hpp>
+#include <holoscan/yolo26/yolo26_overlay_op.hpp>
 #endif
 
 namespace holoscan::yolo26 {
@@ -434,8 +434,8 @@ std::optional<OverlayOutput> run_overlay(const std::vector<float>& boxes,
                                          const std::vector<float>& scores,
                                          const std::vector<std::int32_t>& class_ids,
                                          std::int32_t n) {
-  auto h = holoscan::testing::create_operator_test<DetectionOverlayOp>(DetectionOverlayConfig{
-      .width = 200, .height = 100, .max_detections = 3, .labels = {"person"}});
+  auto h = holoscan::testing::create_operator_test<Yolo26OverlayOp>(
+      Yolo26OverlayConfig{.width = 200, .height = 100, .max_detections = 3, .labels = {"person"}});
   namespace ht = holoscan::testing;
   h.push_frame(ht::frame_at(
       kOverlayCaptured, ht::input("boxes", host_tensor(boxes, {3, 4}, {kDLFloat, 32, 1})),

@@ -19,7 +19,7 @@
 // Each image's four outputs carry its capture time and frame id. They go out
 // one after another: should one fail to go out, those before it have been
 // delivered alone and compute() returns the error. Pair them by capture time
-// (OnAligned), as DetectionOverlayOp does.
+// (OnAligned), as Yolo26OverlayOp does.
 
 #pragma once
 

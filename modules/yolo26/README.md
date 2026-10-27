@@ -5,7 +5,7 @@ an image and emits the objects in it as GPU tensors: boxes in the image's own pi
 class for each, and their count. Inside, a CUDA kernel letterboxes the image into the model's
 input, the SDK's TensorRT inference library (HoloInfer) runs the model, and a second kernel turns
 its output into detections. YOLO26 needs no non-maximum suppression, so nothing else runs.
-`DetectionOverlayOp` turns the detections into HoloViz layers. The
+`Yolo26OverlayOp` turns the detections into HoloViz layers. The
 [YOLO26 Detection demo](../../applications/yolo26_detection/) runs both end to end.
 
 > **The model is AGPL-3.0, and it is not part of this module.** YOLO26 weights and the Ultralytics
@@ -42,7 +42,7 @@ its output into detections. YOLO26 needs no non-maximum suppression, so nothing 
 
 Slots from `count` on are zero. All four outputs carry the image's capture time and frame id. They
 go out one after another: should one fail to go out, those before it have been delivered alone and
-the frame fails. Pair them by capture time, with an `OnAligned` contract, as `DetectionOverlayOp`
+the frame fails. Pair them by capture time, with an `OnAligned` contract, as `Yolo26OverlayOp`
 does. Images may change size from frame to frame; images in host memory are copied to the GPU
 through a staging buffer that grows with the largest one. The frames share the model's buffers, and
 the runtime may give each one another CUDA stream, so each frame's stream waits on a CUDA event that
@@ -80,7 +80,7 @@ The operator uses HoloInfer directly rather than the SDK's `InferenceOp`, which 
 with its own activation time and no frame id: the decode needs each image's letterbox, and every
 output must keep the image's capture time.
 
-### `DetectionOverlayOp`
+### `Yolo26OverlayOp`
 
 | Port | Direction | Type |
 | --- | --- | --- |
@@ -88,7 +88,7 @@ output must keep the image's capture time.
 | `labels` | out | `holoscan::Tensor`: a HoloViz text layer; per detection, a dark shadow and a `<class> 0.87` label above its box, in its class's color |
 | `overlay` | out | `holoscan::schema::ImageT`: a HoloViz RGBA8 image layer; the boxes, 2 px wide in a color per class, on a transparent background |
 
-`DetectionOverlayConfig` gives the image's size, the detector's `max_detections` and the class
+`Yolo26OverlayConfig` gives the image's size, the detector's `max_detections` and the class
 names (ids without one show as `class N`). The overlay emits the labels first and then the boxes,
 both stamped with the frame's capture time, so a HoloViz `FrameTrigger` on the boxes layer draws
 each frame's labels and boxes together over the image they came from. Keep at least four images

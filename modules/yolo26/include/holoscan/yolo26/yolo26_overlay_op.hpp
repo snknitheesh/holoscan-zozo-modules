@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// DetectionOverlayOp: turns one image's detections from Yolo26DetectionOp
+// Yolo26OverlayOp: turns one image's detections from Yolo26DetectionOp
 // into two Holoviz layers: the boxes, 2 px wide in a color per class, on a
 // transparent RGBA8 image, and a "<class> 0.87" label above each box. Both
 // carry the image's capture time, so Holoviz draws them over their own frame.
@@ -26,7 +26,7 @@ namespace holoscan::yolo26 {
 // Bytes of label text per detection; longer labels are cut.
 inline constexpr std::uint32_t kOverlayLabelBytes = 32;
 
-struct DetectionOverlayConfig {
+struct Yolo26OverlayConfig {
   // The image's size, in pixels.
   int width{};
   int height{};
@@ -36,10 +36,10 @@ struct DetectionOverlayConfig {
   std::vector<std::string> labels;
 };
 
-class DetectionOverlayOp final : public holoscan::Operator<> {
+class Yolo26OverlayOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument for a non-positive size or capacity.
-  explicit DetectionOverlayOp(DetectionOverlayConfig config);
+  explicit Yolo26OverlayOp(Yolo26OverlayConfig config);
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
@@ -60,7 +60,7 @@ class DetectionOverlayOp final : public holoscan::Operator<> {
   holoscan::Output<holoscan::schema::ImageT> overlay;
 
  private:
-  DetectionOverlayConfig config_;
+  Yolo26OverlayConfig config_;
   std::vector<float> boxes_;
   std::vector<float> scores_;
   std::vector<std::int32_t> class_ids_;

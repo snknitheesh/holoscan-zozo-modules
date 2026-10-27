@@ -31,7 +31,7 @@
     ],
     "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/yolo26",
     "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
-    "operator_names": ["Yolo26DetectionOp", "DetectionOverlayOp"],
+    "operator_names": ["Yolo26DetectionOp", "Yolo26OverlayOp"],
     "requirements": {
       "hardware": [
         {

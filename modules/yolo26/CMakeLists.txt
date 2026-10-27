@@ -23,7 +23,7 @@ set(CMAKE_CUDA_EXTENSIONS OFF)
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(BUILD_TESTING "Build the module's tests" OFF)
-option(HOLOSCAN_YOLO26_BUILD_OVERLAY "Build DetectionOverlayOp (needs Holoscan Visualization)" ON)
+option(HOLOSCAN_YOLO26_BUILD_OVERLAY "Build Yolo26OverlayOp (needs Holoscan Visualization)" ON)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -76,9 +76,9 @@ set_target_properties(holoscan_yolo26 PROPERTIES
   SOVERSION ${PROJECT_VERSION_MAJOR})
 set(_targets holoscan_yolo26)
 
-# holoscan::yolo26_overlay: DetectionOverlayOp, which draws detections as HoloViz layers.
+# holoscan::yolo26_overlay: Yolo26OverlayOp, which draws detections as HoloViz layers.
 if(HOLOSCAN_YOLO26_BUILD_OVERLAY)
-  add_library(holoscan_yolo26_overlay src/detection_overlay_op.cpp)
+  add_library(holoscan_yolo26_overlay src/yolo26_overlay_op.cpp)
   add_library(holoscan::yolo26_overlay ALIAS holoscan_yolo26_overlay)
   target_compile_features(holoscan_yolo26_overlay PUBLIC cxx_std_20)
   target_link_libraries(holoscan_yolo26_overlay

@@ -4,7 +4,7 @@
 # find_package(holoscan-yolo26 [COMPONENTS overlay]) defines:
 #   holoscan::yolo26                 Yolo26DetectionOp, prepare_engine(), the letterbox and
 #                                    decode kernels, and the stub model and synthetic scenes
-#   holoscan::yolo26_overlay         DetectionOverlayOp (when the overlay component was built)
+#   holoscan::yolo26_overlay         Yolo26OverlayOp (when the overlay component was built)
 #   holoscan-yolo26_PREPARE_MODEL    The installed prepare_model.py, which exports YOLO26
 #                                    weights with a separately installed Ultralytics tool
 

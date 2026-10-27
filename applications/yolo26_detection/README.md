@@ -3,7 +3,7 @@
 The demo of the [holoscan-yolo26](../../modules/yolo26/) module. A source (synthetic frames with
 known detections, JPEG and PPM files, or a live V4L2 webcam) feeds `Yolo26DetectionOp`, whose
 detections a reporter checks, prints and times, and can draw onto the images, which it writes as
-PPM files. A HoloViz window can show the frames with `DetectionOverlayOp`'s boxes and labels drawn
+PPM files. A HoloViz window can show the frames with `Yolo26OverlayOp`'s boxes and labels drawn
 over them. It uses the installed module the way any other project would:
 `find_package(holoscan-yolo26)`.
 
@@ -21,7 +21,7 @@ flowchart LR
     S[Synthetic frames, JPEG and PPM files, or a webcam] -->|image| D[Yolo26DetectionOp]
     D -->|boxes, scores, class_ids, count| R[Report: truth, expectations, latency, PPM files]
     S -->|image, with --image-dir| R
-    D -->|with --display| O[DetectionOverlayOp: boxes and labels] --> V[HoloViz window]
+    D -->|with --display| O[Yolo26OverlayOp: boxes and labels] --> V[HoloViz window]
     S -->|with --display| V
 ```
 

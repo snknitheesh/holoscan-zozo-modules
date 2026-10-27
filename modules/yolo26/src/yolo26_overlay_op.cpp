@@ -19,7 +19,7 @@
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 #include <holoscan/visualization/holoviz_op.hpp>
-#include <holoscan/yolo26/detection_overlay_op.hpp>
+#include <holoscan/yolo26/yolo26_overlay_op.hpp>
 
 namespace holoscan::yolo26 {
 namespace {
@@ -52,7 +52,7 @@ const Rgba& class_color(std::int32_t class_id) {
 }
 
 holoscan::Error invalid(const std::string& message) {
-  return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "DetectionOverlayOp: " + message};
+  return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "Yolo26OverlayOp: " + message};
 }
 
 // Copies a packed tensor of `shape` and element type T to `out`, waiting for
@@ -120,13 +120,13 @@ void write_label(std::uint8_t* row, const std::string& text, float x, float y,
 
 }  // namespace
 
-DetectionOverlayOp::DetectionOverlayOp(DetectionOverlayConfig config) : config_(std::move(config)) {
+Yolo26OverlayOp::Yolo26OverlayOp(Yolo26OverlayConfig config) : config_(std::move(config)) {
   if (config_.width < 1 || config_.height < 1 || config_.max_detections < 1) {
-    throw std::invalid_argument("DetectionOverlayOp needs a positive size and max_detections");
+    throw std::invalid_argument("Yolo26OverlayOp needs a positive size and max_detections");
   }
 }
 
-void DetectionOverlayOp::setup(holoscan::OperatorSpec& spec) {
+void Yolo26OverlayOp::setup(holoscan::OperatorSpec& spec) {
   // Two slots per input: one frame in compute() while the next one arrives.
   spec.input(boxes, "boxes").queue_depth(2U);
   spec.input(scores, "scores").queue_depth(2U);
@@ -156,7 +156,7 @@ void DetectionOverlayOp::setup(holoscan::OperatorSpec& spec) {
       });
 }
 
-holoscan::Contract DetectionOverlayOp::contract() const {
+holoscan::Contract Yolo26OverlayOp::contract() const {
   // One image's four outputs, paired by their capture time.
   holoscan::Contract result;
   result.trigger(holoscan::OnAligned{
@@ -169,7 +169,7 @@ holoscan::Contract DetectionOverlayOp::contract() const {
   return result;
 }
 
-holoscan::expected<void, holoscan::Error> DetectionOverlayOp::compute(
+holoscan::expected<void, holoscan::Error> Yolo26OverlayOp::compute(
     holoscan::ExecutionContext& context) {
   auto count_sample = count.receive();
   auto boxes_sample = boxes.receive();
