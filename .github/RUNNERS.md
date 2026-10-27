@@ -25,8 +25,9 @@ for tests and demos that only hold on Jetson.
 container labeled `io.github.snknitheesh.holoscan-zozo-modules.ci` (plus `...ci.run` with the run
 ID), started with `--rm` and `--init`. Each GPU job:
 
-1. removes every container with that label (`ci_container.py sweep`). A runner runs one job at a
-   time, so any of them is left over;
+1. removes every container with that label (`ci_container.py sweep`), since a runner runs one job
+   at a time, so any of them is left over; and every stopped container made from this
+   repository's image or one of its build steps, which a failed legacy build leaves behind;
 2. builds the image;
 3. runs the tests with `exec ci_container.py run`, so the runner's cancel signals (SIGINT, then
    SIGTERM) reach it, and it removes the container with `docker rm -f` on any exit or signal;
@@ -36,10 +37,11 @@ ID), started with `--rm` and `--init`. Each GPU job:
    with everything else built on the machine.
 
 The job's `timeout-minutes` bounds a hung test. If the job dies before its own cleanup (a runner
-crash, a killed docker CLI), the runner's [job hook](#install-the-job-hook) removes the container
-before and after the next job. Containers without the label, and images without this
-repository's `org.opencontainers.image.source` label or with a tag of their own, are never
-touched.
+crash, a killed docker CLI), the runner's [job hook](#install-the-job-hook) removes the same
+containers before and after the next job. Neither ever touches a container without the CI label
+that is running (someone's container from the image) or that is not from this repository's image
+(no `org.opencontainers.image.source` label for it), nor an image without that label or with a
+tag of its own.
 
 [`workflows/container.yml`](workflows/container.yml) publishes that image; see
 [Publishing the image](#publishing-the-image).

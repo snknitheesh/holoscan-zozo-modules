@@ -94,7 +94,7 @@ jobs:
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
             exit 1
           fi
-          docker buildx build --load --iidfile "$RUNNER_TEMP/ci-image-id" \
+          docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
             -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
           echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
       # `exec`, so that cancelling the job signals ci_container.py, which removes
@@ -157,7 +157,7 @@ jobs:
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
             exit 1
           fi
-          docker buildx build --load --iidfile "$RUNNER_TEMP/ci-image-id" \
+          docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
             -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
           echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
       # The PVA and the integrated GPU need the NVIDIA runtime and a privileged

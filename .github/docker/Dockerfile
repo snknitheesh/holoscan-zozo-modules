@@ -11,7 +11,8 @@
 # (R580 or newer) and on JetPack 7's CUDA 13.0 driver alike. See .github/RUNNERS.md
 # for why this is not the official SDK image.
 #
-#   docker build -f .github/docker/Dockerfile -t holoscan-modules-ci:local .github/docker
+#   docker build --force-rm -f .github/docker/Dockerfile -t holoscan-modules-ci:local \
+#     .github/docker
 #
 # Published as ghcr.io/snknitheesh/holoscan-zozo-modules. Run it with `--gpus all` on
 # x86_64, and with `--runtime nvidia --privileged` and without DISPLAY on Jetson.

@@ -75,7 +75,7 @@ docker run --rm --runtime nvidia --privileged --user "$(id -u):$(id -g)" -e HOME
 To build the image yourself instead:
 
 ```bash
-docker build -f .github/docker/Dockerfile -t holoscan-modules-ci:local .github/docker
+docker build --force-rm -f .github/docker/Dockerfile -t holoscan-modules-ci:local .github/docker
 ```
 
 **Notice:** the image contains NVIDIA CUDA, TensorRT, VPI and the Holoscan SDK, which are
