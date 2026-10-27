@@ -24,8 +24,9 @@ LABEL org.opencontainers.image.source="https://github.com/snknitheesh/holoscan-z
       org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-NVIDIA-Proprietary"
 
 ARG DEBIAN_FRONTEND=noninteractive
-# Set by BuildKit to the platform being built. The packages below are picked from
-# the image's own architecture, which must agree with it.
+# Set by BuildKit to the platform being built, and unset by Docker's legacy builder.
+# The packages below are picked from the image's own architecture, which must agree
+# with it when it is set.
 ARG TARGETARCH
 
 # Holoscan SDK 5.0.0 from NVIDIA's ubuntu2404 CUDA repository (x86_64 or sbsa), each
@@ -38,8 +39,8 @@ ARG HOLOSCAN_DEB_VERSION=5.0.0.8.0-1
 ARG TENSORRT_VERSION=10.14.1.48-1+cuda13.0
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
-    if [ -n "${TARGETARCH}" ] && [ "${TARGETARCH}" != "${arch}" ]; then \
-      echo "TARGETARCH ${TARGETARCH} does not match the image's architecture ${arch}" >&2; exit 1; \
+    if [ -n "${TARGETARCH:-}" ] && [ "${TARGETARCH:-}" != "${arch}" ]; then \
+      echo "TARGETARCH ${TARGETARCH:-} does not match the image's architecture ${arch}" >&2; exit 1; \
     fi; \
     debs="$(mktemp -d)"; \
     cd "${debs}"; \
