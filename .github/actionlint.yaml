@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Custom labels of the self-hosted runners described in RUNNERS.md.
+self-hosted-runner:
+  labels:
+    - gpu
+    - jetson
