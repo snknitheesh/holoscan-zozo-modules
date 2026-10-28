@@ -1,0 +1,28 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// The geometry of a rectified stereo pair, as StereoDisparityOp's optional
+// `geometry` input takes it: one message with the capture time of each pair.
+// The C++ StereoGeometry (stereo_geometry.hpp) describes the fields.
+// Compatible edits keep the root name, file identifier and explicit field ids,
+// and only append fields.
+namespace holoscan.stereo_disparity.schema;
+
+table StereoGeometry {
+  // Focal length of the rectified images, in pixels.
+  fx: double (id: 0);
+  // Meters between the two eyes' optical centers.
+  baseline: double (id: 1);
+  // The image size the geometry is for.
+  width: int (id: 2);
+  height: int (id: 3);
+  // The left eye's principal point, valid when has_principal_point is true.
+  has_principal_point: bool (id: 4);
+  cx: double (id: 5);
+  cy: double (id: 6);
+  // The right eye's principal point x minus the left eye's, in pixels.
+  doffs: double (id: 7);
+}
+
+root_type StereoGeometry;
+file_identifier "STGM";
