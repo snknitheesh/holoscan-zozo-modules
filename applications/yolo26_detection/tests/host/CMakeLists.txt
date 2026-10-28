@@ -11,8 +11,10 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 add_executable(yolo26_yuyv_test yuyv_test.cpp)
-target_include_directories(yolo26_yuyv_test PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../src" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_include_directories(
+  yolo26_yuyv_test
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src" "${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 target_compile_features(yolo26_yuyv_test PRIVATE cxx_std_20)
 add_test(NAME yolo26_yuyv COMMAND yolo26_yuyv_test)
 set_tests_properties(yolo26_yuyv PROPERTIES LABELS "yolo26_detection;host" TIMEOUT 60)

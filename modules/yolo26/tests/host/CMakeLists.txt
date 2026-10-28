@@ -13,22 +13,28 @@ endif()
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 
 set(_module "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-add_executable(yolo26_host_test host_test.cpp
+add_executable(
+  yolo26_host_test
+  host_test.cpp
   "${_module}/src/letterbox.cpp"
   "${_module}/src/stub_model.cpp"
-  "${_module}/src/synthetic_scene.cpp")
-target_include_directories(yolo26_host_test PRIVATE
-  "${_module}/include" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  "${_module}/src/synthetic_scene.cpp"
+)
+target_include_directories(
+  yolo26_host_test
+  PRIVATE "${_module}/include" "${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 target_compile_features(yolo26_host_test PRIVATE cxx_std_20)
 target_compile_options(yolo26_host_test PRIVATE -ffp-contract=off)
-add_test(NAME yolo26_host
-  COMMAND yolo26_host_test "${CMAKE_CURRENT_BINARY_DIR}/host_files")
+add_test(NAME yolo26_host COMMAND yolo26_host_test "${CMAKE_CURRENT_BINARY_DIR}/host_files")
 
-add_test(NAME yolo26_prepare_model
-  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
-    -s "${CMAKE_CURRENT_SOURCE_DIR}" -p test_prepare_model.py -v)
+add_test(
+  NAME yolo26_prepare_model
+  COMMAND
+    "${Python3_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}" -p
+    test_prepare_model.py -v
+)
 
 # Keep the bytecode out of the source tree.
 set_tests_properties(yolo26_prepare_model PROPERTIES ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
-set_tests_properties(yolo26_host yolo26_prepare_model PROPERTIES
-  LABELS "yolo26;host" TIMEOUT 60)
+set_tests_properties(yolo26_host yolo26_prepare_model PROPERTIES LABELS "yolo26;host" TIMEOUT 60)

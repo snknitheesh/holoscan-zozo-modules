@@ -13,4 +13,5 @@ holohub_configure_deb(
   VERSION "${PROJECT_VERSION}"
   VENDOR "zozo"
   CONTACT "zozo <snknitheesh@gmail.com>"
-  DEPENDS "holoscan (>= 5.0.0)")
+  DEPENDS "holoscan (>= 5.0.0)"
+)

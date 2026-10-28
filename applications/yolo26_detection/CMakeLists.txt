@@ -25,24 +25,33 @@ find_package(CUDAToolkit REQUIRED)
 
 # The image sources (synthetic, files, V4L2 camera), the image files, the expected
 # detections and the reporter.
-add_library(yolo26_detection_ops STATIC
+add_library(
+  yolo26_detection_ops
+  STATIC
   src/detection_report_op.cpp
   src/expectations.cpp
   src/image_files.cpp
-  src/image_sources.cpp)
+  src/image_sources.cpp
+)
 target_compile_features(yolo26_detection_ops PUBLIC cxx_std_20)
 target_include_directories(yolo26_detection_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(yolo26_detection_ops
+target_link_libraries(
+  yolo26_detection_ops
   PUBLIC holoscan::yolo26 holoscan::core holoscan::sensor_io CUDA::cudart
-  PRIVATE CUDA::nvjpeg)
+  PRIVATE CUDA::nvjpeg
+)
 
 add_executable(yolo26_detection src/main.cpp)
 target_link_libraries(yolo26_detection PRIVATE yolo26_detection_ops)
-target_compile_definitions(yolo26_detection PRIVATE
-  YOLO26_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${YOLO26_DETECTION_ENABLE_VISUALIZATION}>)
+target_compile_definitions(
+  yolo26_detection
+  PRIVATE YOLO26_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${YOLO26_DETECTION_ENABLE_VISUALIZATION}>
+)
 if(YOLO26_DETECTION_ENABLE_VISUALIZATION)
-  target_link_libraries(yolo26_detection PRIVATE
-    holoscan::yolo26_overlay holoscan::visualization::op_holoviz)
+  target_link_libraries(
+    yolo26_detection
+    PRIVATE holoscan::yolo26_overlay holoscan::visualization::op_holoviz
+  )
 endif()
 install(TARGETS yolo26_detection RUNTIME DESTINATION bin)
 
