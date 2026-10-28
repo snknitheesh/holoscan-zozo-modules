@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Every file is owned by the maintainer, so every pull request from anyone else requests
+# their review, and the `main: code owner review` ruleset makes that review required.
+# See .github/RUNNERS.md.
+* @snknitheesh
