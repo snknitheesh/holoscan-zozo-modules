@@ -167,6 +167,27 @@ runs as a systemd unit of your own with `KillSignal=SIGINT` and `KillMode=proces
 not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 `bin/Runner.Listener` process instead, and the unit restarts it.
 
+### Share the machine with other work
+
+By default a job takes the whole machine: the build runs one compile per CPU, and its container
+has no memory or CPU limit. On a machine that also serves something else, such as a model server
+that keeps most of a Jetson's memory, set two variables in the runner's `.env`:
+
+```bash
+cd <runner directory>
+# Parallel compiles in each build (default: every CPU).
+echo "CI_BUILD_JOBS=8" >> .env
+# Extra `docker run` options for every job's container, after the workflow's own.
+echo "CI_DOCKER_OPTIONS=--memory 22g --cpuset-cpus 2-13" >> .env
+```
+
+Restart the runner while it is idle, as for the job hook. The job's log then shows the options in
+the `docker run` command it prints. Limits on the runner's own service, such as systemd's
+`MemoryMax=`, do not reach the job: Docker's daemon starts the container, outside the runner's
+control group. Leave the server's cores out of `--cpuset-cpus`, and pin the server to them (for
+a container, `docker run --cpuset-cpus 0,1`). A build that runs out of memory fails with
+`Killed` or `nvcc` exit status 137: lower `CI_BUILD_JOBS` before raising `--memory`.
+
 ### x86_64 with an NVIDIA GPU
 
 1. An NVIDIA driver for CUDA 13.2 (R595 or newer), which the CI image's CUDA 13.2 user space
