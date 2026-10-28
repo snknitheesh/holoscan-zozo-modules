@@ -25,6 +25,8 @@
 #include <holoscan/rectify/synthetic_stereo.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
+#include "recording.hpp"
+
 namespace rectify_app {
 
 // What one rectifier did over the run. Written by its ReportOp, read after the run.
@@ -64,7 +66,12 @@ struct ReportConfig {
   // a recording, which must come out unchanged.
   std::optional<holoscan::rectify::SyntheticStereo> scene;
   holoscan::rectify::StereoRectification rectification;
-  // Declare the `view` output.
+  // Without `scene`: the recording's frames, which the reporter reads again
+  // to compare with the rectified pairs.
+  std::vector<RecordedFrame> recording;
+  // Declare the `raw_left` and `raw_right` inputs and the `view` output. A
+  // source's buffer can be released to at most 8 consumers' streams, so only
+  // the reporter that draws the view takes the raw pairs.
   bool view_output{};
 };
 
@@ -77,7 +84,8 @@ class ReportOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  // The raw pair, the rectified pair and the geometry, of one capture time.
+  // The rectified pair and the geometry, and with `view_output` the raw pair,
+  // of one capture time.
   holoscan::Input<holoscan::schema::ImageT> raw_left;
   holoscan::Input<holoscan::schema::ImageT> raw_right;
   holoscan::Input<holoscan::schema::ImageT> rectified_left;

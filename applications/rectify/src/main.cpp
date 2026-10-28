@@ -333,6 +333,9 @@ int execute(const Options& opts, SignalDomain& signals) {
             << " doffs=" << rectification.doffs << " valid_left=" << rectification.valid_left.x
             << "," << rectification.valid_left.y << "," << rectification.valid_left.width << "x"
             << rectification.valid_left.height << '\n';
+  const std::vector<rectify_app::RecordedFrame> recorded_frames =
+      opts.recording ? rectify_app::read_index(*opts.recording)
+                     : std::vector<rectify_app::RecordedFrame>{};
   auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(opts.backends.size()));
   holoscan::CompileOptions compile_options;
   for (std::size_t i = 0; i < opts.backends.size(); ++i) {
@@ -352,11 +355,14 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                       .expected_frames = opts.frames,
                                                       .scene = opts.scene,
                                                       .rectification = rectification,
+                                                      .recording = recorded_frames,
                                                       .view_output = display && i == 0});
     graph.add_flow(source->left, rectify->left, lossless);
     graph.add_flow(source->right, rectify->right, lossless);
-    graph.add_flow(source->left, reporter->raw_left, lossless);
-    graph.add_flow(source->right, reporter->raw_right, lossless);
+    if (display && i == 0) {
+      graph.add_flow(source->left, reporter->raw_left, lossless);
+      graph.add_flow(source->right, reporter->raw_right, lossless);
+    }
     graph.add_flow(rectify->rectified_left, reporter->rectified_left, lossless);
     graph.add_flow(rectify->rectified_right, reporter->rectified_right, lossless);
     graph.add_flow(rectify->geometry, reporter->geometry, lossless);

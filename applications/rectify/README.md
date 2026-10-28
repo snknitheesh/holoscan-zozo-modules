@@ -11,7 +11,7 @@ project would: `find_package(holoscan-rectify)`.
 ```mermaid
 flowchart LR
     S[Synthetic distorted pair or recording] -->|left, right| R1[StereoRectifyOp per backend]
-    S -->|left, right| P[Report: rows against the geometry]
+    S -->|left, right, for the view| P[Report: rows against the geometry]
     R1 -->|rectified_left, rectified_right, geometry| P
     P -->|view| V[HoloViz: raw above, rectified below, epipolar lines]
 ```
@@ -82,7 +82,10 @@ under 0.15 px; on a recording, no pixel changed by more than one gray level. On 
 The exit status is 0 for a pass, 1 for a failure or a stop request, and 2 for bad options.
 
 The source sends a pair only when every reporter has finished the one before, so the lossless edges
-never refuse a pair; the display's edge keeps only the newest view.
+never refuse a pair; the display's edge keeps only the newest view. Only the reporter that draws the
+view takes the raw pairs (on a recording, the reporters read its files again): the SDK releases a
+buffer to at most eight consumers' streams, and `--backend all,auto` makes five rectifiers on a
+Jetson.
 
 ## Tests
 

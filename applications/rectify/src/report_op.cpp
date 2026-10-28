@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,8 +66,10 @@ double Report::rms_row_error() const { return dots > 0 ? std::sqrt(sum_row_error
 ReportOp::ReportOp(ReportConfig config) : config_(std::move(config)) {}
 
 void ReportOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(raw_left, "raw_left").queue_depth(2U);
-  spec.input(raw_right, "raw_right").queue_depth(2U);
+  if (config_.view_output) {
+    spec.input(raw_left, "raw_left").queue_depth(2U);
+    spec.input(raw_right, "raw_right").queue_depth(2U);
+  }
   spec.input(rectified_left, "rectified_left").queue_depth(2U);
   spec.input(rectified_right, "rectified_right").queue_depth(2U);
   spec.input(geometry, "geometry").queue_depth(2U);
@@ -93,11 +96,14 @@ void ReportOp::setup(holoscan::OperatorSpec& spec) {
 holoscan::Contract ReportOp::contract() const {
   // Every input of one pair carries its capture time.
   holoscan::Contract result;
-  const std::vector<holoscan::PortRef> ports{raw_left, raw_right, rectified_left, rectified_right,
-                                             geometry};
+  std::vector<holoscan::PortRef> ports{rectified_left, rectified_right, geometry};
+  if (config_.view_output) {
+    ports.emplace_back(raw_left);
+    ports.emplace_back(raw_right);
+    result.input(raw_left, holoscan::Exact{});
+    result.input(raw_right, holoscan::Exact{});
+  }
   result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
-  result.input(raw_left, holoscan::Exact{});
-  result.input(raw_right, holoscan::Exact{});
   result.input(rectified_left, holoscan::Exact{});
   result.input(rectified_right, holoscan::Exact{});
   result.input(geometry, holoscan::Exact{});
@@ -105,10 +111,6 @@ holoscan::Contract ReportOp::contract() const {
 }
 
 holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionContext& context) {
-  auto rl = raw_left.receive();
-  if (!rl) return holoscan::make_unexpected(std::move(rl).error());
-  auto rr = raw_right.receive();
-  if (!rr) return holoscan::make_unexpected(std::move(rr).error());
   auto xl = rectified_left.receive();
   if (!xl) return holoscan::make_unexpected(std::move(xl).error());
   auto xr = rectified_right.receive();
@@ -117,12 +119,6 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
   if (!g) return holoscan::make_unexpected(std::move(g).error());
 
   const rc::StereoRectification& r = config_.rectification;
-  const int in_width = rl->data.width;
-  const int in_height = rl->data.height;
-  auto raw_l = host_pixels(rl->data, in_width, in_height, context);
-  if (!raw_l) return holoscan::make_unexpected(std::move(raw_l).error());
-  auto raw_r = host_pixels(rr->data, in_width, in_height, context);
-  if (!raw_r) return holoscan::make_unexpected(std::move(raw_r).error());
   auto rect_l = host_pixels(xl->data, r.width, r.height, context);
   if (!rect_l) return holoscan::make_unexpected(std::move(rect_l).error());
   auto rect_r = host_pixels(xr->data, r.width, r.height, context);
@@ -149,14 +145,33 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     report.max_row_error = std::max(report.max_row_error, check.max_row_error);
     report.sum_row_error2 += check.rms_row_error * check.rms_row_error * check.dots;
     report.max_position_error = std::max(report.max_position_error, check.max_position_error);
-  } else if (r.width == in_width && r.height == in_height) {
-    for (std::size_t i = 0; i < raw_l->size(); ++i) {
-      report.max_pixel_change =
-          std::max({report.max_pixel_change, std::abs((*raw_l)[i] - (*rect_l)[i]),
-                    std::abs((*raw_r)[i] - (*rect_r)[i])});
+  } else if (!config_.recording.empty()) {
+    // The recording's pair again, from its files.
+    const RecordedFrame& recorded = config_.recording[frame % config_.recording.size()];
+    try {
+      const GrayImage raw_l = read_pgm(recorded.left);
+      const GrayImage raw_r = read_pgm(recorded.right);
+      if (raw_l.pixels.size() != rect_l->size() || raw_r.pixels.size() != rect_r->size()) {
+        return holoscan::make_unexpected(invalid("the rectified size differs from the recording"));
+      }
+      for (std::size_t i = 0; i < rect_l->size(); ++i) {
+        report.max_pixel_change =
+            std::max({report.max_pixel_change, std::abs(raw_l.pixels[i] - (*rect_l)[i]),
+                      std::abs(raw_r.pixels[i] - (*rect_r)[i])});
+      }
+    } catch (const std::invalid_argument& error) {
+      return holoscan::make_unexpected(invalid(error.what()));
     }
   }
   if (config_.view_output) {
+    auto rl = raw_left.receive();
+    if (!rl) return holoscan::make_unexpected(std::move(rl).error());
+    auto rr = raw_right.receive();
+    if (!rr) return holoscan::make_unexpected(std::move(rr).error());
+    auto raw_l = host_pixels(rl->data, rl->data.width, rl->data.height, context);
+    if (!raw_l) return holoscan::make_unexpected(std::move(raw_l).error());
+    auto raw_r = host_pixels(rr->data, rr->data.width, rr->data.height, context);
+    if (!raw_r) return holoscan::make_unexpected(std::move(raw_r).error());
     // Best effort: the display keeps only the newest view and never holds this back.
     (void)send_view(*raw_l, *raw_r, *rect_l, *rect_r, holoscan::sensor_io::derive_from(*xl));
   }
