@@ -8,6 +8,7 @@
 // HoloViz window can show the frames with their detections drawn over them.
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -448,18 +449,28 @@ int execute(const Options& opts, SignalDomain& signals) {
   holoscan::Graph graph{std::string(kAppName)};
   // Frames the run expects; 0 for a camera that runs until stopped.
   const std::uint32_t frames = opts.count.value_or(0);
+  auto report = std::make_shared<app::DetectionReport>();
+  // The synthetic and file sources send a frame only once the reporter is
+  // done with the one before. A blocking edge does not wait for room for
+  // long: it refuses a frame its consumer has no room for, and the detector
+  // cannot send a refused frame again. One frame in flight fits the depth of
+  // two that every input declares in its operator's setup(): the frame being
+  // reported, which keeps its place until its compute() returns, and the next.
+  const std::shared_ptr<const std::atomic<std::uint32_t>> done(report, &report->frames);
   const holoscan::Output<holoscan::schema::ImageT>* image_out = nullptr;
   if (opts.source == Source::kSynthetic) {
-    image_out =
-        &graph.op<app::SyntheticImageSourceOp>("source", synthetic_source_config(opts))->image;
+    auto config = synthetic_source_config(opts);
+    config.done = done;
+    image_out = &graph.op<app::SyntheticImageSourceOp>("source", std::move(config))->image;
   } else if (opts.source == Source::kFiles) {
-    image_out = &graph.op<app::ImageFileSourceOp>("source", file_source_config(opts))->image;
+    auto config = file_source_config(opts);
+    config.done = done;
+    image_out = &graph.op<app::ImageFileSourceOp>("source", std::move(config))->image;
   } else {
     image_out = &graph.op<app::CameraSourceOp>("source", camera_source_config(opts))->image;
   }
   auto detector = graph.op<y26::Yolo26DetectionOp>("detector", detection);
 
-  auto report = std::make_shared<app::DetectionReport>();
   std::optional<app::SyntheticTruth> truth;
   if (opts.source == Source::kSynthetic && opts.verify.value_or(false)) {
     truth = app::SyntheticTruth{

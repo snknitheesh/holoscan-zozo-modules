@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
@@ -87,6 +88,12 @@ Result settle(Result sent, bool& delivered) {
   return sent;
 }
 
+// Whether every frame out so far is done downstream, or nobody counts them.
+bool previous_done(const std::shared_ptr<const std::atomic<std::uint32_t>>& done,
+                   std::uint32_t emitted) {
+  return !done || done->load(std::memory_order_acquire) >= emitted;
+}
+
 holoscan::schema::ImageT descriptor(int width, int height, PixelFormat format) {
   holoscan::schema::ImageT image;
   image.width = width;
@@ -135,6 +142,9 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the run completes.
+  }
+  if (!previous_done(config_.done, emitted_)) {
+    return {};  // Try again on the next tick.
   }
   if (!pending_capture_) {
     pending_capture_ = context.activation_time();
@@ -243,6 +253,9 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= total_) {
     return {};
+  }
+  if (!previous_done(config_.done, emitted_)) {
+    return {};  // Try again on the next tick.
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {

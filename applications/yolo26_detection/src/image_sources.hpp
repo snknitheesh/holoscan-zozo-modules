@@ -5,10 +5,13 @@
 // for the stub model, and a list of JPEG or PPM files. Both emit a fixed
 // number of frames on a clock, numbered from 1, then idle. A frame that a
 // busy consumer pushes back is sent again on the next tick with its original
-// capture time. And a V4L2 webcam, whose frames a busy consumer drops instead.
+// capture time. Given the count of frames done downstream, they also hold
+// each frame until the one before it is done. And a V4L2 webcam, whose frames
+// a busy consumer drops instead.
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +47,9 @@ struct SyntheticImageSourceConfig {
   PixelFormat format{PixelFormat::kRgb8};
   // Emit frames in GPU memory rather than host memory.
   bool device_output{true};
+  // When set, the count of frames done downstream: a frame goes out only
+  // once it has reached the number of frames out, so one at a time.
+  std::shared_ptr<const std::atomic<std::uint32_t>> done;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -79,6 +85,8 @@ struct ImageFileSourceConfig {
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
   // Emit BGR8 rather than RGB8.
   bool bgr{false};
+  // As for SyntheticImageSourceConfig.
+  std::shared_ptr<const std::atomic<std::uint32_t>> done;
 };
 
 // @throws std::invalid_argument naming the first unusable field.

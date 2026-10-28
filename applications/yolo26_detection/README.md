@@ -118,7 +118,9 @@ invalid options, a missing camera among them; else 1.
 `--expect FILE` lists detections that named image files must yield, as lines of
 `image,class_id,x1,y1,x2,y2`, each matched by a detection of the class with an IoU of at least
 `--expect-iou` (default 0.8). `--image-dir DIR` writes each frame with its boxes drawn as
-`DIR/detections_NNNNNN.ppm`. `--encoding bgr8` decodes the files as BGR8, `--fp16 true` builds an
+`DIR/detections_NNNNNN.ppm`. Synthetic frames and files go one at a time: the source sends a frame
+only once the reporter is done with the one before, so none is lost however long the reporter takes,
+to write an image say, and `--period-ms` is the shortest time between frames. `--encoding bgr8` decodes the files as BGR8, `--fp16 true` builds an
 FP16 engine, and `--score-threshold` sets the threshold. Run the executable with `--help` for every
 option. `-DYOLO26_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
 
