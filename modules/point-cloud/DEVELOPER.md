@@ -33,7 +33,7 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
 | Consumer form | `find_package(holoscan-point-cloud)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Debian package | `holoscan-point-cloud`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
 | Test labels | `point_cloud` and `gpu` on all |
 
 ## Conventions

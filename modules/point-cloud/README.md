@@ -14,7 +14,7 @@ end.
 | Headers | `<holoscan/point_cloud/...>` |
 | C++ namespace | `holoscan::point_cloud` |
 | Debian package | `holoscan-point-cloud` |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
 
 ## Operators
 
