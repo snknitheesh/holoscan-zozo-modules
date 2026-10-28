@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# hadolint, for .github/docker/Dockerfile.
+ignored:
+  # Pin versions in apt-get install. Ubuntu's archive keeps only the newest version of a
+  # package, so a pinned Ubuntu package breaks the build at its next update. What the
+  # image is for is pinned instead: the base image by digest, and the Holoscan SDK
+  # (by SHA-256), TensorRT and VPI packages by version.
+  - DL3008

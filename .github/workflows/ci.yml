@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# Three jobs, each a stable check name for branch protection:
-#   Lint     GitHub-hosted: pre-commit, actionlint, the CI driver's tests and the
-#            SDK-free tests of every module and demo.
-#   x86 GPU  Self-hosted x86_64 runner with an NVIDIA GPU.
-#   Jetson   Self-hosted Jetson Thor and Jetson Orin (JetPack 7).
+# Five checks, each a stable name that branch protection requires:
+#   Lint         GitHub-hosted: prek, actionlint, the CI driver's tests and the
+#                SDK-free tests of every module and demo.
+#   x86 GPU      Self-hosted x86_64 runner with an NVIDIA GPU.
+#   Jetson Thor  Self-hosted Jetson Thor (JetPack 7).
+#   Jetson Orin  Self-hosted Jetson Orin (JetPack 7.2).
+#   CI result    GitHub-hosted, always runs: fails unless every job above
+#                succeeded, so a skipped GPU job (a fork's pull request) is not green.
 # All GPU jobs build the one CI image, .github/docker/Dockerfile, for their own
 # architecture, and run .github/scripts/ci.py in it, which discovers modules/*/ and
 # applications/*/, so adding one needs no change here. Every CI container is labeled
@@ -34,25 +37,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Copyright years are checked against the pull request's base or the previous push.
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
       - name: Install repository tools
         run: python -m pip install -r requirements.txt
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: ~/.cache/pre-commit
-          key: pre-commit-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('.pre-commit-config.yaml') }}
-      - name: pre-commit
+          path: ~/.cache/prek
+          key: prek-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('.pre-commit-config.yaml', 'requirements.txt') }}
+      - name: prek
         env:
           COPYRIGHT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: pre-commit run --all-files --show-diff-on-failure
+        run: prek run --all-files --show-diff-on-failure
       - name: Validate the workflows
         run: >-
           docker run --rm --user "$(id -u):$(id -g)"
@@ -68,7 +71,7 @@ jobs:
     name: x86 GPU
     needs: lint
     # Self-hosted runners never run a fork's code on their own: a pull request from a
-    # fork skips this job; see .github/RUNNERS.md.
+    # fork skips this job, and `CI result` then fails; see .github/RUNNERS.md.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -80,7 +83,7 @@ jobs:
       CI_JOB_KEY: x86
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-x86
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       # The runner's job hook (.github/RUNNERS.md) does this too, before and after
@@ -112,7 +115,7 @@ jobs:
         run: python3 .github/scripts/ci_container.py sweep
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ci-x86_64
           path: |
@@ -143,7 +146,7 @@ jobs:
       CI_JOB_KEY: ${{ matrix.board }}
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.board }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       # The runner's job hook (.github/RUNNERS.md) does this too, before and after
@@ -177,7 +180,7 @@ jobs:
         run: python3 .github/scripts/ci_container.py sweep
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ci-jetson-${{ matrix.board }}
           path: |
@@ -185,3 +188,38 @@ jobs:
             build-ci/**/Testing/Temporary/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # The one check that is never skipped. A skipped job counts as passing for branch
+  # protection, and a skipped matrix job reports under its unexpanded name, so this
+  # job turns a skipped or failed lane into a visible failure.
+  result:
+    name: CI result
+    needs: [lint, x86-gpu, jetson]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          failed=0
+          if [ "$FORK" = true ]; then
+            echo "::error::This pull request is from a fork, so the GPU jobs did not run. A maintainer must review it and push the branch to this repository to run them; see .github/RUNNERS.md."
+            failed=1
+          fi
+          # A jq failure ends the step here, under the default `bash -e`.
+          results="$(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<< "$NEEDS")"
+          if [ -z "$results" ]; then
+            echo "::error::No job results to check"
+            exit 1
+          fi
+          while IFS=$'\t' read -r job result; do
+            echo "$job: $result"
+            if [ "$result" != success ]; then
+              echo "::error::Job $job did not succeed: $result"
+              failed=1
+            fi
+          done <<< "$results"
+          exit "$failed"

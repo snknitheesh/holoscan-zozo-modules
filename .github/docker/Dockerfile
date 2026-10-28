@@ -25,6 +25,8 @@ LABEL org.opencontainers.image.source="https://github.com/snknitheesh/holoscan-z
       org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-NVIDIA-Proprietary"
 
 ARG DEBIAN_FRONTEND=noninteractive
+# A failing command anywhere in a pipe fails the build.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Set by BuildKit to the platform being built, and unset by Docker's legacy builder.
 # The packages below are picked from the image's own architecture, which must agree
 # with it when it is set.
@@ -38,13 +40,13 @@ ARG TARGETARCH
 ARG HOLOSCAN_REPOSITORY=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404
 ARG HOLOSCAN_DEB_VERSION=5.0.0.8.0-1
 ARG TENSORRT_VERSION=10.14.1.48-1+cuda13.0
+# The packages are downloaded to, and installed from, a folder this step removes.
+WORKDIR /tmp/holoscan-debs
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     if [ -n "${TARGETARCH:-}" ] && [ "${TARGETARCH:-}" != "${arch}" ]; then \
       echo "TARGETARCH ${TARGETARCH:-} does not match the image's architecture ${arch}" >&2; exit 1; \
     fi; \
-    debs="$(mktemp -d)"; \
-    cd "${debs}"; \
     case "${arch}" in \
       amd64) \
         repository="${HOLOSCAN_REPOSITORY}/x86_64"; \
@@ -87,8 +89,8 @@ RUN set -eux; \
       "libnvinfer-vc-plugin10=${TENSORRT_VERSION}" \
       "libnvinfer-dispatch10=${TENSORRT_VERSION}" \
       git gnupg libvulkan-dev ninja-build python3 python3-pip; \
-    cd /; \
-    rm -rf "${debs}" /var/lib/apt/lists/*
+    rm -rf /tmp/holoscan-debs /var/lib/apt/lists/*
+WORKDIR /
 
 # VPI 4 from NVIDIA's Jetson package repository: its x86_64/noble component on
 # amd64, and on arm64 its common component, whose PVA backend the nvidia runtime
@@ -98,6 +100,8 @@ RUN set -eux; \
 # Jetson Linux's own libraries (libnvrm_*, libnvmedia, libnvbufsurface, libnvvic,
 # libnvos, the EGL driver), which the nvidia runtime mounts from the board: there,
 # building against VPI, not only running it, needs `--runtime nvidia`.
+# The fingerprint's awk reads all of gpg's output: under pipefail, exiting at the first
+# match could fail gpg, and the build, on EPIPE.
 ARG VPI_REPOSITORY_RELEASE=r38.4
 ARG VPI_VERSION=4.0.5
 ARG VPI_REPOSITORY_FINGERPRINT=3C6D1FF3100C8C3ABB0869C0E6543461A9996195
@@ -107,11 +111,12 @@ RUN set -eux; \
       arm64) component=common ;; \
       *) echo "unsupported architecture" >&2; exit 1 ;; \
     esac; \
-    export GNUPGHOME="$(mktemp -d)"; \
+    GNUPGHOME="$(mktemp -d)"; \
+    export GNUPGHOME; \
     key="${GNUPGHOME}/nvidia-jetson.asc"; \
     curl -fsSL https://repo.download.nvidia.com/jetson/jetson-ota-public.asc -o "${key}"; \
     keys="$(gpg --show-keys --with-colons "${key}" | awk -F: '$1 == "pub"' | wc -l)"; \
-    fingerprint="$(gpg --show-keys --with-colons "${key}" | awk -F: '$1 ~ /^fp/ { print $10; exit }')"; \
+    fingerprint="$(gpg --show-keys --with-colons "${key}" | awk -F: '$1 ~ /^fp/ && !n++ { print $10 }')"; \
     if [ "${keys}" != 1 ] || [ "${fingerprint}" != "${VPI_REPOSITORY_FINGERPRINT}" ]; then \
       echo "unexpected VPI repository signing key: ${keys} key(s), ${fingerprint}" >&2; exit 1; \
     fi; \
@@ -139,3 +144,6 @@ RUN set -eux; \
 
 # Holoviz needs the graphics and display capabilities, not only compute and utility.
 ENV NVIDIA_DRIVER_CAPABILITIES=all
+
+# Images built FROM this one get Docker's default shell back, not this file's pipefail.
+SHELL ["/bin/sh", "-c"]

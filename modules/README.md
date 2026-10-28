@@ -5,11 +5,12 @@ module by its `metadata.json`. The [repository README](../README.md) lists the m
 
 ## What CI expects of a module
 
-CI discovers every `modules/<name>/` that has a `metadata.json`, so a new module needs no workflow
-change. A module must have:
+CI discovers every `modules/<name>/`, so a new module needs no workflow change. Every folder here
+(other than a hidden one) is a module, and one without `metadata.json` fails CI rather than being
+skipped. A module must have:
 
 - `metadata.json` with the `module` envelope (`urn:holoscan:module:v2`), whose `name` is
-  `holoscan-<name>`. pre-commit checks it against the Holoscan CLI's schema.
+  `holoscan-<name>`. The lint hooks check it against the Holoscan CLI's schema.
 - `CMakeLists.txt`, a standalone CMake project against an installed Holoscan SDK. With
   `-DBUILD_TESTING=ON` it builds the module's full test suite and registers it with CTest; the GPU
   jobs run all of it, and it must not be empty. `cmake --install` installs the headers, the
@@ -17,6 +18,10 @@ change. A module must have:
 - `tests/installed_consumer/`, a standalone CMake project that finds the installed package (CI
   passes the install prefix in `CMAKE_PREFIX_PATH`), links its targets and registers at least one
   CTest test that runs them.
+
+CI builds and installs the modules in name order, and each module's build gets the install prefix
+in `CMAKE_PREFIX_PATH`, so a module may `find_package` another module of this collection only if
+that module's name sorts before its own.
 
 The GPU jobs set `HOLOSCAN_CI_PLATFORM` to `x86_64` or `jetson` for the tests, so a test can
 require what holds only on one platform, such as the Jetson's PVA.
