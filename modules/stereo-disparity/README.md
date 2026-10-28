@@ -74,6 +74,11 @@ eye's, and `baseline` is minus the x translation of its right-from-left extrinsi
 | `Backend::kPva` | OFA, PVA and VIC | Jetson Thor, Jetson Orin | The OFA's SGM with the PVA's post-processing: a median filter (`window` 1, 3, 5 or 7) and a confidence map, also a learned one (`ConfidenceType::kInference`). `max_disparity` 128 or 256; the image at least `max(64, max_disparity)` wide |
 | `Backend::kAuto` | One of the above | All | Opt-in. Chosen on the first frame, when the image size is known: `ofa` where VPI reports an OFA and a VIC and the parameters and size suit it, else `cuda`. Logged once, for example `StereoDisparityOp: backend auto chose ofa for 1280x720 images: VPI reports an OFA, and the parameters and image size suit it` |
 
+On Jetson Thor, VPI 4.1.4's `ofa` and `pva` give whole-pixel disparities, up to half a pixel off,
+where Orin's have a sub-pixel part; and `pva` there leaves a few percent of the pixels far off. The
+[demo's README](../../applications/stereo_disparity/README.md#accuracy) has the numbers for each
+backend and platform.
+
 A backend this platform lacks is refused when the operator is made, naming what is missing.
 `available_backends()` and `probe_platform()` in `<holoscan/stereo_disparity/platform.hpp>` say what
 the platform has; `resolve_auto()`, `params_problem()` and `size_problem()` in

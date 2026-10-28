@@ -75,8 +75,9 @@ with a disparity, and the checks. Then `PASS`, `FAIL`, or `STOPPED` when an inte
 window ends it early. It exits 0 on `PASS`, 2 for invalid options, else 1.
 
 **Synthetic**, over the pixels both cameras see: the share with a disparity (`valid`, at least
-0.85), the share of those within 1 px of the truth (`within_1px`, at least 0.9), and their mean
-error (`mae_px`, at most 0.5 px).
+0.85), the share of those within 1 px of the truth (`within_1px`, at least 0.85), and their median
+error (`median_px`, at most 0.5 px); the mean error (`mae_px`) is reported too. Every line also
+reports `whole_px`, the share of disparities without a fractional part.
 
 **Recording**, over the pixels where the camera has depth: the share where the computed depth has
 one too (`coverage`), the median and 90th percentile of `|computed - camera| / camera`, and the
@@ -86,13 +87,15 @@ share within 5 %. They are checked only when the camera itself has depth for at 
 | Check | Pass | Measured, projector on |
 | --- | --- | --- |
 | `coverage` | at least 0.85 | 0.98 to 1.00 |
-| `median_rel_err` | at most 0.03 | 0.0095 to 0.0105 |
-| `within_5pct` | at least 0.75 | 0.87 to 0.90 |
+| `median_rel_err` | at most 0.03 | 0.0095 to 0.0105; 0.0155 to 0.0185 for `ofa` and `pva` on Thor |
+| `within_5pct` | at least 0.75 | 0.87 to 0.90; 0.80 to 0.84 for `ofa` and `pva` on Thor |
 
 The camera and VPI match the same infrared pair, both with semi-global matching, so they should
 agree to a fraction of a pixel. At the ceiling's distance, about 2.5 m, the disparity is about 13 px
-at 720p, so 3 % is 0.4 px; the 90th percentile, 5 to 7 %, is the edges and the textureless ducts,
-where the two matchers fill in differently. With the projector off, the infrared images are nearly
+at 720p, so 3 % is 0.4 px; the 90th percentile, 5 to 8 %, is the edges and the textureless ducts,
+where the two matchers fill in differently. On Jetson Thor, VPI 4.1.4's `ofa` and `pva` give
+whole-pixel disparities (`whole_px=1.000`), up to half a pixel off, which costs them about half a
+percent of median error here. With the projector off, the infrared images are nearly
 black: the camera finds depth on only about 2 % of the pixels, so there is too little to compare,
 and the run must complete and report its valid share, but its accuracy is only reported.
 
@@ -104,26 +107,43 @@ stereo_disparity: verdict=PASS
 
 ## Accuracy
 
-Against the camera's depth, all 60 frames of each clip, VPI 4.1.4 (`cuda` on x86_64 and Jetson
-Orin gave the same numbers; `ofa` and `pva` on Jetson Orin):
+Against the camera's depth, all 60 frames of each clip, VPI 4.1.4. `cuda` gave the same numbers on
+x86_64, Jetson Orin and Jetson Thor.
 
 | Clip | Backend | Valid | Camera has depth | Coverage | Median error | 90th percentile | Within 5 % |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 720p, projector on | `cuda` | 0.929 | 0.693 | 0.994 | 1.05 % | 5.05 % | 0.897 |
-| 720p, projector on | `ofa` | 0.995 | 0.693 | 1.000 | 1.05 % | 6.55 % | 0.866 |
-| 720p, projector on | `pva` | 0.996 | 0.693 | 1.000 | 1.05 % | 6.05 % | 0.877 |
+| 720p, projector on | `ofa`, Orin | 0.995 | 0.693 | 1.000 | 1.05 % | 6.55 % | 0.866 |
+| 720p, projector on | `ofa`, Thor | 0.995 | 0.693 | 1.000 | 1.55 % | 7.35 % | 0.836 |
+| 720p, projector on | `pva`, Orin | 0.996 | 0.693 | 1.000 | 1.05 % | 6.05 % | 0.877 |
+| 720p, projector on | `pva`, Thor | 0.997 | 0.693 | 1.000 | 1.55 % | 7.25 % | 0.841 |
 | 480p, projector on | `cuda` | 0.925 | 0.806 | 0.977 | 1.05 % | 4.95 % | 0.903 |
-| 480p, projector on | `ofa` | 0.996 | 0.806 | 1.000 | 1.05 % | 6.55 % | 0.866 |
-| 480p, projector on | `pva` | 0.996 | 0.806 | 1.000 | 0.95 % | 5.95 % | 0.879 |
+| 480p, projector on | `ofa`, Orin | 0.996 | 0.806 | 1.000 | 1.05 % | 6.55 % | 0.866 |
+| 480p, projector on | `ofa`, Thor | 0.996 | 0.806 | 1.000 | 1.85 % | 8.25 % | 0.805 |
+| 480p, projector on | `pva`, Orin | 0.996 | 0.806 | 1.000 | 0.95 % | 5.95 % | 0.879 |
+| 480p, projector on | `pva`, Thor | 0.996 | 0.806 | 1.000 | 1.75 % | 7.85 % | 0.814 |
 | 720p, projector off | `cuda` | 0.902 | 0.018 | 0.964 | 6.65 % | 64 % | 0.440 |
-| 720p, projector off | `ofa` | 0.987 | 0.018 | 0.996 | 7.85 % | 75 % | 0.407 |
-| 720p, projector off | `pva` | 0.994 | 0.018 | 0.998 | 7.55 % | 73 % | 0.414 |
+| 720p, projector off | `ofa`, Orin | 0.987 | 0.018 | 0.996 | 7.85 % | 75 % | 0.407 |
+| 720p, projector off | `ofa`, Thor | 0.987 | 0.018 | 0.996 | 8.05 % | 75 % | 0.400 |
+| 720p, projector off | `pva`, Orin | 0.994 | 0.018 | 0.998 | 7.55 % | 73 % | 0.414 |
+| 720p, projector off | `pva`, Thor | 0.996 | 0.018 | 0.999 | 8.05 % | 80 % | 0.394 |
 | 480p, projector off | `cuda` | 0.932 | 0.021 | 0.982 | 6.75 % | 49 % | 0.428 |
-| 480p, projector off | `ofa` | 0.977 | 0.021 | 0.992 | 7.35 % | 57 % | 0.408 |
-| 480p, projector off | `pva` | 0.986 | 0.021 | 0.995 | 7.05 % | 55 % | 0.417 |
+| 480p, projector off | `ofa`, Orin | 0.977 | 0.021 | 0.992 | 7.35 % | 57 % | 0.408 |
+| 480p, projector off | `ofa`, Thor | 0.977 | 0.021 | 0.992 | 7.55 % | 58 % | 0.394 |
+| 480p, projector off | `pva`, Orin | 0.986 | 0.021 | 0.995 | 7.05 % | 55 % | 0.417 |
+| 480p, projector off | `pva`, Thor | 0.990 | 0.021 | 0.997 | 7.45 % | 61 % | 0.399 |
 
-On the synthetic scene (30 frames, 1280x720, the `ci` mode): `cuda` 0.994 valid, 0.994 within
-1 px, 0.23 px mean error; `ofa` 1.000, 0.999, 0.094 px; `pva` 1.000, 0.999, 0.088 px.
+On the synthetic scene (30 frames, 1280x720, the `ci` mode):
+
+| Backend | Valid | Within 1 px | Median error | Mean error |
+| --- | --- | --- | --- | --- |
+| `cuda`, x86_64, Orin and Thor | 0.994 | 0.994 | 0.14 px | 0.23 px |
+| `ofa`, Orin | 1.000 | 0.999 | not measured | 0.094 px |
+| `ofa`, Thor | 1.000 | 0.999 | 0.20 px | 0.22 px |
+| `pva`, Orin | 1.000 | 0.999 | not measured | 0.088 px |
+| `pva`, Thor | 1.000 | 0.922 | 0.20 px | 3.2 px |
+
+On Thor, `pva` leaves 8 % of the pixels more than a pixel off, some of them far off.
 
 ## Performance
 
@@ -136,15 +156,16 @@ build/stereo_disparity/stereo_disparity --source recording --clip d585_720p_emit
   --period-ms 150 --display false
 ```
 
-| Input | `cuda`, RTX 5090 | `cuda`, Jetson Orin | `ofa`, Jetson Orin | `pva`, Jetson Orin |
-| --- | --- | --- | --- | --- |
-| Recording, 1280x720 | 9.2 ms | 61.8 ms | 46.2 ms | 51.3 ms |
-| Recording, 848x480 | 6.6 ms | 22.2 ms | 24.1 ms | 27.9 ms |
-| Synthetic, 1280x720 | 7.2 ms | 61.3 ms | 45.7 ms | 51.2 ms |
+| Input | `cuda`, RTX 5090 | `cuda`, Thor | `ofa`, Thor | `pva`, Thor | `cuda`, Orin | `ofa`, Orin | `pva`, Orin |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Recording, 1280x720 | 9.2 ms | 10.3 ms | 19.9 ms | 17.1 ms | 61.8 ms | 46.2 ms | 51.3 ms |
+| Recording, 848x480 | 6.6 ms | 5.0 ms | 11.1 ms | 9.7 ms | 22.2 ms | 24.1 ms | 27.9 ms |
+| Synthetic, 1280x720 | 7.2 ms | 10.5 ms | 20.2 ms | 17.1 ms | 61.3 ms | 45.7 ms | 51.2 ms |
 
 The RTX 5090 was shared with another process that kept it fully busy, so its times are upper
-bounds: VPI's matching alone took 3.5 to 4 ms of them. On the Jetson, `ofa` and `pva` leave the
-GPU free for other work; `cuda` there grows quickly with the image size.
+bounds: VPI's matching alone took 3.5 to 4 ms of them. The Thor numbers are from a CI runner. On a
+Jetson, `ofa` and `pva` leave the GPU free for other work; on the Orin, `cuda` grows quickly with
+the image size.
 
 ## Tests
 

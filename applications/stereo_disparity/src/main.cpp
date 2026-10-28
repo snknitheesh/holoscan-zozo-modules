@@ -66,11 +66,12 @@ constexpr auto kTimeoutAllowance = std::chrono::seconds{120};
 // What every backend must reach on the synthetic scene, over the pixels both
 // cameras see: the share with a disparity, the share of those within 1 px of
 // the truth, and their median error. The median, not the mean: on Jetson
-// Thor, pva leaves a few pixels far off, which move the mean but not the
-// median. And there ofa and pva give whole-pixel disparities, up to 0.5 px
-// off. The module's tests hold each backend to bounds of its own.
+// Thor, pva leaves 7 % of the pixels more than 1 px off (0.92 within 1 px at
+// 1280x720), some far off, which move the mean (3 px) but not the median.
+// And there ofa and pva give whole-pixel disparities, up to 0.5 px off. The
+// module's tests hold each backend to bounds of its own.
 constexpr double kMinTruthValid = 0.85;
-constexpr double kMinWithin1px = 0.9;
+constexpr double kMinWithin1px = 0.85;
 constexpr double kMaxMedianErrorPx = 0.5;
 
 // Against the camera's own depth, on a clip where the camera has depth for at
@@ -78,9 +79,11 @@ constexpr double kMaxMedianErrorPx = 0.5;
 // this share of the camera's pixels, with this median relative error and this
 // share within 5 %. Measured with VPI 4.1.4, the projector on, at 720p and
 // 480p: coverage 0.98 to 1.0, median 0.9 % to 1.1 %, within 5 % 0.86 to 0.90 on
-// cuda, ofa and pva alike. The camera and VPI match the same infrared pair,
-// both with semi-global matching, so they should agree to a fraction of a
-// pixel: at the ceiling's 2.5 m (13 px at 720p), 3 % is 0.4 px.
+// cuda, ofa and pva on x86_64 and Jetson Orin; on Jetson Thor, whose ofa and
+// pva give whole pixels, median 1.5 % to 1.9 % and within 5 % 0.80 to 0.84. The
+// camera and VPI match the same infrared pair, both with semi-global matching,
+// so they should agree to a fraction of a pixel: at the ceiling's 2.5 m (13 px
+// at 720p), 3 % is 0.4 px, and a whole-pixel disparity is up to 0.5 px off.
 constexpr double kMinCoverage = 0.85;
 constexpr double kMaxMedianError = 0.03;
 constexpr double kMinWithin5pct = 0.75;
