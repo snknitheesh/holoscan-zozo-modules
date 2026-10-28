@@ -16,8 +16,24 @@
 function(holohub_configure_deb)
   # parse args
   set(options)
-  set(requiredArgs NAME DESCRIPTION VERSION VENDOR CONTACT DEPENDS)
-  list(APPEND oneValueArgs ${requiredArgs} SECTION PRIORITY RECOMMENDS SUGGESTS EXPORT_NAME)
+  set(
+    requiredArgs
+    NAME
+    DESCRIPTION
+    VERSION
+    VENDOR
+    CONTACT
+    DEPENDS
+  )
+  list(
+    APPEND oneValueArgs
+    ${requiredArgs}
+    SECTION
+    PRIORITY
+    RECOMMENDS
+    SUGGESTS
+    EXPORT_NAME
+  )
   set(multiValueArgs COMPONENTS)
   cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGV})
 
@@ -33,7 +49,7 @@ function(holohub_configure_deb)
   endif()
 
   if(NOT ARG_SECTION)
-   set(ARG_SECTION "devel")
+    set(ARG_SECTION "devel")
   endif()
   if(NOT ARG_PRIORITY)
     set(ARG_PRIORITY "optional")
@@ -63,7 +79,8 @@ function(holohub_configure_deb)
     )
     # Generate the config files that include the exports
     include(CMakePackageConfigHelpers)
-    configure_package_config_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Config.cmake.in"
+    configure_package_config_file(
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Config.cmake.in"
       "${CMAKE_CURRENT_BINARY_DIR}/${ARG_NAME}Config.cmake"
       INSTALL_DESTINATION ${config_install_dir}
       NO_SET_AND_CHECK_MACRO
@@ -74,9 +91,10 @@ function(holohub_configure_deb)
       COMPATIBILITY AnyNewerVersion
     )
     # Install the config files
-    install(FILES
-      ${CMAKE_CURRENT_BINARY_DIR}/${ARG_NAME}Config.cmake
-      ${CMAKE_CURRENT_BINARY_DIR}/${ARG_NAME}ConfigVersion.cmake
+    install(
+      FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/${ARG_NAME}Config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/${ARG_NAME}ConfigVersion.cmake
       DESTINATION ${config_install_dir}
       COMPONENT ${export_component}
     )
@@ -107,7 +125,10 @@ function(holohub_configure_deb)
   set(CPACK_STRIP_FILES TRUE)
   set(CPACK_GENERATOR DEB) # default, can be overridden with cpack -G <generator>
   set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
-  set(CPACK_ARCHIVE_FILE_NAME "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_${CMAKE_SYSTEM_PROCESSOR}")
+  set(
+    CPACK_ARCHIVE_FILE_NAME
+    "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_${CMAKE_SYSTEM_PROCESSOR}"
+  )
   # Note: CPACK_ARCHIVE_FILE_NAME above does not work if there is no components:
   # https://gitlab.kitware.com/cmake/cmake/-/issues/20419
   # Fixed in CMake 4.0: https://gitlab.kitware.com/cmake/cmake/-/blob/master/Help/release/4.0.rst
