@@ -4,8 +4,8 @@
 # Five checks, each a stable name that branch protection requires:
 #   Lint         GitHub-hosted: prek, actionlint, the CI driver's tests and the
 #                SDK-free tests of every module and demo.
-#   x86 GPU      Self-hosted x86_64 runner with an NVIDIA GPU.
-#   Jetson Thor  Self-hosted Jetson Thor (JetPack 7).
+#   x86 GPU      Self-hosted x86_64 runner with an NVIDIA GPU (driver R595 or newer).
+#   Jetson Thor  Self-hosted Jetson Thor (JetPack 7.2).
 #   Jetson Orin  Self-hosted Jetson Orin (JetPack 7.2).
 #   CI result    GitHub-hosted, always runs: fails unless every job above
 #                succeeded, so a skipped GPU job (a fork's pull request) is not green.

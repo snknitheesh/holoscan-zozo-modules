@@ -36,8 +36,8 @@ the rules a module or a demo follows so that CI picks it up without changes.
 
 ## Requirements
 
-- Linux on x86_64 with an NVIDIA GPU, or on aarch64: Jetson Thor with JetPack 7, or Jetson Orin
-  with JetPack 7.2.
+- Linux on x86_64 with an NVIDIA GPU and a driver for CUDA 13.2 (R595 or newer), or on aarch64:
+  Jetson Thor or Jetson Orin with JetPack 7.2.
 - Holoscan SDK 5.0 with CUDA 13, CMake 4.0 or later and a C++20 compiler.
 - Module-specific dependencies, listed in each module's README.
 
@@ -48,7 +48,7 @@ The CI container has all of these, for both architectures; see
 
 Every CI job runs in one image, built from
 [`.github/docker/Dockerfile`](.github/docker/Dockerfile) for `linux/amd64` and `linux/arm64`
-and published to the GitHub Container Registry. It has CUDA 13.0, the Holoscan SDK 5.0.0,
+and published to the GitHub Container Registry. It has CUDA 13.2, the Holoscan SDK 5.0.0,
 TensorRT, VPI 4, CMake 4 and the Holoscan CLI, and makes a good development container:
 
 ```bash
@@ -56,7 +56,7 @@ docker pull ghcr.io/snknitheesh/holoscan-zozo-modules:latest
 ```
 
 From a clone of this repository, build and test every module and demo the way CI does. On
-x86_64 with an NVIDIA GPU:
+x86_64 with an NVIDIA GPU and an R595 or newer driver:
 
 ```bash
 docker run --rm --init --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
@@ -64,7 +64,7 @@ docker run --rm --init --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
   python3 .github/scripts/ci.py sdk --platform x86_64
 ```
 
-On Jetson Thor with JetPack 7 or Jetson Orin with JetPack 7.2 (the PVA needs `--privileged`, and
+On Jetson Thor or Jetson Orin with JetPack 7.2 (the PVA needs `--privileged`, and
 `DISPLAY` must stay unset):
 
 ```bash
