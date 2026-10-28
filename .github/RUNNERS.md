@@ -106,10 +106,10 @@ when `config.sh` asks, or pass `--labels`:
 # x86_64 workstation with an NVIDIA GPU
 ./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
   --name x86-gpu --labels gpu --unattended
-# Jetson Thor (JetPack 7)
+# Jetson Thor (JetPack 7.2 or later)
 ./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
   --name jetson-thor --labels jetson,thor --unattended
-# Jetson Orin (JetPack 7.2 or later, which brings CUDA 13 to Orin)
+# Jetson Orin (JetPack 7.2 or later)
 ./config.sh --url https://github.com/snknitheesh/holoscan-zozo-modules --token <token> \
   --name jetson-orin --labels jetson,orin --unattended
 ```
@@ -169,7 +169,8 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 
 ### x86_64 with an NVIDIA GPU
 
-1. An NVIDIA driver for CUDA 13 (R580 or newer).
+1. An NVIDIA driver for CUDA 13.2 (R595 or newer), which the CI image's CUDA 13.2 user space
+   needs.
 2. [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) with the Buildx plugin
    (`docker buildx version` must work): `docker-buildx-plugin` with Docker's packages, or
    `sudo apt-get install docker-buildx` with Ubuntu's `docker.io`. The jobs fail without it.
@@ -186,15 +187,17 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 
 ### Jetson Thor
 
-1. JetPack 7 (L4T R38), which brings the CUDA 13.0 driver, the PVA firmware and the NVIDIA
-   Container Toolkit with its `nvidia` runtime.
+1. JetPack 7.2 (L4T R39.2) or later, which brings the CUDA 13.2 driver, the PVA firmware and the
+   NVIDIA Container Toolkit with its `nvidia` runtime. The CI image's CUDA 13.2 user space, and
+   the TensorRT and VPI it takes from the Jetson repository's `r39.2` release, need it: JetPack 7.0
+   and 7.1 (L4T R38) have a CUDA 13.0 driver.
 2. Docker Engine with the Buildx plugin, as on x86_64 (Ubuntu's `docker.io` needs
    `sudo apt-get install docker-buildx`), and the `nvidia` runtime registered:
 
    ```bash
    sudo nvidia-ctk runtime configure --runtime=docker
    sudo systemctl restart docker
-   docker run --rm --runtime nvidia nvcr.io/nvidia/cuda:13.0.2-base-ubuntu24.04 nvidia-smi
+   docker run --rm --runtime nvidia nvcr.io/nvidia/cuda:13.2.1-base-ubuntu24.04 nvidia-smi
    ```
 
 3. The job runs its container with `--runtime nvidia --privileged`. The PVA needs both, and the
@@ -206,9 +209,8 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 
 ### Jetson Orin
 
-1. JetPack 7.2 (L4T R39) or later, which brings CUDA 13 to Orin; the CI image's CUDA 13.0 user
-   space needs it. Like JetPack 7 on Thor, it brings the PVA firmware and the NVIDIA Container
-   Toolkit with its `nvidia` runtime.
+1. JetPack 7.2 (L4T R39.2) or later, which brings CUDA 13.2 to Orin, as on Thor, with the PVA
+   firmware and the NVIDIA Container Toolkit with its `nvidia` runtime.
 2. Docker Engine with the Buildx plugin. Ubuntu's `docker.io` has none, and without it the job
    fails at "Build the CI image":
 
@@ -223,7 +225,7 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
    ```bash
    sudo nvidia-ctk runtime configure --runtime=docker
    sudo systemctl restart docker
-   docker run --rm --runtime nvidia nvcr.io/nvidia/cuda:13.0.2-base-ubuntu24.04 nvidia-smi
+   docker run --rm --runtime nvidia nvcr.io/nvidia/cuda:13.2.1-base-ubuntu24.04 nvidia-smi
    ```
 
 4. The job's container runs as on Thor: `--runtime nvidia --privileged`, without `DISPLAY`.
@@ -234,14 +236,16 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 [`docker/Dockerfile`](docker/Dockerfile) builds the one image every lane uses, for `linux/amd64`
 and `linux/arm64`:
 
-- `nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04`, pinned by its multi-arch index digest;
+- `nvcr.io/nvidia/cuda:13.2.1-devel-ubuntu24.04`, pinned by its multi-arch index digest;
 - the Holoscan SDK 5.0.0 packages from NVIDIA's `ubuntu2404` CUDA repository (`x86_64` or
   `sbsa`): `holoscan-core-cuda-13`, `libholoscan-visualization-cuda-13` and `-dev`, and
   `libholoscan-inference-cuda-13` and `-dev`, each checked against its SHA-256;
-- TensorRT 10.14 for CUDA 13.0 (libraries, headers and `trtexec`), pinned;
-- VPI 4.0.5 from NVIDIA's Jetson repository, release `r38.4`: `x86_64/noble` on amd64, `common`
-  on arm64, whose PVA backend the `nvidia` runtime connects to the board's PVA; the repository
-  key is accepted only with its pinned fingerprint;
+- TensorRT for CUDA 13.2 (libraries, headers and `trtexec`), pinned: 10.16.1 from the CUDA
+  repository on amd64, and 10.16.2 from NVIDIA's Jetson repository on arm64, whose Jetson build
+  supports Orin's GPU (SM 87), which the CUDA repository's `sbsa` builds do not;
+- VPI 4.1.4 from NVIDIA's Jetson repository, release `r39.2` (JetPack 7.2): `x86_64/noble` on
+  amd64, `common` on arm64, whose PVA backend the `nvidia` runtime connects to the board's PVA;
+  the repository key is accepted only with its pinned fingerprint;
 - from PyPI, CMake 4.4.4, `holoscan-cli` 5.0.0 and the SDK's Python bindings
   (`holoscan-*-cu13` 5.0.0), installed from [`docker/requirements.txt`](docker/requirements.txt),
   which pins every package and dependency to the SHA-256 of its files. Regenerate it with the
@@ -250,10 +254,11 @@ and `linux/arm64`:
 It is not the official `nvcr.io/nvidia/clara-holoscan/holoscan:v5.0.0-cuda13` image because that
 image's arm64 variant is the discrete-GPU (SBSA) build: CUDA 13.2 user-space libraries with a CUDA
 13.2 data-center forward-compatibility driver in `/usr/local/cuda/compat`, which the image puts
-first on the library path. JetPack 7 ships a CUDA 13.0 driver for the integrated GPU, and that
-forward-compatibility driver is not made for it. The image also has no VPI. A CUDA 13.0 user space
-runs on both JetPack 7 and a discrete-GPU driver for CUDA 13 (R580 or newer), so one image built
-from the CUDA 13.0 base serves every lane.
+first on the library path. That driver is not made for Jetson's integrated GPU, whose CUDA 13.2
+driver comes with JetPack 7.2, and the image's TensorRT is the SBSA build, which does not support
+Orin. The image also has no VPI. NVIDIA's plain CUDA 13.2 image keeps its forward-compatibility
+driver off the library path, so a CUDA 13.2 user space built on it runs on both JetPack 7.2 and a
+discrete-GPU driver for CUDA 13.2 (R595 or newer), and one image serves every lane.
 
 ## Publishing the image
 
