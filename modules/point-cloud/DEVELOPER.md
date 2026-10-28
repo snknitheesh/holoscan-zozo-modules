@@ -25,8 +25,8 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
 
 | | |
 | --- | --- |
-| Build contexts | Standalone top-level CMake project only; it is not built inside the SDK tree |
-| Options | `BUILD_TESTING` (`OFF`), `PKG_holoscan_point_cloud` (`OFF`), `BUILD_SHARED_LIBS` (`ON`) |
+| Build contexts | Top-level CMake project, or included by another project (`add_subdirectory()`, `FetchContent`, the repository root); it is not built inside the SDK tree |
+| Options | Top level: `BUILD_TESTING` (`OFF`), `BUILD_SHARED_LIBS` (`ON`). Included: `HOLOSCAN_POINT_CLOUD_BUILD_TESTING` (`OFF`), always shared, the includer's `BUILD_TESTING` and `BUILD_SHARED_LIBS` left alone. Both: `PKG_holoscan_point_cloud` (`OFF`) |
 | Public targets | `holoscan::point_cloud` (`libholoscan_point_cloud.so.1`) |
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-point-cloud/holoscan-point-cloud-config.cmake`, `SameMajorVersion` |

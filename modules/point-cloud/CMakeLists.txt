@@ -23,14 +23,23 @@ project(
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 
-option(BUILD_SHARED_LIBS "Build shared libraries" ON)
-option(BUILD_TESTING "Build the module's tests" OFF)
+# Built on its own, the usual CMake switches; inside another project (the repository root,
+# FetchContent, add_subdirectory), shared libraries and no tests unless asked for, and the
+# including project's own BUILD_SHARED_LIBS and BUILD_TESTING are left alone.
+if(PROJECT_IS_TOP_LEVEL)
+  option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+  option(BUILD_TESTING "Build the module's tests" OFF)
+  set(HOLOSCAN_POINT_CLOUD_BUILD_TESTING ${BUILD_TESTING})
+else()
+  set(BUILD_SHARED_LIBS ON)
+  option(HOLOSCAN_POINT_CLOUD_BUILD_TESTING "Build the module's tests in the including project" OFF)
+endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 set(_holoscan_components core sensor_io)
-if(BUILD_TESTING)
+if(HOLOSCAN_POINT_CLOUD_BUILD_TESTING)
   # The operator tests use the SDK's operator test harness.
   list(APPEND _holoscan_components testing)
 endif()
@@ -112,7 +121,7 @@ install(
   DESTINATION "${_cmake_dir}"
 )
 
-if(BUILD_TESTING)
+if(HOLOSCAN_POINT_CLOUD_BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
 endif()

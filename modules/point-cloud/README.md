@@ -128,7 +128,8 @@ cmake --install build/point-cloud --prefix "$PWD/install"
 
 | CMake option | Default | |
 | --- | --- | --- |
-| `BUILD_TESTING` | `OFF` | Build the tests |
+| `BUILD_TESTING` | `OFF` | Build the tests, when the module is the top-level project |
+| `HOLOSCAN_POINT_CLOUD_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
 The tests:
