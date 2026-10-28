@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-point-cloud) defines:
+#   holoscan::point_cloud  DepthToPointCloudOp, its deprojection kernel and the synthetic
+#                          depth camera
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-point-cloud-targets.cmake")
+
+check_required_components(holoscan-point-cloud)
