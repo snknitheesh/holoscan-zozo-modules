@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Assigns every new pull request to the repository owner, so it appears in their assigned
+# list. CODEOWNERS requests their review; this also covers their own pull requests, for which
+# GitHub never requests the author's review.
+#
+# `pull_request_target` runs this file as it is on `main`, with a token that may write, also
+# for a fork's pull request. It is safe because it never checks out or runs the pull request's
+# code: it only calls the GitHub API. A manual run assigns an existing pull request.
+
+name: Assign pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Number of the pull request to assign
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  assign:
+    name: Assign the owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Assign the repository owner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          NUMBER: ${{ github.event.pull_request.number || inputs.pull_request }}
+        run: |
+          gh api --method POST "repos/$REPO/issues/$NUMBER/assignees" \
+            -f "assignees[]=$OWNER" --jq '"Assigned #\(.number) to " + ([.assignees[].login] | join(", "))'
