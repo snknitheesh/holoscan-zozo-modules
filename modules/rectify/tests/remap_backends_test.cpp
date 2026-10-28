@@ -140,15 +140,20 @@ std::size_t blended(const std::vector<T>& output, const std::vector<T>& input, i
 }
 
 // The backends this platform can run: the compiled ones it has the hardware for.
+// (On a Jetson runner, test_platform requires the VIC among them.)
 std::vector<Backend> platform_backends() {
-  const PlatformFacts facts = probe_platform();
-  std::vector<Backend> result;
-  for (const Backend b : available_backends()) {
-    if (!backend_limitation(b, facts, PixelFormat::kMono8, Interpolation::kLinear, 1280, 720)) {
-      result.push_back(b);
+  static const std::vector<Backend> backends = [] {
+    std::vector<Backend> result;
+    for (const Backend b : available_backends()) {
+      if (const auto why = try_backend(b, PixelFormat::kMono8, Interpolation::kLinear, 1280, 720)) {
+        std::cout << "  " << backend_name(b) << " cannot run here: " << *why << '\n';
+      } else {
+        result.push_back(b);
+      }
     }
-  }
-  return result;
+    return result;
+  }();
+  return backends;
 }
 
 // Largest difference from the CPU reference each backend may show with
@@ -421,8 +426,14 @@ void test_platform() {
   std::cout << "  VPI " << (facts.vpi_compiled ? "compiled" : "absent") << ", VIC " << facts.has_vic
             << ", PVA " << facts.has_pva << ", CUDA " << facts.cuda_device << '\n';
   VERIFY(facts.cuda_device);
+  const std::vector<Backend> backends = platform_backends();
+  std::cout << "  backends:";
+  for (const Backend b : backends) std::cout << ' ' << backend_name(b);
+  std::cout << '\n';
   if (ci_platform() == "jetson") {
     VERIFY_MSG(facts.vpi_compiled && facts.has_vic, "a Jetson runner must have VPI and the VIC");
+    VERIFY_MSG(std::find(backends.begin(), backends.end(), Backend::kVpiVic) != backends.end(),
+               "the VIC must remap gray images on a Jetson runner");
   }
 }
 

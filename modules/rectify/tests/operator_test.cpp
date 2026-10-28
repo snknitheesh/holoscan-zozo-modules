@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/rectify/remapper.hpp>
 #include <holoscan/rectify/stereo_rectify_op.hpp>
 #include <holoscan/rectify/synthetic_stereo.hpp>
 #include <holoscan/rectify/undistort_op.hpp>
@@ -126,8 +127,7 @@ void test_stereo_cuda() {
 void test_stereo_vpi() {
   for (const Backend backend : available_backends()) {
     if (backend == Backend::kCuda) continue;
-    if (backend_limitation(backend, probe_platform(), PixelFormat::kMono8, Interpolation::kLinear,
-                           kWidth, kHeight)) {
+    if (try_backend(backend, PixelFormat::kMono8, Interpolation::kLinear, kWidth, kHeight)) {
       continue;
     }
     check_stereo(backend, true, 2);

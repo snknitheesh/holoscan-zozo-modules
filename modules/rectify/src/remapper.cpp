@@ -3,8 +3,10 @@
 
 #include "holoscan/rectify/remapper.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -121,6 +123,30 @@ std::unique_ptr<Remapper> create_remapper(Backend backend, const RemapModel& mod
   if (auto why = limitation(Backend::kCuda)) throw std::invalid_argument(*why);
   if (auto_reason != nullptr) *auto_reason = "not the VIC: " + reason;
   return build(Backend::kCuda);
+}
+
+std::optional<std::string> try_backend(Backend backend, PixelFormat format,
+                                       Interpolation interpolation, int width, int height) {
+  if (backend == Backend::kAuto) return std::nullopt;
+  try {
+    check_available(backend);
+    if (auto why =
+            backend_limitation(backend, probe_platform(), format, interpolation, width, height)) {
+      return why;
+    }
+    CameraModel camera;
+    camera.width = width;
+    camera.height = height;
+    camera.fx = camera.fy = std::max(width, height);
+    camera.cx = (width - 1) / 2.0;
+    camera.cy = (height - 1) / 2.0;
+    const RemapModel identity(camera, Matrix3{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0},
+                              Intrinsics{camera.fx, camera.fy, camera.cx, camera.cy});
+    (void)create_remapper(backend, identity, width, height, format, interpolation);
+  } catch (const std::invalid_argument& error) {
+    return std::string(error.what());
+  }
+  return std::nullopt;
 }
 
 }  // namespace holoscan::rectify

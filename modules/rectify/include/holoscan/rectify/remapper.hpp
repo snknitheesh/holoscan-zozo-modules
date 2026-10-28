@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -79,5 +80,13 @@ class Remapper {
                                                         PixelFormat format,
                                                         Interpolation interpolation,
                                                         std::string* auto_reason = nullptr);
+
+// Why `backend` cannot remap `width` x `height` `format` images with
+// `interpolation` on this machine: backend_limitation(), or VPI refusing them
+// when the backend is built (as Thor's VIC refuses nearest interpolation);
+// nullopt when it can. Builds an identity remapper of that size and drops it.
+[[nodiscard]] std::optional<std::string> try_backend(Backend backend, PixelFormat format,
+                                                     Interpolation interpolation, int width,
+                                                     int height);
 
 }  // namespace holoscan::rectify

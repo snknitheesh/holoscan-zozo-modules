@@ -42,6 +42,7 @@
 #include <holoscan/rectify/backend.hpp>
 #include <holoscan/rectify/camera_model.hpp>
 #include <holoscan/rectify/rectification.hpp>
+#include <holoscan/rectify/remapper.hpp>
 #include <holoscan/rectify/stereo_rectify_op.hpp>
 #include <holoscan/rectify/synthetic_stereo.hpp>
 #include <holoscan/time/realtime_clock.hpp>
@@ -108,11 +109,13 @@ void parse_number(std::string_view value, std::string_view option, T& result) {
 
 // The backends that can rectify `width` x `height` MONO8 pairs on this machine.
 std::vector<rc::Backend> runnable_backends(rc::Interpolation interpolation, int width, int height) {
-  const rc::PlatformFacts facts = rc::probe_platform();
   std::vector<rc::Backend> result;
   for (const rc::Backend backend : rc::available_backends()) {
-    if (!rc::backend_limitation(backend, facts, rc::PixelFormat::kMono8, interpolation, width,
-                                height)) {
+    if (const auto why =
+            rc::try_backend(backend, rc::PixelFormat::kMono8, interpolation, width, height)) {
+      std::cout << kAppName << ": not running " << rc::backend_name(backend) << ": " << *why
+                << '\n';
+    } else {
       result.push_back(backend);
     }
   }
