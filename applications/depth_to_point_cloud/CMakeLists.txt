@@ -18,14 +18,19 @@ find_package(holoscan-point-cloud 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
 # The sources, the ground-truth reporter and the PGM and PLY files.
-add_library(depth_to_point_cloud_ops STATIC
+add_library(
+  depth_to_point_cloud_ops
+  STATIC
   src/depth_sources.cpp
   src/image_io.cpp
-  src/point_cloud_report_op.cpp)
+  src/point_cloud_report_op.cpp
+)
 target_compile_features(depth_to_point_cloud_ops PUBLIC cxx_std_20)
 target_include_directories(depth_to_point_cloud_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(depth_to_point_cloud_ops PUBLIC
-  holoscan::point_cloud holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  depth_to_point_cloud_ops
+  PUBLIC holoscan::point_cloud holoscan::core holoscan::sensor_io CUDA::cudart
+)
 # The ground truth evaluates the synthetic camera on the host, as the module renders it
 # on the GPU: without contracting, whatever the compiler's default. Everything that
 # computes the truth links this library.

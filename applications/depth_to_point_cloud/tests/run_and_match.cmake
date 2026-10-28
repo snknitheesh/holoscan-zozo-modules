@@ -35,8 +35,12 @@ if(DEFINED MAKE_DIRECTORY)
   file(MAKE_DIRECTORY "${MAKE_DIRECTORY}")
 endif()
 
-execute_process(COMMAND ${_command}
-  RESULT_VARIABLE _status OUTPUT_VARIABLE _output ERROR_VARIABLE _output)
+execute_process(
+  COMMAND ${_command}
+  RESULT_VARIABLE _status
+  OUTPUT_VARIABLE _output
+  ERROR_VARIABLE _output
+)
 message("${_output}")
 if(NOT _status STREQUAL "${EXPECT_EXIT}")
   message(FATAL_ERROR "exit status ${_status}, expected ${EXPECT_EXIT}")
