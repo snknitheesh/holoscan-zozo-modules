@@ -91,10 +91,18 @@ pushing its branch here.
   "Require approval for all external contributors".
 - **Settings > Actions > General > Workflow permissions**: "Read repository contents and packages
   permissions". `container.yml` asks for `packages: write` itself.
-- **Settings > Branches > Branch protection rule for `main`** (or a ruleset): require a pull
-  request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin`
-  and `CI result`; require branches to be up to date before merging; and do not allow bypassing
-  these settings.
+- **Settings > Rules > Rulesets**: two active rulesets on the default branch.
+  - **`main: required checks`**, which nobody can bypass, the owner included:
+    - changes to `main` go through a pull request;
+    - these status checks must pass, from GitHub Actions, on a branch that is up to date with
+      `main`: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin` and `CI result`;
+    - `main` cannot be force-pushed or deleted.
+  - **`main: code owner review`**: a pull request needs an approving review from a code owner
+    ([`CODEOWNERS`](CODEOWNERS)), which is the owner, for every file. Repository admins may bypass it
+    when merging a pull request. GitHub never lets an author approve their own pull request, so
+    without the bypass the owner could not merge theirs. The checks stay required for everyone,
+    because they live in the other ruleset; a bypass applies to a whole ruleset.
+- [`workflows/assign.yml`](workflows/assign.yml) assigns every new pull request to the owner.
 
   `CI result` is the check that cannot be skipped, so it is what fails a pull request whose GPU
   jobs did not run. The four lane checks stay required as well: a pull request that edits `ci.yml`
