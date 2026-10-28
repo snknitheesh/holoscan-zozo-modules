@@ -1,0 +1,72 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-apriltag",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "AprilTag detection with 6-DoF poses on the CPU (AprilTag 3), the GPU (CUDA) or the PVA (VPI 4), and a HoloViz overlay of the detected tags.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::apriltag"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Pose Estimation",
+      "Fiducial Markers",
+      "CUDA",
+      "VPI"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/apriltag",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "AprilTagDetectorOp",
+      "AprilTagOverlayOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "PVA",
+          "description": "The Programmable Vision Accelerator of Jetson Orin or Thor, used by the vpi backend when present. Elsewhere VPI runs on the CPU.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-apriltag",
+      "install_commands": [
+        "sudo apt install ./holoscan-apriltag_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
