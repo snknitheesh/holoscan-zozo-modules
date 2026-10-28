@@ -79,11 +79,11 @@ the operator once. `StereoRectification::depth_from_disparity()` is `fx * baseli
 | `Backend::kCuda` (default) | GPU | Every format, linear and nearest, any size | This module's kernel: one thread per output pixel, a dense float map, on the operator's CUDA stream. |
 | `Backend::kVpiCuda` | GPU | Every format, linear and nearest, at least 64x16 | VPI's remap with a dense warp map, on the operator's stream, through wrappers of its images. |
 | `Backend::kVpiVic` | VIC | MONO8 and MONO16; even width and height up to 16384; no nearest on Thor | VPI's remap with a warp map sampled every 4 pixels. Frees the GPU. |
-| `Backend::kVpiPva` | PVA | MONO8; width a multiple of 256, even height of at least 64 | VPI's remap with a warp map sampled every 4 pixels. Frees the GPU and the VIC; slower than the VIC. |
+| `Backend::kVpiPva` | PVA | MONO8; width a multiple of 256, even height of at least 64 | VPI's remap with a warp map sampled every 4 pixels. Frees the GPU and the VIC. |
 | `Backend::kAuto` | One of the above | | Opt-in. `vpi-vic` where the VIC takes the images (gray pairs on Jetson), else `cuda`. Chosen at the first image and logged once. |
 
 The constraints of the VIC and the PVA were measured with VPI 4.1.4 on Jetson Orin; VPI's header
-lists only CPU, CUDA and VIC for remap, yet the PVA runs it there. An odd image size corrupts VPI's
+lists only CPU, CUDA and VIC for remap, yet the PVA runs it on Orin and Thor. An odd image size corrupts VPI's
 memory on the VIC, so the module refuses it. Thor's VIC has no nearest interpolation; VPI refuses
 it when the backend is built, which fails `vpi-vic` and makes `auto` fall back to `cuda`.
 `backend_limitation()` says why a backend cannot take some images, and `resolve_auto()` is auto's
@@ -93,8 +93,8 @@ Every backend samples with pixel centers at integer coordinates. A source within
 outside the input takes the edge pixel; further out the output is zero. MONO16 holds depth or
 other values that must not be blended, so it takes nearest interpolation only; nearest never
 blends on any backend. The VIC and the PVA interpolate in fixed point and differ from the CUDA
-kernel by at most 2 gray levels (linear); the VIC's nearest picks the other neighbor near a
-half-pixel boundary more often (about 5 % of pixels).
+kernel by at most 3 gray levels (linear, 0.5 on average on the VIC, 0.2 on the PVA); the VIC's
+nearest picks the other neighbor near a half-pixel boundary more often (about 5 % of pixels).
 
 | Where the images are | What happens |
 | --- | --- |
@@ -180,23 +180,24 @@ rectified images, for tests and demos.
 The geometry is exact to rounding: rectified projections of random points share a row to 1e-12
 px, and the maps send each rectified pixel to the raw pixel of the same point to 1e-12 px. The
 VIC's and PVA's 4-pixel warp grid moves a source by at most 0.003 px at 1280x720. Measured in the
-images, on the synthetic pair (Brown-Conrady and fisheye, 1280x720, about 500 dots), each dot lies
-on the same row in both rectified images to 0.05 px (0.015 px RMS) on every backend, the VIC's
-0.08 px, and where the geometry puts it to 0.1 px; that is the precision of measuring a dot, not of
-the remap. Undistortion puts dots where they belong to 0.1 px. The RealSense recordings, which the
-camera has rectified already, come out unchanged.
+images, on the synthetic pair (Brown-Conrady and fisheye, 1280x720, 275 dots a pair), each dot lies
+on the same row in both rectified images to 0.05 px (0.009 px RMS) on cuda, vpi-cuda and the PVA,
+and to 0.085 px on the VIC; and where the geometry puts it to 0.05 px, 0.11 px on the VIC. That is
+about the precision of measuring a dot, not of the remap. Undistortion puts dots where they belong
+to 0.1 px. The RealSense recordings, which the camera has rectified already, come out unchanged.
 
 Time per 1280x720 frame, from submit to the result on the operator's stream, mean of 100 frames:
 
-| Backend | x86_64, RTX 5090, MONO8 / RGBA8 | Jetson Orin, MONO8 / RGBA8 |
-| --- | --- | --- |
-| `cuda` | 0.15 / 0.84 ms | 0.22 / 0.15 ms |
-| `vpi-cuda` | 0.51 / 0.47 ms | 0.36 / 0.90 ms |
-| `vpi-vic` | | 5.3 ms |
-| `vpi-pva` | | 7.8 ms |
+| Backend | x86_64, RTX 5090, MONO8 / RGBA8 | Jetson Orin, MONO8 / RGBA8 | Jetson Thor, MONO8 / RGBA8 |
+| --- | --- | --- | --- |
+| `cuda` | 0.15 / 0.84 ms | 0.27 / 0.39 ms | 0.06 / 0.08 ms |
+| `vpi-cuda` | 0.51 / 0.47 ms | 0.19 / 0.66 ms | 0.06 / 0.07 ms |
+| `vpi-vic` | | 4.4 ms | 4.3 ms |
+| `vpi-pva` | | 5.9 ms | 2.6 ms |
 
-The GPU times include a stream synchronization and vary with the GPU's clocks and load; the VIC's
-and PVA's include VPI's synchronization and the copies into and out of VPI's images. The VIC and
+The GPU times include a stream synchronization and vary with the GPU's clocks and load (the x86
+GPU was shared with another process); the VIC's and PVA's include VPI's synchronization and the
+copies into and out of VPI's images, and vary by a millisecond or so from run to run. The VIC and
 PVA are slower than the GPU but leave it free for other work.
 
 ## Requirements
