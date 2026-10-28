@@ -12,15 +12,22 @@
       }
     ],
     "license": "Apache-2.0",
-    "language": ["C++"],
+    "language": [
+      "C++"
+    ],
     "namespace": {
       "cpp": "holoscan::point_cloud"
     },
     "holoscan_sdk": {
       "minimum_required_version": "5.0.0",
-      "tested_versions": ["5.0.0"]
+      "tested_versions": [
+        "5.0.0"
+      ]
     },
-    "platforms": ["x86_64", "aarch64"],
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
     "tags": [
       "Robotics",
       "Computer Vision and Perception",
@@ -31,7 +38,9 @@
     ],
     "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/point-cloud",
     "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
-    "operator_names": ["DepthToPointCloudOp"],
+    "operator_names": [
+      "DepthToPointCloudOp"
+    ],
     "requirements": {
       "hardware": [
         {
