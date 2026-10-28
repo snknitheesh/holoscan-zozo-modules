@@ -43,12 +43,10 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
 - Public headers carry only SDK, CUDA runtime and standard types.
 - Device code needs nothing newer than CUDA 13.0 (no CCCL header beyond its own), so the module
   also builds with JetPack 7's toolkit.
-- Exact checks hold because nothing contracts floating-point arithmetic: `project.cu`,
-  `synthetic_depth.cu` and `synthetic_scene.cu` are compiled with `--fmad=false`, and the library's
-  and the tests' host code with `-ffp-contract=off`. Keep both for any code that projects, renders
-  or checks synthetic data.
+- Exact checks against the synthetic camera hold because nothing contracts floating-point
+  arithmetic: `synthetic_depth.cu` is compiled with `--fmad=false`, and the library's and the tests'
+  host code with `-ffp-contract=off`. Keep both for any code that renders or checks synthetic data.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails.
-- A new kernel option needs a case in `point_cloud_deproject` or `point_cloud_project`; a new port
-  or behavior of an operator, a case in `point_cloud_depth_to_point_cloud_op` or
-  `point_cloud_point_cloud_to_depth_op`.
+- A new kernel option needs a case in `point_cloud_deproject`; a new port or behavior of the
+  operator, a case in `point_cloud_depth_to_point_cloud_op`.
