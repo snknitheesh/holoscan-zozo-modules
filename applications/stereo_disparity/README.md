@@ -125,6 +125,27 @@ Orin gave the same numbers; `ofa` and `pva` on Jetson Orin):
 On the synthetic scene (30 frames, 1280x720, the `ci` mode): `cuda` 0.994 valid, 0.994 within
 1 px, 0.23 px mean error; `ofa` 1.000, 0.999, 0.094 px; `pva` 1.000, 0.999, 0.088 px.
 
+## Performance
+
+Mean time in `StereoDisparityOp::compute()` per frame, one backend at a time, from receiving the
+pair to having the outputs queued (SDK 5.0.0, CUDA 13.2, VPI 4.1.4). The recordings are MONO8 in
+host memory, so they include the copy to the GPU; the synthetic frames are RGB8 in device memory.
+
+```bash
+build/stereo_disparity/stereo_disparity --source recording --clip d585_720p_emitter_on --backend ofa \
+  --period-ms 150 --display false
+```
+
+| Input | `cuda`, RTX 5090 | `cuda`, Jetson Orin | `ofa`, Jetson Orin | `pva`, Jetson Orin |
+| --- | --- | --- | --- | --- |
+| Recording, 1280x720 | 9.2 ms | 61.8 ms | 46.2 ms | 51.3 ms |
+| Recording, 848x480 | 6.6 ms | 22.2 ms | 24.1 ms | 27.9 ms |
+| Synthetic, 1280x720 | 7.2 ms | 61.3 ms | 45.7 ms | 51.2 ms |
+
+The RTX 5090 was shared with another process that kept it fully busy, so its times are upper
+bounds: VPI's matching alone took 3.5 to 4 ms of them. On the Jetson, `ofa` and `pva` leave the
+GPU free for other work; `cuda` there grows quickly with the image size.
+
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest` runs the demo: the synthetic scene through every backend and
