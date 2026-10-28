@@ -9,16 +9,23 @@
         "affiliation": "Independent"
       }
     ],
-    "language": ["C++"],
+    "language": [
+      "C++"
+    ],
     "version": "1.0.0",
     "changelog": {
       "1.0.0": "Initial release: the holoscan-apriltag demo, with a synthetic source checked against ground truth and a HoloViz overlay."
     },
     "holoscan_sdk": {
       "minimum_required_version": "5.0.0",
-      "tested_versions": ["5.0.0"]
+      "tested_versions": [
+        "5.0.0"
+      ]
     },
-    "platforms": ["x86_64", "aarch64"],
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
     "tags": [
       "Robotics",
       "Computer Vision and Perception",
