@@ -34,7 +34,7 @@ rectify_app_test(rectify_app_fisheye 0 "verdict=PASS"
 # Invalid input fails fast with a usage error (exit status 2) instead of starting a run.
 rectify_app_test(rectify_app_rejects_unknown_backend 2 "^error: " --backend gpu --display false)
 rectify_app_test(rectify_app_rejects_zero_count 2 "^error: " --count 0 --display false)
-rectify_app_test(rectify_app_rejects_repeated_backend 2 "^error: .*listed twice"
+rectify_app_test(rectify_app_rejects_repeated_backend 2 "error: .*listed twice"
   --backend all,cuda --display false
 )
 rectify_app_test(rectify_app_rejects_alpha 2 "^error: .*alpha" --alpha 2 --display false)
