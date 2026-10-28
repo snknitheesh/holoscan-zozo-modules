@@ -1,0 +1,79 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Rectify",
+    "description": "Rectifies a synthetic distorted stereo pair with known geometry, or a recorded one, with holoscan-rectify's StereoRectifyOp on every backend the machine can run and on the one auto picks; checks that every dot lies on the same row in both rectified images, where the geometry puts it; and shows the raw and rectified pairs with epipolar lines on a HoloViz display.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-rectify demo, with a synthetic distorted pair checked against its geometry, a recording mode and a HoloViz view with epipolar lines."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Camera",
+      "Calibration",
+      "CUDA",
+      "VPI"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "rectify"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Rectify the synthetic distorted pair on every backend this machine can run and on auto, check every dot's row against the geometry, and show the first backend's raw and rectified pairs when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/rectify\" --backend all,auto --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "recording": {
+        "description": "Rectify a stereo recording (calibration.json, index.csv and PGM eyes, as holoscan-stereo-camera records them): one of the RealSense clips under $HOLOSCAN_TEST_DATA, which the camera rectified already, so that nothing may change.",
+        "run": {
+          "command": "\"<holohub_app_bin>/rectify\" --recording \"${HOLOSCAN_TEST_DATA}/stereo-camera/d585_720p_emitter_on\" --backend auto",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic pairs through every backend this machine can run and auto, each dot's row and position verified against the geometry; on a CI runner, auto must pick vpi-vic on a Jetson and cuda on x86_64.",
+        "run": {
+          "command": "\"<holohub_app_bin>/rectify\" --backend all,auto --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
