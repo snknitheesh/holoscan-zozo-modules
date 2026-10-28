@@ -23,10 +23,31 @@ project(
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 
-option(BUILD_SHARED_LIBS "Build shared libraries" ON)
-option(BUILD_TESTING "Build the module's tests" OFF)
+# Built on its own, the usual CMake switches; inside another project (the repository root,
+# FetchContent, add_subdirectory), shared libraries and no tests unless asked for, and the
+# including project's own BUILD_SHARED_LIBS and BUILD_TESTING are left alone.
+if(PROJECT_IS_TOP_LEVEL)
+  option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+  option(BUILD_TESTING "Build the module's tests" OFF)
+  set(HOLOSCAN_APRILTAG_BUILD_TESTING ${BUILD_TESTING})
+else()
+  set(BUILD_SHARED_LIBS ON)
+  option(HOLOSCAN_APRILTAG_BUILD_TESTING "Build the module's tests in the including project" OFF)
+endif()
 option(HOLOSCAN_APRILTAG_WITH_VPI "Build the vpi backend when VPI 4 is installed" ON)
-option(HOLOSCAN_APRILTAG_BUILD_OVERLAY "Build AprilTagOverlayOp (needs Holoscan Visualization)" ON)
+# The repository root lists the operators asked for; without AprilTagOverlayOp, the
+# overlay, and so Holoscan Visualization, is left out.
+set(_overlay_default ON)
+if(DEFINED HOLOSCAN_ZOZO_MODULES_OPERATORS)
+  if(NOT "AprilTagOverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS)
+    set(_overlay_default OFF)
+  endif()
+endif()
+option(
+  HOLOSCAN_APRILTAG_BUILD_OVERLAY
+  "Build AprilTagOverlayOp (needs Holoscan Visualization)"
+  ${_overlay_default}
+)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -35,7 +56,7 @@ set(_holoscan_components core sensor_io)
 if(HOLOSCAN_APRILTAG_BUILD_OVERLAY)
   list(APPEND _holoscan_components visualization)
 endif()
-if(BUILD_TESTING)
+if(HOLOSCAN_APRILTAG_BUILD_TESTING)
   # The operator tests use the SDK's operator test harness.
   list(APPEND _holoscan_components testing)
 endif()
@@ -229,7 +250,7 @@ install(
   DESTINATION "${_cmake_dir}"
 )
 
-if(BUILD_TESTING)
+if(HOLOSCAN_APRILTAG_BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
 endif()

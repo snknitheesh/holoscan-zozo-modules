@@ -146,9 +146,23 @@ cmake --install build/apriltag --prefix "$PWD/install"
 | CMake option | Default | |
 | --- | --- | --- |
 | `HOLOSCAN_APRILTAG_WITH_VPI` | `ON` | Build the `vpi` backend when VPI 4 is found |
-| `HOLOSCAN_APRILTAG_BUILD_OVERLAY` | `ON` | Build `holoscan::apriltag_overlay` (needs Holoscan Visualization) |
-| `BUILD_TESTING` | `OFF` | Build the tests |
-| `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
+| `HOLOSCAN_APRILTAG_BUILD_OVERLAY` | `ON`; inside another project, `OFF` if `HOLOSCAN_ZOZO_MODULES_OPERATORS` is set without `AprilTagOverlayOp` | Build `holoscan::apriltag_overlay` (needs Holoscan Visualization) |
+| `BUILD_TESTING` | `OFF` | Build the tests, when the module is built on its own |
+| `HOLOSCAN_APRILTAG_BUILD_TESTING` | `OFF` | Build the tests inside another project |
+| `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for, unless already set |
+
+Another project can also build the module as part of its own build, with `add_subdirectory()` or
+`FetchContent`, and link `holoscan::apriltag` (and `holoscan::apriltag_overlay`) without
+`find_package()`. The module then leaves the including project's `BUILD_TESTING` and
+`BUILD_SHARED_LIBS` alone: it builds shared libraries, and none of its tests, even under the
+project's `include(CTest)`, unless `HOLOSCAN_APRILTAG_BUILD_TESTING` is `ON`. A project that sets
+`HOLOSCAN_ZOZO_MODULES_OPERATORS` to the operators it wants, without `AprilTagOverlayOp`, gets no
+overlay, and so needs no Holoscan Visualization.
+
+```cmake
+add_subdirectory(path/to/modules/apriltag apriltag)
+target_link_libraries(my_app PRIVATE holoscan::apriltag)
+```
 
 The tests:
 

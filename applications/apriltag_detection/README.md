@@ -22,7 +22,9 @@ Both are the frames HoloViz rendered, recorded one by one rather than captured f
 
 - holoscan-apriltag, installed (see [its README](../../modules/apriltag/README.md)), and what it
   needs: Holoscan SDK 5.0 with Core, Sensor I/O and Visualization (Testing for the tests), CUDA 13,
-  CMake 4.0 or later and a C++20 compiler.
+  CMake 4.0 or later and a C++20 compiler. The demo finds the installed package; a project of your
+  own can instead build the module inside its own build with `add_subdirectory()`, as the module's
+  README shows.
 - A display for the HoloViz window; without one, run with `--display false`.
 
 ## Build and run

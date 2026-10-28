@@ -27,8 +27,8 @@ keeps the template's `holohub_configure_deb()` and `PKG_holoscan_apriltag` switc
 
 | | |
 | --- | --- |
-| Build contexts | Standalone top-level CMake project only; it is not built inside the SDK tree |
-| Options | `BUILD_TESTING` (`OFF`), `HOLOSCAN_APRILTAG_WITH_VPI` (`ON`), `HOLOSCAN_APRILTAG_BUILD_OVERLAY` (`ON`), `PKG_holoscan_apriltag` (`OFF`), `BUILD_SHARED_LIBS` (`ON`) |
+| Build contexts | Standalone top-level CMake project; or inside another project through `add_subdirectory()` or `FetchContent`, where its targets are used as `holoscan::apriltag` and `holoscan::apriltag_overlay`. It is not built inside the SDK tree |
+| Options | Standalone: `BUILD_TESTING` (`OFF`) and `BUILD_SHARED_LIBS` (`ON`). Inside another project those two are the project's and are left alone: the module sets `BUILD_SHARED_LIBS` `ON` in its own scope and builds its tests only with `HOLOSCAN_APRILTAG_BUILD_TESTING` (`OFF`). Both: `HOLOSCAN_APRILTAG_WITH_VPI` (`ON`), `HOLOSCAN_APRILTAG_BUILD_OVERLAY` (`ON`, or `OFF` when `HOLOSCAN_ZOZO_MODULES_OPERATORS` is defined without `AprilTagOverlayOp`), `PKG_holoscan_apriltag` (`OFF`) |
 | Public targets | `holoscan::apriltag` (`libholoscan_apriltag.so.1`), `holoscan::apriltag_overlay` (`libholoscan_apriltag_overlay.so.1`) |
 | Include root | `include/`, installed to `<prefix>/include`; the generated `apriltag_detections_*` headers install beside the others in `holoscan/apriltag/` |
 | Package | `<prefix>/lib/cmake/holoscan-apriltag/holoscan-apriltag-config.cmake`, `SameMajorVersion` |
@@ -54,6 +54,10 @@ keeps the template's `holohub_configure_deb()` and `PKG_holoscan_apriltag` switc
   round as the CPU reference does.
 - Logging goes through `HOLOSCAN_LOG_*`. Nothing is logged per frame: a condition that holds on
   every frame (a host/device copy) is logged once, and capacity warnings at most every five seconds.
+- The CMake project must also work inside another one: only its own paths
+  (`CMAKE_CURRENT_SOURCE_DIR`, `PROJECT_SOURCE_DIR`, never `CMAKE_SOURCE_DIR`; the Debian packaging
+  is the one exception), options other than the standard ones prefixed `HOLOSCAN_APRILTAG_`, and
+  `HOLOSCAN_APRILTAG_BUILD_TESTING`, never `BUILD_TESTING`, to decide whether to build the tests.
 - `Backend::kAuto` is not a backend: `resolve_auto()` maps it, from `PlatformFacts`, to one that is,
   and `available_backends()` never lists it. The rule is `constexpr` in `detection.hpp`, so the
   SDK-free `apriltag_backend_resolution` test covers it with injected facts; `probe_platform()`
