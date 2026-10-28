@@ -236,7 +236,8 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
 [`docker/Dockerfile`](docker/Dockerfile) builds the one image every lane uses, for `linux/amd64`
 and `linux/arm64`:
 
-- `nvcr.io/nvidia/cuda:13.2.1-devel-ubuntu24.04`, pinned by its multi-arch index digest;
+- `nvcr.io/nvidia/cuda:13.2.1-devel-ubuntu24.04`, pinned by its multi-arch index digest, without
+  its CUDA forward-compatibility driver;
 - the Holoscan SDK 5.0.0 packages from NVIDIA's `ubuntu2404` CUDA repository (`x86_64` or
   `sbsa`): `holoscan-core-cuda-13`, `libholoscan-visualization-cuda-13` and `-dev`, and
   `libholoscan-inference-cuda-13` and `-dev`, each checked against its SHA-256;
@@ -255,10 +256,11 @@ It is not the official `nvcr.io/nvidia/clara-holoscan/holoscan:v5.0.0-cuda13` im
 image's arm64 variant is the discrete-GPU (SBSA) build: CUDA 13.2 user-space libraries with a CUDA
 13.2 data-center forward-compatibility driver in `/usr/local/cuda/compat`, which the image puts
 first on the library path. That driver is not made for Jetson's integrated GPU, whose CUDA 13.2
-driver comes with JetPack 7.2, and the image's TensorRT is the SBSA build, which does not support
-Orin. The image also has no VPI. NVIDIA's plain CUDA 13.2 image keeps its forward-compatibility
-driver off the library path, so a CUDA 13.2 user space built on it runs on both JetPack 7.2 and a
-discrete-GPU driver for CUDA 13.2 (R595 or newer), and one image serves every lane.
+driver comes with JetPack 7.2. The image also has no VPI. This image starts from NVIDIA's plain CUDA 13.2 image instead and
+removes its forward-compatibility driver (`cuda-compat-13-2`), which nothing here needs and which
+the NVIDIA Container Toolkit's cuda-compat hook (1.19) fails to read on JetPack 7.2, refusing to
+start the container. Its CUDA 13.2 user space runs on both JetPack 7.2 and a discrete-GPU driver
+for CUDA 13.2 (R595 or newer), so one image serves every lane.
 
 ## Publishing the image
 
