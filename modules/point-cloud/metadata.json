@@ -2,9 +2,9 @@
   "$schema": "urn:holoscan:module:v2",
   "module": {
     "name": "holoscan-point-cloud",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "support_level": "community",
-    "description": "Depth images (uint16 or float32, with optional aligned color and per-frame intrinsics) deprojected into organized, optionally colored, XYZ point clouds on the GPU.",
+    "description": "Point clouds on the GPU in both directions: depth images (uint16 or float32, with optional aligned color and per-frame intrinsics) deprojected into organized, optionally colored XYZ point clouds, and point clouds projected through extrinsics and pinhole intrinsics into z-buffered depth images (float32 or uint16) with optional color.",
     "authors": [
       {
         "name": "zozo",
@@ -39,7 +39,8 @@
     "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/point-cloud",
     "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
     "operator_names": [
-      "DepthToPointCloudOp"
+      "DepthToPointCloudOp",
+      "PointCloudToDepthOp"
     ],
     "requirements": {
       "hardware": [
@@ -53,7 +54,7 @@
     "binary_packages": {
       "debian": "holoscan-point-cloud",
       "install_commands": [
-        "sudo apt install ./holoscan-point-cloud_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-point-cloud_1.1.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

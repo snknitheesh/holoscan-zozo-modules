@@ -16,8 +16,8 @@ endif()
 
 project(
   holoscan_point_cloud
-  VERSION 1.0.0
-  DESCRIPTION "Depth images to organized point clouds on the GPU"
+  VERSION 1.1.0
+  DESCRIPTION "Depth images to point clouds and point clouds to depth images on the GPU"
   LANGUAGES CXX CUDA
 )
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -46,18 +46,30 @@ endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
 
-# holoscan::point_cloud: DepthToPointCloudOp, its kernel and the synthetic depth camera.
+# holoscan::point_cloud: DepthToPointCloudOp and PointCloudToDepthOp, their kernels, the
+# synthetic depth camera and cloud, and the cloud's ground truth.
 add_library(
   holoscan_point_cloud
   src/deproject.cu
   src/depth_to_point_cloud_op.cpp
+  src/depth_truth.cpp
   src/host_input.cpp
+  src/point_cloud_to_depth_op.cpp
+  src/project.cu
   src/synthetic_depth.cu
+  src/synthetic_scene.cu
 )
 add_library(holoscan::point_cloud ALIAS holoscan_point_cloud)
-# Without fused multiply-adds the synthetic camera renders the depths the host computes
-# from the same functions, so checks against it can be exact.
-set_source_files_properties(src/synthetic_depth.cu PROPERTIES COMPILE_OPTIONS --fmad=false)
+# Without fused multiply-adds the kernels compute bit for bit what the host computes from
+# the same expressions: the synthetic camera and cloud match their host versions, and the
+# projection matches a CPU reference pixel for pixel, so checks against them can be exact.
+# The projection is bound by memory and atomics, not arithmetic.
+set_source_files_properties(
+  src/project.cu
+  src/synthetic_depth.cu
+  src/synthetic_scene.cu
+  PROPERTIES COMPILE_OPTIONS --fmad=false
+)
 # Nor does the library's host code contract, whatever the compiler's default.
 target_compile_options(
   holoscan_point_cloud
