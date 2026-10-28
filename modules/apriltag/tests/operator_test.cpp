@@ -4,28 +4,36 @@
 // The operators on their own, through the SDK's operator test harness: images
 // of each supported encoding and layout in, detections with the scene's ids,
 // corners and poses out, for every compiled backend; a change of image size
-// and non-default options; unsupported images rejected; the detector off the
-// legacy default CUDA stream; the reporter's counts; and the overlay's
-// Holoviz layers shaped, drawn and stamped as Holoviz expects.
+// and non-default options; a host/device copy logged once, and only when there
+// is one; unsupported images rejected; the detector off the legacy default CUDA
+// stream; the reporter's counts; and the overlay's Holoviz layers shaped, drawn
+// and stamped as Holoviz expects.
 
 #include <cuda_runtime_api.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <functional>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include <holoscan/apriltag/apriltag_detector_op.hpp>
 #include <holoscan/apriltag/synthetic_scene.hpp>
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 #if HOLOSCAN_APRILTAG_WITH_OVERLAY
 #include <holoscan/apriltag/apriltag_overlay_op.hpp>
@@ -67,6 +75,14 @@ std::shared_ptr<holoscan::Tensor> host_tensor(std::vector<std::uint8_t> bytes,
     delete static_cast<Storage*>(value->manager_ctx);
   };
   return std::make_shared<holoscan::Tensor>(&storage.release()->managed);
+}
+
+// A copy of `host` in CUDA device memory on GPU 0, ready to read when this returns.
+std::shared_ptr<holoscan::Tensor> device_tensor(const holoscan::Tensor& host) {
+  auto copy = host.copy_to(DLDevice{kDLCUDA, 0});
+  VERIFY_MSG(copy.has_value(), "copy to the device: " + (copy ? "" : copy.error().message));
+  VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+  return copy ? std::make_shared<holoscan::Tensor>(std::move(*copy)) : nullptr;
 }
 
 // `scene` as an image tensor; with `rank2`, MONO8 as [height, width], not
@@ -137,9 +153,12 @@ void check_message(const schema::AprilTagDetectionsT& message, const SyntheticSc
 }
 
 // Runs a detector over `images`: one message per image, or none if the run fails.
+// With `device_input`, the images' tensors are in CUDA device memory on GPU 0.
 std::vector<schema::AprilTagDetectionsT> run_detector(
-    const AprilTagDetectorConfig& config, const std::vector<holoscan::schema::ImageT>& images) {
+    const AprilTagDetectorConfig& config, const std::vector<holoscan::schema::ImageT>& images,
+    bool device_input = false) {
   auto h = holoscan::testing::create_operator_test<AprilTagDetectorOp>(config);
+  if (device_input) h.input_source_device("image", holoscan::DeviceId{0});
   for (const auto& image : images) h.push("image", image);
   h.capture<schema::AprilTagDetectionsT>("detections");
   const auto result = h.run();
@@ -310,6 +329,84 @@ void check_detector_stream_with_host_input() {
     for (const auto& message : result.values<schema::AprilTagDetectionsT>("detections")) {
       check_message(message, scene, false);
     }
+  }
+}
+
+// What the process writes to stdout and stderr, where the SDK logs, while `body` runs.
+std::string capture_output(const std::function<void()>& body) {
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  FILE* file = std::tmpfile();
+  VERIFY(file != nullptr);
+  if (file == nullptr) return {};
+  const int saved_out = dup(STDOUT_FILENO);
+  const int saved_err = dup(STDERR_FILENO);
+  dup2(fileno(file), STDOUT_FILENO);
+  dup2(fileno(file), STDERR_FILENO);
+  struct Restore {
+    int out;
+    int err;
+    ~Restore() {
+      std::cout.flush();
+      std::cerr.flush();
+      std::fflush(nullptr);
+      dup2(out, STDOUT_FILENO);
+      dup2(err, STDERR_FILENO);
+      close(out);
+      close(err);
+    }
+  };
+  {
+    const Restore restore{saved_out, saved_err};
+    body();
+  }
+  std::string output;
+  std::rewind(file);
+  char buffer[4096];
+  for (std::size_t n; (n = std::fread(buffer, 1, sizeof(buffer), file)) > 0;) {
+    output.append(buffer, n);
+  }
+  std::fclose(file);
+  return output;
+}
+
+std::size_t count_of(const std::string& text, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t at = text.find(needle); at != std::string::npos;
+       at = text.find(needle, at + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+// A frame whose gray image must cross between host and device memory is logged
+// once, at the first such frame, naming the backend, the direction and the size;
+// frames read where they are log nothing.
+void check_cross_copy_logged_once(Backend backend, bool device_input, std::size_t expected) {
+  holoscan::set_log_level(holoscan::LogLevel::INFO);
+  constexpr int kFrames = 3;
+  const SyntheticScene scene = make_scene("tag36h11", 0, kWidth, kHeight);
+  std::vector<holoscan::schema::ImageT> images;
+  for (int i = 0; i < kFrames; ++i) {
+    images.push_back(scene_image(scene, holoscan::schema::ImageEncoding_RGB8));
+    if (device_input) images.back().data = device_tensor(*images.back().data);
+  }
+  std::vector<schema::AprilTagDetectionsT> messages;
+  const std::string output =
+      capture_output([&] { messages = run_detector({.backend = backend}, images, device_input); });
+  for (const auto& message : messages) check_message(message, scene, false);
+  const std::size_t logged = count_of(output, "gray image is copied");
+  VERIFY_MSG(logged == expected,
+             "the copy was logged " + std::to_string(logged) + " times:\n" + output);
+  if (expected == 0 || logged != 1) return;
+  const std::string direction = device_input ? "copied device to host" : "copied host to device";
+  const std::string size = std::to_string(kWidth * kHeight) + " bytes";
+  const std::string advice = device_input ? "use the cuda backend or send host images"
+                                          : "send CUDA device images or use the cpu backend";
+  for (const std::string& part :
+       {"(" + messages.front().backend + " backend)", direction, size, advice}) {
+    VERIFY_MSG(output.find(part) != std::string::npos, "the copy log names '" + part + "'");
   }
 }
 
@@ -499,6 +596,18 @@ int main() {
     cases.push_back({"detector " + std::string(holoscan::apriltag::backend_name(backend)) +
                          " non-default options",
                      [=] { holoscan::apriltag::check_options(backend); }});
+  }
+  // Host images reach cpu in place and cuda through a copy; device images the reverse.
+  for (const auto& [backend, device_input, logs] :
+       {std::tuple{Backend::kCpu, false, 0}, std::tuple{Backend::kCuda, false, 1},
+        std::tuple{Backend::kCpu, true, 1}, std::tuple{Backend::kCuda, true, 0}}) {
+    const std::string name = std::string(holoscan::apriltag::backend_name(backend)) +
+                             (device_input ? " device" : " host");
+    cases.push_back(
+        {"detector " + name + " images: copy logged " + (logs == 0 ? "never" : "once"), [=] {
+           holoscan::apriltag::check_cross_copy_logged_once(backend, device_input,
+                                                            static_cast<std::size_t>(logs));
+         }});
   }
   cases.push_back({"detector rejects unsupported encodings",
                    holoscan::apriltag::check_rejects_unsupported_encoding});

@@ -14,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,21 @@ holoscan::expected<ImageView, holoscan::Error> view_image(const holoscan::schema
                    .location = on_device ? MemoryLocation::kDevice : MemoryLocation::kHost};
 }
 
+// Says, once, that every frame's gray image crosses between host and device
+// memory because the images are not where `backend` reads them, and how not to.
+void log_cross_copy(std::string_view backend, MemoryLocation images, int width, int height) {
+  const bool to_device = images == MemoryLocation::kHost;
+  const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  HOLOSCAN_LOG_INFO(
+      "AprilTagDetectorOp ({} backend): the images are in {} memory and the backend reads {} "
+      "memory, so each frame's gray image is copied {}, {} bytes ({:.1f} MB) per frame; to avoid "
+      "the copy, {}",
+      backend, to_device ? "host" : "CUDA device", to_device ? "CUDA device" : "host",
+      to_device ? "host to device" : "device to host", bytes, static_cast<double>(bytes) / 1e6,
+      to_device ? "send CUDA device images or use the cpu backend"
+                : "use the cuda backend or send host images");
+}
+
 schema::TagDetection to_message(const Detection& detection) {
   std::array<schema::Point2f, 4> corners;
   for (int i = 0; i < 4; ++i) {
@@ -139,6 +155,8 @@ struct AprilTagDetectorOp::State {
   // For frames whose activation has no runtime CUDA stream; made on first use.
   std::unique_ptr<CUstream_st, StreamDestroy> own_stream;
   std::uint64_t frames{};
+  // Whether a frame has been copied between host and device memory, which is logged once.
+  bool cross_copy_logged{};
   // Frames over a backend capacity since the last warning, and when that was.
   std::uint64_t overflowed_frames{};
   std::optional<std::chrono::steady_clock::time_point> last_overflow_warning;
@@ -252,10 +270,14 @@ holoscan::expected<void, holoscan::Error> AprilTagDetectorOp::compute(
       state.image_width = view->width;
       state.image_height = view->height;
     }
+    const MemoryLocation target = state.backend->input_location();
+    if (view->location != target && !state.cross_copy_logged) {
+      state.cross_copy_logged = true;
+      log_cross_copy(state.backend->name(), view->location, view->width, view->height);
+    }
     // Detection time leaves out building the backend, which happens once.
     start = std::chrono::steady_clock::now();
-    const GrayImageView gray =
-        state.converter.convert(*view, state.backend->input_location(), stream);
+    const GrayImageView gray = state.converter.convert(*view, target, stream);
     found = state.backend->detect(gray, stream);
     if (config_.intrinsics) {
       for (Detection& detection : found.tags) {

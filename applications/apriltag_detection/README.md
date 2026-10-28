@@ -37,7 +37,9 @@ build/apriltag_detection/apriltag_detection --backend all --count 30 --period-ms
 ```
 
 `--help` lists the options, for example `--backend cuda,vpi`, `--family tagStandard41h12` and
-`--device-input true`. `-DAPRILTAG_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
+`--device-input true`. A backend that reads the other memory (`cuda` or `vpi` on the PVA with host
+frames; `cpu` or `vpi` on the CPU with `--device-input true`) copies each frame's gray image, and
+its detector logs that once, at the first frame. `-DAPRILTAG_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
 The modes in [metadata.json](metadata.json) are the two commands above: `synthetic`, displayed when
 there is a display, and `ci`, a finite headless check that CI runs.
 

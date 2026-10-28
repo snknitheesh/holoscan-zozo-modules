@@ -52,5 +52,7 @@ keeps the template's `holohub_configure_deb()` and `PKG_holoscan_apriltag` switc
   module also builds with JetPack 7's toolkit.
 - The CUDA quad fit and decoder are compiled without FMA contraction (`--fmad=false`), so they
   round as the CPU reference does.
+- Logging goes through `HOLOSCAN_LOG_*`. Nothing is logged per frame: a condition that holds on
+  every frame (a host/device copy) is logged once, and capacity warnings at most every five seconds.
 - A new backend or option needs a case in `apriltag_backend_accuracy`; a new port or behavior of an
   operator, a case in `apriltag_operators`.

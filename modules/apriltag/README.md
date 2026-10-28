@@ -47,6 +47,14 @@ of 128.
 | `cuda` | Gray copied to the GPU. | Read in place (color is converted to gray on the GPU); no copy. |
 | `vpi` on the PVA | Gray copied into a VPI image. | Gray copied into a VPI image on the GPU. |
 
+When the image is not where the backend reads it, so that its gray image crosses between host and
+device memory on every frame, the operator says so once, at info level, at the first such frame:
+which backend, which direction, the bytes per frame, and how to avoid the copy. For example:
+
+```text
+AprilTagDetectorOp (cuda backend): the images are in host memory and the backend reads CUDA device memory, so each frame's gray image is copied host to device, 921600 bytes (0.9 MB) per frame; to avoid the copy, send CUDA device images or use the cpu backend
+```
+
 Each `AprilTagDetections` message ([schema](schemas/apriltag_detections.fbs)) holds the frame
 number, the image header's `device_sequence`, the image size, the backend that ran (`cpu`, `cuda`,
 `vpi-pva` or `vpi-cpu`), the family, the detection time, and per tag its id, corrected bits,
@@ -136,7 +144,7 @@ The tests:
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `apriltag_backend_accuracy` | GPU | Every backend against ground truth, from host and GPU memory, for four families (among them `tagCircle21h7`) and two-bit correction; the CUDA backend against the CPU on tags cut by the image edge; that frames over a capacity report what they dropped; on the Jetson CI runner, that `vpi` runs on the PVA |
-| `apriltag_operators` | GPU | Both operators through the SDK's operator test harness: every encoding and backend, size changes, options, provenance, CUDA streams, bad input and configuration, and the overlay's layers |
+| `apriltag_operators` | GPU | Both operators through the SDK's operator test harness: every encoding and backend, size changes, options, provenance, CUDA streams, the copy log (once when frames cross between host and device, never otherwise), bad input and configuration, and the overlay's layers |
 | `apriltag_tag_axes` | Nothing | The overlay's axis drawing; also built on its own from `tests/host/` by the hosted CI job |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
