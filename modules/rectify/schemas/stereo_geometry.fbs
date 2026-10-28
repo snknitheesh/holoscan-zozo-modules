@@ -1,0 +1,56 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// StereoRectifyOp's geometry message: what a disparity or depth operator needs
+// to use a rectified pair, sent with every pair and stamped like its images.
+// Compatible edits keep the root name, file identifier and explicit field ids,
+// and only append fields.
+namespace holoscan.rectify.schema;
+
+// Whole pixels: columns x .. x + width - 1, rows y .. y + height - 1.
+struct PixelRect {
+  x: int;
+  y: int;
+  width: int;
+  height: int;
+}
+
+// Row-major matrices.
+struct Matrix3 {
+  m: [double:9];
+}
+
+struct Matrix4 {
+  m: [double:16];
+}
+
+table StereoGeometry {
+  // The rectified images' size.
+  width: int (id: 0);
+  height: int (id: 1);
+  // Both rectified cameras share fx = fy and cy; pixel centers at integers.
+  fx: double (id: 2);
+  cx_left: double (id: 3);
+  cx_right: double (id: 4);
+  cy: double (id: 5);
+  // Metres from the left rectified camera to the right one, along +x.
+  baseline: double (id: 6);
+  // cx_right - cx_left. A disparity d = x_left - x_right is at depth
+  // Z = fx * baseline / (d + doffs) metres.
+  doffs: double (id: 7);
+  // OpenCV's Q, row-major: (x, y, d, 1) to a homogeneous point in the
+  // rectified left camera's frame.
+  disparity_to_depth: Matrix4 (id: 8);
+  // From each input camera's frame to its rectified frame, row-major.
+  rect_from_left: Matrix3 (id: 9);
+  rect_from_right: Matrix3 (id: 10);
+  // The pixels of each rectified image that see its input.
+  valid_left: PixelRect (id: 11);
+  valid_right: PixelRect (id: 12);
+  // The backend that remapped the pair: "cuda", "vpi-cuda", "vpi-vic" or
+  // "vpi-pva" (what "auto" chose).
+  backend: string (id: 13);
+}
+
+root_type StereoGeometry;
+file_identifier "STGM";
