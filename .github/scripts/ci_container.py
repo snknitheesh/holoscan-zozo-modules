@@ -138,6 +138,17 @@ def sweep(_args: argparse.Namespace) -> int:
     return 0
 
 
+def runner_options(env: dict[str, str]) -> list[str]:
+    """`docker run` options the runner adds to every job, from its own environment
+    (the runner's .env file): CI_DOCKER_OPTIONS, such as `--memory 22g --cpuset-cpus
+    2-13` on a machine that also serves other work, and CI_BUILD_JOBS, passed into
+    the container for ci.py. Neither set, nothing is added."""
+    options = shlex.split(env.get("CI_DOCKER_OPTIONS", ""))
+    if env.get("CI_BUILD_JOBS", "").strip():
+        options += ["-e", "CI_BUILD_JOBS"]
+    return options
+
+
 def run(args: argparse.Namespace) -> int:
     name = args.name
     workspace = os.environ.get("GITHUB_WORKSPACE", str(ROOT))
@@ -155,6 +166,7 @@ def run(args: argparse.Namespace) -> int:
         "--label",
         f"{RUN_LABEL}={run_id()}",
         *shlex.split(args.docker_options),
+        *runner_options(dict(os.environ)),
         "-e",
         "NVIDIA_DRIVER_CAPABILITIES=all",
         "-e",
