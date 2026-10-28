@@ -34,7 +34,7 @@ env:
   # The OCI description and licenses, also set in the Dockerfile. The repository is
   # Apache-2.0, but the image also holds NVIDIA software under NVIDIA's own licenses.
   OCI_LABELS: |
-    org.opencontainers.image.description=Build and test environment for Holoscan SDK 5.0 Modules: CUDA 13.0, Holoscan SDK 5.0.0, TensorRT, VPI 4 and CMake 4, for x86_64 and Jetson Thor and Orin.
+    org.opencontainers.image.description=Build and test environment for Holoscan SDK 5.0 Modules: CUDA 13.2, Holoscan SDK 5.0.0, TensorRT, VPI 4 and CMake 4, for x86_64 and Jetson Thor and Orin with JetPack 7.2.
     org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-NVIDIA-Proprietary
 
 jobs:
