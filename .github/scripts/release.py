@@ -25,7 +25,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ci import ROOT, CiError, Project, discover, exit_on_signals, generator, run, section
+from ci import (
+    ROOT,
+    CiError,
+    Project,
+    build_jobs,
+    discover,
+    exit_on_signals,
+    generator,
+    run,
+    section,
+)
 
 TAG = re.compile(
     r"(?P<module>[a-z0-9][a-z0-9-]*)-v(?P<version>(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2})"
@@ -106,7 +116,7 @@ def package(root: Path, name: str, version: str, out: Path, build_root: Path) ->
             f"-D{option}=ON",
         ]
     )
-    run(["cmake", "--build", str(build), "--parallel", str(os.cpu_count() or 2)])
+    run(["cmake", "--build", str(build), "--parallel", str(build_jobs())])
     config = build / "pkg" / f"CPackConfig-{deb_name}.cmake"
     if not config.is_file():
         raise CiError(f"{option}=ON wrote no {config}; see modules/README.md")
@@ -144,7 +154,7 @@ def consume(root: Path, name: str, deb: Path, build_root: Path) -> int:
     run(
         ["cmake", "-S", str(consumer), "-B", str(build), *generator(), "-DCMAKE_BUILD_TYPE=Release"]
     )
-    run(["cmake", "--build", str(build), "--parallel", str(os.cpu_count() or 2)])
+    run(["cmake", "--build", str(build), "--parallel", str(build_jobs())])
     run(["ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error"])
     return 0
 

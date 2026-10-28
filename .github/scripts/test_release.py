@@ -6,6 +6,7 @@ and dpkg faked. No SDK needed."""
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -128,6 +129,18 @@ class PackageTest(Fixture):
         self.assertIn("-DPKG_holoscan_point_cloud=ON", configure)
         self.assertIn("-DBUILD_TESTING=OFF", configure)
         self.assertEqual(self.commands[2][:2], ["cpack", "--config"])
+
+    def test_build_takes_the_runners_job_limit(self):
+        module(self.root, "point-cloud", "1.0.0")
+        self.fields = {
+            "Package": "holoscan-point-cloud",
+            "Version": "1.0.0",
+            "Architecture": "arm64",
+        }
+        with mock.patch.dict(os.environ, {"CI_BUILD_JOBS": "3"}):
+            self.package()
+        build = self.commands[1]
+        self.assertEqual(build[build.index("--parallel") + 1], "3")
 
     def test_wrong_control_fields_fail(self):
         module(self.root, "point-cloud", "1.0.0")
