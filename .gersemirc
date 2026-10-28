@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# gersemi, the CMake formatter: 2-space indentation and 100 columns, like the C++.
+indent: 2
+line_length: 100

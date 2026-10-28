@@ -6,8 +6,9 @@
 # test the modules. Each architecture is built natively, without emulation: linux/amd64
 # on the self-hosted x86_64 runner and linux/arm64 on the self-hosted Jetson Thor. Each
 # is pushed by digest only; the last job joins them into one multi-arch image and tags
-# it `sha-<short commit>`, `latest` (from main and from release tags) and the version
-# (from `v*` tags). Never runs for a pull request. See .github/RUNNERS.md.
+# it `sha-<short commit>`, `latest` (from main only) and the version (from `v*` tags).
+# Never runs for a pull request, and publishes only from main or a `v*` tag, also when
+# run by hand. See .github/RUNNERS.md.
 
 name: Container
 
@@ -17,7 +18,8 @@ on:
     # Path filters apply to branch pushes only; every `v*` tag publishes.
     tags: ["v*"]
     paths:
-      - .github/docker/Dockerfile
+      # Everything the image is built from: the Dockerfile and its build context.
+      - .github/docker/**
       - .github/workflows/container.yml
   workflow_dispatch:
 
@@ -38,6 +40,8 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.platform }}
+    # A manual run from any other branch publishes nothing (and skips the merge too).
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: true
       matrix:
@@ -54,7 +58,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - id: meta
@@ -87,7 +91,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/digests"
           touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -103,7 +107,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: ${{ runner.temp }}/digests
           pattern: digest-*
@@ -116,6 +120,9 @@ jobs:
           images: ${{ env.IMAGE }}
           labels: ${{ env.OCI_LABELS }}
           annotations: ${{ env.OCI_LABELS }}
+          # `latest` follows main only: with the default latest=auto, every `v*` tag
+          # would take it, so pushing an older release's tag would move it back.
+          flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}

@@ -36,7 +36,8 @@ the rules a module or a demo follows so that CI picks it up without changes.
 
 ## Requirements
 
-- Linux on x86_64 or aarch64 (Jetson Thor with JetPack 7) with an NVIDIA GPU.
+- Linux on x86_64 with an NVIDIA GPU, or on aarch64: Jetson Thor with JetPack 7, or Jetson Orin
+  with JetPack 7.2.
 - Holoscan SDK 5.0 with CUDA 13, CMake 4.0 or later and a C++20 compiler.
 - Module-specific dependencies, listed in each module's README.
 
@@ -58,16 +59,16 @@ From a clone of this repository, build and test every module and demo the way CI
 x86_64 with an NVIDIA GPU:
 
 ```bash
-docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
+docker run --rm --init --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$PWD:$PWD" -w "$PWD" ghcr.io/snknitheesh/holoscan-zozo-modules:latest \
   python3 .github/scripts/ci.py sdk --platform x86_64
 ```
 
-On Jetson Thor or Orin with JetPack 7 (the PVA needs `--privileged`, and `DISPLAY` must stay
-unset):
+On Jetson Thor with JetPack 7 or Jetson Orin with JetPack 7.2 (the PVA needs `--privileged`, and
+`DISPLAY` must stay unset):
 
 ```bash
-docker run --rm --runtime nvidia --privileged --user "$(id -u):$(id -g)" -e HOME=/tmp \
+docker run --rm --init --runtime nvidia --privileged --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$PWD:$PWD" -w "$PWD" ghcr.io/snknitheesh/holoscan-zozo-modules:latest \
   python3 .github/scripts/ci.py sdk --platform jetson
 ```
@@ -141,12 +142,14 @@ The workflows, their runners, the image's publishing and the repository settings
 
 Every change goes through a pull request into `main`. Sign off each commit (`git commit -s`) to
 certify the [Developer Certificate of Origin](https://developercertificate.org/), and run the
-linters before pushing:
+linters before pushing. They run with [prek](https://prek.j178.dev), as in CI; `pre-commit` reads
+the same `.pre-commit-config.yaml` and works too. Both check tracked files only, so `git add` new
+files first.
 
 ```bash
 python3 -m pip install -r requirements.txt
-pre-commit install
-pre-commit run --all-files
+prek install
+prek run --all-files
 ```
 
 ## License

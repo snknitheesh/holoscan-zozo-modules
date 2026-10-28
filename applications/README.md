@@ -6,13 +6,15 @@ sources.
 
 ## What CI expects of a demo
 
-CI discovers every `applications/<demo>/` that has a `metadata.json`, so a new demo needs no
-workflow change. A demo must have:
+CI discovers every `applications/<demo>/`, so a new demo needs no workflow change. Every folder
+here (other than a hidden one) is a demo, and one without `metadata.json` fails CI rather than
+being skipped. A demo must have:
 
 - `metadata.json` with the `application` envelope (`urn:holoscan:application:v1`) and a `ci` mode:
   a finite, headless run that exits 0 only when it succeeded. `modes.ci.run.command` may use
   `<holohub_app_bin>`, which CI replaces with the demo's build directory, and
-  `modes.ci.build.cmake_options` adds CMake options for that build.
+  `modes.ci.build.cmake_options` adds CMake options for that build. CI stops the run, with
+  everything it started, and fails after `modes.ci.run.timeout` seconds (default 900).
 - `CMakeLists.txt`, a standalone CMake project. CI configures it with the modules' install prefix in
   `CMAKE_PREFIX_PATH` and `-DBUILD_TESTING=ON`, builds it, runs its CTest tests if it has any, and
   then runs the `ci` mode.

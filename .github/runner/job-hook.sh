@@ -23,13 +23,12 @@ if ! ci="$(docker ps --all --quiet --filter "label=${label}")" ||
   echo "${hook}: cannot reach Docker; no containers removed" >&2
   exit 0
 fi
-ids="$(printf '%s\n' ${ci} ${stopped} | sort -u)"
-if [ -z "${ids}" ]; then
+# One container ID per line in each list; an array of them, without duplicates.
+mapfile -t ids < <(printf '%s\n' "${ci}" "${stopped}" | sed '/^$/d' | sort -u)
+if [ "${#ids[@]}" -eq 0 ]; then
   echo "${hook}: no CI or build containers left over"
   exit 0
 fi
-# shellcheck disable=SC2086  # One container ID per word.
-echo "${hook}: removing left-over CI or build container(s):" ${ids}
-# shellcheck disable=SC2086
-docker rm --force ${ids} > /dev/null || echo "${hook}: docker rm failed" >&2
+echo "${hook}: removing left-over CI or build container(s): ${ids[*]}"
+docker rm --force "${ids[@]}" > /dev/null || echo "${hook}: docker rm failed" >&2
 exit 0

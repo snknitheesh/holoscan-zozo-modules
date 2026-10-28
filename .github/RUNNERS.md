@@ -1,18 +1,20 @@
 # CI runners
 
-[`workflows/ci.yml`](workflows/ci.yml) has four jobs. Their names are the checks branch protection
-requires:
+[`workflows/ci.yml`](workflows/ci.yml) reports five checks, all of which branch protection
+requires (see [Repository settings](#repository-settings)):
 
 | Check | Runs on | What it does |
 | --- | --- | --- |
-| `Lint` | GitHub-hosted `ubuntu-24.04` | pre-commit, actionlint, the CI driver's unit tests, and every module's and demo's SDK-free tests (`tests/host/`) |
+| `Lint` | GitHub-hosted `ubuntu-24.04` | [prek](https://prek.j178.dev) (the hooks in `.pre-commit-config.yaml`), actionlint, the CI driver's unit tests, and every module's and demo's SDK-free tests (`tests/host/`) |
 | `x86 GPU` | Self-hosted, labels `self-hosted, linux, x64, gpu` | `ci.py sdk --platform x86_64` in the CI image |
 | `Jetson Thor` | Self-hosted, labels `self-hosted, linux, arm64, jetson, thor` | `ci.py sdk --platform jetson` in the CI image |
 | `Jetson Orin` | Self-hosted, labels `self-hosted, linux, arm64, jetson, orin` | `ci.py sdk --platform jetson` in the CI image |
+| `CI result` | GitHub-hosted `ubuntu-24.04` | Always runs, after the others; fails unless every one of them succeeded |
 
 `ci.py sdk` builds each module, runs its full test suite, installs it, and builds and runs a
 consumer project against the installed package; then it builds each demo against the installed
-modules, runs its tests and runs its finite `ci` mode. Any failure fails the job.
+modules, runs its tests and runs its finite `ci` mode, which is stopped after
+`modes.ci.run.timeout` seconds (default 900). Any failure fails the job.
 
 The GPU jobs all build the same image, [`docker/Dockerfile`](docker/Dockerfile), on the runner for
 its own architecture with `docker buildx build`, and tag it `holoscan-modules-ci:local` (Docker's
@@ -52,19 +54,29 @@ The repository is public and the GPU runners are machines on a private network, 
 
 - The GPU jobs never run automatically for a pull request from a fork. They run for pushes to
   `main`, for manual runs, and for pull requests whose branch is in this repository. A fork's pull
-  request gets only `Lint`; to test it on the GPUs, a maintainer reviews the code and pushes it to a
-  branch of this repository.
+  request gets only `Lint`, and `CI result` fails with an error saying that the GPU jobs did not
+  run; to test it on the GPUs, a maintainer reviews the code and pushes it to a branch of this
+  repository.
 - `ci.yml` has `permissions: contents: read`, never uses `pull_request_target`, and checks out
   with `persist-credentials: false`, so the build cannot push or read secrets.
 - `container.yml`, the only workflow that can write, never runs for a pull request: only for a
   push to `main` that changes the image, a `v*` tag, or a manual run, all of which need write
-  access to the repository. Only its jobs get `packages: write`, and only for this repository's
+  access to the repository. It publishes only from `main` or a `v*` tag; a manual run from any
+  other branch builds and pushes nothing. Only its jobs get `packages: write`, and only for this repository's
   package.
 - Every action is pinned to a commit, and the base images (and the BuildKit image the publishing
   jobs build with) to a digest.
 
-Because a skipped job counts as passing for branch protection, review a fork's pull request
-yourself before merging it.
+A skipped job counts as passing for branch protection, and a skipped matrix job reports under its
+unexpanded name (`Jetson ${{ matrix.title }}`), not as `Jetson Thor` or `Jetson Orin`. That is why
+`CI result` exists: it always runs, so a fork's pull request, whose GPU jobs are skipped, fails
+visibly instead of merging untested.
+
+None of this is a defence against the code itself: a pull request can edit the workflows, and the
+edited workflows are what run for it. What keeps a fork's code off the runners is the approval
+setting below, which holds every workflow run of an outside contributor until a maintainer
+approves it. Review a fork's pull request, workflow changes included, before approving its run or
+pushing its branch here.
 
 ## Repository settings
 
@@ -73,8 +85,16 @@ yourself before merging it.
 - **Settings > Actions > General > Workflow permissions**: "Read repository contents and packages
   permissions". `container.yml` asks for `packages: write` itself.
 - **Settings > Branches > Branch protection rule for `main`** (or a ruleset): require a pull
-  request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin`; require branches to
-  be up to date before merging; and do not allow bypassing these settings.
+  request, require these status checks to pass: `Lint`, `x86 GPU`, `Jetson Thor`, `Jetson Orin`
+  and `CI result`; require branches to be up to date before merging; and do not allow bypassing
+  these settings.
+
+  `CI result` is the check that cannot be skipped, so it is what fails a pull request whose GPU
+  jobs did not run. The four lane checks stay required as well: a pull request that edits `ci.yml`
+  to drop a lane, or to make `CI result` stop waiting for it, still lacks that lane's check and
+  cannot merge. For a fork's pull request, `Jetson Thor` and `Jetson Orin` never report (see
+  [Security](#security)); `CI result` says why, and the checks report once a maintainer pushes the
+  branch here.
 
 ## Registering a runner
 
@@ -94,13 +114,35 @@ when `config.sh` asks, or pass `--labels`:
   --name jetson-orin --labels jetson,orin --unattended
 ```
 
-The runner adds `self-hosted`, `linux` and `x64` or `arm64` itself. Install it as a service so it
-starts at boot and restarts if it stops, under a user that is in the `docker` group:
+The runner adds `self-hosted`, `linux` and `x64` or `arm64` itself. The workflows' actions run on
+Node.js 24, which needs runner version 2.327.1 or newer; the runner updates itself unless it was
+configured with `--disableupdate`.
+
+Put the runner's user in the `docker` group **before** its service manager starts: a running
+manager keeps the groups it started with, so a user added later gets `permission denied` on the
+Docker socket until the manager restarts (for a system service, the unit; for a user service, the
+user's manager, `user@<uid>.service`, or the machine).
+
+```bash
+sudo usermod -aG docker <runner-user>
+```
+
+Then install the runner as a service so it starts at boot. `svc.sh` installs a systemd unit
+without `Restart=`, so a runner that crashes or exits stays down; add a drop-in that restarts it:
 
 ```bash
 sudo ./svc.sh install <runner-user>
+# svc.sh writes the unit's name to .service.
+unit="$(cat .service)"
+sudo mkdir -p "/etc/systemd/system/${unit}.d"
+printf '[Service]\nRestart=always\nRestartSec=10\n' |
+  sudo tee "/etc/systemd/system/${unit}.d/restart.conf" > /dev/null
+sudo systemctl daemon-reload
 sudo ./svc.sh start
+systemctl show "${unit}" --property=Restart   # must print Restart=always
 ```
+
+`sudo ./svc.sh stop` still stops it: systemd does not restart a unit that was stopped on purpose.
 
 A job waits in the queue until a runner with its labels is online.
 
@@ -162,6 +204,31 @@ not pass the signal on and the stop hangs until the timeout; send SIGINT to the
    `EGL_NOT_INITIALIZED`. Do not set `DISPLAY` in the runner service's environment.
 4. About 60 GB of free disk on the NVMe drive that holds Docker's data root.
 
+### Jetson Orin
+
+1. JetPack 7.2 (L4T R39) or later, which brings CUDA 13 to Orin; the CI image's CUDA 13.0 user
+   space needs it. Like JetPack 7 on Thor, it brings the PVA firmware and the NVIDIA Container
+   Toolkit with its `nvidia` runtime.
+2. Docker Engine with the Buildx plugin. Ubuntu's `docker.io` has none, and without it the job
+   fails at "Build the CI image":
+
+   ```bash
+   sudo apt-get install docker-buildx   # or docker-buildx-plugin with Docker's packages
+   docker buildx version                # must work as the runner's user
+   ```
+
+3. The `nvidia` runtime registered, and the runner's user in the `docker` group before its service
+   manager starts, as in [Registering a runner](#registering-a-runner):
+
+   ```bash
+   sudo nvidia-ctk runtime configure --runtime=docker
+   sudo systemctl restart docker
+   docker run --rm --runtime nvidia nvcr.io/nvidia/cuda:13.0.2-base-ubuntu24.04 nvidia-smi
+   ```
+
+4. The job's container runs as on Thor: `--runtime nvidia --privileged`, without `DISPLAY`.
+5. About 60 GB of free disk on the drive that holds Docker's data root.
+
 ## The CI image
 
 [`docker/Dockerfile`](docker/Dockerfile) builds the one image every lane uses, for `linux/amd64`
@@ -191,9 +258,10 @@ from the CUDA 13.0 base serves every lane.
 ## Publishing the image
 
 [`workflows/container.yml`](workflows/container.yml) publishes the image as
-`ghcr.io/snknitheesh/holoscan-zozo-modules`. It runs on a push to `main` that changes
-`docker/Dockerfile` or the workflow, on every `v*` tag, and by hand (`workflow_dispatch`); never
-for a pull request.
+`ghcr.io/snknitheesh/holoscan-zozo-modules`. It runs on a push to `main` that changes anything
+in `docker/` (the Dockerfile or its Python requirements) or the workflow, on every `v*` tag, and
+by hand (`workflow_dispatch`, which publishes only when run from `main` or a `v*` tag); never for
+a pull request.
 
 | Job | Runs on | What it does |
 | --- | --- | --- |
@@ -201,8 +269,9 @@ for a pull request.
 | `Build linux/arm64` | The Jetson Thor runner | The same for arm64, without emulation |
 | `Publish the multi-arch image` | GitHub-hosted `ubuntu-24.04` | Joins both digests into one multi-arch image and tags it |
 
-The tags are `sha-<short commit>` always, `latest` for `main` and for `v*` tags, and the version
-for a `v*` tag (`v1.2.3` gives `1.2.3`). The jobs log in with the workflow's own `GITHUB_TOKEN`;
+The tags are `sha-<short commit>` always, `latest` for `main` only, and the version for a `v*` tag
+(`v1.2.3` gives `1.2.3`). A tag does not move `latest`, so pushing a tag for an older release
+cannot set `latest` back to it. The jobs log in with the workflow's own `GITHUB_TOKEN`;
 no secret is needed.
 
 The first push creates the package **private**. Make it public once: open the package from the

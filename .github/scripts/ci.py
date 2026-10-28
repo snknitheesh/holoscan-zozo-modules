@@ -8,8 +8,10 @@ applications/README.md), so adding one needs no workflow change:
   host   Build and run the SDK-free test projects (<folder>/tests/host/).
   sdk    For each module: build it, run its full CTest suite, install it, then
          build and test its installed-package consumer (tests/installed_consumer/).
+         Modules build in name order, each against those installed before it.
          Then, for each demo: build it against the installed modules, run its
-         tests, and run its finite `ci` mode from metadata.json.
+         tests, and run its finite `ci` mode from metadata.json, which is killed
+         after modes.ci.run.timeout seconds (default 900).
   list   Print what would be built.
 
 Every step must succeed; the first failure ends the run with a nonzero status.
@@ -18,10 +20,13 @@ Every step must succeed; the first failure ends the run with a nonzero status.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import math
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -30,6 +35,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 APP_BIN = "<holohub_app_bin>"
+# Seconds a demo's ci mode may run, unless its modes.ci.run.timeout says otherwise.
+CI_MODE_TIMEOUT = 900
 
 
 class CiError(Exception):
@@ -49,7 +56,8 @@ class Project:
 
 
 def discover(root: Path, folder: str, kind: str) -> list[Project]:
-    """Every <root>/<folder>/<name>/ with a metadata.json, sorted by name."""
+    """Every <root>/<folder>/<name>/, sorted by name. Each must have a metadata.json:
+    a folder without one would otherwise never be built or tested."""
     base = root / folder
     if not base.is_dir():
         return []
@@ -57,7 +65,7 @@ def discover(root: Path, folder: str, kind: str) -> list[Project]:
     for path in sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")):
         metadata_file = path / "metadata.json"
         if not metadata_file.is_file():
-            continue
+            raise CiError(f"{path}: has no metadata.json")
         try:
             metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -73,10 +81,28 @@ def discover(root: Path, folder: str, kind: str) -> list[Project]:
 def ci_mode(app: Project) -> dict:
     """The application's `ci` mode: a finite, headless run."""
     modes = app.metadata["application"].get("modes", {})
-    mode = modes.get("ci")
-    if not isinstance(mode, dict) or not isinstance(mode.get("run", {}).get("command"), str):
+    mode = modes.get("ci") if isinstance(modes, dict) else None
+    run = mode.get("run") if isinstance(mode, dict) else None
+    if not isinstance(run, dict) or not isinstance(run.get("command"), str):
         raise CiError(f"{app.path / 'metadata.json'}: needs modes.ci.run.command")
+    try:
+        ci_timeout(mode)
+    except CiError as error:
+        raise CiError(f"{app.path / 'metadata.json'}: {error}") from error
     return mode
+
+
+def ci_timeout(mode: dict) -> float:
+    """Seconds the ci mode may run: modes.ci.run.timeout, or CI_MODE_TIMEOUT."""
+    timeout = mode["run"].get("timeout", CI_MODE_TIMEOUT)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise CiError("modes.ci.run.timeout must be a positive number of seconds")
+    return timeout
 
 
 def ci_command(mode: dict, app: Project, app_bin: Path) -> tuple[list[str], Path]:
@@ -99,13 +125,63 @@ def ci_cmake_options(mode: dict) -> list[str]:
     return options
 
 
-def run(command: list[str], *, cwd: Path | None = None) -> None:
+def run(command: list[str], *, cwd: Path | None = None, timeout: float | None = None) -> None:
+    """Run a command; any nonzero status fails the run. With a timeout, the command
+    and everything it started are killed when it expires, and the run fails."""
     print(f"+ {shlex.join(command)}", flush=True)
     started = time.monotonic()
-    result = subprocess.run(command, cwd=cwd, check=False)
-    if result.returncode:
-        raise CiError(f"exit status {result.returncode}: {shlex.join(command)}")
+    # With a timeout, its own process group, so that the kill reaches the command's
+    # children too. Without one, it stays in ci.py's group: a signal to that group
+    # (Ctrl-C, a hang-up, `timeout`), or a SIGKILL of ci.py's group, reaches all of it,
+    # while a signal to ci.py's PID alone stops only the command, not what it started.
+    group = timeout is not None
+    process = subprocess.Popen(command, cwd=cwd, start_new_session=group)
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop(process, group)
+        raise CiError(f"timed out after {timeout:g} s: {shlex.join(command)}") from None
+    except BaseException:
+        # Interrupted: Ctrl-C, or SIGTERM or SIGHUP through exit_on_signals().
+        stop(process, group)
+        raise
+    if returncode:
+        raise CiError(f"exit status {returncode}: {shlex.join(command)}")
     print(f"  ({time.monotonic() - started:.1f} s)", flush=True)
+
+
+def stop(process: subprocess.Popen, group: bool, grace: float = 10) -> None:
+    """SIGTERM the command (its whole group if it has one), give it `grace` seconds,
+    then SIGKILL whatever is left: what ignored SIGTERM, or outlived the leader."""
+    if process.returncode is not None:
+        return  # Already reaped: its PID, and so its group ID, may now be another's.
+
+    def send(sig: signal.Signals) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            if group:
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
+
+    try:
+        send(signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=grace)
+    finally:
+        # Also when a second Ctrl-C interrupts the wait.
+        send(signal.SIGKILL)
+        process.wait()
+
+
+def exit_on_signals() -> None:
+    """Turn SIGTERM and SIGHUP into SystemExit, so that run() stops its command
+    instead of leaving it running when ci.py is told to stop."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
 
 
 def section(title: str) -> None:
@@ -166,7 +242,13 @@ def sdk(root: Path, build_root: Path, platform: str) -> int:
         cmake_build_and_test(
             module.path,
             build,
-            [*release, "-DBUILD_TESTING=ON", f"-DCMAKE_INSTALL_PREFIX={prefix}"],
+            [
+                *release,
+                "-DBUILD_TESTING=ON",
+                f"-DCMAKE_INSTALL_PREFIX={prefix}",
+                # The modules installed before this one, in name order.
+                f"-DCMAKE_PREFIX_PATH={prefix}",
+            ],
             no_tests="error",
         )
         section(f"{module.label}: install")
@@ -198,7 +280,7 @@ def sdk(root: Path, build_root: Path, platform: str) -> int:
         )
         section(f"{app.label}: ci mode")
         command, cwd = ci_command(mode, app, build.resolve())
-        run(command, cwd=cwd)
+        run(command, cwd=cwd, timeout=ci_timeout(mode))
     if not modules and not apps:
         print("No modules or applications; nothing to build.")
     section(f"OK: {len(modules)} module(s), {len(apps)} application(s) on {platform}")
@@ -227,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     build_root = args.build_root.resolve()
+    exit_on_signals()
     try:
         if args.command == "host":
             return host(ROOT, build_root)

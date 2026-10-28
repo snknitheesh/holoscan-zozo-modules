@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# yamllint, for every YAML file the lint hooks see. The repository's YAML is indented
+# by 2 spaces, with block sequences indented under their key.
+extends: default
+
+rules:
+  document-start: disable
+  indentation:
+    spaces: 2
+    indent-sequences: true
+  # GitHub's `on:` key is a string, not a boolean; values must still be true or false.
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  # Off: a workflow's expressions, `::error::` messages, digests and label values are
+  # single values that cannot be wrapped without changing them.
+  line-length: disable
