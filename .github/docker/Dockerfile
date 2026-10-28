@@ -32,6 +32,18 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # with it when it is set.
 ARG TARGETARCH
 
+# The base image's CUDA forward-compatibility driver (cuda-compat, in
+# /usr/local/cuda/compat) goes: every lane has a driver for CUDA 13.2, so nothing
+# needs it, and on JetPack 7.2 the NVIDIA Container Toolkit's cuda-compat hook
+# (1.19) fails to read the 13.2 one and refuses to start the container at all.
+RUN set -eux; \
+    packages="$(dpkg-query -W -f '${Package}\n' 'cuda-compat-*')"; \
+    test -n "${packages}"; \
+    printf '%s\n' "${packages}" | xargs dpkg --purge; \
+    if [ -n "$(find /usr/local -path '/usr/local/cuda*/compat/libcuda.so*')" ]; then \
+      echo "a CUDA forward-compatibility driver is left in /usr/local/cuda*/compat" >&2; exit 1; \
+    fi
+
 # NVIDIA's Jetson package repository, release r39.2 (JetPack 7.2): its x86_64/noble
 # component on amd64, for VPI; on arm64 its common component, for VPI and TensorRT,
 # whose Jetson builds support every Jetson GPU (the CUDA repository's sbsa TensorRT
