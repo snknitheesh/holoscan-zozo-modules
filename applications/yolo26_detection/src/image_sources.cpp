@@ -551,7 +551,8 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
   if (xioctl(fd_, VIDIOC_QBUF, &buffer) != 0) {
     return holoscan::make_unexpected(failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
   }
-  // A live frame is not worth waiting for: drop it while the detector is busy.
+  // A live frame is not worth waiting for: on a blocking edge, drop one the
+  // detector has no room for.
   bool delivered = false;
   const Result result = settle(emitted, delivered);
   if (delivered) {

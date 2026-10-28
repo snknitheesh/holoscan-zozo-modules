@@ -3,8 +3,8 @@
 //
 // DetectionReportOp: the application's sink. It takes each image's
 // detections from Yolo26DetectionOp, checks that frame ids run 1, 2, 3, ...
-// without a gap, measures the time from capture to detections on the host,
-// and then, depending on the input:
+// without a gap (in real time, that they go up), measures the time from
+// capture to detections on the host, and then, depending on the input:
 //
 // - synthetic frames with the stub model: checks the detections against the
 //   frame's known ones;
@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -53,8 +54,12 @@ using holoscan::yolo26::TruthMatch;
 struct DetectionReport {
   std::atomic<std::uint32_t> frames{};
   std::uint64_t detections{};
-  // Frames whose id is not the one after the previous frame's.
+  // Frames whose id is not the one after the previous frame's; in real time,
+  // only those whose id is not above it.
   std::uint32_t frame_gaps{};
+  // In real time: the frames passed over for newer ones, and the last id seen.
+  std::uint64_t skipped{};
+  std::uint64_t last_frame_id{};
   // Synthetic truth: detections missed and extra, and the largest edge error
   // of the nearest candidates, in image pixels.
   bool verified{};
@@ -84,8 +89,16 @@ struct SyntheticTruth {
 struct DetectionReportConfig {
   // Where the reporter adds what it sees; one report per run.
   std::shared_ptr<DetectionReport> report;
-  // Frames after which the run completes; 0 never completes.
+  // Frames after which the run completes; 0 never completes. In real time,
+  // the run completes at the frame with this id.
   std::uint32_t expected_frames{};
+  // The inputs keep only the newest sample (see edges.hpp): frames come with
+  // ids that go up, but not one by one, as those that came while the reporter
+  // was busy are passed over and counted as skipped.
+  bool realtime{false};
+  // Time spent on each frame on top of the work: a stand-in, in tests, for a
+  // consumer slower than the source.
+  std::chrono::nanoseconds delay{};
   // The detector's capacity: the length of its outputs.
   int max_detections{300};
   // Check synthetic frames against their known detections.

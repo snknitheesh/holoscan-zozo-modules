@@ -47,6 +47,7 @@
 #include <holoscan/yolo26/yolo26_detection_op.hpp>
 
 #include "detection_report_op.hpp"
+#include "edges.hpp"
 #include "expectations.hpp"
 #include "image_files.hpp"
 #include "image_sources.hpp"
@@ -450,12 +451,17 @@ int execute(const Options& opts, SignalDomain& signals) {
   // Frames the run expects; 0 for a camera that runs until stopped.
   const std::uint32_t frames = opts.count.value_or(0);
   auto report = std::make_shared<app::DetectionReport>();
-  // The synthetic and file sources send a frame only once the reporter is
-  // done with the one before. A blocking edge does not wait for room for
-  // long: it refuses a frame its consumer has no room for, and the detector
-  // cannot send a refused frame again. One frame in flight fits the depth of
-  // two that every input declares in its operator's setup(): the frame being
-  // reported, which keeps its place until its compute() returns, and the next.
+  // The camera runs in real time, the other sources losslessly (edges.hpp).
+  const bool realtime = opts.source == Source::kCamera;
+  // Lossless, the synthetic and file sources send a frame only once the
+  // reporter is done with the one before. A blocking edge does not wait for
+  // room for long: it refuses a frame its consumer has no room for, and the
+  // detector cannot send a refused frame again. One frame in flight fits the
+  // depth of two that every input declares in its operator's setup(): the
+  // frame being reported, which keeps its place until its compute() returns,
+  // and the next. The reporter's count of frames done is the signal, read by
+  // the source: an edge back from the reporter to the source would carry it
+  // as data, but the SDK refuses a graph with a cycle (GRAPH_DIRECT_CYCLE).
   const std::shared_ptr<const std::atomic<std::uint32_t>> done(report, &report->frames);
   const holoscan::Output<holoscan::schema::ImageT>* image_out = nullptr;
   if (opts.source == Source::kSynthetic) {
@@ -479,6 +485,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   auto reporter = graph.op<app::DetectionReportOp>(
       "report", app::DetectionReportConfig{.report = report,
                                            .expected_frames = frames,
+                                           .realtime = realtime,
                                            .max_detections = opts.max_detections,
                                            .truth = truth,
                                            .files = opts.source == Source::kFiles
@@ -490,16 +497,15 @@ int execute(const Options& opts, SignalDomain& signals) {
                                            .print = opts.source == Source::kFiles,
                                            .image_dir = opts.image_dir});
 
-  // Lossless edges: every frame is detected and reported, in order. The
-  // queue depth is the one each input declares in its operator's setup().
-  const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(*image_out, detector->image, lossless);
-  graph.add_flow(detector->boxes, reporter->boxes, lossless);
-  graph.add_flow(detector->scores, reporter->scores, lossless);
-  graph.add_flow(detector->class_ids, reporter->class_ids, lossless);
-  graph.add_flow(detector->count, reporter->count, lossless);
+  // Lossless, every frame is detected and reported, in order. In real time,
+  // the detector takes the newest frame and the reporter the newest
+  // detections; the reporter pairs them with their frame by capture time, so
+  // its images keep a few frames.
+  const holoscan::ConnectionOptions edge = realtime ? app::newest() : app::lossless();
+  graph.add_flow(*image_out, detector->image, edge);
+  app::connect_detections(graph, detector, reporter, edge);
   if (!opts.image_dir.empty()) {
-    graph.add_flow(*image_out, reporter->image, lossless);
+    graph.add_flow(*image_out, reporter->image, realtime ? app::recent_frames() : app::lossless());
   }
 
 #if YOLO26_DETECTION_ENABLE_VISUALIZATION
@@ -533,21 +539,18 @@ int execute(const Options& opts, SignalDomain& signals) {
                                             .height = frame_height(opts),
                                             .max_detections = opts.max_detections,
                                             .labels = opts.labels});
-    // Best effort: the display keeps the newest sample and never holds back
-    // the detector.
-    const holoscan::ConnectionOptions latest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                             .queue_depth = 1U};
-    // The frame's image must still be queued when its detections arrive, or Holoviz, which takes
-    // the newest image no newer than them, falls back to an older one: keep a few frames.
-    const holoscan::ConnectionOptions recent{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                             .queue_depth = 4U};
-    graph.add_flow(*image_out, visualizer->image_layer_input(0), recent);
-    graph.add_flow(detector->boxes, overlay->boxes, latest);
-    graph.add_flow(detector->scores, overlay->scores, latest);
-    graph.add_flow(detector->class_ids, overlay->class_ids, latest);
-    graph.add_flow(detector->count, overlay->count, latest);
-    graph.add_flow(overlay->overlay, visualizer->image_layer_input(1), latest);
-    graph.add_flow(overlay->labels, visualizer->tensor_layer_input(2), latest);
+    // Real time in either mode: the display keeps the newest sample and never
+    // holds back the detector. Its video is a layer that does not trigger a
+    // frame, which HoloViz pairs with the boxes by taking the newest image no
+    // newer than them: that image must still be queued when the boxes arrive,
+    // or it falls back to an older one, so it keeps a few frames.
+    graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames());
+    graph.add_flow(detector->boxes, overlay->boxes, app::newest());
+    graph.add_flow(detector->scores, overlay->scores, app::newest());
+    graph.add_flow(detector->class_ids, overlay->class_ids, app::newest());
+    graph.add_flow(detector->count, overlay->count, app::newest());
+    graph.add_flow(overlay->overlay, visualizer->image_layer_input(1), app::newest());
+    graph.add_flow(overlay->labels, visualizer->tensor_layer_input(2), app::newest());
   }
 #endif
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
@@ -648,9 +651,12 @@ int execute(const Options& opts, SignalDomain& signals) {
               << ": warning: no detection in any image; check the model, its input size and the "
                  "score threshold\n";
   }
+  // In real time, the frames that came while the detector or the reporter
+  // was busy are skipped; the last one must arrive.
+  const bool all_frames = realtime ? report->last_frame_id == frames : report->frames == frames;
   const bool passed = !timed_out_after && session.diagnostics().empty() &&
-                      termination == holoscan::RunTermination::kRequestedCompleted &&
-                      report->frames == frames && report->passed() && !none_found;
+                      termination == holoscan::RunTermination::kRequestedCompleted && all_frames &&
+                      report->passed() && !none_found;
   const std::vector<double>& latencies = report->latencies_ms;
   double mean = 0.0;
   for (const double value : latencies) {
@@ -672,6 +678,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (report->frame_gaps != 0) {
     std::cout << " frame_gaps=" << report->frame_gaps;
+  }
+  if (report->skipped != 0) {
+    std::cout << " skipped=" << report->skipped;
   }
   if (report->verified) {
     std::cout << " truth: missed=" << report->missed << " extra=" << report->extra

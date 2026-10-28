@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -82,6 +83,9 @@ DetectionReportOp::DetectionReportOp(DetectionReportConfig config) : config_(std
   if (!(config_.expect_iou > 0.0F && config_.expect_iou <= 1.0F)) {
     throw std::invalid_argument("DetectionReportOp: expect_iou must be in (0, 1]");
   }
+  if (config_.delay < std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("DetectionReportOp: delay must not be negative");
+  }
   if (!config_.expectations.empty() && config_.files.empty()) {
     throw std::invalid_argument("DetectionReportOp: expectations apply to image files");
   }
@@ -89,6 +93,7 @@ DetectionReportOp::DetectionReportOp(DetectionReportConfig config) : config_(std
 
 void DetectionReportOp::setup(holoscan::OperatorSpec& spec) {
   // Two slots per input: one frame in compute() while the next one arrives.
+  // A real-time edge sets its own depth (see edges.hpp).
   spec.input(boxes, "boxes").queue_depth(2U);
   spec.input(scores, "scores").queue_depth(2U);
   spec.input(class_ids, "class_ids").queue_depth(2U);
@@ -191,10 +196,13 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
   }
   // Sources number their frames from 1; the detections keep their image's.
   const std::uint64_t frame_id = metadata.frame_id;
-  if (frame_id != last_frame_id_ + 1U) {
+  if (config_.realtime && frame_id > last_frame_id_) {
+    report.skipped += frame_id - last_frame_id_ - 1U;
+  } else if (frame_id != last_frame_id_ + 1U) {
     ++report.frame_gaps;
   }
   last_frame_id_ = frame_id;
+  report.last_frame_id = frame_id;
   report.detections += detections.size();
 
   if (config_.truth && frame_id != 0) {
@@ -245,9 +253,14 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
     }
   }
 
+  if (config_.delay > std::chrono::nanoseconds::zero()) {
+    std::this_thread::sleep_for(config_.delay);
+  }
   ++seen_;
   report.frames.fetch_add(1U);
-  if (config_.expected_frames != 0 && seen_ == config_.expected_frames) {
+  const bool last =
+      config_.realtime ? frame_id >= config_.expected_frames : seen_ == config_.expected_frames;
+  if (config_.expected_frames != 0 && last) {
     context.request_completion();
   }
   return {};

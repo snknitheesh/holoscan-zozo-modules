@@ -109,7 +109,8 @@ against the rectangles: each box edge within a model input pixel or so (`2 / r +
 the exact score, and nothing extra.
 
 Each run prints the frame count, the detections, the latency and, as they apply, the truth check and
-the expected detections found. A gap in the frame ids fails the run, as does a run over files with
+the expected detections found. A gap in the frame ids fails the run (but for the camera, see
+[Lossless or real time](#lossless-or-real-time)), as does a run over files with
 nothing expected and no detection at all, which most likely means a wrong model, input size or
 threshold. Then comes a `verdict`: `PASS`, `FAIL`, or `STOPPED` when an interrupt or a closed window
 ends the run early. It exits 0 on `PASS`, or on `STOPPED` for a camera run without `--count`; 2 for
@@ -118,11 +119,28 @@ invalid options, a missing camera among them; else 1.
 `--expect FILE` lists detections that named image files must yield, as lines of
 `image,class_id,x1,y1,x2,y2`, each matched by a detection of the class with an IoU of at least
 `--expect-iou` (default 0.8). `--image-dir DIR` writes each frame with its boxes drawn as
-`DIR/detections_NNNNNN.ppm`. Synthetic frames and files go one at a time: the source sends a frame
-only once the reporter is done with the one before, so none is lost however long the reporter takes,
-to write an image say, and `--period-ms` is the shortest time between frames. `--encoding bgr8` decodes the files as BGR8, `--fp16 true` builds an
+`DIR/detections_NNNNNN.ppm`. `--encoding bgr8` decodes the files as BGR8, `--fp16 true` builds an
 FP16 engine, and `--score-threshold` sets the threshold. Run the executable with `--help` for every
 option. `-DYOLO26_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
+
+### Lossless or real time
+
+Synthetic frames and files are lossless: every frame is detected and reported, in order, over
+blocking edges. They go one at a time: the source sends a frame only once the reporter is done with
+the one before, so none is lost however long the reporter takes, to write an image say, and
+`--period-ms` is the shortest time between frames. The reporter's count of frames done is the
+signal; it cannot reach the source as data, over an edge, because the SDK refuses a graph with a
+cycle.
+
+The camera runs in real time. The camera to the detector, and the detector to the reporter, the
+overlay and the window, are depth-1 drop-oldest edges: a full queue drops its oldest sample rather
+than refusing the new one. The detector never waits for a slower consumer, takes the newest frame
+when the camera is faster, and a slow consumer finds the newest detections waiting when it is done.
+Frames passed over are counted as `skipped`, not as gaps, and a run with `--count N` ends with frame
+`N`'s detections. The reporter's images (with `--image-dir`) and the window's video keep the four
+newest frames instead of one, so that a frame is still queued when its detections arrive, a
+detector's latency later, to be paired with them. The window, with `--display true`, is real time
+in either mode.
 
 ### Webcam
 
@@ -135,7 +153,8 @@ build/yolo26_detection/yolo26_detection --model data/yolo26_detection/yolo26n.on
 ```
 
 The camera is opened when the run starts and closed when it stops; frames that arrive while the
-detector is busy are dropped, so each detection is of the newest frame. The window shows each frame
+detector is busy are dropped, so each detection is of the newest frame (see
+[Lossless or real time](#lossless-or-real-time)). The window shows each frame
 with its boxes, a color per class, and a `<class> 0.87` label above each box. The camera must offer
 YUYV at the requested size (default 640x480, or for example `--width 1280 --height 720`); otherwise
 the run stops with the sizes it offers. To use another camera, list them with

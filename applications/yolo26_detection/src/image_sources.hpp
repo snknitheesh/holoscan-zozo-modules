@@ -6,8 +6,8 @@
 // number of frames on a clock, numbered from 1, then idle. A frame that a
 // busy consumer pushes back is sent again on the next tick with its original
 // capture time. Given the count of frames done downstream, they also hold
-// each frame until the one before it is done. And a V4L2 webcam, whose frames
-// a busy consumer drops instead.
+// each frame until the one before it is done. And a V4L2 webcam, for real
+// time: connected with only the newest frame kept, it is never held back.
 
 #pragma once
 
@@ -139,8 +139,10 @@ void check_camera(const CameraSourceConfig& config);
 
 // RGB8 frames in host memory from a V4L2 camera offering YUYV at the
 // requested size, numbered from 1 and stamped with their capture time. Only
-// the newest frame is kept; one arriving while the detector is busy is
-// dropped.
+// the camera's newest frame goes out. Connect it with drop-oldest edges
+// (edges.hpp), so that a frame arriving while the detector is busy replaces
+// the one waiting; on a blocking edge, a frame the detector has no room for
+// is dropped here.
 class CameraSourceOp final : public holoscan::Operator<> {
  public:
   // The device is opened in start() and closed in stop(), not here: the runtime may
