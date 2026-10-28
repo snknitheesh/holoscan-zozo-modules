@@ -27,22 +27,34 @@ find_package(CUDAToolkit REQUIRED)
 add_library(apriltag_detection_ops STATIC src/detection_report_op.cpp src/frame_source_op.cpp)
 target_compile_features(apriltag_detection_ops PUBLIC cxx_std_20)
 target_include_directories(apriltag_detection_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(apriltag_detection_ops PUBLIC
-  holoscan::apriltag holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  apriltag_detection_ops
+  PUBLIC holoscan::apriltag holoscan::core holoscan::sensor_io CUDA::cudart
+)
 
 add_executable(apriltag_detection src/main.cpp)
 target_link_libraries(apriltag_detection PRIVATE apriltag_detection_ops)
-target_compile_definitions(apriltag_detection PRIVATE
-  APRILTAG_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${APRILTAG_DETECTION_ENABLE_VISUALIZATION}>)
+target_compile_definitions(
+  apriltag_detection
+  PRIVATE APRILTAG_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${APRILTAG_DETECTION_ENABLE_VISUALIZATION}>
+)
 if(APRILTAG_DETECTION_ENABLE_VISUALIZATION)
-  target_link_libraries(apriltag_detection PRIVATE
-    holoscan::apriltag_overlay holoscan::visualization::op_holoviz)
+  target_link_libraries(
+    apriltag_detection
+    PRIVATE holoscan::apriltag_overlay holoscan::visualization::op_holoviz
+  )
   # On Jetson, VPI loads Tegra's EGL driver, after which HoloViz cannot create its Vulkan
   # instance unless the Vulkan loader was loaded first: link the loader ahead of everything.
   if(holoscan-apriltag_WITH_VPI)
     find_library(APRILTAG_DETECTION_VULKAN_LOADER NAMES vulkan REQUIRED)
-    target_link_options(apriltag_detection BEFORE PRIVATE "LINKER:--push-state,--no-as-needed"
-      "${APRILTAG_DETECTION_VULKAN_LOADER}" "LINKER:--pop-state")
+    target_link_options(
+      apriltag_detection
+      BEFORE
+      PRIVATE
+        "LINKER:--push-state,--no-as-needed"
+        "${APRILTAG_DETECTION_VULKAN_LOADER}"
+        "LINKER:--pop-state"
+    )
   endif()
 endif()
 install(TARGETS apriltag_detection RUNTIME DESTINATION bin)

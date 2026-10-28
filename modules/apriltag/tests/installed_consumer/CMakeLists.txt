@@ -8,12 +8,17 @@ project(holoscan_apriltag_consumer LANGUAGES CXX)
 enable_testing()
 
 find_package(holoscan-apriltag 1.0 REQUIRED CONFIG)
-message(STATUS "Found holoscan-apriltag ${holoscan-apriltag_VERSION} in ${holoscan-apriltag_DIR}"
-  " (vpi backend: ${holoscan-apriltag_WITH_VPI})")
+message(
+  STATUS
+  "Found holoscan-apriltag ${holoscan-apriltag_VERSION} in ${holoscan-apriltag_DIR}"
+  " (vpi backend: ${holoscan-apriltag_WITH_VPI})"
+)
 
 add_executable(apriltag_consumer main.cpp)
 target_link_libraries(apriltag_consumer PRIVATE holoscan::apriltag)
 
 add_test(NAME apriltag_installed_consumer COMMAND apriltag_consumer)
-set_tests_properties(apriltag_installed_consumer PROPERTIES
-  PASS_REGULAR_EXPRESSION "apriltag_consumer: PASS" TIMEOUT 300)
+set_tests_properties(
+  apriltag_installed_consumer
+  PROPERTIES PASS_REGULAR_EXPRESSION "apriltag_consumer: PASS" TIMEOUT 300
+)

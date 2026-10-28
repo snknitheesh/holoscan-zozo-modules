@@ -18,4 +18,5 @@ holohub_configure_deb(
   VERSION "${PROJECT_VERSION}"
   VENDOR "zozo"
   CONTACT "zozo <snknitheesh@gmail.com>"
-  DEPENDS "${_depends}")
+  DEPENDS "${_depends}"
+)

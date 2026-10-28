@@ -10,7 +10,13 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(holoscan 5.0 CONFIG COMPONENTS @HOLOSCAN_APRILTAG_HOLOSCAN_COMPONENTS@)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  @HOLOSCAN_APRILTAG_HOLOSCAN_COMPONENTS@
+)
 find_dependency(CUDAToolkit)
 
 include("${CMAKE_CURRENT_LIST_DIR}/holoscan-apriltag-targets.cmake")

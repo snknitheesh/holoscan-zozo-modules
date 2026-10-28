@@ -11,8 +11,10 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 add_executable(apriltag_tag_axes_test tag_axes_test.cpp)
-target_include_directories(apriltag_tag_axes_test PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../include" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_include_directories(
+  apriltag_tag_axes_test
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include" "${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 target_compile_features(apriltag_tag_axes_test PRIVATE cxx_std_20)
 add_test(NAME apriltag_tag_axes COMMAND apriltag_tag_axes_test)
 set_tests_properties(apriltag_tag_axes PROPERTIES LABELS "apriltag;host" TIMEOUT 60)
