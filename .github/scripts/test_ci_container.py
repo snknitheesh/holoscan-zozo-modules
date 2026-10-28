@@ -95,7 +95,7 @@ class RunTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def start(self):
+    def start(self, *options):
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -109,6 +109,7 @@ class RunTest(unittest.TestCase):
                 str(self.log),
                 "--docker-options",
                 "--gpus all",
+                *options,
                 "--",
                 "python3",
                 "ci.py",
@@ -137,6 +138,22 @@ class RunTest(unittest.TestCase):
         self.assertIn(f"{ci_container.RUN_LABEL}=7-2-x86", command)
         self.assertEqual(command[-3:], ["image@sha256:1", "python3", "ci.py"])
         self.assertIn("started", self.log.read_text())
+
+    def test_runs_as_the_runner_user_with_a_writable_workspace(self):
+        process = self.start()
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=20)
+        command = self.calls_made()[0].split()
+        self.assertEqual(command[command.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
+        self.assertFalse(command[command.index("-v") + 1].endswith(":ro"))
+
+    def test_root_gets_a_read_only_workspace(self):
+        process = self.start("--root")
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=20)
+        command = self.calls_made()[0].split()
+        self.assertEqual(command[command.index("--user") + 1], "0:0")
+        self.assertTrue(command[command.index("-v") + 1].endswith(":ro"))
 
     def test_signals_remove_the_container(self):
         for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

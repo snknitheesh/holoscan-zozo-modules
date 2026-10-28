@@ -106,3 +106,31 @@ option(HOLOSCAN_APRILTAG_BUILD_OVERLAY "Build AprilTagOverlayOp" ${_overlay_defa
 The root builds the modules in name order, as CI does. A module that depends on another module of
 this collection links that module's `holoscan::` targets when they are defined
 (`if(TARGET holoscan::<other>)`), and otherwise finds its installed package.
+
+## Releases and `binary_packages`
+
+A module is released by pushing a tag `<name>-v<version>`; see
+[.github/RELEASING.md](../.github/RELEASING.md). The release has one Debian package per
+architecture and their SHA-256 sums, at:
+
+```text
+https://github.com/snknitheesh/holoscan-zozo-modules/releases/download/<name>-v<version>/holoscan-<name>_<version>_<arch>.deb
+https://github.com/snknitheesh/holoscan-zozo-modules/releases/download/<name>-v<version>/SHA256SUMS
+```
+
+`<arch>` is `amd64` or `arm64`, as `dpkg --print-architecture` prints it. Once a version is
+released, the module's `metadata.json` names that release's package (a `releases/latest/` URL
+would not do: the latest release of the repository may be another module's):
+
+```json
+"binary_packages": {
+  "debian": "holoscan-<name>",
+  "install_commands": [
+    "curl -fLO https://github.com/snknitheesh/holoscan-zozo-modules/releases/download/<name>-v<version>/holoscan-<name>_<version>_$(dpkg --print-architecture).deb",
+    "sudo apt install ./holoscan-<name>_<version>_$(dpkg --print-architecture).deb"
+  ]
+}
+```
+
+`module.version`, the CMake `project(VERSION)` and the tag must be the same version; the release
+workflow fails otherwise.
