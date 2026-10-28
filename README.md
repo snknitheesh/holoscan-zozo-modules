@@ -18,6 +18,7 @@ Each module's README lists its operators, requirements, build options and tests.
 ## Layout
 
 ```text
+CMakeLists.txt           Builds the enabled modules together; what FetchContent and the CLI fetch
 modules/<name>/          One Holoscan Module: a standalone CMake project
   metadata.json          Module metadata (urn:holoscan:module:v2), read by HoloHub and the CLI
   include/holoscan/<name>/  Installed public headers
@@ -95,6 +96,15 @@ cmake --install build/<name> --prefix "$PWD/install"
 ```
 
 To build a Debian package instead, see the module's README.
+
+The repository root is a CMake project too, which builds the modules together, in one build tree:
+all of them by default, or a selection with `BUILD_ALL=OFF` and the `MODULE_holoscan_<name>` or
+`OP_<operator>` options described in [modules/README.md](modules/README.md#what-the-root-build-expects-of-a-module):
+
+```bash
+cmake -S . -B build/all -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build/apriltag -G Ninja -DBUILD_ALL=OFF -DMODULE_holoscan_apriltag=ON
+```
 
 ## Use a module in your project
 
