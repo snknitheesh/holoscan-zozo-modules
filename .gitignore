@@ -8,6 +8,9 @@ CMakeUserPresets.json
 _CPack_Packages/
 *.deb
 
+# Models and images that tools prepare, such as modules/yolo26/tools/prepare_model.py
+/data/
+
 # Python tooling
 .cache/
 .venv/

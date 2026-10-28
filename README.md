@@ -13,6 +13,7 @@ module source whose path is [`modules/`](modules/).
 | Module | CMake package and targets | C++ namespace | What it does |
 | --- | --- | --- | --- |
 | [holoscan-apriltag](modules/apriltag/) | `holoscan-apriltag`: `holoscan::apriltag`, `holoscan::apriltag_overlay` | `holoscan::apriltag` | AprilTag detection and 6-DoF poses on the CPU, the GPU (CUDA) or the PVA (VPI 4), and a HoloViz overlay. Demo: [AprilTag Detection](applications/apriltag_detection/) |
+| [holoscan-yolo26](modules/yolo26/) | `holoscan-yolo26`: `holoscan::yolo26`, `holoscan::yolo26_overlay` | `holoscan::yolo26` | End-to-end YOLO26 object detection on the GPU: CUDA letterbox, TensorRT through HoloInfer and GPU decode, and a HoloViz overlay. The AGPL-3.0 model is not included; a tool exports it. Demo: [YOLO26 Detection](applications/yolo26_detection/) |
 
 Each module's README lists its operators, requirements, build options and tests.
 
