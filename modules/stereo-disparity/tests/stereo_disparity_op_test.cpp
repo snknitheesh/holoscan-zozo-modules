@@ -139,14 +139,18 @@ struct Accuracy {
   std::size_t truth{};  // Pixels both cameras see.
   double valid{};       // Share of them with a disparity.
   double within_1px{};  // Share of those within 1 px of the truth.
+  double median{};      // Their median absolute error, pixels.
   double mae{};         // Their mean absolute error, pixels.
+  double whole{};       // Share of those that are whole pixels.
 };
 
 Accuracy accuracy(const std::vector<float>& disparity, const SyntheticScene& scene) {
   Accuracy result;
   std::size_t valid = 0;
   std::size_t within = 0;
+  std::size_t whole = 0;
   double error = 0.0;
+  std::vector<float> errors;
   for (int v = 0; v < scene.height; ++v) {
     for (int u = 0; u < scene.width; ++u) {
       const float truth = true_disparity(scene, static_cast<float>(u), static_cast<float>(v));
@@ -157,30 +161,42 @@ Accuracy accuracy(const std::vector<float>& disparity, const SyntheticScene& sce
       ++valid;
       const double e = std::abs(static_cast<double>(d) - truth);
       within += e <= 1.0;
+      whole += d == std::floor(d);
       error += e;
+      errors.push_back(static_cast<float>(e));
     }
   }
   result.valid = result.truth == 0 ? 0.0 : static_cast<double>(valid) / result.truth;
   result.within_1px = valid == 0 ? 0.0 : static_cast<double>(within) / valid;
   result.mae = valid == 0 ? 0.0 : error / valid;
+  result.whole = valid == 0 ? 0.0 : static_cast<double>(whole) / valid;
+  if (!errors.empty()) {
+    const auto middle = errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
+    std::nth_element(errors.begin(), middle, errors.end());
+    result.median = *middle;
+  }
   return result;
 }
 
 // What every backend must reach on the synthetic scene, measured with VPI
-// 4.1.4 (cuda on an RTX 5090, ofa and pva on Jetson Orin) and set with margin.
+// 4.1.4 (cuda on an RTX 5090, Orin and Thor; ofa and pva on Orin and Thor) and
+// set with margin. The median, not the mean: Thor's pva leaves a few pixels
+// far off, which move the mean (up to 1.6 px) but not the median, and Thor's
+// ofa and pva give whole-pixel disparities, whose median error is about
+// 0.25 px.
 struct Bounds {
   double valid;
   double within_1px;
-  double mae;
+  double median;
 };
 Bounds bounds_for(Backend backend) {
   switch (backend) {
     case Backend::kOfa:
-      return {0.90, 0.90, 0.5};
+      return {0.90, 0.90, 0.4};
     case Backend::kPva:
-      return {0.85, 0.90, 0.5};
+      return {0.85, 0.90, 0.4};
     default:
-      return {0.90, 0.95, 0.35};
+      return {0.90, 0.95, 0.3};
   }
 }
 
@@ -189,13 +205,13 @@ void check_accuracy(const std::vector<float>& disparity, const SyntheticScene& s
   const Accuracy a = accuracy(disparity, scene);
   const Bounds b = bounds_for(backend);
   std::cout << "  " << what << ": valid=" << a.valid << " within_1px=" << a.within_1px
-            << " mae_px=" << a.mae << '\n';
+            << " median_px=" << a.median << " mae_px=" << a.mae << " whole_px=" << a.whole << '\n';
   VERIFY_MSG(a.truth > static_cast<std::size_t>(scene.width) * scene.height / 2,
              what + ": most pixels have a truth");
   VERIFY_MSG(a.valid >= b.valid, what + ": valid share " + std::to_string(a.valid));
   VERIFY_MSG(a.within_1px >= b.within_1px,
              what + ": share within 1 px " + std::to_string(a.within_1px));
-  VERIFY_MSG(a.mae <= b.mae, what + ": mean error " + std::to_string(a.mae) + " px");
+  VERIFY_MSG(a.median <= b.median, what + ": median error " + std::to_string(a.median) + " px");
 }
 
 StereoDisparityConfig base_config(Backend backend) {

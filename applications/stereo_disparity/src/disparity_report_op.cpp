@@ -65,6 +65,15 @@ double DisparityReport::share_within(double relative) const {
   return static_cast<double>(within) / static_cast<double>(both_pixels);
 }
 
+double DisparityReport::truth_median() const {
+  std::uint64_t seen = 0;
+  for (std::size_t bin = 0; bin < kTruthBins; ++bin) {
+    seen += truth_bins[bin];
+    if (2 * seen > matched_pixels) return (static_cast<double>(bin) + 0.5) * kTruthBin;
+  }
+  return static_cast<double>(kTruthBins) * kTruthBin;
+}
+
 DisparityReportOp::DisparityReportOp(DisparityReportConfig config) : config_(std::move(config)) {
   if (!config_.report || !config_.remaining) {
     throw std::invalid_argument("DisparityReportOp needs a report and a completion counter");
@@ -140,8 +149,12 @@ holoscan::expected<void, holoscan::Error> DisparityReportOp::compute(
   }
   last_frame_id_ = frame_id;
   report.pixels += pixels;
-  report.valid_pixels += static_cast<std::uint64_t>(
-      std::count_if(disparity_.begin(), disparity_.end(), [](float d) { return d > 0.0F; }));
+  for (const float d : disparity_) {
+    if (d > 0.0F) {
+      ++report.valid_pixels;
+      report.whole_pixels += d == std::floor(d) ? 1U : 0U;
+    }
+  }
 
   if (config_.camera_depth_scale) {
     auto depth_sample = depth.receive();
@@ -225,6 +238,8 @@ holoscan::expected<void, holoscan::Error> DisparityReportOp::compute(
           ++report.matched_pixels;
           report.abs_error_sum += error;
           report.within_1px += error <= 1.0 ? 1U : 0U;
+          ++report
+                .truth_bins[std::min(static_cast<std::size_t>(error / kTruthBin), kTruthBins - 1)];
         }
       }
     }

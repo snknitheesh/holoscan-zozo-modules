@@ -30,6 +30,8 @@ namespace stereo_disparity_app {
 // everything from 100 % up.
 inline constexpr double kErrorBin = 0.001;
 inline constexpr std::size_t kErrorBins = 1001;
+inline constexpr double kTruthBin = 0.01;
+inline constexpr std::size_t kTruthBins = 1001;
 
 // A run's results for one backend. Written by its reporter during the run and
 // read by main() after the run has stopped.
@@ -39,6 +41,7 @@ struct DisparityReport {
   std::vector<float> latency_ms;  // Capture to report, per frame.
   std::uint64_t pixels{};
   std::uint64_t valid_pixels{};
+  std::uint64_t whole_pixels{};  // Valid disparities that are whole pixels.
   // Synthetic truth: pixels both cameras see, those with a disparity, those
   // within 1 px of the truth, and their absolute error.
   bool verified{};
@@ -46,6 +49,9 @@ struct DisparityReport {
   std::uint64_t matched_pixels{};
   std::uint64_t within_1px{};
   double abs_error_sum{};
+  // Their absolute errors in bins of kTruthBin pixels, the last for
+  // everything from kTruthBins bins up.
+  std::array<std::uint64_t, kTruthBins> truth_bins{};
   // The camera's own depth: pixels where it has one, those where the computed
   // depth has one too, and the relative error |computed - camera| / camera of
   // those, binned.
@@ -61,6 +67,8 @@ struct DisparityReport {
   [[nodiscard]] double error_quantile(double fraction) const;
   // The share of compared pixels within `relative` of the camera's depth.
   [[nodiscard]] double share_within(double relative) const;
+  // The median absolute error against the truth, to a bin's width.
+  [[nodiscard]] double truth_median() const;
 };
 
 struct DisparityReportConfig {
