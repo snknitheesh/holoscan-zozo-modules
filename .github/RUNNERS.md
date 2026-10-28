@@ -190,7 +190,7 @@ that keeps most of a Jetson's memory, set two variables in the runner's `.env`:
 
 ```bash
 cd <runner directory>
-# Parallel compiles in each build (default: every CPU).
+# Parallel compiles in each CI and release build (default: every CPU).
 echo "CI_BUILD_JOBS=8" >> .env
 # Extra `docker run` options for every job's container, after the workflow's own.
 echo "CI_DOCKER_OPTIONS=--memory 22g --cpuset-cpus 2-13" >> .env
