@@ -132,6 +132,24 @@ class CiModeTest(unittest.TestCase):
             ci.ci_cmake_options({"build": {"cmake_options": "-DA=ON"}})
 
 
+class BuildJobsTest(unittest.TestCase):
+    def test_every_cpu_by_default(self):
+        for unset in ({}, {"CI_BUILD_JOBS": ""}, {"CI_BUILD_JOBS": "  "}):
+            with self.subTest(env=unset), mock.patch.dict(os.environ, unset, clear=True):
+                with mock.patch.object(ci.os, "cpu_count", return_value=14):
+                    self.assertEqual(ci.build_jobs(), 14)
+
+    def test_runner_sets_the_jobs(self):
+        with mock.patch.dict(os.environ, {"CI_BUILD_JOBS": "8"}):
+            self.assertEqual(ci.build_jobs(), 8)
+
+    def test_bad_value_is_a_ci_error(self):
+        for bad in ("0", "-2", "eight", "2.5"):
+            with self.subTest(value=bad), mock.patch.dict(os.environ, {"CI_BUILD_JOBS": bad}):
+                with self.assertRaisesRegex(ci.CiError, "CI_BUILD_JOBS"):
+                    ci.build_jobs()
+
+
 class RunTest(unittest.TestCase):
     def test_success(self):
         ci.run([sys.executable, "-c", "pass"], timeout=30)
