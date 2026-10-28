@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -16,10 +17,11 @@
 namespace holoscan::apriltag {
 namespace {
 
-constexpr std::array<std::pair<Backend, std::string_view>, 3> kBackendNames{{
+constexpr std::array<std::pair<Backend, std::string_view>, 4> kBackendNames{{
     {Backend::kCpu, "cpu"},
     {Backend::kCuda, "cuda"},
     {Backend::kVpi, "vpi"},
+    {Backend::kAuto, "auto"},
 }};
 
 // Decode-table entries allowed: AprilTag advises two-bit correction only for small families.
@@ -84,10 +86,28 @@ void check_available(Backend backend) {
 }
 
 #if !HOLOSCAN_APRILTAG_WITH_VPI
+bool vpi_platform_has_pva() { return false; }
+
 std::unique_ptr<DetectorBackend> create_vpi_backend(const DetectorOptions&, int, int) {
   throw std::invalid_argument(std::string(kNoVpi));
 }
 #endif
+
+PlatformFacts probe_platform() noexcept {
+  PlatformFacts facts{.vpi_compiled = HOLOSCAN_APRILTAG_WITH_VPI != 0};
+  try {
+    facts.has_pva = vpi_platform_has_pva();
+  } catch (const std::exception&) {
+    facts.has_pva = false;  // VPI that cannot answer cannot run the vpi backend either.
+  }
+  int devices = 0;
+  facts.cuda_device = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0;
+  return facts;
+}
+
+Backend resolve_backend(Backend backend) noexcept {
+  return backend == Backend::kAuto ? resolve_auto(probe_platform()) : backend;
+}
 
 FrameDetections DetectorBackend::detect(const GrayImageView& image, cudaStream_t stream) {
   if (image.location != input_location() || image.width != width_ || image.height != height_) {
@@ -109,13 +129,15 @@ std::unique_ptr<DetectorBackend> create_backend(Backend backend, const DetectorO
   if (width <= 0 || height <= 0) {
     throw std::invalid_argument("image size must be positive");
   }
-  switch (backend) {
+  switch (resolve_backend(backend)) {
     case Backend::kCpu:
       return create_cpu_backend(options, width, height);
     case Backend::kCuda:
       return create_cuda_backend(options, width, height);
     case Backend::kVpi:
       return create_vpi_backend(options, width, height);
+    case Backend::kAuto:
+      break;  // resolve_backend() never returns it.
   }
   throw std::invalid_argument("unknown backend");
 }

@@ -3,7 +3,8 @@
 //
 // AprilTag Detection: a synthetic scene source fans out to an AprilTagDetectorOp
 // per backend, each feeding a reporter that checks it against ground truth; the
-// first can also draw on a Holoviz display.
+// first can also draw on a Holoviz display. On a CI runner, an auto backend must
+// also choose the platform's best one.
 
 #include <algorithm>
 #include <atomic>
@@ -96,22 +97,25 @@ void parse_number(std::string_view value, std::string_view option, T& result) {
 }
 
 std::vector<at::Backend> parse_backends(std::string_view value) {
-  if (value == "all") {
-    return at::available_backends();
-  }
   std::vector<at::Backend> backends;
+  const auto add = [&backends](at::Backend backend) {
+    if (std::find(backends.begin(), backends.end(), backend) != backends.end()) {
+      throw std::invalid_argument("backend '" + std::string(at::backend_name(backend)) +
+                                  "' is listed twice");
+    }
+    backends.push_back(backend);
+  };
   while (!value.empty()) {
     const std::size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
-    const auto backend = at::parse_backend(name);
-    if (!backend) {
+    if (name == "all") {
+      for (const at::Backend backend : at::available_backends()) add(backend);
+    } else if (const auto backend = at::parse_backend(name)) {
+      add(*backend);
+    } else {
       throw std::invalid_argument("unknown backend '" + std::string(name) +
-                                  "'; use cpu, cuda, vpi or all");
+                                  "'; use cpu, cuda, vpi, auto or all");
     }
-    if (std::find(backends.begin(), backends.end(), *backend) != backends.end()) {
-      throw std::invalid_argument("backend '" + std::string(name) + "' is listed twice");
-    }
-    backends.push_back(*backend);
     value = comma == std::string_view::npos ? std::string_view{} : value.substr(comma + 1);
   }
   if (backends.empty()) {
@@ -183,8 +187,9 @@ void usage(const char* argv0) {
          "  --width N --height N       Image size (default: 1280x720)\n"
          "  --device-input true|false  Frames in GPU memory (default: false)\n"
          "Detection:\n"
-         "  --backend LIST             Comma-separated: cpu, cuda, vpi, or all compiled\n"
-         "                             backends (default: cuda)\n"
+         "  --backend LIST             Comma-separated: cpu, cuda, vpi, auto (vpi on a\n"
+         "                             PVA, else cuda, else cpu), or all compiled backends\n"
+         "                             (default: cuda)\n"
          "  --family NAME              AprilTag family (default: tag36h11)\n"
          "  --max-hamming N            Bit errors to correct, 0..2 (default: 1)\n"
          "  --decimate N               Detect quads at 1/N resolution, 1..8 (default: 2)\n"
@@ -220,14 +225,28 @@ double percentile(std::vector<float> values, double fraction) {
   return values[index];
 }
 
-void print_report(const apriltag_app::BackendReport& report, std::uint32_t expected_frames) {
+// What the auto backend must resolve to on a CI runner, from HOLOSCAN_CI_PLATFORM:
+// vpi on the Jetson's PVA, cuda on x86_64; nothing elsewhere.
+std::optional<std::string> expected_auto_backend() {
+  const char* platform = std::getenv("HOLOSCAN_CI_PLATFORM");
+  if (platform == nullptr) return std::nullopt;
+  if (std::string_view(platform) == "jetson") return "vpi-pva";
+  if (std::string_view(platform) == "x86_64") return "cuda";
+  return std::nullopt;
+}
+
+void print_report(at::Backend requested, const apriltag_app::BackendReport& report,
+                  std::uint32_t expected_frames) {
   double mean = 0.0;
   for (const float ms : report.detect_ms) mean += ms;
   mean = report.detect_ms.empty() ? 0.0 : mean / static_cast<double>(report.detect_ms.size());
-  std::cout << std::fixed << std::setprecision(2) << kAppName << ": backend=" << report.backend
-            << " frames=" << report.frames << '/' << expected_frames << " tags=" << report.tags
-            << " detect_ms(mean/p50/p95/max)=" << mean << '/' << percentile(report.detect_ms, 0.5)
-            << '/' << percentile(report.detect_ms, 0.95) << '/'
+  std::cout << std::fixed << std::setprecision(2) << kAppName << ": backend=";
+  if (requested == at::Backend::kAuto) {
+    std::cout << "auto:";
+  }
+  std::cout << report.backend << " frames=" << report.frames << '/' << expected_frames
+            << " tags=" << report.tags << " detect_ms(mean/p50/p95/max)=" << mean << '/'
+            << percentile(report.detect_ms, 0.5) << '/' << percentile(report.detect_ms, 0.95) << '/'
             << percentile(report.detect_ms, 1.0);
   if (report.verified) {
     std::cout << " truth: missed=" << report.missed_tags << " extra=" << report.extra_tags
@@ -412,9 +431,19 @@ int execute(const Options& opts, SignalDomain& signals) {
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
   bool passed = !timed_out && session.diagnostics().empty() &&
                 termination == holoscan::RunTermination::kRequestedCompleted;
-  for (const auto& report : reports) {
-    print_report(*report, frames);
-    passed = passed && report->frames == frames && report->passed();
+  for (std::size_t i = 0; i < reports.size(); ++i) {
+    print_report(opts.backends[i], *reports[i], frames);
+    passed = passed && reports[i]->frames == frames && reports[i]->passed();
+  }
+  // On a CI runner, auto must have chosen the platform's best backend.
+  const auto auto_backend =
+      std::find(opts.backends.begin(), opts.backends.end(), at::Backend::kAuto);
+  const auto expected_auto = expected_auto_backend();
+  if (auto_backend != opts.backends.end() && expected_auto) {
+    const std::string& chosen = reports[auto_backend - opts.backends.begin()]->backend;
+    std::cout << kAppName << ": auto=" << chosen << " expected=" << *expected_auto << " ("
+              << std::getenv("HOLOSCAN_CI_PLATFORM") << ")\n";
+    passed = passed && chosen == *expected_auto;
   }
   std::cout << kAppName << ": verdict=" << (passed ? "PASS" : stopped ? "STOPPED" : "FAIL") << '\n';
   return passed ? 0 : 1;

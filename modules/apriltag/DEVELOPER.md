@@ -54,5 +54,9 @@ keeps the template's `holohub_configure_deb()` and `PKG_holoscan_apriltag` switc
   round as the CPU reference does.
 - Logging goes through `HOLOSCAN_LOG_*`. Nothing is logged per frame: a condition that holds on
   every frame (a host/device copy) is logged once, and capacity warnings at most every five seconds.
+- `Backend::kAuto` is not a backend: `resolve_auto()` maps it, from `PlatformFacts`, to one that is,
+  and `available_backends()` never lists it. The rule is `constexpr` in `detection.hpp`, so the
+  SDK-free `apriltag_backend_resolution` test covers it with injected facts; `probe_platform()`
+  gathers the real ones. A new backend that `auto` may choose changes both, and their tests.
 - A new backend or option needs a case in `apriltag_backend_accuracy`; a new port or behavior of an
   operator, a case in `apriltag_operators`.

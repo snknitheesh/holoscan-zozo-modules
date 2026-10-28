@@ -212,6 +212,8 @@ class VpiBackend final : public DetectorBackend {
 
 }  // namespace
 
+bool vpi_platform_has_pva() { return platform_has_pva(); }
+
 std::unique_ptr<DetectorBackend> create_vpi_backend(const DetectorOptions& options, int width,
                                                     int height) {
   return std::make_unique<VpiBackend>(options, width, height);

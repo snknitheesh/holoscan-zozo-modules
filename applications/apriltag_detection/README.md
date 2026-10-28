@@ -2,9 +2,10 @@
 
 The demo of the [holoscan-apriltag](../../modules/apriltag/) module. It renders synthetic scenes of
 AprilTags at known poses, fans each frame out to an `AprilTagDetectorOp` per selected backend
-(`cpu`, `cuda`, `vpi`), checks every detection against the scene's ground truth, and can show the
-first backend's detections on a HoloViz display through `AprilTagOverlayOp`. It uses the installed
-module the way any other project would: `find_package(holoscan-apriltag)`.
+(`cpu`, `cuda`, `vpi`, or `auto`, which the module picks for the platform), checks every detection
+against the scene's ground truth, and can show the first backend's detections on a HoloViz display
+through `AprilTagOverlayOp`. It uses the installed module the way any other project would:
+`find_package(holoscan-apriltag)`.
 
 ## Demo
 
@@ -32,16 +33,22 @@ From the repository root, after installing the module into `install/`:
 cmake -S applications/apriltag_detection -B build/apriltag_detection -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
 cmake --build build/apriltag_detection
-build/apriltag_detection/apriltag_detection --backend all --count 300          # synthetic mode
-build/apriltag_detection/apriltag_detection --backend all --count 30 --period-ms 10 --display false  # ci mode
+build/apriltag_detection/apriltag_detection --backend all,auto --count 300          # synthetic mode
+build/apriltag_detection/apriltag_detection --backend all,auto --count 30 --period-ms 10 --display false  # ci mode
 ```
 
-`--help` lists the options, for example `--backend cuda,vpi`, `--family tagStandard41h12` and
-`--device-input true`. A backend that reads the other memory (`cuda` or `vpi` on the PVA with host
-frames; `cpu` or `vpi` on the CPU with `--device-input true`) copies each frame's gray image, and
-its detector logs that once, at the first frame. `-DAPRILTAG_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
+`--help` lists the options, for example `--backend cuda,vpi`, `--backend auto`,
+`--family tagStandard41h12` and `--device-input true`. `--backend` takes a comma-separated list of
+`cpu`, `cuda`, `vpi`, `auto` and `all` (every compiled backend), each at most once; `auto` resolves
+to `vpi` where there is a PVA, else `cuda`, and is reported as `auto:<backend that ran>`. A backend
+that reads the other memory (`cuda` or `vpi` on the PVA with host frames; `cpu` or `vpi` on the
+CPU with `--device-input true`) copies each frame's gray image, and its detector logs that once, at
+the first frame. `-DAPRILTAG_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
+
 The modes in [metadata.json](metadata.json) are the two commands above: `synthetic`, displayed when
-there is a display, and `ci`, a finite headless check that CI runs.
+there is a display, and `ci`, a finite headless check that CI runs. When `HOLOSCAN_CI_PLATFORM` is
+set, as on the CI runners, a run with `auto` also checks its choice: `vpi-pva` for `jetson`, `cuda`
+for `x86_64`; anything else fails the run.
 
 On a Jetson, the demo links the Vulkan loader first: once VPI has loaded Tegra's EGL driver,
 HoloViz can no longer create its Vulkan instance. In a headless container there, leave `DISPLAY`
@@ -57,6 +64,8 @@ interrupt or a closed window ends it early. It exits 0 on `PASS`, 2 for invalid 
 apriltag_detection: backend=cpu frames=30/30 tags=120 ... truth: missed=0 extra=0 misplaced=0/120 ...
 apriltag_detection: backend=cuda frames=30/30 tags=120 ... truth: missed=0 extra=0 misplaced=0/120 ...
 apriltag_detection: backend=vpi-cpu frames=30/30 tags=120 ... truth: missed=0 extra=0 misplaced=0/120 ...
+apriltag_detection: backend=auto:cuda frames=30/30 tags=120 ... truth: missed=0 extra=0 misplaced=0/120 ...
+apriltag_detection: auto=cuda expected=cuda (x86_64)
 apriltag_detection: verdict=PASS
 ```
 
@@ -85,9 +94,10 @@ of 37.9 ms (`cpu`), 14.2 ms (`cuda`) and 11.7 ms (`vpi` on the PVA).
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest` checks the reporter through the SDK's operator test harness,
-and the demo's runs: every backend against ground truth from host and GPU memory, the exit statuses
-for invalid options, a failed run and a stopped one, a run without managed signal handling, and
-that the display graph compiles.
+and the demo's runs: every backend and `auto` against ground truth from host and GPU memory (and,
+on a CI runner, `auto`'s choice), the exit statuses for invalid options and repeated backends, a
+failed run and a stopped one, a run without managed signal handling, and that the display graph
+compiles.
 
 ## Licenses
 

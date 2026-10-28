@@ -32,6 +32,16 @@ intrinsics and the tag's size:
 | `Backend::kCpu` | CPU | The AprilTag 3 reference detector, with its default of one thread. |
 | `Backend::kCuda` | GPU | Every stage on the GPU; only the final detections are copied to the host. |
 | `Backend::kVpi` | PVA, or CPU | NVIDIA VPI 4's detector: on the PVA where there is one and the image suits it, otherwise on the CPU. x86_64 hosts have no PVA. |
+| `Backend::kAuto` | One of the above | Chosen once, at start: `vpi` where it is compiled in and the platform has a PVA, else `cuda` where a CUDA device is usable, else `cpu`. Opt-in; the default is `kCuda`. |
+
+With `kAuto`, the operator logs its choice once, at start, and
+`AprilTagDetectorOp::resolved_backend()` returns it (`kAuto` before start); for example
+`AprilTagDetectorOp: backend auto chose vpi: VPI reports a PVA`. It resolves to `vpi` on Jetson
+Orin and Thor and to `cuda` on x86_64. The choice is made before the first image, so an image whose
+sides the PVA cannot take still runs `vpi` on VPI's CPU path, as with `kVpi`.
+`holoscan::apriltag::resolve_auto()` is the rule itself, a function of `PlatformFacts`, and
+`probe_platform()` and `resolve_backend()` in `<holoscan/apriltag/detector_backend.hpp>` apply it
+to the running platform.
 
 Every backend accepts every AprilTag 3 family (`tag36h11`, `tag25h9`, `tag16h5`, `tag36h10`,
 `tagStandard41h12`, `tagStandard52h13`, `tagCircle21h7`, `tagCircle49h12`, `tagCustom48h12`).
@@ -105,7 +115,8 @@ graph.add_flow(detector->detections, consumer->detections);  // Output<at::schem
 ```
 
 `holoscan-apriltag_WITH_VPI` tells whether the installed module has the `vpi` backend, and
-`holoscan::apriltag::available_backends()` lists the backends at run time. The backends themselves
+`holoscan::apriltag::available_backends()` lists the backends at run time. `parse_backend()` reads
+`cpu`, `cuda`, `vpi` and `auto`. The backends themselves
 need no Holoscan graph: `holoscan::apriltag::create_backend()` in
 `<holoscan/apriltag/detector_backend.hpp>`. `<holoscan/apriltag/synthetic_scene.hpp>` renders scenes
 of tags at known poses and checks detections against them, for tests.
@@ -143,9 +154,10 @@ The tests:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| `apriltag_backend_accuracy` | GPU | Every backend against ground truth, from host and GPU memory, for four families (among them `tagCircle21h7`) and two-bit correction; the CUDA backend against the CPU on tags cut by the image edge; that frames over a capacity report what they dropped; on the Jetson CI runner, that `vpi` runs on the PVA |
-| `apriltag_operators` | GPU | Both operators through the SDK's operator test harness: every encoding and backend, size changes, options, provenance, CUDA streams, the copy log (once when frames cross between host and device, never otherwise), bad input and configuration, and the overlay's layers |
+| `apriltag_backend_accuracy` | GPU | Every backend against ground truth, from host and GPU memory, for four families (among them `tagCircle21h7`) and two-bit correction; the CUDA backend against the CPU on tags cut by the image edge; that frames over a capacity report what they dropped; what `auto` resolves to (on the CI runners, `vpi-pva` on Jetson and `cuda` on x86_64); on the Jetson CI runner, that `vpi` runs on the PVA |
+| `apriltag_operators` | GPU | Both operators through the SDK's operator test harness: every encoding and backend, size changes, options, the `auto` backend's choice and its log, provenance, CUDA streams, the copy log (once when frames cross between host and device, never otherwise), bad input and configuration, and the overlay's layers |
 | `apriltag_tag_axes` | Nothing | The overlay's axis drawing; also built on its own from `tests/host/` by the hosted CI job |
+| `apriltag_backend_resolution` | Nothing | `auto`'s choice for every combination of platform facts; also built from `tests/host/` by the hosted CI job |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
 installed package: a small graph that runs `AprilTagDetectorOp` on every installed backend. Build

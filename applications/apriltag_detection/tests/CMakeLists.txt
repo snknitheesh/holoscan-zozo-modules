@@ -21,13 +21,14 @@ function(apriltag_app_test name status output)
   )
 endfunction()
 
-# The demo on synthetic frames, every compiled backend, from host and from GPU memory.
-# Each run checks its detections against ground truth.
-apriltag_app_test(apriltag_app_synthetic 0 "verdict=PASS"
-  --backend all --count 30 --period-ms 10 --display false
+# The demo on synthetic frames, every compiled backend and auto, from host and from GPU
+# memory. Each run checks its detections against ground truth and, on a CI runner, that
+# auto picked the platform's backend.
+apriltag_app_test(apriltag_app_synthetic 0 "backend=auto:.*verdict=PASS"
+  --backend all,auto --count 30 --period-ms 10 --display false
 )
-apriltag_app_test(apriltag_app_device_input 0 "verdict=PASS"
-  --backend all --count 20 --period-ms 10 --device-input true --display false
+apriltag_app_test(apriltag_app_device_input 0 "backend=auto:.*verdict=PASS"
+  --backend all,auto --count 20 --period-ms 10 --device-input true --display false
 )
 
 # Invalid input fails fast with a usage error (exit status 2) instead of starting a run.
@@ -35,6 +36,9 @@ apriltag_app_test(apriltag_app_rejects_unknown_backend 2 "^error: "
   --backend gpu --display false
 )
 apriltag_app_test(apriltag_app_rejects_zero_count 2 "^error: " --count 0 --display false)
+apriltag_app_test(apriltag_app_rejects_repeated_backend 2 "^error: .*listed twice"
+  --backend all,cuda --display false
+)
 
 # A run whose detections fail the ground-truth check: at 1/8 resolution the tags of a
 # 320x240 scene are too small to find. It exits 1.

@@ -20,13 +20,30 @@ enum class Backend : std::uint8_t {
   kCpu,   // AprilTag 3 reference library on the CPU.
   kCuda,  // The whole detector on the GPU.
   kVpi,   // VPI: the PVA when the platform has one and the image fits, the CPU otherwise.
+  kAuto,  // One of the above, chosen once at start by resolve_auto().
 };
 
 [[nodiscard]] std::string_view backend_name(Backend backend) noexcept;
-// Parses "cpu", "cuda" or "vpi"; nullopt for anything else.
+// Parses "cpu", "cuda", "vpi" or "auto"; nullopt for anything else.
 [[nodiscard]] std::optional<Backend> parse_backend(std::string_view name) noexcept;
-// Backends compiled into this build, in a stable order.
+// Backends compiled into this build, in a stable order; never kAuto, which picks one of them.
 [[nodiscard]] std::vector<Backend> available_backends();
+
+// What Backend::kAuto's choice depends on.
+struct PlatformFacts {
+  bool vpi_compiled{};  // This build has the vpi backend.
+  bool has_pva{};       // VPI reports a PVA (Jetson Orin and Thor).
+  bool cuda_device{};   // A CUDA device is usable.
+};
+
+// Backend::kAuto's choice: vpi where it is compiled in and there is a PVA, else
+// cuda where there is a usable CUDA device, else cpu.
+[[nodiscard]] constexpr Backend resolve_auto(const PlatformFacts& facts) noexcept {
+  if (facts.vpi_compiled && facts.has_pva) {
+    return Backend::kVpi;
+  }
+  return facts.cuda_device ? Backend::kCuda : Backend::kCpu;
+}
 
 // Where a gray image lives.
 enum class MemoryLocation : std::uint8_t { kHost, kDevice };

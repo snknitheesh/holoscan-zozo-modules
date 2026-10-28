@@ -4,8 +4,8 @@
 // Every compiled backend against the synthetic scene's ground truth: each tag
 // found with its id, corners in order and in place, poses close, and nothing
 // else reported. Also checks the CUDA backend against the CPU reference on tags
-// cut by the image edge, and that every backend reports the work it drops when a
-// frame is over one of its capacities.
+// cut by the image edge, that every backend reports the work it drops when a
+// frame is over one of its capacities, and what the auto backend resolves to.
 
 #include <cuda_runtime_api.h>
 
@@ -347,6 +347,28 @@ void check_vpi_on_pva() {
              "the vpi backend runs as " + std::string(backend->name()));
 }
 
+// "auto" names Backend::kAuto, which resolves to a compiled backend on this
+// platform. On the CI runners: vpi on the Jetson's PVA, cuda on x86_64.
+void check_auto(const char* platform) {
+  VERIFY(parse_backend("auto") == Backend::kAuto && backend_name(Backend::kAuto) == "auto");
+  const PlatformFacts facts = probe_platform();
+  const Backend resolved = resolve_backend(Backend::kAuto);
+  VERIFY(resolved == resolve_auto(facts));
+  const auto available = available_backends();
+  VERIFY(std::find(available.begin(), available.end(), Backend::kAuto) == available.end());
+  VERIFY(std::find(available.begin(), available.end(), resolved) != available.end());
+  const auto backend = create_backend(Backend::kAuto, DetectorOptions{}, kWidth, kHeight);
+  const std::string_view expected = platform == nullptr                      ? backend->name()
+                                    : std::string_view(platform) == "jetson" ? "vpi-pva"
+                                    : std::string_view(platform) == "x86_64" ? "cuda"
+                                                                             : backend->name();
+  VERIFY_MSG(backend->name() == expected, "auto resolves to " + std::string(backend->name()) +
+                                              ", expected " + std::string(expected));
+  std::printf("  auto     resolves to %s (vpi compiled %d, PVA %d, CUDA device %d)\n",
+              std::string(backend->name()).c_str(), facts.vpi_compiled, facts.has_pva,
+              facts.cuda_device);
+}
+
 }  // namespace
 }  // namespace holoscan::apriltag
 
@@ -381,6 +403,8 @@ int main() {
   cases.push_back(
       {"cuda more quad candidates than it fits", holoscan::apriltag::check_candidate_overflow});
   const char* platform = std::getenv("HOLOSCAN_CI_PLATFORM");
+  cases.push_back(
+      {"auto resolves for the platform", [=] { holoscan::apriltag::check_auto(platform); }});
   if (platform != nullptr && std::string_view(platform) == "jetson") {
     cases.push_back({"vpi runs on the PVA", holoscan::apriltag::check_vpi_on_pva});
   }

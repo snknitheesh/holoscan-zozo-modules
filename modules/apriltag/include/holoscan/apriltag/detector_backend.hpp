@@ -58,16 +58,27 @@ class DetectorBackend {
 }
 
 // Checks that `backend` is compiled into this build, without building it.
+// kAuto always is.
 // @throws std::invalid_argument naming what is missing.
 void check_available(Backend backend);
 
-// Builds `backend` for `width` x `height` gray images.
+// The facts about this process's platform that resolve_auto() needs. A fact that
+// cannot be established (VPI or CUDA fails to answer) is false.
+[[nodiscard]] PlatformFacts probe_platform() noexcept;
+// `backend`, or for kAuto, resolve_auto() of this platform's facts.
+[[nodiscard]] Backend resolve_backend(Backend backend) noexcept;
+
+// Builds `backend` for `width` x `height` gray images; kAuto builds resolve_backend()'s.
 // @throws std::invalid_argument if the options or size are not usable with this
 //         backend, or the backend is not compiled into this build.
 // @throws std::runtime_error if the backend fails to initialize.
 [[nodiscard]] std::unique_ptr<DetectorBackend> create_backend(Backend backend,
                                                               const DetectorOptions& options,
                                                               int width, int height);
+
+// Whether VPI reports a PVA on this platform; false in a build without VPI.
+// @throws std::runtime_error if VPI fails to answer.
+[[nodiscard]] bool vpi_platform_has_pva();
 
 // Each backend's factory, in its own source file; create_backend validates
 // their arguments first. VPI's throws in a build without VPI.

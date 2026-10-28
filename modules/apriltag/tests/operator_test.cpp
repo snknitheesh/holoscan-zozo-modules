@@ -4,10 +4,10 @@
 // The operators on their own, through the SDK's operator test harness: images
 // of each supported encoding and layout in, detections with the scene's ids,
 // corners and poses out, for every compiled backend; a change of image size
-// and non-default options; a host/device copy logged once, and only when there
-// is one; unsupported images rejected; the detector off the legacy default CUDA
-// stream; the reporter's counts; and the overlay's Holoviz layers shaped, drawn
-// and stamped as Holoviz expects.
+// and non-default options; the auto backend's choice; a host/device copy logged
+// once, and only when there is one; unsupported images rejected; the detector off the legacy
+// default CUDA stream; the reporter's counts; and the overlay's Holoviz layers shaped, drawn and
+// stamped as Holoviz expects.
 
 #include <cuda_runtime_api.h>
 #include <unistd.h>
@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <holoscan/apriltag/apriltag_detector_op.hpp>
+#include <holoscan/apriltag/detector_backend.hpp>
 #include <holoscan/apriltag/synthetic_scene.hpp>
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/logger/logger.hpp>
@@ -410,6 +411,40 @@ void check_cross_copy_logged_once(Backend backend, bool device_input, std::size_
   }
 }
 
+// A detector configured with kAuto chooses at start, logs the choice once, and
+// reports it; until then it reports kAuto. Another backend is reported as configured.
+void check_auto_backend() {
+  holoscan::set_log_level(holoscan::LogLevel::INFO);
+  VERIFY(AprilTagDetectorOp({.backend = Backend::kCpu}).resolved_backend() == Backend::kCpu);
+  const Backend expected = resolve_backend(Backend::kAuto);
+  VERIFY(expected != Backend::kAuto);
+  {
+    AprilTagDetectorOp op({.backend = Backend::kAuto});
+    VERIFY(op.resolved_backend() == Backend::kAuto);
+    const std::string output = capture_output([&] {
+      op.start();
+      op.start();
+    });
+    VERIFY(op.resolved_backend() == expected);
+    VERIFY_MSG(count_of(output, "backend auto chose " + std::string(backend_name(expected))) == 1,
+               "the choice is logged once:\n" + output);
+    op.stop();
+  }
+  const SyntheticScene scene = make_scene("tag36h11", 0, kWidth, kHeight);
+  std::vector<schema::AprilTagDetectionsT> messages;
+  const std::string output = capture_output([&] {
+    messages = run_detector({.backend = Backend::kAuto},
+                            {scene_image(scene, holoscan::schema::ImageEncoding_MONO8),
+                             scene_image(scene, holoscan::schema::ImageEncoding_MONO8)});
+  });
+  VERIFY_MSG(count_of(output, "backend auto chose") == 1, "one choice logged:\n" + output);
+  for (const auto& message : messages) {
+    VERIFY_MSG(message.backend.starts_with(backend_name(expected)),
+               "auto ran as " + message.backend);
+    check_message(message, scene, false);
+  }
+}
+
 void check_rejects_unsupported_encoding() {
   auto h = holoscan::testing::create_operator_test<AprilTagDetectorOp>(
       AprilTagDetectorConfig{.backend = Backend::kCpu});
@@ -609,6 +644,7 @@ int main() {
                                                             static_cast<std::size_t>(logs));
          }});
   }
+  cases.push_back({"detector auto backend", holoscan::apriltag::check_auto_backend});
   cases.push_back({"detector rejects unsupported encodings",
                    holoscan::apriltag::check_rejects_unsupported_encoding});
   cases.push_back(

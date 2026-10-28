@@ -46,16 +46,16 @@
     "default_mode": "synthetic",
     "modes": {
       "synthetic": {
-        "description": "Detect tags in a rendered scene with every compiled backend, check them against ground truth, and display the first backend's detections when a display is available.",
+        "description": "Detect tags in a rendered scene with every compiled backend and with the one auto picks for the platform, check them against ground truth, and display the first backend's detections when a display is available.",
         "run": {
-          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all --count 300",
+          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all,auto --count 300",
           "workdir": "holohub_app_bin"
         }
       },
       "ci": {
-        "description": "Finite headless check: 30 synthetic frames (120 tags) through every compiled backend, verified against ground truth.",
+        "description": "Finite headless check: 30 synthetic frames (120 tags) through every compiled backend and auto, verified against ground truth; on a CI runner, auto must pick vpi on the Jetson's PVA and cuda on x86_64.",
         "run": {
-          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all --count 30 --period-ms 10 --display false",
+          "command": "\"<holohub_app_bin>/apriltag_detection\" --backend all,auto --count 30 --period-ms 10 --display false",
           "workdir": "holohub_app_bin"
         }
       }

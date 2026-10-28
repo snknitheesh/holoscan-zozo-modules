@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -114,6 +115,18 @@ void log_cross_copy(std::string_view backend, MemoryLocation images, int width, 
                 : "use the cuda backend or send host images");
 }
 
+// Why resolve_auto() chose what it did for `facts`.
+std::string_view auto_reason(const PlatformFacts& facts) noexcept {
+  if (facts.vpi_compiled && facts.has_pva) {
+    return "VPI reports a PVA";
+  }
+  if (facts.cuda_device) {
+    return facts.vpi_compiled ? "VPI reports no PVA, and a CUDA device is usable"
+                              : "this build has no vpi backend, and a CUDA device is usable";
+  }
+  return "there is no PVA and no usable CUDA device";
+}
+
 schema::TagDetection to_message(const Detection& detection) {
   std::array<schema::Point2f, 4> corners;
   for (int i = 0; i < 4; ++i) {
@@ -147,6 +160,8 @@ struct AprilTagDetectorOp::State {
     }
   };
 
+  // The configured backend, or what kAuto resolved to at start.
+  std::atomic<Backend> resolved{Backend::kAuto};
   // Built on the first image, and again if the image size changes.
   std::unique_ptr<DetectorBackend> backend;
   int image_width{};
@@ -196,7 +211,10 @@ void validate_config(const AprilTagDetectorConfig& config) {
 AprilTagDetectorOp::AprilTagDetectorOp(AprilTagDetectorConfig config)
     : config_(std::move(config)), state_(std::make_unique<State>()) {
   validate_config(config_);
+  state_->resolved = config_.backend;
 }
+
+Backend AprilTagDetectorOp::resolved_backend() const noexcept { return state_->resolved; }
 
 AprilTagDetectorOp::~AprilTagDetectorOp() = default;
 
@@ -212,6 +230,13 @@ holoscan::Contract AprilTagDetectorOp::contract() const {
 }
 
 void AprilTagDetectorOp::start() {
+  if (state_->resolved == Backend::kAuto) {
+    const PlatformFacts facts = probe_platform();
+    const Backend chosen = resolve_auto(facts);
+    state_->resolved = chosen;
+    HOLOSCAN_LOG_INFO("AprilTagDetectorOp: backend auto chose {}: {}", backend_name(chosen),
+                      auto_reason(facts));
+  }
   state_->frames = 0;
   state_->overflowed_frames = 0;
   state_->last_overflow_warning.reset();
@@ -266,7 +291,7 @@ holoscan::expected<void, holoscan::Error> AprilTagDetectorOp::compute(
   std::chrono::steady_clock::time_point start;
   try {
     if (!state.backend || view->width != state.image_width || view->height != state.image_height) {
-      state.backend = create_backend(config_.backend, config_.options, view->width, view->height);
+      state.backend = create_backend(state.resolved, config_.options, view->width, view->height);
       state.image_width = view->width;
       state.image_height = view->height;
     }

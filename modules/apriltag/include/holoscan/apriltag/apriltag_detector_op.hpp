@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // AprilTagDetectorOp: an image in, one AprilTagDetections out, on the configured
-// backend (CPU, CUDA or VPI), with poses when the camera's intrinsics are known.
+// backend (CPU, CUDA, VPI, or chosen for the platform), with poses when the camera's intrinsics are
+// known.
 
 #pragma once
 
@@ -22,6 +23,7 @@
 namespace holoscan::apriltag {
 
 struct AprilTagDetectorConfig {
+  // kAuto lets the operator choose at start: see resolve_auto().
   Backend backend{Backend::kCuda};
   DetectorOptions options;
   // With both, each detection carries the tag's pose.
@@ -49,6 +51,10 @@ class AprilTagDetectorOp final : public holoscan::Operator<> {
   void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
+
+  // The backend this operator runs: the configured one, or for Backend::kAuto
+  // the one start() chose, and kAuto until then. Safe to call from any thread.
+  [[nodiscard]] Backend resolved_backend() const noexcept;
 
   // MONO8, RGB8, BGR8, RGBA8 or BGRA8, in host or CUDA device memory.
   holoscan::Input<holoscan::schema::ImageT> image;
