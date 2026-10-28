@@ -181,9 +181,10 @@ Accuracy accuracy(const std::vector<float>& disparity, const SyntheticScene& sce
 // What every backend must reach on the synthetic scene, measured with VPI
 // 4.1.4 (cuda on an RTX 5090, Orin and Thor; ofa and pva on Orin and Thor) and
 // set with margin. The median, not the mean: Thor's pva leaves a few pixels
-// far off, which move the mean (up to 1.6 px) but not the median, and Thor's
-// ofa and pva give whole-pixel disparities, whose median error is about
-// 0.25 px.
+// far off, which move the mean (up to 1.6 px) but not the median. Thor's ofa
+// and pva give whole-pixel disparities, which are up to 0.5 px off: the
+// scene's background, most of the image, is 6.4 px away at 640 px wide, so
+// their median error there is 0.4 px.
 struct Bounds {
   double valid;
   double within_1px;
@@ -192,9 +193,9 @@ struct Bounds {
 Bounds bounds_for(Backend backend) {
   switch (backend) {
     case Backend::kOfa:
-      return {0.90, 0.90, 0.4};
+      return {0.90, 0.90, 0.5};
     case Backend::kPva:
-      return {0.85, 0.90, 0.4};
+      return {0.85, 0.90, 0.5};
     default:
       return {0.90, 0.95, 0.3};
   }

@@ -67,10 +67,11 @@ constexpr auto kTimeoutAllowance = std::chrono::seconds{120};
 // cameras see: the share with a disparity, the share of those within 1 px of
 // the truth, and their median error. The median, not the mean: on Jetson
 // Thor, pva leaves a few pixels far off, which move the mean but not the
-// median. The module's tests hold each backend to bounds of its own.
+// median. And there ofa and pva give whole-pixel disparities, up to 0.5 px
+// off. The module's tests hold each backend to bounds of its own.
 constexpr double kMinTruthValid = 0.85;
 constexpr double kMinWithin1px = 0.9;
-constexpr double kMaxMedianErrorPx = 0.4;
+constexpr double kMaxMedianErrorPx = 0.5;
 
 // Against the camera's own depth, on a clip where the camera has depth for at
 // least --min-camera-coverage of the pixels: the computed depth must cover
