@@ -97,8 +97,19 @@ jobs:
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
             exit 1
           fi
-          docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
-            -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
+          # Up to three attempts: a network hiccup while pulling the base image or the
+          # Dockerfile frontend should not fail the lane. A broken Dockerfile still fails.
+          for attempt in 1 2 3; do
+            if docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
+              -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            echo "::warning::Building the CI image failed (attempt $attempt of 3); retrying in $((attempt * 30)) s."
+            sleep $((attempt * 30))
+          done
           echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
       # `exec`, so that cancelling the job signals ci_container.py, which removes
       # the container, rather than this step's shell.
@@ -113,8 +124,11 @@ jobs:
       - name: Remove the container and stale images
         if: always()
         run: python3 .github/scripts/ci_container.py sweep
+      # The logs are for diagnosis only: failing to upload them must not fail a lane
+      # whose build and tests passed.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ci-x86_64
@@ -160,8 +174,19 @@ jobs:
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
             exit 1
           fi
-          docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
-            -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker
+          # Up to three attempts: a network hiccup while pulling the base image or the
+          # Dockerfile frontend should not fail the lane. A broken Dockerfile still fails.
+          for attempt in 1 2 3; do
+            if docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
+              -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            echo "::warning::Building the CI image failed (attempt $attempt of 3); retrying in $((attempt * 30)) s."
+            sleep $((attempt * 30))
+          done
           echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
       # The PVA and the integrated GPU need the NVIDIA runtime and a privileged
       # container. DISPLAY must stay unset: with it, VPI fails with EGL_NOT_INITIALIZED.
@@ -178,8 +203,11 @@ jobs:
       - name: Remove the container and stale images
         if: always()
         run: python3 .github/scripts/ci_container.py sweep
+      # The logs are for diagnosis only: failing to upload them must not fail a lane
+      # whose build and tests passed.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ci-jetson-${{ matrix.board }}
