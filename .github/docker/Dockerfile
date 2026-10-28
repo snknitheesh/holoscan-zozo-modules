@@ -6,8 +6,8 @@
 # The CI and development image for every lane: x86_64 with a discrete GPU, and
 # Jetson Thor and Orin (JetPack 7.2, aarch64). One Dockerfile for linux/amd64 and
 # linux/arm64: NVIDIA's CUDA 13.2 image, plus the Holoscan SDK 5.0.0 Debian
-# packages and Python bindings, TensorRT for CUDA 13.2, VPI 4, CMake 4 and the
-# Holoscan CLI. A CUDA 13.2 user space needs a driver for CUDA 13.2: R595 or newer
+# packages and Python bindings, TensorRT for CUDA 13.2, VPI 4, the RealSense SDK
+# (librealsense 2), CMake 4 and the Holoscan CLI. A CUDA 13.2 user space needs a driver for CUDA 13.2: R595 or newer
 # with a discrete GPU, and JetPack 7.2 (L4T R39.2) on Jetson. See .github/RUNNERS.md
 # for why this is not the official SDK image.
 #
@@ -21,7 +21,7 @@ ARG BASE_IMAGE=nvcr.io/nvidia/cuda:13.2.1-devel-ubuntu24.04@sha256:44a9504c6dfb5
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.source="https://github.com/snknitheesh/holoscan-zozo-modules" \
-      org.opencontainers.image.description="Build and test environment for Holoscan SDK 5.0 Modules: CUDA 13.2, Holoscan SDK 5.0.0, TensorRT, VPI 4 and CMake 4, for x86_64 and Jetson Thor and Orin with JetPack 7.2." \
+      org.opencontainers.image.description="Build and test environment for Holoscan SDK 5.0 Modules: CUDA 13.2, Holoscan SDK 5.0.0, TensorRT, VPI 4, librealsense 2 and CMake 4, for x86_64 and Jetson Thor and Orin with JetPack 7.2." \
       org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-NVIDIA-Proprietary"
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -147,6 +147,44 @@ RUN set -eux; \
       git libvulkan-dev ninja-build python3 python3-pip; \
     rm -rf /tmp/holoscan-debs /var/lib/apt/lists/*
 WORKDIR /
+
+# The RealSense SDK (librealsense 2) from RealSense's own package repository, for
+# modules with a RealSense camera backend: its library (librealsense2) and its
+# headers, CMake package and pkg-config file (librealsense2-dev), pinned per
+# architecture, whose builds have their own revisions, and pkg-config to read that
+# file. Not its udev rules or kernel modules (librealsense2-udev-rules,
+# librealsense2-dkms): a container has no camera to give permissions to and loads no
+# kernel modules. The repository's key file holds its signing key and an older one;
+# apt trusts only the signing key, accepted only with the fingerprint below.
+ARG LIBREALSENSE_REPOSITORY=https://librealsense.realsenseai.com/Debian
+ARG LIBREALSENSE_FINGERPRINT=5381411D24E659FB18195FA5FB0B24895113F120
+ARG LIBREALSENSE_VERSION_AMD64=2.58.4-0~realsense.19927
+ARG LIBREALSENSE_VERSION_ARM64=2.58.4-0~realsense.8908
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+      amd64) librealsense="${LIBREALSENSE_VERSION_AMD64}" ;; \
+      arm64) librealsense="${LIBREALSENSE_VERSION_ARM64}" ;; \
+      *) echo "unsupported architecture ${arch}" >&2; exit 1 ;; \
+    esac; \
+    GNUPGHOME="$(mktemp -d)"; \
+    export GNUPGHOME; \
+    key="${GNUPGHOME}/librealsense.asc"; \
+    curl -fsSL "${LIBREALSENSE_REPOSITORY}/librealsenseai.asc" -o "${key}"; \
+    gpg --batch --quiet --import "${key}"; \
+    fingerprints="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "pub" { primary = 1; next } $1 ~ /^fp/ && primary { print $10; primary = 0 }')"; \
+    if ! printf '%s\n' "${fingerprints}" | grep -qx "${LIBREALSENSE_FINGERPRINT}"; then \
+      echo "the RealSense repository's key file has no key ${LIBREALSENSE_FINGERPRINT}" >&2; exit 1; \
+    fi; \
+    gpg --batch --export "${LIBREALSENSE_FINGERPRINT}" > /usr/share/keyrings/librealsense.gpg; \
+    rm -rf "${GNUPGHOME}"; \
+    echo "deb [signed-by=/usr/share/keyrings/librealsense.gpg] ${LIBREALSENSE_REPOSITORY}/apt-repo noble main" \
+      > /etc/apt/sources.list.d/librealsense.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      "librealsense2=${librealsense}" "librealsense2-dev=${librealsense}" pkgconf; \
+    rm -rf /var/lib/apt/lists/*; \
+    pkg-config --modversion realsense2
 
 # From PyPI: CMake 4, the Holoscan CLI, and the SDK's Python bindings, which SDK 5.0
 # ships only as wheels (holoscan-*-cu13). requirements.txt pins every package and

@@ -53,7 +53,8 @@ The CI container has all of these, for both architectures; see
 Every CI job runs in one image, built from
 [`.github/docker/Dockerfile`](.github/docker/Dockerfile) for `linux/amd64` and `linux/arm64`
 and published to the GitHub Container Registry. It has CUDA 13.2, the Holoscan SDK 5.0.0,
-TensorRT, VPI 4, CMake 4 and the Holoscan CLI, and makes a good development container:
+TensorRT, VPI 4, the RealSense SDK (librealsense 2), CMake 4 and the Holoscan CLI, and makes a
+good development container:
 
 ```bash
 docker pull ghcr.io/snknitheesh/holoscan-zozo-modules:latest

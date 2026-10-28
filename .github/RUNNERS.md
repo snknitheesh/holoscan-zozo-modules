@@ -283,6 +283,10 @@ and `linux/arm64`:
 - VPI 4.1.4 from NVIDIA's Jetson repository, release `r39.2` (JetPack 7.2): `x86_64/noble` on
   amd64, `common` on arm64, whose PVA backend the `nvidia` runtime connects to the board's PVA;
   the repository key is accepted only with its pinned fingerprint;
+- the RealSense SDK 2.58.4 (`librealsense2` and `librealsense2-dev`: library, headers, CMake
+  package and pkg-config file) from RealSense's package repository, pinned per architecture,
+  with `pkgconf`; its signing key is accepted only with its pinned fingerprint. Not its udev
+  rules or kernel modules: no camera is attached to a CI container;
 - from PyPI, CMake 4.4.4, `holoscan-cli` 5.0.0 and the SDK's Python bindings
   (`holoscan-*-cu13` 5.0.0), installed from [`docker/requirements.txt`](docker/requirements.txt),
   which pins every package and dependency to the SHA-256 of its files. Regenerate it with the
