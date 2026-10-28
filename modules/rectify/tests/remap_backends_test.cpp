@@ -238,7 +238,10 @@ void test_parity() {
                 << 100 * fraction << "%\n";
       if (linear) {
         VERIFY_MSG(d.max <= tolerance(backend), what + ": too far from the reference");
-        VERIFY_MSG(d.mean < 0.5, what + ": too far from the reference on average");
+        // The VIC rounds its result differently: about 0.5 gray levels on Orin,
+        // 0.6 on Thor, on average.
+        VERIFY_MSG(d.mean < (backend == Backend::kVpiVic ? 1.0 : 0.5),
+                   what + ": too far from the reference on average");
       } else {
         // Nearest never blends: every value is one of the four input pixels
         // around its source. It picks another of them than the reference only

@@ -265,6 +265,8 @@ class VpiRemapper final : public Remapper {
     check_cuda(cudaMalloc(&input.data, input_pitch * input_height_), "cudaMalloc");
     check_cuda(cudaMalloc(&output.data, output_pitch * output_height_), "cudaMalloc");
     check_cuda(cudaMemset(input.data, 0, input_pitch * input_height_), "cudaMemset");
+    // The memset runs on the legacy default stream, which `cuda_stream` does not wait for.
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     cudaStream_t cuda_stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&cuda_stream, cudaStreamNonBlocking), "cudaStreamCreate");
     struct StreamDestroy {

@@ -38,6 +38,10 @@ inline holoscan::Tensor make(const std::vector<std::int64_t>& shape, DLDataType 
   if (size != 0 && cudaMemcpy(*destination, bytes, size, cudaMemcpyDefault) != cudaSuccess) {
     throw std::runtime_error("cudaMemcpy failed");
   }
+  // From pageable memory the copy may still be landing; the operators read on
+  // streams that do not wait for the legacy default one.
+  if (cudaDeviceSynchronize() != cudaSuccess)
+    throw std::runtime_error("cudaDeviceSynchronize failed");
   return std::move(*tensor);
 }
 

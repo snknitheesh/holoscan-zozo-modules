@@ -109,6 +109,9 @@ class CudaRemapper final : public Remapper {
     map_.reset(static_cast<float2*>(map));
     check(cudaMemcpy(map, table.xy.data(), table.xy.size() * sizeof(float), cudaMemcpyHostToDevice),
           "cudaMemcpy");
+    // From pageable memory, cudaMemcpy may return before the copy lands, and
+    // the remap runs on streams that do not wait for the legacy default one.
+    check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
 
   [[nodiscard]] std::string_view name() const noexcept override { return "cuda"; }
