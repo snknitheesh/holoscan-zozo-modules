@@ -1,0 +1,13 @@
+holoscan-stereo-camera
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-stereo-camera uses the following open source software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+librealsense (https://github.com/IntelRealSense/librealsense), when the realsense backend is built
+Copyright (c) Intel Corporation and RealSense contributors.
+Licensed under Apache-2.0. Linked from the installed library; not redistributed.
