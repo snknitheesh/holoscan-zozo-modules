@@ -185,6 +185,9 @@ With `-DBUILD_TESTING=ON`, `ctest` checks:
   another input size, FP16 engines, engine files, image output, expected detections, and the exit
   status and verdict of failed, stopped and invalid runs, a run without managed signal handling, a
   missing camera, and the display graph.
+- The real-time edges with a consumer ten times slower than the source: the run completes without a
+  failure, the detector keeps the source's pace, and the consumer gets the newest detections,
+  ending with the last frame's.
 - With the real model, the two cats and the remote that the Ultralytics predictor finds in the COCO
   image, in RGB8 and BGR8, with an FP16 engine and looped. These run when the model has been
   prepared in `data/yolo26_detection`, and are reported as skipped otherwise; point them elsewhere

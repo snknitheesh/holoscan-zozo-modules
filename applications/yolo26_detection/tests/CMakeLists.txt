@@ -15,6 +15,8 @@ set(
 
 add_executable(yolo26_files_test files_test.cpp)
 target_link_libraries(yolo26_files_test PRIVATE yolo26_detection_ops)
+add_executable(yolo26_slow_consumer_test slow_consumer_test.cpp)
+target_link_libraries(yolo26_slow_consumer_test PRIVATE yolo26_detection_ops)
 add_executable(yolo26_make_test_images make_test_images.cpp)
 target_link_libraries(yolo26_make_test_images PRIVATE yolo26_detection_ops CUDA::nvjpeg)
 add_library(yolo26_spawn_thread_preload SHARED spawn_thread_preload.cpp)
@@ -92,6 +94,11 @@ set_tests_properties(
 )
 set_tests_properties(yolo26_app_input_320 PROPERTIES RESOURCE_LOCK yolo26_stub_320)
 set_tests_properties(yolo26_app_fp16 PROPERTIES RESOURCE_LOCK yolo26_stub_fp16)
+
+# The real-time path with a consumer slower than the source: the detector keeps
+# the source's pace, and the consumer gets the newest detections.
+add_test(NAME yolo26_app_slow_consumer COMMAND yolo26_slow_consumer_test)
+set_tests_properties(yolo26_app_slow_consumer PROPERTIES FIXTURES_REQUIRED yolo26_stub)
 
 # Image output: each frame with its boxes drawn.
 set(_images "${CMAKE_CURRENT_BINARY_DIR}/images")
