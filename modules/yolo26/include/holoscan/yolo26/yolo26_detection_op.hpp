@@ -20,6 +20,14 @@
 // one after another: should one fail to go out, those before it have been
 // delivered alone and compute() returns the error. Pair them by capture time
 // (OnAligned), as Yolo26OverlayOp does.
+//
+// On a blocking edge, an output a busy consumer has no room for is such a
+// failure (kBackpressured): a lossless graph paces its source to what its
+// consumers keep up with. For a live source, connect the input and every
+// output with holoscan::ConnectionOptions{.queue_policy =
+// holoscan::QueuePolicy::kDropOldest, .queue_depth = 1}: a full queue then
+// drops its oldest sample, so the operator never waits for a slower consumer
+// and takes the newest image.
 
 #pragma once
 

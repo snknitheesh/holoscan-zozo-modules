@@ -43,10 +43,11 @@ its output into detections. YOLO26 needs no non-maximum suppression, so nothing 
 Slots from `count` on are zero. All four outputs carry the image's capture time and frame id. They
 go out one after another: should one fail to go out, those before it have been delivered alone and
 the frame fails. Pair them by capture time, with an `OnAligned` contract, as `Yolo26OverlayOp`
-does. Images may change size from frame to frame; images in host memory are copied to the GPU
-through a staging buffer that grows with the largest one. The frames share the model's buffers, and
-the runtime may give each one another CUDA stream, so each frame's stream waits on a CUDA event that
-the previous frame recorded.
+does. For a live source, connect the operator with drop-oldest edges (see
+[Lossless or real time](#lossless-or-real-time)). Images may change size from frame to frame;
+images in host memory are copied to the GPU through a staging buffer that grows with the largest
+one. The frames share the model's buffers, and the runtime may give each one another CUDA stream,
+so each frame's stream waits on a CUDA event that the previous frame recorded.
 
 | `Yolo26DetectionConfig` | Default | Meaning |
 | --- | --- | --- |
@@ -149,6 +150,37 @@ const auto plan = holoscan::compile(graph, std::move(options));
 y26::prepare_engine(config);   // Before the run: see above.
 const int status = holoscan::run(plan);   // Adopts `signals`.
 ```
+
+### Lossless or real time
+
+`add_flow()` without options gives a blocking edge: every image is detected and every output
+delivered, in order, at the queue depth the input declares (two). A blocking edge waits only
+briefly for room, though. When a consumer is still busy with earlier frames, `emit()` returns
+`kBackpressured` with nothing delivered, and the operator cannot send that frame's outputs again,
+so the run fails. A lossless graph therefore paces its source to what its consumers keep up with,
+as the demo's test modes do with one frame in flight.
+
+For a live source, such as a camera, connect the operator's input and every output as a depth-1
+drop-oldest edge instead. A full queue then drops its oldest sample rather than refusing the new
+one: the operator never waits for, and is never refused by, a slower consumer, a camera faster
+than the operator makes it take the newest frame, and a slow consumer finds the newest detections
+waiting when it is done.
+
+```cpp
+#include <holoscan/core/connection_options.hpp>
+
+const holoscan::ConnectionOptions newest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                         .queue_depth = 1U};
+graph.add_flow(camera->image, detector->image, newest);
+graph.add_flow(detector->boxes, consumer->boxes, newest);
+graph.add_flow(detector->scores, consumer->scores, newest);
+graph.add_flow(detector->class_ids, consumer->class_ids, newest);
+graph.add_flow(detector->count, consumer->count, newest);
+```
+
+A consumer that pairs the detections with their image by capture time, as `OnAligned` does, takes
+the image over a deeper drop-oldest edge, so that the image is still queued when its detections
+arrive, a detector's latency later; the demo keeps four frames.
 
 The kernels need no Holoscan graph: `<holoscan/yolo26/kernels.hpp>` has `launch_letterbox()` and
 `launch_decode()`, and `<holoscan/yolo26/letterbox.hpp>` the letterbox geometry, which needs no CUDA
