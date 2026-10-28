@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # find_package(holoscan-point-cloud) defines:
-#   holoscan::point_cloud  DepthToPointCloudOp, its deprojection kernel and the synthetic
-#                          depth camera
+#   holoscan::point_cloud  DepthToPointCloudOp and PointCloudToDepthOp, their kernels, the
+#                          synthetic depth camera and cloud, and the cloud's ground truth
 
 @PACKAGE_INIT@
 
