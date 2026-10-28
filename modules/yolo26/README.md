@@ -248,8 +248,9 @@ cmake --install build/yolo26 --prefix "$PWD/install"
 
 | CMake option | Default | |
 | --- | --- | --- |
-| `HOLOSCAN_YOLO26_BUILD_OVERLAY` | `ON` | Build `holoscan::yolo26_overlay` (needs Holoscan Visualization) |
-| `BUILD_TESTING` | `OFF` | Build the tests |
+| `HOLOSCAN_YOLO26_BUILD_OVERLAY` | `ON`; from the repository root, `OFF` unless `Yolo26OverlayOp` is asked for | Build `holoscan::yolo26_overlay` (needs Holoscan Visualization) |
+| `BUILD_TESTING` | `OFF` | Build the tests, when the module is the top-level project |
+| `HOLOSCAN_YOLO26_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
 The tests need no download: the stub model stands in for YOLO26.
