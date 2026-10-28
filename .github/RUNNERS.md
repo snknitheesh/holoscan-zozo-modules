@@ -46,7 +46,9 @@ that is running (someone's container from the image) or that is not from this re
 tag of its own.
 
 [`workflows/container.yml`](workflows/container.yml) publishes that image; see
-[Publishing the image](#publishing-the-image).
+[Publishing the image](#publishing-the-image). [`workflows/release.yml`](workflows/release.yml)
+runs on the same two runners, in the same image and with the same cleanup, to release a module's
+Debian packages; see [RELEASING.md](RELEASING.md).
 
 ## Security
 
@@ -59,11 +61,16 @@ The repository is public and the GPU runners are machines on a private network, 
   repository.
 - `ci.yml` has `permissions: contents: read`, never uses `pull_request_target`, and checks out
   with `persist-credentials: false`, so the build cannot push or read secrets.
-- `container.yml`, the only workflow that can write, never runs for a pull request: only for a
-  push to `main` that changes the image, a `v*` tag, or a manual run, all of which need write
-  access to the repository. It publishes only from `main` or a `v*` tag; a manual run from any
-  other branch builds and pushes nothing. Only its jobs get `packages: write`, and only for this repository's
-  package.
+- `container.yml` and `release.yml` are the only workflows that can write, and neither runs for a
+  pull request.
+  - `container.yml` runs only for a push to `main` that changes the image, a `v*` tag, or a
+    manual run, all of which need write access to the repository. It publishes only from `main`
+    or a `v*` tag; a manual run from any other branch builds and pushes nothing. Only its jobs get
+    `packages: write`, and only for this repository's package.
+  - `release.yml` runs only for a pushed `<module>-v<major>.<minor>.<patch>` tag, which also
+    needs write access, and only in this repository; it releases nothing unless the tag is on
+    `main`. Only its `Publish` job, on a GitHub-hosted runner, gets `contents: write`, to create
+    the release; the jobs on the GPU runners only read.
 - Every action is pinned to a commit, and the base images (and the BuildKit image the publishing
   jobs build with) to a digest.
 

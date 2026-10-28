@@ -1,0 +1,197 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Releases one module's Debian packages. Pushing a tag <module>-v<major>.<minor>.<patch>
+# (apriltag-v1.0.0) on a commit of main:
+#   Package amd64  Self-hosted x86_64 runner: builds the module's .deb in the CI image,
+#                  with its pkg/ configuration, then installs it with apt in a fresh CI
+#                  container and builds and runs its tests/installed_consumer/ against it.
+#   Package arm64  The same, natively, on the self-hosted Jetson Thor.
+#   Publish        GitHub-hosted: creates the GitHub Release for the tag, or updates it,
+#                  with both .debs and their SHA-256 sums (SHA256SUMS).
+# Only the publishing job can write, and only to this repository's releases. Never runs
+# for a pull request or in a fork. How to cut a release is in .github/RELEASING.md.
+
+name: Release
+
+on:
+  push:
+    # The module's metadata.json and CMake project must already have this version;
+    # .github/scripts/release.py checks them, and the tag's form, before building.
+    tags: ["*-v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package ${{ matrix.arch }}
+    if: github.repository == 'snknitheesh/holoscan-zozo-modules'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: [self-hosted, linux, x64, gpu]
+            docker-options: --gpus all
+          # The PVA and the integrated GPU need the NVIDIA runtime and a privileged
+          # container. DISPLAY must stay unset: with it, VPI fails with EGL_NOT_INITIALIZED.
+          - arch: arm64
+            runner: [self-hosted, linux, arm64, jetson, thor]
+            docker-options: --runtime nvidia --privileged
+    runs-on: ${{ matrix.runner }}
+    # Also bounds a hung test: the container goes with the job.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      module: ${{ steps.tag.outputs.module }}
+      version: ${{ steps.tag.outputs.version }}
+      package: ${{ steps.tag.outputs.package }}
+    env:
+      CI_IMAGE: holoscan-modules-ci:local
+      CI_JOB_KEY: release-${{ matrix.arch }}
+      CI_CONTAINER: holoscan-modules-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The whole history, to check that the tag is on main.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 .github/scripts/release.py tag "$TAG" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG is not on main. Release only reviewed commits: tag a commit of main; see .github/RELEASING.md."
+            exit 1
+          fi
+      # The runner's job hook (.github/RUNNERS.md) does this too, before and after
+      # every job; this covers a runner without it.
+      - name: Remove left-over CI containers and images
+        run: python3 .github/scripts/ci_container.py sweep
+      # As in ci.yml.
+      - name: Build the CI image
+        id: image
+        run: |
+          if ! docker buildx version > /dev/null 2>&1; then
+            echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
+            exit 1
+          fi
+          # Up to three attempts: a network hiccup while pulling the base image or the
+          # Dockerfile frontend should not fail the job. A broken Dockerfile still fails.
+          for attempt in 1 2 3; do
+            if docker buildx build --load --force-rm --iidfile "$RUNNER_TEMP/ci-image-id" \
+              -f .github/docker/Dockerfile -t "$CI_IMAGE" .github/docker; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            echo "::warning::Building the CI image failed (attempt $attempt of 3); retrying in $((attempt * 30)) s."
+            sleep $((attempt * 30))
+          done
+          echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
+      # `exec`, so that cancelling the job signals ci_container.py, which removes
+      # the container, rather than this step's shell.
+      - name: Build the Debian package
+        env:
+          IMAGE_ID: ${{ steps.image.outputs.id }}
+          MODULE: ${{ steps.tag.outputs.module }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          DOCKER_OPTIONS: ${{ matrix.docker-options }}
+        run: >-
+          exec python3 .github/scripts/ci_container.py run
+          --image "$IMAGE_ID" --name "$CI_CONTAINER-package" --log "release-package-${{ matrix.arch }}.log"
+          --docker-options "$DOCKER_OPTIONS"
+          -- python3 -B .github/scripts/release.py package "$MODULE"
+          --version "$VERSION" --out build-release/dist
+      # A new container from the same image, as root to install the package; the
+      # workspace is read-only there, and the consumer builds in the container's /tmp.
+      - name: Install the package and build its consumer against it
+        env:
+          IMAGE_ID: ${{ steps.image.outputs.id }}
+          MODULE: ${{ steps.tag.outputs.module }}
+          DEB: build-release/dist/${{ steps.tag.outputs.package }}_${{ steps.tag.outputs.version }}_${{ matrix.arch }}.deb
+          DOCKER_OPTIONS: ${{ matrix.docker-options }}
+        run: >-
+          exec python3 .github/scripts/ci_container.py run --root
+          --image "$IMAGE_ID" --name "$CI_CONTAINER-consume" --log "release-consume-${{ matrix.arch }}.log"
+          --docker-options "$DOCKER_OPTIONS"
+          -- python3 -B .github/scripts/release.py consume "$MODULE" --deb "$DEB"
+      - name: Remove the containers and stale images
+        if: always()
+        run: python3 .github/scripts/ci_container.py sweep
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: deb-${{ matrix.arch }}
+          path: build-release/dist/*.deb
+          if-no-files-found: error
+          retention-days: 7
+      # The logs are for diagnosis only: failing to upload them must not fail the job.
+      - name: Upload logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-logs-${{ matrix.arch }}
+          path: release-*-${{ matrix.arch }}.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: package
+    if: github.repository == 'snknitheesh/holoscan-zozo-modules'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          path: dist
+          pattern: deb-*
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PACKAGE: ${{ needs.package.outputs.package }}
+          VERSION: ${{ needs.package.outputs.version }}
+        working-directory: dist
+        run: |
+          debs=("${PACKAGE}_${VERSION}_amd64.deb" "${PACKAGE}_${VERSION}_arm64.deb")
+          for deb in "${debs[@]}"; do
+            test -f "$deb" || { echo "::error::Missing $deb"; exit 1; }
+          done
+          sha256sum -- "${debs[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          url="https://github.com/$GH_REPO/releases/download/$TAG"
+          {
+            echo "Debian packages of \`$PACKAGE\` $VERSION for Holoscan SDK 5.0 with CUDA 13, for x86_64 (\`amd64\`) and Jetson Thor and Orin with JetPack 7.2 (\`arm64\`)."
+            echo
+            echo '```bash'
+            echo "curl -fLO $url/${PACKAGE}_${VERSION}_\$(dpkg --print-architecture).deb"
+            echo "sudo apt install ./${PACKAGE}_${VERSION}_\$(dpkg --print-architecture).deb"
+            echo '```'
+            echo
+            echo "It depends on \`holoscan (>= 5.0.0)\` from NVIDIA's CUDA repository. SHA-256 (also in \`SHA256SUMS\`):"
+            echo
+            echo '```text'
+            cat SHA256SUMS
+            echo '```'
+          } > notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${debs[@]}" SHA256SUMS --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${debs[@]}" SHA256SUMS --verify-tag \
+              --title "$PACKAGE $VERSION" --notes-file notes.md
+          fi

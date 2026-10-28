@@ -18,6 +18,7 @@ Each module's README lists its operators, requirements, build options and tests.
 ## Layout
 
 ```text
+CMakeLists.txt           Builds the enabled modules together; what FetchContent and the CLI fetch
 modules/<name>/          One Holoscan Module: a standalone CMake project
   metadata.json          Module metadata (urn:holoscan:module:v2), read by HoloHub and the CLI
   include/holoscan/<name>/  Installed public headers
@@ -96,20 +97,165 @@ cmake --install build/<name> --prefix "$PWD/install"
 
 To build a Debian package instead, see the module's README.
 
+The repository root is a CMake project too, which builds the modules together, in one build tree:
+all of them by default, or a selection with `BUILD_ALL=OFF` and the options of
+[Build it from source](#b-build-it-from-source-with-fetchcontent):
+
+```bash
+cmake -S . -B build/all -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build/apriltag -G Ninja -DBUILD_ALL=OFF -DMODULE_holoscan_apriltag=ON
+```
+
 ## Use a module in your project
 
-Point CMake at the install prefix (not needed for the Debian package, which installs to `/usr`),
-then find the module's package and link its targets:
+A project uses a module in one of three ways, as NVIDIA's
+[Use a Holoscan Module](https://github.com/nvidia-holoscan/holoscan-tutorials/tree/main/tutorials/holoscan-modules/use-a-module)
+tutorial describes them: (A) install its Debian package, (B) build it from source with CMake's
+`FetchContent`, or (C) declare it in a Holoscan CLI project's `metadata.json`. In B and C the
+module is built as part of the consuming project, from this repository's root
+[`CMakeLists.txt`](CMakeLists.txt), which builds only the modules that project enables. The
+examples use `holoscan-apriltag` and its `AprilTagDetectorOp`; every module's README names its
+operators and targets.
+
+### A. Install its Debian package
+
+Each released version of a module is a [GitHub Release](https://github.com/snknitheesh/holoscan-zozo-modules/releases)
+tagged `<name>-v<version>`, with a package for `amd64` (x86_64) and one for `arm64` (Jetson Thor
+and Orin with JetPack 7.2), and their SHA-256 sums. The package depends on `holoscan (>= 5.0.0)`,
+so APT needs NVIDIA's CUDA repository, and on what the module's README lists (the AprilTag
+module's VPI backend needs NVIDIA's Jetson repository for `libnvvpi4`):
+
+```bash
+release=https://github.com/snknitheesh/holoscan-zozo-modules/releases/download/apriltag-v1.0.0
+deb="holoscan-apriltag_1.0.0_$(dpkg --print-architecture).deb"
+curl -fL -O "$release/$deb" -O "$release/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+sudo apt install "./$deb"
+```
+
+It installs to `/usr`, where CMake finds it. Find the package and link its targets:
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core)
-find_package(holoscan-<name> REQUIRED CONFIG)
-target_link_libraries(my_app PRIVATE holoscan::<name>)
+find_package(holoscan-apriltag 1.0 REQUIRED CONFIG)
+target_link_libraries(my_app PRIVATE holoscan::apriltag)
 ```
+
+A module installed from source with `cmake --install` works the same way, with its prefix on
+`CMAKE_PREFIX_PATH`:
 
 ```bash
 cmake -S my_app -B build/my_app -DCMAKE_PREFIX_PATH="$PWD/install"
 ```
+
+### B. Build it from source with FetchContent
+
+Fetch the repository at a pinned commit, and enable what you use before making it available:
+`OP_<operator>` builds the module that has that operator, `MODULE_holoscan_<name>` all of a
+module (`-` in the name becomes `_`). Nothing else is built:
+
+```cmake
+find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core)
+
+set(OP_AprilTagDetectorOp ON)
+include(FetchContent)
+FetchContent_Declare(
+  holoscan_zozo_modules
+  GIT_REPOSITORY https://github.com/snknitheesh/holoscan-zozo-modules.git
+  GIT_TAG <40-character commit SHA>
+)
+FetchContent_MakeAvailable(holoscan_zozo_modules)
+
+target_link_libraries(my_app PRIVATE holoscan::apriltag)
+```
+
+The module's targets are part of your build, so link them without `find_package(holoscan-apriltag)`.
+Its own options, in its README, apply as well; a module builds its tests only when asked
+(`HOLOSCAN_<NAME>_BUILD_TESTING=ON`), as [modules/README.md](modules/README.md) requires. To build against a local checkout instead of fetching,
+configure with `-DFETCHCONTENT_SOURCE_DIR_HOLOSCAN_ZOZO_MODULES=/path/to/holoscan-zozo-modules`, or
+use `add_subdirectory(/path/to/holoscan-zozo-modules holoscan-zozo-modules)` in place of the
+`FetchContent` calls.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `BUILD_ALL` | `ON` when the repository is the top-level project, else `OFF` (or the including project's `BUILD_ALL`) | Enables every module |
+| `MODULE_holoscan_<name>` | `BUILD_ALL` | Enables the module, all of its operators |
+| `OP_<operator>` | `OFF` | Enables the module that has the operator; one for each entry of `operator_names` in a module's `metadata.json` |
+
+### C. Declare it in a Holoscan CLI project
+
+In a project built with the [Holoscan CLI](https://github.com/nvidia-holoscan/holoscan-cli)
+(`holoscan build`), declare the module in the application's `metadata.json`. `name` is the
+module's own `module.name`, `git_url` this repository, and `ref` a full commit SHA, which the CLI
+requires:
+
+```json
+"dependencies": {
+  "modules": [
+    {
+      "name": "holoscan-apriltag",
+      "source": {
+        "git_url": "https://github.com/snknitheesh/holoscan-zozo-modules.git",
+        "ref": "<40-character commit SHA>"
+      },
+      "provides_operators": ["AprilTagDetectorOp"]
+    }
+  ]
+}
+```
+
+`holoscan build` writes a `FetchContent` declaration of this repository, with the provider name
+`holoscan_apriltag`, to `external_operators_manifest.cmake` in the application's build folder. The
+project's root `CMakeLists.txt` includes it, enables the operators its applications use, and then
+makes the providers of the enabled operators available, as in section 6.3 of the tutorial. With the
+CLI's `HoloHubConfigHelpers.cmake` in `cmake/`:
+
+```cmake
+include(FetchContent)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HoloHubConfigHelpers.cmake")
+include("${CMAKE_BINARY_DIR}/external_operators_manifest.cmake" OPTIONAL)
+
+# add_holohub_application(my_app DEPENDS OPERATORS AprilTagDetectorOp) sets OP_AprilTagDetectorOp.
+add_subdirectory(applications)
+
+get_cmake_property(_variables VARIABLES)
+set(_providers "")
+foreach(_variable IN LISTS _variables)
+  if(_variable MATCHES "^HOLOHUB_EXT_OP_(.+)_PROVIDER$")
+    if(OP_${CMAKE_MATCH_1})
+      list(APPEND _providers "${${_variable}}")
+    endif()
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES _providers)
+if(_providers)
+  FetchContent_MakeAvailable(${_providers})
+endif()
+```
+
+The application links `holoscan::apriltag` as in B. Then:
+
+```bash
+holoscan build my_app --dryrun --verbose
+holoscan build my_app
+```
+
+For several modules of this collection, add one entry for each, all with the same `ref`; the
+first one fetched builds every module enabled by then, and the others add nothing. To build against
+a local checkout, point the CLI's override for the module at the module's folder (in a container
+build, also mount it and pass `--forward-env`, as the tutorial shows):
+
+```bash
+export HOLOSCAN_CLI_LOCAL_HOLOSCAN_APRILTAG="$HOME/src/holoscan-zozo-modules/modules/apriltag"
+holoscan build my_app --local
+```
+
+A single entry named `holoscan-zozo-modules`, whose `provides_operators` lists the operators of
+every module you use, works too and fetches the repository once. The CLI's override cannot point
+at it, though, because it requires a `metadata.json` at the root of the folder it names, and this
+repository has none: build against a checkout with
+`holoscan build my_app --configure-args=-DFETCHCONTENT_SOURCE_DIR_HOLOSCAN_ZOZO_MODULES=/path/to/holoscan-zozo-modules`
+instead.
 
 ## Run a demo
 
@@ -136,7 +282,8 @@ Running the whole of `ci.py sdk` in the CI container is shown in
 [Use the CI container](#use-the-ci-container).
 
 The workflows, their runners, the image's publishing and the repository settings are described in
-[.github/RUNNERS.md](.github/RUNNERS.md).
+[.github/RUNNERS.md](.github/RUNNERS.md); releasing a module in
+[.github/RELEASING.md](.github/RELEASING.md).
 
 ## Contributing
 

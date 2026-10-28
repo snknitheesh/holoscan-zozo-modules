@@ -6,7 +6,9 @@
          and removed however the run ends: `--rm` and `--init`, plus `docker rm -f`
          on exit and on SIGINT, SIGTERM and SIGHUP (which is how the runner cancels a
          step). Output also goes to a log file. Start it with `exec`, so that the
-         runner's signals reach it rather than the step's shell.
+         runner's signals reach it rather than the step's shell. It runs as the
+         runner's user; with --root, as root (to install a package) with the
+         workspace mounted read-only, so that it leaves no root-owned files there.
   sweep  Remove every container with the CI label (a runner runs one job at a time,
          so any of them is left over), every stopped container made from this
          repository's image or its build steps (a failed legacy build leaves those),
@@ -174,9 +176,9 @@ def run(args: argparse.Namespace) -> int:
         "-e",
         "PYTHONUNBUFFERED=1",
         "--user",
-        f"{os.getuid()}:{os.getgid()}",
+        "0:0" if args.root else f"{os.getuid()}:{os.getgid()}",
         "-v",
-        f"{workspace}:{workspace}",
+        f"{workspace}:{workspace}:ro" if args.root else f"{workspace}:{workspace}",
         "-w",
         workspace,
         args.image,
@@ -225,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     execute.add_argument("--name", required=True)
     execute.add_argument("--log", required=True, type=Path)
     execute.add_argument("--docker-options", default="", help="extra `docker run` options")
+    execute.add_argument(
+        "--root", action="store_true", help="run as root, with the workspace read-only"
+    )
     execute.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command")
     args = parser.parse_args(argv)
     if args.action == "sweep":
