@@ -73,6 +73,26 @@ class BuildCacheTest(unittest.TestCase):
         )
 
 
+class RunnerOptionsTest(unittest.TestCase):
+    def test_nothing_without_the_variables(self):
+        self.assertEqual(ci_container.runner_options({}), [])
+        self.assertEqual(
+            ci_container.runner_options({"CI_DOCKER_OPTIONS": "", "CI_BUILD_JOBS": " "}), []
+        )
+
+    def test_docker_options_are_split_like_a_shell(self):
+        env = {"CI_DOCKER_OPTIONS": "--memory 22g --cpuset-cpus 2-13 --label 'a b=1'"}
+        self.assertEqual(
+            ci_container.runner_options(env),
+            ["--memory", "22g", "--cpuset-cpus", "2-13", "--label", "a b=1"],
+        )
+
+    def test_build_jobs_are_passed_into_the_container(self):
+        self.assertEqual(
+            ci_container.runner_options({"CI_BUILD_JOBS": "8"}), ["-e", "CI_BUILD_JOBS"]
+        )
+
+
 class RunTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -137,6 +157,19 @@ class RunTest(unittest.TestCase):
         self.assertIn(f"{ci_container.RUN_LABEL}=7-2-x86", command)
         self.assertEqual(command[-3:], ["image@sha256:1", "python3", "ci.py"])
         self.assertIn("started", self.log.read_text())
+
+    def test_runner_options_reach_docker_run(self):
+        self.env.update(CI_DOCKER_OPTIONS="--memory 22g --cpuset-cpus 2-13", CI_BUILD_JOBS="8")
+        process = self.start()
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=20)
+        command = self.calls_made()[0].split()
+        # After the workflow's options, so that the runner's limits apply to every job.
+        gpus = command.index("--gpus")
+        self.assertEqual(
+            command[gpus + 2 : gpus + 8],
+            ["--memory", "22g", "--cpuset-cpus", "2-13", "-e", "CI_BUILD_JOBS"],
+        )
 
     def test_signals_remove_the_container(self):
         for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
