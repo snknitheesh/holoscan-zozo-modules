@@ -1,19 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
-"""Build and test every module under modules/ and every demo under applications/.
+"""Build and test the modules under modules/ and the demos under applications/.
 
 Each folder plugs in by layout alone (see modules/README.md and
 applications/README.md), so adding one needs no workflow change:
 
-  host   Build and run the SDK-free test projects (<folder>/tests/host/).
-  sdk    For each module: build it, run its full CTest suite, install it, then
-         build and test its installed-package consumer (tests/installed_consumer/).
-         Modules build in name order, each against those installed before it.
-         Then, for each demo: build it against the installed modules, run its
-         tests, and run its finite `ci` mode from metadata.json, which is killed
-         after modes.ci.run.timeout seconds (default 900).
-  list   Print what would be built.
+  select  Decide what a run tests, and print why. With --changed-since <ref>, only
+          the modules and demos whose folders changed since the merge base of <ref>
+          and HEAD, the modules and demos that depend on them, and nothing for a
+          change to documentation alone; a change anywhere else selects everything.
+          Without it, everything. --output appends `selection=` and `gpu=` lines for
+          GITHUB_OUTPUT.
+  host    Build and run the SDK-free test projects (<folder>/tests/host/).
+  sdk     For each module, in dependency order: build it, run its full CTest suite,
+          install it, then build and test its installed-package consumer
+          (tests/installed_consumer/). Each module builds against those installed
+          before it. Then, for each demo: build it against the installed modules, run
+          its tests, and run its finite `ci` mode from metadata.json, which is killed
+          after modes.ci.run.timeout seconds (default 900).
+  list    Print the modules in build order and the demos, with their dependencies.
 
+host and sdk take --selection, the JSON that select printed, and then test only what
+it names; sdk still builds and installs, without testing, the modules those depend on.
 Every step must succeed; the first failure ends the run with a nonzero status.
 """
 
@@ -21,9 +29,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import heapq
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -31,12 +41,16 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[2]
 APP_BIN = "<holohub_app_bin>"
 # Seconds a demo's ci mode may run, unless its modes.ci.run.timeout says otherwise.
 CI_MODE_TIMEOUT = 900
+# A CMake file's use of a module of this collection: find_package(holoscan-<name> ...).
+FIND_MODULE = re.compile(
+    r"\b(?:find_package|find_dependency)\s*\(\s*holoscan-([A-Za-z0-9_-]+)", re.IGNORECASE
+)
 
 
 class CiError(Exception):
@@ -53,6 +67,10 @@ class Project:
     @property
     def label(self) -> str:
         return f"{self.kind} {self.name}"
+
+    @property
+    def metadata_file(self) -> Path:
+        return self.path / "metadata.json"
 
 
 def discover(root: Path, folder: str, kind: str) -> list[Project]:
@@ -76,6 +94,339 @@ def discover(root: Path, folder: str, kind: str) -> list[Project]:
             raise CiError(f"{path}: has metadata.json but no CMakeLists.txt")
         projects.append(Project(kind, path.name, path, metadata))
     return projects
+
+
+# --- The dependency graph -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Graph:
+    """Every module and demo, and the modules each one depends on, by folder name."""
+
+    modules: dict[str, Project]  # In build order: each after the modules it depends on.
+    applications: dict[str, Project]  # In name order.
+    requires: dict[tuple[str, str], tuple[str, ...]]  # (kind, name) -> module folders
+
+    def module_deps(self, name: str) -> tuple[str, ...]:
+        return self.requires[("module", name)]
+
+    def app_deps(self, name: str) -> tuple[str, ...]:
+        return self.requires[("application", name)]
+
+    def dependencies(self, modules: set[str]) -> set[str]:
+        """Every module that `modules` depend on, directly or not, without themselves."""
+        found: set[str] = set()
+        pending = [dep for name in modules for dep in self.module_deps(name)]
+        while pending:
+            name = pending.pop()
+            if name not in found:
+                found.add(name)
+                pending.extend(self.module_deps(name))
+        return found - modules
+
+    def dependents(self, modules: set[str]) -> set[str]:
+        """Every module that depends on `modules`, directly or not, without themselves."""
+        found = set(modules)
+        for name in self.modules:  # Build order: a module comes after its dependencies.
+            if found.intersection(self.module_deps(name)):
+                found.add(name)
+        return found - modules
+
+
+def dependency_names(project: Project) -> list[str]:
+    """The in-tree modules a project declares in its metadata.json, as written.
+
+    A module lists them in module.dependencies, a demo in
+    application.dependencies.modules, as the Holoscan CLI reads them. An entry with a
+    `source` block is a module from another repository and is not part of the graph;
+    any other entry is a module of this collection, named by its folder under
+    modules/, which is also where the CLI looks for it.
+    """
+    envelope = project.metadata[project.kind]
+    where = "module.dependencies"
+    entries = envelope.get("dependencies", [])
+    if project.kind == "application":
+        where = "application.dependencies.modules"
+        dependencies = envelope.get("dependencies", {})
+        if not isinstance(dependencies, dict):
+            raise CiError(f"{project.metadata_file}: application.dependencies must be an object")
+        entries = dependencies.get("modules", [])
+    if not isinstance(entries, list):
+        raise CiError(f"{project.metadata_file}: {where} must be a list")
+    names = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise CiError(f"{project.metadata_file}: every entry of {where} needs a name")
+        if "source" not in entry:
+            names.append(entry["name"])
+    return names
+
+
+def cmake_uses(project: Project) -> set[str]:
+    """The holoscan-<name> packages the project's CMake files find, other than itself."""
+    found = set()
+    for path in sorted(project.path.rglob("*")):
+        if path.name == "CMakeLists.txt" or path.name.endswith((".cmake", ".cmake.in")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+            found.update(match.lower() for match in FIND_MODULE.findall(code))
+    found.discard(project.name)
+    return found
+
+
+def toposort(requires: dict[str, tuple[str, ...]]) -> list[str]:
+    """The names in an order where each comes after those it requires; ties by name.
+    A cycle is a CiError that names it."""
+    waiting = {name: set(deps) for name, deps in requires.items()}
+    ready = [name for name, deps in waiting.items() if not deps]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        name = heapq.heappop(ready)
+        order.append(name)
+        for other, deps in waiting.items():
+            if name in deps:
+                deps.discard(name)
+                if not deps:
+                    heapq.heappush(ready, other)
+    if len(order) < len(requires):
+        raise CiError(f"modules depend on each other in a cycle: {find_cycle(requires, order)}")
+    return order
+
+
+def find_cycle(requires: dict[str, tuple[str, ...]], done: list[str]) -> str:
+    """One cycle among the modules toposort() could not order, as "a -> b -> a"."""
+    left = {name: [dep for dep in requires[name] if dep not in done] for name in requires}
+    name = min(n for n in left if n not in done)
+    path: list[str] = []
+    while name not in path:
+        path.append(name)
+        name = min(left[name])  # Every module left over depends on one left over.
+    return " -> ".join([*path[path.index(name) :], name])
+
+
+def load_graph(root: Path) -> Graph:
+    """Discover every module and demo, check their declared dependencies against each
+    other and against their CMake files, and order the modules by dependency."""
+    modules = {p.name: p for p in discover(root, "modules", "module")}
+    apps = {p.name: p for p in discover(root, "applications", "application")}
+    requires: dict[tuple[str, str], tuple[str, ...]] = {}
+    for project in [*modules.values(), *apps.values()]:
+        where = "module.dependencies"
+        if project.kind == "application":
+            where = "application.dependencies.modules"
+        names = dependency_names(project)
+        for name in names:
+            if name in modules:
+                continue
+            hint = ""
+            if name.startswith("holoscan-") and name.removeprefix("holoscan-") in modules:
+                hint = (
+                    f": name the folder, {name.removeprefix('holoscan-')!r}, which is"
+                    " where the Holoscan CLI looks for an in-tree module"
+                )
+            raise CiError(
+                f"{project.metadata_file}: {where} names {name!r}, which is not a module"
+                f" in modules/ and has no source{hint}"
+            )
+        if project.kind == "module" and project.name in names:
+            raise CiError(f"{project.metadata_file}: the module depends on itself")
+        undeclared = sorted((cmake_uses(project) & modules.keys()) - set(names))
+        if undeclared:
+            entries = ", ".join(f'{{"name": "{name}"}}' for name in undeclared)
+            raise CiError(
+                f"{project.path}: its CMake files find holoscan-{', holoscan-'.join(undeclared)},"
+                f" which {project.metadata_file.name} does not declare; add {entries}"
+                f" to {where}"
+            )
+        requires[(project.kind, project.name)] = tuple(sorted(set(names)))
+    order = toposort({name: requires[("module", name)] for name in modules})
+    return Graph({name: modules[name] for name in order}, apps, requires)
+
+
+# --- Selecting what to test ---------------------------------------------------------
+
+
+@dataclass
+class Selection:
+    """What a run tests: these modules' suites and these demos. `everything` is a run
+    of every module and demo, whatever the lists say; `nightly` asks also for the
+    tests that only the nightly run makes (HOLOSCAN_CI_NIGHTLY)."""
+
+    everything: bool
+    modules: list[str]
+    applications: list[str]
+    nightly: bool = False
+
+    @property
+    def empty(self) -> bool:
+        return not self.everything and not self.modules and not self.applications
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "everything": self.everything,
+                "nightly": self.nightly,
+                "modules": self.modules,
+                "applications": self.applications,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, text: str, graph: Graph) -> Selection:
+        try:
+            data = json.loads(text)
+            selection = cls(
+                bool(data["everything"]),
+                list(data["modules"]),
+                list(data["applications"]),
+                bool(data.get("nightly", False)),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise CiError(f"--selection is not what `ci.py select` prints: {error}") from error
+        if selection.everything:
+            return everything(graph, selection.nightly)
+        for kind, names, known in (
+            ("module", selection.modules, graph.modules),
+            ("application", selection.applications, graph.applications),
+        ):
+            unknown = [name for name in names if name not in known]
+            if unknown:
+                raise CiError(f"--selection names no such {kind}: {', '.join(unknown)}")
+        return selection
+
+
+def everything(graph: Graph, nightly: bool = False) -> Selection:
+    return Selection(True, list(graph.modules), list(graph.applications), nightly)
+
+
+def is_documentation(root: Path, path: str) -> bool:
+    """A Markdown file that still exists, outside .github/: nothing builds from one.
+    A deleted one is not, since a module may install its README."""
+    return path.endswith(".md") and not path.startswith(".github/") and (root / path).is_file()
+
+
+def select(graph: Graph, root: Path, paths: list[str]) -> tuple[Selection, list[str]]:
+    """What a change to `paths` (relative to the root) tests, and why, line by line.
+
+    A path in modules/<m>/ selects module m, every module that depends on it, and every
+    demo that uses any of those; a path in applications/<a>/ selects demo a. A
+    documentation file selects nothing. Any other path, such as the workflows, the
+    root CMakeLists.txt, cmake/, the CI image or a folder that is no longer a module or
+    demo, selects everything: what it affects is not known.
+    """
+    changed: dict[tuple[str, str], str] = {}
+    docs = []
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if is_documentation(root, path):
+            docs.append(path)
+            continue
+        if len(parts) >= 3 and parts[0] == "modules" and parts[1] in graph.modules:
+            changed.setdefault(("module", parts[1]), path)
+        elif len(parts) >= 3 and parts[0] == "applications" and parts[1] in graph.applications:
+            changed.setdefault(("application", parts[1]), path)
+        else:
+            return everything(graph), [f"everything: {path} is not in a module's or demo's folder"]
+    why = [f"documentation only, nothing to build: {path}" for path in docs]
+    direct = {name for kind, name in changed if kind == "module"}
+    modules = direct | graph.dependents(direct)
+    for name in graph.modules:
+        if name in direct:
+            why.append(f"module {name}: changed ({changed[('module', name)]})")
+        elif name in modules:
+            on = sorted(direct & graph.dependencies({name}))
+            why.append(f"module {name}: depends on {', '.join(on)}")
+    apps = []
+    for name in graph.applications:
+        uses = sorted(set(graph.app_deps(name)) & modules)
+        if ("application", name) in changed:
+            why.append(f"application {name}: changed ({changed[('application', name)]})")
+        elif uses:
+            why.append(f"application {name}: uses {', '.join(uses)}")
+        else:
+            continue
+        apps.append(name)
+    order = [name for name in graph.modules if name in modules]
+    return Selection(False, order, apps), why
+
+
+def to_build(graph: Graph, selection: Selection) -> list[str]:
+    """The modules a run builds and installs, in build order: those it tests, and those
+    that they, or the demos it runs, depend on."""
+    tested = set(selection.modules)
+    needed = tested | {dep for app in selection.applications for dep in graph.app_deps(app)}
+    needed |= graph.dependencies(needed)
+    return [name for name in graph.modules if name in needed]
+
+
+def changed_files(root: Path, base: str) -> list[str]:
+    """The files that differ between HEAD and its merge base with `base`, as a pull
+    request shows them. Both sides of a rename count."""
+    if not base or base.startswith("-"):
+        raise CiError(f"not a commit: {base!r}")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                f"{base}...HEAD",
+                "--",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", "") or error
+        raise CiError(f"cannot diff {base}...HEAD: {str(detail).strip()}") from error
+    return [path for path in result.stdout.split("\0") if path]
+
+
+def select_command(root: Path, base: str | None, nightly: bool, output: Path | None) -> int:
+    graph = load_graph(root)
+    if nightly:
+        selection, why = everything(graph, True), ["everything: the nightly run"]
+    elif not base:
+        selection, why = everything(graph), ["everything: no base to compare with"]
+    else:
+        try:
+            paths = changed_files(root, base)
+        except CiError as error:
+            # Fail safe: what cannot be compared is tested in full.
+            print(f"::warning::{error}; testing everything")
+            selection, why = everything(graph), [f"everything: {error}"]
+        else:
+            print(f"{len(paths)} file(s) changed since the merge base with {base}.")
+            selection, why = select(graph, root, paths)
+    section("Selection")
+    for line in why or ["nothing: no file changed"]:
+        print(f"  {line}")
+    built = [name for name in to_build(graph, selection) if name not in selection.modules]
+    for name in built:
+        print(f"  module {name}: built and installed for what depends on it, not tested")
+    if selection.empty:
+        summary = "Nothing to build or test on the GPUs"
+    else:
+        summary = (
+            f"Testing {'everything: ' if selection.everything else ''}"
+            f"module(s) {', '.join(selection.modules) or 'none'};"
+            f" demo(s) {', '.join(selection.applications) or 'none'}"
+        )
+        if built:
+            summary += f"; building without tests {', '.join(built)}"
+    print(f"::notice title=CI selection::{summary}")
+    if output is not None:
+        with output.open("a", encoding="utf-8") as stream:
+            stream.write(f"selection={selection.to_json()}\n")
+            stream.write(f"gpu={'false' if selection.empty else 'true'}\n")
+    return 0
 
 
 def ci_mode(app: Project) -> dict:
@@ -219,11 +570,22 @@ def cmake_build_and_test(source: Path, build: Path, options: list[str], no_tests
     )
 
 
-def host(root: Path, build_root: Path) -> int:
-    """Build and run each folder's SDK-free tests/host/ project."""
-    projects = discover(root, "modules", "module") + discover(root, "applications", "application")
+def selected(graph: Graph, selection_json: str | None) -> Selection:
+    """The run's selection: --selection, or everything without it."""
+    if selection_json is None:
+        return everything(graph)
+    return Selection.from_json(selection_json, graph)
+
+
+def host(root: Path, build_root: Path, selection_json: str | None = None) -> int:
+    """Build and run the SDK-free tests/host/ project of each selected folder."""
+    graph = load_graph(root)
+    selection = selected(graph, selection_json)
+    projects = [graph.modules[name] for name in selection.modules] + [
+        graph.applications[name] for name in selection.applications
+    ]
     suites = [p for p in projects if (p.path / "tests" / "host" / "CMakeLists.txt").is_file()]
-    print(f"Discovered {len(projects)} project(s), {len(suites)} with SDK-free tests.")
+    print(f"Selected {len(projects)} project(s), {len(suites)} with SDK-free tests.")
     for project in suites:
         section(f"{project.label}: SDK-free tests")
         cmake_build_and_test(
@@ -237,31 +599,56 @@ def host(root: Path, build_root: Path) -> int:
     return 0
 
 
-def sdk(root: Path, build_root: Path, platform: str) -> int:
-    """Build, test, install and consume every module, then build and run every demo."""
-    modules = discover(root, "modules", "module")
-    apps = discover(root, "applications", "application")
-    modes = {app.name: ci_mode(app) for app in apps}  # Fail before building anything.
-    print(f"Platform {platform}: {len(modules)} module(s), {len(apps)} application(s).")
+def sdk(root: Path, build_root: Path, platform: str, selection_json: str | None = None) -> int:
+    """Build, test, install and consume the selected modules, building and installing
+    what they and the selected demos depend on first; then build and run the demos."""
+    graph = load_graph(root)
+    # Fail on any demo's ci mode before building anything.
+    modes = {name: ci_mode(app) for name, app in graph.applications.items()}
+    selection = selected(graph, selection_json)
+    tested = set(selection.modules)
+    modules = [graph.modules[name] for name in to_build(graph, selection)]
+    apps = [graph.applications[name] for name in selection.applications]
+    print(
+        f"Platform {platform}: {len(tested)} module(s) to test, of {len(graph.modules)};"
+        f" {len(modules) - len(tested)} more to build for them;"
+        f" {len(apps)} application(s), of {len(graph.applications)}."
+    )
     prefix = build_root / "install"
-    # Module tests and ci modes may check what holds only on one platform.
+    # Module tests and ci modes may check what holds only on one platform, and leave
+    # long runs or downloaded models to the nightly run.
     os.environ["HOLOSCAN_CI_PLATFORM"] = platform
+    os.environ["HOLOSCAN_CI_NIGHTLY"] = "1" if selection.nightly else "0"
     release = ["-DCMAKE_BUILD_TYPE=Release"]
     for module in modules:
         build = build_root / "modules" / module.name
+        options = [
+            *release,
+            f"-DCMAKE_INSTALL_PREFIX={prefix}",
+            # The modules installed before this one: those it depends on.
+            f"-DCMAKE_PREFIX_PATH={prefix}",
+        ]
+        if module.name not in tested:
+            # Only a dependency of what is tested: its own tests are not this run's.
+            section(f"{module.label}: build, for what depends on it")
+            run(
+                [
+                    "cmake",
+                    "-S",
+                    str(module.path),
+                    "-B",
+                    str(build),
+                    *generator(),
+                    *options,
+                    "-DBUILD_TESTING=OFF",
+                ]
+            )
+            run(["cmake", "--build", str(build), "--parallel", str(build_jobs())])
+            section(f"{module.label}: install")
+            run(["cmake", "--install", str(build)])
+            continue
         section(f"{module.label}: build and full test suite")
-        cmake_build_and_test(
-            module.path,
-            build,
-            [
-                *release,
-                "-DBUILD_TESTING=ON",
-                f"-DCMAKE_INSTALL_PREFIX={prefix}",
-                # The modules installed before this one, in name order.
-                f"-DCMAKE_PREFIX_PATH={prefix}",
-            ],
-            no_tests="error",
-        )
+        cmake_build_and_test(module.path, build, [*options, "-DBUILD_TESTING=ON"], "error")
         section(f"{module.label}: install")
         run(["cmake", "--install", str(build)])
         consumer = module.path / "tests" / "installed_consumer"
@@ -293,22 +680,29 @@ def sdk(root: Path, build_root: Path, platform: str) -> int:
         command, cwd = ci_command(mode, app, build.resolve())
         run(command, cwd=cwd, timeout=ci_timeout(mode))
     if not modules and not apps:
-        print("No modules or applications; nothing to build.")
-    section(f"OK: {len(modules)} module(s), {len(apps)} application(s) on {platform}")
+        print("No modules or applications selected; nothing to build.")
+    section(
+        f"OK: {len(tested)} module(s) tested, {len(modules) - len(tested)} more built,"
+        f" {len(apps)} application(s) on {platform}"
+    )
     return 0
 
 
 def list_projects(root: Path) -> int:
-    for project in discover(root, "modules", "module") + discover(
-        root, "applications", "application"
-    ):
-        print(f"{project.kind:12} {project.name:30} {project.path.relative_to(root)}")
+    """The modules in build order, then the demos, each with what it depends on."""
+    graph = load_graph(root)
+    for project in [*graph.modules.values(), *graph.applications.values()]:
+        deps = ", ".join(graph.requires[(project.kind, project.name)]) or "-"
+        print(
+            f"{project.kind:12} {project.name:30} {project.path.relative_to(root)!s:40}"
+            f" depends on: {deps}"
+        )
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=["host", "sdk", "list"])
+    parser.add_argument("command", choices=["select", "host", "sdk", "list"])
     parser.add_argument(
         "--build-root", type=Path, default=ROOT / "build-ci", help="where builds go"
     )
@@ -318,14 +712,34 @@ def main(argv: list[str] | None = None) -> int:
         choices=["x86_64", "jetson"],
         help="exported to the tests and ci modes as HOLOSCAN_CI_PLATFORM",
     )
+    parser.add_argument(
+        "--changed-since",
+        metavar="REF",
+        help="select: test only what changed since the merge base of REF and HEAD",
+    )
+    parser.add_argument(
+        "--nightly",
+        action="store_true",
+        help="select: test everything, with HOLOSCAN_CI_NIGHTLY=1 for the tests",
+    )
+    parser.add_argument(
+        "--output", type=Path, help="select: append selection= and gpu= lines to this file"
+    )
+    parser.add_argument(
+        "--selection",
+        metavar="JSON",
+        help="host, sdk: test only what this selection, printed by select, names",
+    )
     args = parser.parse_args(argv)
     build_root = args.build_root.resolve()
     exit_on_signals()
     try:
+        if args.command == "select":
+            return select_command(ROOT, args.changed_since, args.nightly, args.output)
         if args.command == "host":
-            return host(ROOT, build_root)
+            return host(ROOT, build_root, args.selection)
         if args.command == "sdk":
-            return sdk(ROOT, build_root, args.platform)
+            return sdk(ROOT, build_root, args.platform, args.selection)
         return list_projects(ROOT)
     except CiError as error:
         print(f"\nci.py: FAILED: {error}", file=sys.stderr)
