@@ -192,9 +192,20 @@ def generator() -> list[str]:
     return ["-G", "Ninja"] if shutil.which("ninja") else []
 
 
+def build_jobs() -> int:
+    """Parallel build jobs: CI_BUILD_JOBS when the runner sets it (a machine that also
+    serves other work keeps cores and memory for it), else every CPU."""
+    value = os.environ.get("CI_BUILD_JOBS", "").strip()
+    if not value:
+        return os.cpu_count() or 2
+    if not value.isdigit() or int(value) < 1:
+        raise CiError(f"CI_BUILD_JOBS must be a positive whole number, not {value!r}")
+    return int(value)
+
+
 def cmake_build_and_test(source: Path, build: Path, options: list[str], no_tests: str) -> None:
     run(["cmake", "-S", str(source), "-B", str(build), *generator(), *options])
-    run(["cmake", "--build", str(build), "--parallel", str(os.cpu_count() or 2)])
+    run(["cmake", "--build", str(build), "--parallel", str(build_jobs())])
     run(
         [
             "ctest",
