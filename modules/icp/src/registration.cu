@@ -44,6 +44,9 @@ constexpr std::uint32_t kMaxCount = std::uint32_t{1} << 30;
 
 // At most this many correspondence distances, halving from the maximum.
 constexpr int kMaxLevels = 8;
+// Grid cells are this much wider than the search radius, so that rounding in
+// a point's cell never puts a neighbor within the radius two cells away.
+constexpr float kCellMargin = 1.001F;
 
 constexpr int kBlock = 256;
 // The association pass's grid is at most this many blocks, fixed by the
@@ -690,7 +693,7 @@ struct IcpRegistration::Impl {
   // The target's grid for distance level `level`.
   cudaError_t grid_for(int level, cudaStream_t stream) {
     if (!grid_ready[level]) {
-      ICP_TRY(build_grid(target, distances[level], grids[level], stream));
+      ICP_TRY(build_grid(target, distances[level] * kCellMargin, grids[level], stream));
       grid_ready[level] = true;
     }
     return cudaSuccess;
@@ -711,7 +714,7 @@ struct IcpRegistration::Impl {
     const float radius = normal_radius();
     const Grid* neighbors = &grids[0];
     if (radius != distances[0]) {
-      ICP_TRY(build_grid(target, radius, normal_grid, stream));
+      ICP_TRY(build_grid(target, radius * kCellMargin, normal_grid, stream));
       neighbors = &normal_grid;
     }
     normal_kernel<<<blocks_for(target.count), kBlock, 0, stream>>>(

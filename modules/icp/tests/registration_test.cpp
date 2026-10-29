@@ -373,6 +373,25 @@ void check_odometry() {
   }
 }
 
+// A frame that cannot register keeps the guess: as its result's transform and
+// as its motion.
+void check_odometry_failure() {
+  const SyntheticScene scene = synthetic_scene(SceneKind::kRoom);
+  IcpOdometry odometry(options_for(IcpMethod::kPointToPlane, 0.10F));
+  const DeviceCloud cloud = render(scene, identity_transform(), kWidth, kHeight, kNoise);
+  const DeviceCloud empty(std::vector<float>(300U, std::nanf("")));
+  OdometryStep step;
+  test::cuda_check(odometry.track(cloud.data(), cloud.count(), nullptr, step), "track");
+  test::cuda_check(odometry.track(cloud.data(), cloud.count(), nullptr, step), "track");
+  const Matrix4 before = step.pose;
+  const Matrix4 guess = transform_from({0.0, radians(1.0), 0.0}, {0.02, 0.0, 0.01});
+  test::cuda_check(odometry.track(empty.data(), empty.count(), nullptr, step, &guess), "track");
+  VERIFY(!step.result.converged && step.result.status == IcpStatus::kTooFewCorrespondences);
+  VERIFY(step.result.transform == guess);
+  VERIFY(step.pose == compose(before, guess));
+  VERIFY(odometry.frames() == 3U);
+}
+
 void check_options() {
   const auto rejects = [](auto change) {
     IcpOptions o;
@@ -411,6 +430,7 @@ int main() {
       {"bit-identical repeated runs", holoscan::icp::check_determinism},
       {"CPU reference", holoscan::icp::check_cpu_reference},
       {"odometry drift along a camera path", holoscan::icp::check_odometry},
+      {"odometry keeps the guess on a failed frame", holoscan::icp::check_odometry_failure},
       {"options validated", holoscan::icp::check_options},
   });
 }
