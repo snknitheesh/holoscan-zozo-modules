@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Five checks, each a stable name that branch protection requires:
-#   Lint         GitHub-hosted: prek, actionlint, the CI driver's tests and the
-#                SDK-free tests of every module and demo.
+#   Lint         GitHub-hosted: selects what to test (below), then prek, actionlint,
+#                the CI driver's tests and the selected modules' and demos' SDK-free tests.
 #   x86 GPU      Self-hosted x86_64 runner with an NVIDIA GPU (driver R595 or newer).
 #   Jetson Thor  Self-hosted Jetson Thor (JetPack 7.2).
 #   Jetson Orin  Self-hosted Jetson Orin (JetPack 7.2).
@@ -14,6 +14,13 @@
 # applications/*/, so adding one needs no change here. Every CI container is labeled
 # and removed however its job ends (.github/scripts/ci_container.py). Runner setup and the repository
 # settings these jobs rely on are in .github/RUNNERS.md.
+#
+# What runs: a pull request tests the modules and demos it changes, what depends on
+# them, and builds what they depend on (`ci.py select`); a change outside their
+# folders tests everything. When it selects nothing to build, such as documentation
+# only, the GPU jobs still report, from a GitHub-hosted runner, without touching a
+# GPU. A push to main, a manual run and the nightly run test everything; the nightly
+# run also sets HOLOSCAN_CI_NIGHTLY=1 for tests that need long runs or real models.
 
 name: CI
 
@@ -22,26 +29,65 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Nightly: everything, on every lane, with HOLOSCAN_CI_NIGHTLY=1.
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      base:
+        description: >-
+          Test only what changed since this commit SHA or origin/<branch> (as for a
+          pull request, from the merge base); empty tests everything
+        type: string
+        default: ""
+      nightly:
+        description: Run the nightly tests too (HOLOSCAN_CI_NIGHTLY=1); tests everything
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The nightly run has a group of its own, so that it neither cancels nor is
+  # cancelled by a push to main waiting in the queue.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     name: Lint
+    # A fork that turns its scheduled workflows on has no GPU runners to run them.
+    if: github.event_name != 'schedule' || github.repository == 'snknitheesh/holoscan-zozo-modules'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      # What the GPU jobs test, as `ci.py select` printed it, and whether they need a GPU.
+      selection: ${{ steps.select.outputs.selection }}
+      gpu: ${{ steps.select.outputs.gpu }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Copyright years are checked against the pull request's base or the previous push.
+          # Copyright years are checked against the pull request's base or the previous
+          # push, and the selection against the pull request's base.
           fetch-depth: 0
           persist-credentials: false
+      # A pull request compares with its base, from their merge base; a manual run with
+      # its `base` input when given. Anything else tests everything.
+      - name: Select what to test
+        id: select
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly == true }}
+        run: |
+          args=()
+          if [ -n "$BASE" ]; then
+            args+=(--changed-since "$BASE")
+          fi
+          if [ "$NIGHTLY" = true ]; then
+            args+=(--nightly)
+          fi
+          python3 .github/scripts/ci.py select "${args[@]}" --output "$GITHUB_OUTPUT"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
@@ -65,7 +111,9 @@ jobs:
       - name: Test the CI driver
         run: python -m unittest discover -s .github/scripts -v
       - name: SDK-free tests
-        run: python .github/scripts/ci.py host
+        env:
+          SELECTION: ${{ steps.select.outputs.selection }}
+        run: python .github/scripts/ci.py host --selection "$SELECTION"
 
   x86-gpu:
     name: x86 GPU
@@ -75,7 +123,9 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, gpu]
+    # With nothing to build, the job only reports, from a GitHub-hosted runner: the
+    # check must exist, and the GPU runner stays free.
+    runs-on: ${{ needs.lint.outputs.gpu == 'true' && fromJSON('["self-hosted", "linux", "x64", "gpu"]') || 'ubuntu-24.04' }}
     # Also bounds a hung test: the container goes with the job.
     timeout-minutes: 180
     env:
@@ -83,15 +133,21 @@ jobs:
       CI_JOB_KEY: x86
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-x86
     steps:
+      - name: Nothing to build
+        if: needs.lint.outputs.gpu != 'true'
+        run: echo "This change selects no module or demo to build; see the Lint job's selection."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: needs.lint.outputs.gpu == 'true'
         with:
           persist-credentials: false
       # The runner's job hook (.github/RUNNERS.md) does this too, before and after
       # every job; this covers a runner without it.
       - name: Remove left-over CI containers and images
+        if: needs.lint.outputs.gpu == 'true'
         run: python3 .github/scripts/ci_container.py sweep
       - name: Build the CI image
         id: image
+        if: needs.lint.outputs.gpu == 'true'
         run: |
           if ! docker buildx version > /dev/null 2>&1; then
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
@@ -113,21 +169,23 @@ jobs:
           echo "id=$(cat "$RUNNER_TEMP/ci-image-id")" >> "$GITHUB_OUTPUT"
       # `exec`, so that cancelling the job signals ci_container.py, which removes
       # the container, rather than this step's shell.
-      - name: Build, test, install and consume every module; build and run every demo
+      - name: Build, test, install and consume the selected modules; build and run the selected demos
+        if: needs.lint.outputs.gpu == 'true'
         env:
           IMAGE_ID: ${{ steps.image.outputs.id }}
+          SELECTION: ${{ needs.lint.outputs.selection }}
         run: >-
           exec python3 .github/scripts/ci_container.py run
           --image "$IMAGE_ID" --name "$CI_CONTAINER" --log "ci-x86_64.log"
           --docker-options "--gpus all"
-          -- python3 .github/scripts/ci.py sdk --platform x86_64
+          -- python3 .github/scripts/ci.py sdk --platform x86_64 --selection "$SELECTION"
       - name: Remove the container and stale images
-        if: always()
+        if: always() && needs.lint.outputs.gpu == 'true'
         run: python3 .github/scripts/ci_container.py sweep
       # The logs are for diagnosis only: failing to upload them must not fail a lane
       # whose build and tests passed.
       - name: Upload logs
-        if: always()
+        if: always() && needs.lint.outputs.gpu == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -152,7 +210,8 @@ jobs:
             title: Thor
           - board: orin
             title: Orin
-    runs-on: [self-hosted, linux, arm64, jetson, "${{ matrix.board }}"]
+    # With nothing to build, the job only reports, from a GitHub-hosted runner, as above.
+    runs-on: ${{ needs.lint.outputs.gpu == 'true' && fromJSON(format('["self-hosted", "linux", "arm64", "jetson", "{0}"]', matrix.board)) || 'ubuntu-24.04' }}
     # Also bounds a hung test: the container goes with the job.
     timeout-minutes: 240
     env:
@@ -160,15 +219,21 @@ jobs:
       CI_JOB_KEY: ${{ matrix.board }}
       CI_CONTAINER: holoscan-modules-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.board }}
     steps:
+      - name: Nothing to build
+        if: needs.lint.outputs.gpu != 'true'
+        run: echo "This change selects no module or demo to build; see the Lint job's selection."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: needs.lint.outputs.gpu == 'true'
         with:
           persist-credentials: false
       # The runner's job hook (.github/RUNNERS.md) does this too, before and after
       # every job; this covers a runner without it.
       - name: Remove left-over CI containers and images
+        if: needs.lint.outputs.gpu == 'true'
         run: python3 .github/scripts/ci_container.py sweep
       - name: Build the CI image
         id: image
+        if: needs.lint.outputs.gpu == 'true'
         run: |
           if ! docker buildx version > /dev/null 2>&1; then
             echo "::error::Docker Buildx is not installed on this runner. Install it (Docker's packages: docker-buildx-plugin; Ubuntu's docker.io: sudo apt-get install docker-buildx); see .github/RUNNERS.md."
@@ -192,21 +257,23 @@ jobs:
       # container. DISPLAY must stay unset: with it, VPI fails with EGL_NOT_INITIALIZED.
       # `exec`, so that cancelling the job signals ci_container.py, which removes
       # the container, rather than this step's shell.
-      - name: Build, test, install and consume every module; build and run every demo
+      - name: Build, test, install and consume the selected modules; build and run the selected demos
+        if: needs.lint.outputs.gpu == 'true'
         env:
           IMAGE_ID: ${{ steps.image.outputs.id }}
+          SELECTION: ${{ needs.lint.outputs.selection }}
         run: >-
           exec python3 .github/scripts/ci_container.py run
           --image "$IMAGE_ID" --name "$CI_CONTAINER" --log "ci-jetson-${{ matrix.board }}.log"
           --docker-options "--runtime nvidia --privileged"
-          -- python3 .github/scripts/ci.py sdk --platform jetson
+          -- python3 .github/scripts/ci.py sdk --platform jetson --selection "$SELECTION"
       - name: Remove the container and stale images
-        if: always()
+        if: always() && needs.lint.outputs.gpu == 'true'
         run: python3 .github/scripts/ci_container.py sweep
       # The logs are for diagnosis only: failing to upload them must not fail a lane
       # whose build and tests passed.
       - name: Upload logs
-        if: always()
+        if: always() && needs.lint.outputs.gpu == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -223,7 +290,7 @@ jobs:
   result:
     name: CI result
     needs: [lint, x86-gpu, jetson]
-    if: always()
+    if: always() && (github.event_name != 'schedule' || github.repository == 'snknitheesh/holoscan-zozo-modules')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

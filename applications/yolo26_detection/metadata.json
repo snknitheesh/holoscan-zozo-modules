@@ -61,6 +61,13 @@
         }
       ]
     },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "yolo26"
+        }
+      ]
+    },
     "default_mode": "demo",
     "modes": {
       "demo": {

@@ -42,6 +42,13 @@
         }
       ]
     },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "point-cloud"
+        }
+      ]
+    },
     "default_mode": "synthetic",
     "modes": {
       "synthetic": {

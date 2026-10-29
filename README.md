@@ -273,12 +273,15 @@ Each demo's README has its options and modes.
 
 ## Run CI locally
 
-[`.github/scripts/ci.py`](.github/scripts/ci.py) is what the GPU jobs run: for every module it
-builds, runs the full test suite, installs, and builds and runs the installed-package consumer;
-then it builds every demo against the installed modules and runs its `ci` mode.
+[`.github/scripts/ci.py`](.github/scripts/ci.py) is what the GPU jobs run: for every module, in
+dependency order, it builds, runs the full test suite, installs, and builds and runs the
+installed-package consumer; then it builds every demo against the installed modules and runs its
+`ci` mode. A pull request runs only what it changes and what depends on it; see
+[What a run tests](.github/RUNNERS.md#what-a-run-tests).
 
 ```bash
-python3 .github/scripts/ci.py list
+python3 .github/scripts/ci.py list                                  # modules, demos, dependencies
+python3 .github/scripts/ci.py select --changed-since origin/main    # what a pull request tests
 ```
 
 Running the whole of `ci.py sdk` in the CI container is shown in
