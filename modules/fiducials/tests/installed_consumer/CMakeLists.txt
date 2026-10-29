@@ -8,7 +8,10 @@ project(holoscan_fiducials_consumer LANGUAGES CXX)
 enable_testing()
 
 find_package(holoscan-fiducials 1.0 REQUIRED CONFIG)
-message(STATUS "Found holoscan-fiducials ${holoscan-fiducials_VERSION} in ${holoscan-fiducials_DIR}")
+message(
+  STATUS
+  "Found holoscan-fiducials ${holoscan-fiducials_VERSION} in ${holoscan-fiducials_DIR}"
+)
 
 add_executable(fiducials_consumer main.cpp)
 target_link_libraries(fiducials_consumer PRIVATE holoscan::fiducials)

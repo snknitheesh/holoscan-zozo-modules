@@ -5,6 +5,7 @@
 // from exact points with and without distortion, markers seen obliquely and from afar (the
 // planar ambiguity), noisy corners, and too few or collinear points.
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -40,7 +41,10 @@ Matrix3 rotation(double yaw, double pitch, double roll) {
 }
 
 const CameraIntrinsics kCamera{900.0, 905.0, 639.5, 359.5, {}};
-const CameraIntrinsics kDistorted{900.0, 905.0, 641.2, 357.9, {-0.28, 0.09, 0.0007, -0.0004, -0.01}};
+// A camera with strong barrel distortion.
+CameraIntrinsics distorted() {
+  return {900.0, 905.0, 641.2, 357.9, {-0.28, 0.09, 0.0007, -0.0004, -0.01}};
+}
 
 double translation_error(const Pose& a, const Pose& b) {
   return std::hypot(a.translation[0] - b.translation[0], a.translation[1] - b.translation[1],
@@ -64,8 +68,8 @@ void check_undistort() {
   double worst = 0.0;
   for (double x = -0.6; x <= 0.6; x += 0.1) {
     for (double y = -0.35; y <= 0.35; y += 0.07) {
-      const Point2 pixel = project(kDistorted, Point3{x, y, 1.0});
-      const Point2 back = undistort(kDistorted, pixel);
+      const Point2 pixel = project(distorted(), Point3{x, y, 1.0});
+      const Point2 back = undistort(distorted(), pixel);
       worst = std::max(worst, std::hypot(back[0] - x, back[1] - y));
     }
   }
@@ -81,7 +85,7 @@ void check_exact_board_poses() {
   }
   double worst_t = 0.0;
   double worst_r = 0.0;
-  for (const CameraIntrinsics& camera : {kCamera, kDistorted}) {
+  for (const CameraIntrinsics& camera : {kCamera, distorted()}) {
     for (int trial = 0; trial < 30; ++trial) {
       const Pose truth{.rotation = rotation(angle(random), angle(random), 3.0 * angle(random)),
                        .translation = {-0.14 + 0.1 * angle(random), -0.1 + 0.1 * angle(random),

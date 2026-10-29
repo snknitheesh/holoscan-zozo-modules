@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "backends.hpp"
 #include "cpu_detector.hpp"

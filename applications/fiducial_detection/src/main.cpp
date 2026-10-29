@@ -269,16 +269,15 @@ void validate(Options& opts) {
     throw std::invalid_argument("--device-input applies to synthetic frames only");
   }
   if (!(opts.marker_length > 0.0)) throw std::invalid_argument("--marker-length must be positive");
-  fd::validate_options(fd::DetectorOptions{.dictionary = opts.dictionary,
-                                           .min_marker_px = opts.min_marker_px});
+  fd::validate_options(
+      fd::DetectorOptions{.dictionary = opts.dictionary, .min_marker_px = opts.min_marker_px});
   (void)fd::CharucoBoard(opts.board);
   if (opts.intrinsics) fd::validate_intrinsics(*opts.intrinsics);
   if (!opts.camera) {
     // The scenes' own camera; also checks the size.
-    opts.intrinsics =
-        fiducial_app::make_scene(SceneKind{.dictionary = opts.dictionary}, 0, opts.width,
-                                 opts.height)
-            .intrinsics;
+    opts.intrinsics = fiducial_app::make_scene(SceneKind{.dictionary = opts.dictionary}, 0,
+                                               opts.width, opts.height)
+                          .intrinsics;
     opts.marker_length = kSceneMarkerLength;
   }
 }
@@ -307,8 +306,8 @@ void print_report(const Run& run, std::uint32_t expected_frames) {
             << " backend=" << (run.requested == fd::Backend::kAuto ? "auto:" : "") << r.backend
             << " frames=" << r.frames << '/' << expected_frames << " markers=" << r.markers;
   if (run.scene == "charuco") std::cout << " corners=" << r.corners;
-  std::cout << " detect_ms(mean/p50/p95/max)=" << mean << '/' << percentile(r.detect_ms, 0.5)
-            << '/' << percentile(r.detect_ms, 0.95) << '/' << percentile(r.detect_ms, 1.0);
+  std::cout << " detect_ms(mean/p50/p95/max)=" << mean << '/' << percentile(r.detect_ms, 0.5) << '/'
+            << percentile(r.detect_ms, 0.95) << '/' << percentile(r.detect_ms, 1.0);
   if (r.verified) {
     const double mean_px =
         r.measured_corners ? r.sum_corner_px / static_cast<double>(r.measured_corners) : 0.0;
@@ -340,8 +339,9 @@ int execute(const Options& opts, SignalDomain& signals) {
     throw std::invalid_argument("--display needs a build with visualization enabled");
   }
   if (display && !display_available && !opts.compile_only) {
-    throw std::invalid_argument("the display needs a display server; set DISPLAY or add "
-                                "--display false");
+    throw std::invalid_argument(
+        "the display needs a display server; set DISPLAY or add "
+        "--display false");
   }
   // Synthetic frames: every detector sees every frame, in order, for the ground truth. The
   // camera: every edge keeps only the newest sample, so nothing waits for a slower consumer.
@@ -354,20 +354,20 @@ int execute(const Options& opts, SignalDomain& signals) {
   std::vector<Run> runs;
   auto remaining = std::make_shared<std::atomic<int>>(0);
   // The first detector's output and the frames it saw, for the display.
-  std::optional<std::pair<ImageOutput*, DetectionsOutput*>> shown;
+  std::optional<std::pair<const ImageOutput*, const DetectionsOutput*>> shown;
 
   std::optional<holoscan::OperatorHandle<fiducial_app::CameraSourceOp>> camera;
   if (opts.camera) {
     camera.emplace(graph.op<fiducial_app::CameraSourceOp>(
-        "camera", fiducial_app::CameraSourceConfig{
-                      .device = opts.device, .width = opts.width, .height = opts.height,
-                      .count = frames}));
+        "camera",
+        fiducial_app::CameraSourceConfig{
+            .device = opts.device, .width = opts.width, .height = opts.height, .count = frames}));
   }
   for (const bool board : {false, true}) {
     if ((board && !opts.charuco) || (!board && !opts.aruco)) continue;
     const std::string scene = board ? "charuco" : "aruco";
     const SceneKind kind{.board = board, .dictionary = opts.dictionary, .board_config = opts.board};
-    ImageOutput* images = nullptr;
+    const ImageOutput* images = nullptr;
     if (camera) {
       images = &(*camera)->image;
     } else {
@@ -382,8 +382,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     }
     for (const fd::Backend backend : opts.backends) {
       const std::string name = scene + "_" + std::string(fd::backend_name(backend));
-      DetectionsOutput* detections = nullptr;
-      holoscan::Input<holoscan::schema::ImageT>* input = nullptr;
+      const DetectionsOutput* detections = nullptr;
+      const holoscan::Input<holoscan::schema::ImageT>* input = nullptr;
       if (board) {
         auto detector = graph.op<fd::CharucoDetectorOp>(
             "detector_" + name,
@@ -396,11 +396,11 @@ int execute(const Options& opts, SignalDomain& signals) {
       } else {
         auto detector = graph.op<fd::ArucoDetectorOp>(
             "detector_" + name,
-            fd::ArucoDetectorConfig{.backend = backend,
-                                    .options = {.dictionary = opts.dictionary,
-                                                .min_marker_px = opts.min_marker_px},
-                                    .intrinsics = opts.intrinsics,
-                                    .marker_length = opts.marker_length});
+            fd::ArucoDetectorConfig{
+                .backend = backend,
+                .options = {.dictionary = opts.dictionary, .min_marker_px = opts.min_marker_px},
+                .intrinsics = opts.intrinsics,
+                .marker_length = opts.marker_length});
         detections = &detector->detections;
         input = &detector->image;
       }
@@ -436,10 +436,9 @@ int execute(const Options& opts, SignalDomain& signals) {
         "overlay", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8A8Unorm,
                                        .max_width = static_cast<std::uint32_t>(opts.width),
                                        .max_height = static_cast<std::uint32_t>(opts.height)});
-    layers.add_text_layer("labels",
-                          viz::TextLayerDesc{.max_glyphs = fd::kOverlayLabelRows *
-                                                           fd::kOverlayLabelBytes,
-                                             .normalized_coordinates = true});
+    layers.add_text_layer(
+        "labels", viz::TextLayerDesc{.max_glyphs = fd::kOverlayLabelRows * fd::kOverlayLabelBytes,
+                                     .normalized_coordinates = true});
     // Draw when the overlay arrives, over the newest image, which is its own.
     const auto max_input_age = std::max(4 * period, std::chrono::milliseconds{250});
     auto visualizer = graph.op<viz::HolovizOp>(
@@ -473,8 +472,10 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (opts.device_input) {
     for (const std::string scene : {"aruco", "charuco"}) {
       if ((scene == "aruco" && !opts.aruco) || (scene == "charuco" && !opts.charuco)) continue;
-      compile_options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
-          .operator_path = scene + "_source", .output_port = "image", .device = holoscan::DeviceId{0}});
+      compile_options.deployment.bind_tensor_output_device(
+          holoscan::TensorOutputDevicePlacement{.operator_path = scene + "_source",
+                                                .output_port = "image",
+                                                .device = holoscan::DeviceId{0}});
     }
   }
   const auto plan = holoscan::compile(graph, std::move(compile_options));
@@ -536,8 +537,8 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (opts.camera) {
     // The camera has no ground truth: a run that ends, by its count or a stop, is done.
-    const bool done = !timed_out && (stopped || termination ==
-                                                    holoscan::RunTermination::kRequestedCompleted);
+    const bool done =
+        !timed_out && (stopped || termination == holoscan::RunTermination::kRequestedCompleted);
     std::cout << kAppName << ": verdict=" << (done ? "DONE" : "FAIL") << '\n';
     return done ? 0 : 1;
   }

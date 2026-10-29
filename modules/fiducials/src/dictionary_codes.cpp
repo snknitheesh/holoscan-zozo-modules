@@ -7,10 +7,10 @@
 // Each code is a marker's inner cells row by row from the top-left one, the first in the
 // most significant bit, 1 for white.
 
+#include "dictionary_codes.hpp"
+
 #include <array>
 #include <cstdint>
-
-#include "dictionary_codes.hpp"
 
 namespace holoscan::fiducials {
 namespace {

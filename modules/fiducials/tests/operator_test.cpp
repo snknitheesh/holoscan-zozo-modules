@@ -46,8 +46,14 @@ namespace {
 constexpr int kWidth = 800;
 constexpr int kHeight = 600;
 constexpr const char* kDictionary = "DICT_5X5_100";
-const CharucoBoardConfig kBoard{.squares_x = 7, .squares_y = 5, .square_length = 0.04,
-                                .marker_length = 0.03, .dictionary = "DICT_4X4_50"};
+// The board the ChArUco tests show.
+CharucoBoardConfig test_board() {
+  return {.squares_x = 7,
+          .squares_y = 5,
+          .square_length = 0.04,
+          .marker_length = 0.03,
+          .dictionary = "DICT_4X4_50"};
+}
 
 // A host tensor owning `bytes`, with `shape` and `strides` (in elements).
 std::shared_ptr<holoscan::Tensor> host_tensor(std::vector<std::uint8_t> bytes,
@@ -197,12 +203,12 @@ void check_charuco(Backend backend, bool device_input) {
   std::vector<SyntheticScene> scenes;
   std::vector<holoscan::schema::ImageT> images;
   for (std::uint32_t frame = 0; frame < 3; ++frame) {
-    scenes.push_back(make_board_scene(kBoard, frame * 12, kWidth, kHeight));
+    scenes.push_back(make_board_scene(test_board(), frame * 12, kWidth, kHeight));
     images.push_back(scene_image(scenes.back(), holoscan::schema::ImageEncoding_RGB8));
     if (device_input) images.back().data = device_tensor(*images.back().data);
   }
   auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(CharucoDetectorConfig{
-      .backend = backend, .board = kBoard, .intrinsics = scenes[0].intrinsics});
+      .backend = backend, .board = test_board(), .intrinsics = scenes[0].intrinsics});
   if (device_input) h.input_source_device("image", holoscan::DeviceId{0});
   for (const auto& image : images) h.push("image", image);
   h.capture<schema::FiducialDetectionsT>("detections");
@@ -211,17 +217,19 @@ void check_charuco(Backend backend, bool device_input) {
   if (!result.ok()) return;
   const auto messages = result.values<schema::FiducialDetectionsT>("detections");
   VERIFY(messages.size() == scenes.size());
-  const CharucoBoard board(kBoard);
+  const CharucoBoard board(test_board());
   for (std::size_t i = 0; i < messages.size() && i < scenes.size(); ++i) {
     const auto& message = messages[i];
-    VERIFY(message.backend == backend_name(backend) && message.dictionary == kBoard.dictionary);
+    VERIFY(message.backend == backend_name(backend) &&
+           message.dictionary == test_board().dictionary);
     VERIFY(message.board != nullptr);
     if (!message.board) continue;
     const schema::CharucoViewT& view = *message.board;
     VERIFY(view.squares_x == 7 && view.squares_y == 5 && !view.legacy_pattern &&
            view.first_marker_id == 0 && std::abs(view.square_length - 0.04F) < 1e-7F &&
            std::abs(view.marker_length - 0.03F) < 1e-7F);
-    VERIFY(view.corners_total == board.corner_count() && view.markers_total == board.marker_count());
+    VERIFY(view.corners_total == board.corner_count() &&
+           view.markers_total == board.marker_count());
     VERIFY(view.markers_found == board.marker_count() &&
            message.markers.size() == static_cast<std::size_t>(board.marker_count()));
     const auto truth = board_truth(scenes[i]);
@@ -257,7 +265,7 @@ void check_charuco_empty() {
   SyntheticScene scene = make_marker_scene("DICT_4X4_50", 0, kWidth, kHeight);
   scene.markers.clear();
   auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(
-      CharucoDetectorConfig{.backend = Backend::kCpu, .board = kBoard});
+      CharucoDetectorConfig{.backend = Backend::kCpu, .board = test_board()});
   h.push("image", scene_image(scene, holoscan::schema::ImageEncoding_MONO8));
   h.capture<schema::FiducialDetectionsT>("detections");
   const auto result = h.run();
@@ -356,12 +364,14 @@ void check_cross_copy_logged_once(Backend backend, bool device_input, std::size_
   }
   std::vector<schema::FiducialDetectionsT> messages;
   const std::string output = capture_output([&] {
-    messages = run_aruco(ArucoDetectorConfig{.backend = backend, .options = {.dictionary = kDictionary}},
-                         images, device_input);
+    messages =
+        run_aruco(ArucoDetectorConfig{.backend = backend, .options = {.dictionary = kDictionary}},
+                  images, device_input);
   });
   for (const auto& message : messages) check_markers(message, scene, false);
   const std::size_t logged = count_of(output, "gray image is copied");
-  VERIFY_MSG(logged == expected, "the copy was logged " + std::to_string(logged) + " times:\n" + output);
+  VERIFY_MSG(logged == expected,
+             "the copy was logged " + std::to_string(logged) + " times:\n" + output);
   if (expected == 0 || logged != 1) return;
   const std::string direction = device_input ? "copied device to host" : "copied host to device";
   const std::string size = std::to_string(kWidth * kHeight) + " bytes";
@@ -380,7 +390,7 @@ void check_auto_backend() {
   VERIFY(ArucoDetectorOp({.backend = Backend::kCpu}).resolved_backend() == Backend::kCpu);
   const Backend expected = resolve_backend(Backend::kAuto);
   {
-    CharucoDetectorOp op({.backend = Backend::kAuto, .board = kBoard});
+    CharucoDetectorOp op({.backend = Backend::kAuto, .board = test_board()});
     VERIFY(op.resolved_backend() == Backend::kAuto);
     const std::string output = capture_output([&] {
       op.start();
@@ -429,9 +439,8 @@ void check_rejects_bad_config() {
     ArucoDetectorOp op(ArucoDetectorConfig{.intrinsics = CameraIntrinsics{-1, 900, 320, 240, {}},
                                            .marker_length = 0.1});
   }));
-  VERIFY(test::throws<std::invalid_argument>([] {
-    CharucoDetectorOp op(CharucoDetectorConfig{.board = {.square_length = 0.02}});
-  }));
+  VERIFY(test::throws<std::invalid_argument>(
+      [] { CharucoDetectorOp op(CharucoDetectorConfig{.board = {.square_length = 0.02}}); }));
   VERIFY(test::throws<std::invalid_argument>(
       [] { CharucoDetectorOp op(CharucoDetectorConfig{.charuco = {.min_markers = 0}}); }));
   // The board's dictionary is used, whatever options.dictionary says.
@@ -511,29 +520,31 @@ void check_overlay() {
   const auto out = run_overlay({.width = 200, .height = 100}, std::move(sample));
   if (!out) return;
   for (const auto* metadata : {&out->overlay.sample_metadata(), &out->labels.sample_metadata()}) {
-    VERIFY(metadata->source_clock_id.valid() && metadata->capture_timestamp_ns == kCaptured.count() &&
-           metadata->frame_id == kFrameId);
+    VERIFY(metadata->source_clock_id.valid() &&
+           metadata->capture_timestamp_ns == kCaptured.count() && metadata->frame_id == kFrameId);
   }
   VERIFY(out->overlay.metadata().encoding == holoscan::schema::ImageEncoding_RGBA8);
   const auto& image = out->overlay.tensor(holoscan::schema::ImageTensorFields::data);
   VERIFY(image.shape() == (std::vector<std::int64_t>{100, 200, 4}));
-  VERIFY((pixel(image, 50, 80) == std::array<std::uint8_t, 4>{255, 255, 0, 255}));  // Outline.
-  VERIFY((pixel(image, 23, 23) == std::array<std::uint8_t, 4>{255, 0, 0, 255}));    // Corner 0.
+  VERIFY((pixel(image, 50, 80) == std::array<std::uint8_t, 4>{255, 255, 0, 255}));   // Outline.
+  VERIFY((pixel(image, 23, 23) == std::array<std::uint8_t, 4>{255, 0, 0, 255}));     // Corner 0.
   VERIFY((pixel(image, 146, 50) == std::array<std::uint8_t, 4>{255, 0, 255, 255}));  // Corner.
   VERIFY((pixel(image, 50, 50) == std::array<std::uint8_t, 4>{0, 0, 0, 0}));
-  VERIFY(out->labels.shape() ==
-         (std::vector<std::int64_t>{kOverlayLabelRows, holoscan::visualization::kTextRunHeaderBytes +
-                                                           kOverlayLabelBytes}));
+  VERIFY(
+      out->labels.shape() ==
+      (std::vector<std::int64_t>{
+          kOverlayLabelRows, holoscan::visualization::kTextRunHeaderBytes + kOverlayLabelBytes}));
   VERIFY(label_text(out->labels, 0) == "id 7");
   VERIFY(label_text(out->labels, kOverlayLabelRows - 1) == "corners 1/24");
 }
 
 // With poses and intrinsics, the axes are drawn: x to the right in red, y down in green.
 void check_overlay_pose() {
-  const auto out = run_overlay(
-      {.width = 200, .height = 100, .intrinsics = CameraIntrinsics{400, 400, 100, 50, {}},
-       .marker_length = 0.4},
-      {.data = overlay_message(true, true)});
+  const auto out = run_overlay({.width = 200,
+                                .height = 100,
+                                .intrinsics = CameraIntrinsics{400, 400, 100, 50, {}},
+                                .marker_length = 0.4},
+                               {.data = overlay_message(true, true)});
   if (!out) return;
   const auto& image = out->overlay.tensor(holoscan::schema::ImageTensorFields::data);
   // The marker's axes, 0.2 m from (100, 50): x to (140, 50), y to (100, 90).
@@ -548,7 +559,8 @@ void check_overlay_empty() {
   if (!out) return;
   const auto& bytes = out->overlay.tensor(holoscan::schema::ImageTensorFields::data).bytes();
   VERIFY(std::all_of(bytes.begin(), bytes.end(), [](std::byte b) { return b == std::byte{0}; }));
-  VERIFY(label_text(out->labels, 0).empty() && label_text(out->labels, kOverlayLabelRows - 1).empty());
+  VERIFY(label_text(out->labels, 0).empty() &&
+         label_text(out->labels, kOverlayLabelRows - 1).empty());
 }
 
 void check_overlay_unstamped() {
@@ -560,7 +572,9 @@ void check_overlay_unstamped() {
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return;
-  VERIFY(result.snapshot<holoscan::schema::ImageT>("overlay").sample_metadata().source_clock_id.valid());
+  VERIFY(result.snapshot<holoscan::schema::ImageT>("overlay")
+             .sample_metadata()
+             .source_clock_id.valid());
 }
 
 void check_overlay_too_large() {
@@ -570,7 +584,8 @@ void check_overlay_too_large() {
   h.capture_snapshot<holoscan::schema::ImageT>("overlay");
   h.capture_snapshot<holoscan::Tensor>("labels");
   VERIFY(!h.run().ok());
-  VERIFY(test::throws<std::invalid_argument>([] { FiducialOverlayOp op({.width = 0, .height = 10}); }));
+  VERIFY(test::throws<std::invalid_argument>(
+      [] { FiducialOverlayOp op({.width = 0, .height = 10}); }));
 }
 #endif
 
@@ -596,9 +611,12 @@ int main() {
     cases.push_back({"aruco " + name + " device images", [=] {
                        f::check_aruco(backend, holoscan::schema::ImageEncoding_RGBA8, false, true);
                      }});
-    cases.push_back({"aruco " + name + " image size change", [=] { f::check_size_change(backend); }});
-    cases.push_back({"charuco " + name + " host images", [=] { f::check_charuco(backend, false); }});
-    cases.push_back({"charuco " + name + " device images", [=] { f::check_charuco(backend, true); }});
+    cases.push_back(
+        {"aruco " + name + " image size change", [=] { f::check_size_change(backend); }});
+    cases.push_back(
+        {"charuco " + name + " host images", [=] { f::check_charuco(backend, false); }});
+    cases.push_back(
+        {"charuco " + name + " device images", [=] { f::check_charuco(backend, true); }});
   }
   // Host images reach cpu in place and cuda through a copy; device images the reverse.
   for (const auto& [backend, device_input, logs] :
@@ -606,10 +624,10 @@ int main() {
         std::tuple{Backend::kCpu, true, 1}, std::tuple{Backend::kCuda, true, 0}}) {
     const std::string name =
         std::string(f::backend_name(backend)) + (device_input ? " device" : " host");
-    cases.push_back({"aruco " + name + " images: copy logged " + (logs == 0 ? "never" : "once"), [=] {
-                       f::check_cross_copy_logged_once(backend, device_input,
-                                                       static_cast<std::size_t>(logs));
-                     }});
+    cases.push_back(
+        {"aruco " + name + " images: copy logged " + (logs == 0 ? "never" : "once"), [=] {
+           f::check_cross_copy_logged_once(backend, device_input, static_cast<std::size_t>(logs));
+         }});
   }
   cases.push_back({"charuco reports an empty view", f::check_charuco_empty});
   cases.push_back({"auto backend", f::check_auto_backend});

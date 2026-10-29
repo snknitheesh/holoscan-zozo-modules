@@ -57,10 +57,10 @@ struct MarkerStats {
   [[nodiscard]] double mean_corner_px() const { return corners ? sum_corner_px / corners : 0.0; }
 
   void print(const std::string& what) const {
-    std::cout << "  " << what << ": " << expected - missed << '/' << expected
-              << " found, extra " << extra << ", corner px mean " << mean_corner_px() << " max "
-              << max_corner_px << ", translation max " << 100.0 * max_translation
-              << "%, rotation max " << max_rotation_deg << " deg\n";
+    std::cout << "  " << what << ": " << expected - missed << '/' << expected << " found, extra "
+              << extra << ", corner px mean " << mean_corner_px() << " max " << max_corner_px
+              << ", translation max " << 100.0 * max_translation << "%, rotation max "
+              << max_rotation_deg << " deg\n";
   }
 };
 
@@ -84,8 +84,7 @@ inline std::vector<Marker> detect_scene(const SyntheticScene& scene) {
 
 // The cpu detector's view of `scene`'s board.
 inline CharucoObservation observe_scene(const SyntheticScene& scene, const CharucoBoard& board,
-                                        CharucoOptions charuco = {},
-                                        DetectorOptions options = {}) {
+                                        CharucoOptions charuco = {}, DetectorOptions options = {}) {
   options.dictionary = board.config().dictionary;
   CpuDetector detector(options, scene.width, scene.height);
   const auto gray = render_scene(scene, 1);
@@ -128,10 +127,11 @@ struct CornerStats {
       ++poses;
       const auto& t = scene.board->pose.translation;
       const auto& p = view.pose->translation;
-      max_translation = std::max(max_translation, std::hypot(p[0] - t[0], p[1] - t[1], p[2] - t[2]) /
-                                                      std::hypot(t[0], t[1], t[2]));
-      max_rotation_deg = std::max(max_rotation_deg,
-                                  rotation_error_deg(view.pose->rotation, scene.board->pose.rotation));
+      max_translation =
+          std::max(max_translation, std::hypot(p[0] - t[0], p[1] - t[1], p[2] - t[2]) /
+                                        std::hypot(t[0], t[1], t[2]));
+      max_rotation_deg = std::max(
+          max_rotation_deg, rotation_error_deg(view.pose->rotation, scene.board->pose.rotation));
     }
   }
   [[nodiscard]] double mean_px() const { return found ? sum_px / found : 0.0; }

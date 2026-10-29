@@ -42,8 +42,8 @@ FiducialOverlayOp::FiducialOverlayOp(FiducialOverlayConfig config) : config_(std
 
 void FiducialOverlayOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(detections, "detections").queue_depth(2U);
-  image_output(spec, overlay, "overlay", holoscan::MemoryKind::kHost, config_.width,
-               config_.height, 4);
+  image_output(spec, overlay, "overlay", holoscan::MemoryKind::kHost, config_.width, config_.height,
+               4);
   spec.output(labels, "labels")
       .produces_tensor(holoscan::TensorOutputSpec{
           .representation =
@@ -162,7 +162,8 @@ holoscan::expected<void, holoscan::Error> FiducialOverlayOp::compute(
   });
   if (!label_loan) return holoscan::make_unexpected(std::move(label_loan).error());
   // Labels first: the overlay image triggers the frame, which takes the newest labels.
-  if (auto sent = labels.emit(std::move(*label_loan), emit); !sent) return sent;
+  auto sent = labels.emit(std::move(*label_loan), emit);
+  if (!sent) return sent;
   holoscan::schema::ImageT descriptor;
   descriptor.width = width;
   descriptor.height = height;

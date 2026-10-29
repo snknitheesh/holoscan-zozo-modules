@@ -47,7 +47,7 @@ class FrameDetector {
     GrayImageView gray;
     DetectorBackend* backend;
     cudaStream_t stream;
-    std::uint64_t number;  // Frames prepared before this one since start.
+    std::uint64_t number;                         // Frames prepared before this one since start.
     std::chrono::steady_clock::time_point start;  // When conversion began.
   };
 

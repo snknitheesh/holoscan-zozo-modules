@@ -6,6 +6,7 @@
 #include <exception>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -38,8 +39,8 @@ std::optional<PixelFormat> pixel_format(holoscan::schema::ImageEncoding encoding
 
 // Says, once, that every frame's gray image crosses between host and device memory because the
 // images are not where `backend` reads them, and how not to.
-void log_cross_copy(std::string_view op, std::string_view backend, MemoryLocation images,
-                    int width, int height) {
+void log_cross_copy(std::string_view op, std::string_view backend, MemoryLocation images, int width,
+                    int height) {
   const bool to_device = images == MemoryLocation::kHost;
   const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
   HOLOSCAN_LOG_INFO(

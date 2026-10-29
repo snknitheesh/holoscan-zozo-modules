@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <holoscan/fiducials/dictionary.hpp>
 #include <holoscan/fiducials/pose.hpp>
@@ -141,7 +142,8 @@ std::array<Point3, 4> CharucoBoard::marker_corners(int index) const {
 }
 
 Point3 CharucoBoard::corner(int id) const {
-  if (id < 0 || id >= corner_count()) throw std::out_of_range("no chessboard corner " + std::to_string(id));
+  if (id < 0 || id >= corner_count())
+    throw std::out_of_range("no chessboard corner " + std::to_string(id));
   const int per_row = config_.squares_x - 1;
   return {(id % per_row + 1) * config_.square_length, (id / per_row + 1) * config_.square_length,
           0.0};

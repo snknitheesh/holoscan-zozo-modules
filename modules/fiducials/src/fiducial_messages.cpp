@@ -4,6 +4,7 @@
 #include "holoscan/fiducials/fiducial_messages.hpp"
 
 #include <array>
+#include <vector>
 
 namespace holoscan::fiducials {
 
@@ -31,10 +32,9 @@ schema::Marker to_message(const Marker& marker) {
     corners[i] = schema::Point2f(static_cast<float>(marker.corners[i][0]),
                                  static_cast<float>(marker.corners[i][1]));
   }
-  return schema::Marker(marker.id, marker.hamming,
-                        ::flatbuffers::span<const schema::Point2f, 4>(corners),
-                        marker.pose.has_value(), marker.pose ? to_message(*marker.pose)
-                                                             : schema::Pose());
+  return schema::Marker(
+      marker.id, marker.hamming, ::flatbuffers::span<const schema::Point2f, 4>(corners),
+      marker.pose.has_value(), marker.pose ? to_message(*marker.pose) : schema::Pose());
 }
 
 Marker from_message(const schema::Marker& marker) {
@@ -60,9 +60,10 @@ std::optional<CharucoObservation> board_of(const schema::FiducialDetectionsT& me
   result.markers = markers_of(message);
   result.corners.reserve(view.corners.size());
   for (const schema::CharucoCorner& corner : view.corners) {
-    result.corners.push_back({.id = corner.id(),
-                              .image = {corner.image().x(), corner.image().y()},
-                              .board = {corner.board().x(), corner.board().y(), corner.board().z()}});
+    result.corners.push_back(
+        {.id = corner.id(),
+         .image = {corner.image().x(), corner.image().y()},
+         .board = {corner.board().x(), corner.board().y(), corner.board().z()}});
   }
   if (view.has_pose && view.pose) result.pose = from_message(*view.pose);
   result.quality = CharucoQuality{.corners_found = static_cast<int>(view.corners.size()),

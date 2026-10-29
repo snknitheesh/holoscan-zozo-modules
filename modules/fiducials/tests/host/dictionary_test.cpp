@@ -112,8 +112,8 @@ void check_cells() {
   VERIFY(cells.size() == 49);
   bool border = true;
   for (int i = 0; i < 7; ++i) {
-    border = border && cells[i] == 0 && cells[42 + i] == 0 && cells[i * 7] == 0 &&
-             cells[i * 7 + 6] == 0;
+    border =
+        border && cells[i] == 0 && cells[42 + i] == 0 && cells[i * 7] == 0 && cells[i * 7 + 6] == 0;
   }
   VERIFY_MSG(border, "the border is black");
   std::uint64_t code = 0;

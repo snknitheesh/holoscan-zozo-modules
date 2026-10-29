@@ -39,7 +39,7 @@ struct Report {
   bool verified{};
   std::uint64_t expected{};  // Markers, or chessboard corners.
   std::uint64_t missed{};
-  std::uint64_t extra{};     // Markers of no scene marker, or corners of no corner in view.
+  std::uint64_t extra{};      // Markers of no scene marker, or corners of no corner in view.
   std::uint64_t misplaced{};  // Found, but off by more than the limits below.
   std::uint32_t frames_without_pose{};  // Boards whose pose was not found.
   double max_corner_px{};

@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <holoscan/fiducials/charuco.hpp>
@@ -85,8 +86,9 @@ void compare(const TestImage& image, const DetectorOptions& options,
     same = a.markers[i].id == b.markers[i].id && a.markers[i].hamming == b.markers[i].hamming;
     for (int c = 0; c < 4; ++c) {
       parity.max_corner_diff =
-          std::max(parity.max_corner_diff, std::hypot(a.markers[i].corners[c][0] - b.markers[i].corners[c][0],
-                                                      a.markers[i].corners[c][1] - b.markers[i].corners[c][1]));
+          std::max(parity.max_corner_diff,
+                   std::hypot(a.markers[i].corners[c][0] - b.markers[i].corners[c][0],
+                              a.markers[i].corners[c][1] - b.markers[i].corners[c][1]));
     }
   }
   parity.mismatched_frames += !same;
@@ -105,9 +107,9 @@ void compare(const TestImage& image, const DetectorOptions& options,
     if (on_cpu[i].has_value() != on_cuda[i].has_value()) {
       ++parity.mismatched_saddles;
     } else if (on_cpu[i]) {
-      parity.max_saddle_diff =
-          std::max(parity.max_saddle_diff, std::hypot((*on_cpu[i])[0] - (*on_cuda[i])[0],
-                                                      (*on_cpu[i])[1] - (*on_cuda[i])[1]));
+      parity.max_saddle_diff = std::max(
+          parity.max_saddle_diff,
+          std::hypot((*on_cpu[i])[0] - (*on_cuda[i])[0], (*on_cpu[i])[1] - (*on_cuda[i])[1]));
     }
   }
 }
@@ -131,7 +133,9 @@ void check_parity() {
     }
   }
   for (const CharucoBoardConfig& config :
-       {CharucoBoardConfig{}, CharucoBoardConfig{.squares_x = 9, .squares_y = 6, .square_length = 0.03,
+       {CharucoBoardConfig{}, CharucoBoardConfig{.squares_x = 9,
+                                                 .squares_y = 6,
+                                                 .square_length = 0.03,
                                                  .marker_length = 0.022,
                                                  .dictionary = "DICT_5X5_100"}}) {
     const CharucoBoard board(config);
@@ -211,7 +215,8 @@ void check_overflow() {
   for (int y = 2; y + 6 < kHeight; y += 9) {
     for (int x = 2; x + 6 < kWidth; x += 9) {
       for (int dy = 0; dy < 6; ++dy) {
-        for (int dx = 0; dx < 6; ++dx) dots[static_cast<std::size_t>(y + dy) * kWidth + x + dx] = 30;
+        for (int dx = 0; dx < 6; ++dx)
+          dots[static_cast<std::size_t>(y + dy) * kWidth + x + dx] = 30;
       }
     }
   }
@@ -242,7 +247,8 @@ double time_ms(int runs, const Body& body) {
   const auto start = std::chrono::steady_clock::now();
   for (int i = 0; i < runs; ++i) body();
   cudaDeviceSynchronize();
-  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() /
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+             .count() /
          runs;
 }
 
@@ -251,16 +257,19 @@ void report_timings() {
   VERIFY(cudaStreamCreate(&stream) == cudaSuccess);
   const TestImage markers(render_scene(make_marker_scene("DICT_4X4_50", 0, kWidth, kHeight), 1),
                           kWidth, kHeight);
-  const CharucoBoardConfig config{.squares_x = 9, .squares_y = 6, .square_length = 0.03,
-                                  .marker_length = 0.022, .dictionary = "DICT_5X5_100"};
+  const CharucoBoardConfig config{.squares_x = 9,
+                                  .squares_y = 6,
+                                  .square_length = 0.03,
+                                  .marker_length = 0.022,
+                                  .dictionary = "DICT_5X5_100"};
   const CharucoBoard board(config);
   const TestImage boards(render_scene(make_board_scene(config, 0, kWidth, kHeight), 1), kWidth,
                          kHeight);
   std::cout << std::fixed << std::setprecision(2);
   for (const Backend kind : available_backends()) {
     auto aruco = create_backend(kind, DetectorOptions{}, kWidth, kHeight);
-    auto charuco = create_backend(kind, DetectorOptions{.dictionary = config.dictionary}, kWidth,
-                                  kHeight);
+    auto charuco =
+        create_backend(kind, DetectorOptions{.dictionary = config.dictionary}, kWidth, kHeight);
     constexpr int kRuns = 20;
     const double aruco_ms =
         time_ms(kRuns, [&] { (void)aruco->detect(view_for(markers, *aruco), stream); });

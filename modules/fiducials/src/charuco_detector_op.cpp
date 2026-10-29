@@ -40,8 +40,8 @@ void validate_config(const CharucoDetectorConfig& config) {
 
 CharucoDetectorOp::CharucoDetectorOp(CharucoDetectorConfig config)
     : config_((validate_config(config), std::move(config))), board_(config_.board) {
-  detector_ = std::make_unique<FrameDetector>("CharucoDetectorOp", config_.backend,
-                                              board_options(config_));
+  detector_ =
+      std::make_unique<FrameDetector>("CharucoDetectorOp", config_.backend, board_options(config_));
 }
 
 CharucoDetectorOp::~CharucoDetectorOp() = default;

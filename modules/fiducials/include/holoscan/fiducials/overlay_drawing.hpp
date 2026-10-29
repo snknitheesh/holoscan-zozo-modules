@@ -82,8 +82,8 @@ inline void draw_line(const RgbaCanvas& canvas, Point2 a, Point2 b, const Rgba& 
 inline void draw_marker(const RgbaCanvas& canvas, const std::array<Point2, 4>& corners) {
   for (int i = 0; i < 4; ++i) draw_line(canvas, corners[i], corners[(i + 1) % 4], kYellow);
   const Point2& c = corners[0];
-  const std::array<Point2, 4> box{{{c[0] - 3, c[1] - 3}, {c[0] + 3, c[1] - 3},
-                                   {c[0] + 3, c[1] + 3}, {c[0] - 3, c[1] + 3}}};
+  const std::array<Point2, 4> box{
+      {{c[0] - 3, c[1] - 3}, {c[0] + 3, c[1] - 3}, {c[0] + 3, c[1] + 3}, {c[0] - 3, c[1] + 3}}};
   for (int i = 0; i < 4; ++i) draw_line(canvas, box[i], box[(i + 1) % 4], kRed);
 }
 

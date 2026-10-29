@@ -1,0 +1,25 @@
+holoscan-fiducials
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-fiducials uses the following open source and NVIDIA software and data.
+
+OpenCV's predefined marker dictionaries (https://github.com/opencv/opencv)
+Copyright (C) 2000-2022, Intel Corporation; 2009-2011, Willow Garage Inc.; 2009-2016,
+NVIDIA Corporation; 2010-2013, Advanced Micro Devices, Inc.; 2015-2023, OpenCV Foundation;
+2015-2016, Itseez Inc.; 2019-2023, Xperience AI; and other contributors.
+Licensed under Apache-2.0. The marker codes in src/dictionary_codes.cpp were generated from
+OpenCV 4.12's predefined dictionaries by tools/generate_dictionaries.py; OpenCV itself is
+neither linked nor distributed. The ArUco dictionaries originate in the ArUco library of the
+University of Cordoba (Rafael Munoz-Salinas, Sergio Garrido-Jurado); the AprilTag families in
+AprilTag (https://github.com/AprilRobotics/apriltag), Copyright (C) 2013-2016, The Regents of
+The University of Michigan, licensed under BSD-2-Clause.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+NVIDIA CUDA Toolkit
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's license. The CUDA runtime is linked from the installed toolkit; not
+redistributed.

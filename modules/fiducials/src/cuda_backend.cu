@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The cuda backend: every step of detection_core.hpp in a kernel, a thread per pixel or tile,
-// a warp per candidate or chessboard corner. Components are joined by a lock-free union-find whose roots
-// are each component's lowest pixel index, as on the CPU; candidates are numbered in whatever
+// a warp per candidate or chessboard corner. Components are joined by a lock-free union-find whose
+// roots are each component's lowest pixel index, as on the CPU; candidates are numbered in whatever
 // order threads reach them, and collect_markers() sorts the markers.
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -48,8 +49,8 @@ struct WarpLanes {
     return __shfl_xor_sync(0xFFFFFFFFU, value, offset);
   }
   __device__ static core::Moments exchange(const core::Moments& m, int offset) {
-    return {exchange(m.w, offset),  exchange(m.x, offset),  exchange(m.y, offset),
-            exchange(m.xx, offset), exchange(m.xy, offset), exchange(m.yy, offset),
+    return {exchange(m.w, offset),     exchange(m.x, offset),  exchange(m.y, offset),
+            exchange(m.xx, offset),    exchange(m.xy, offset), exchange(m.yy, offset),
             exchange(m.points, offset)};
   }
   __device__ static core::SaddleSums exchange(const core::SaddleSums& s, int offset) {
@@ -66,10 +67,10 @@ struct WarpLanes {
     return value;
   }
   template <typename Part>
-  __device__ unsigned long long min(const Part& part) const {
-    unsigned long long value = part(lane);
+  __device__ core::Key min(const Part& part) const {
+    core::Key value = part(lane);
     for (int offset = core::kLanes / 2; offset > 0; offset /= 2) {
-      const unsigned long long other = __shfl_xor_sync(0xFFFFFFFFU, value, offset);
+      const core::Key other = __shfl_xor_sync(0xFFFFFFFFU, value, offset);
       value = other < value ? other : value;
     }
     return value;
@@ -199,8 +200,8 @@ __global__ void stats_kernel(Params p, const std::int32_t* labels, const std::in
   if (c == nullptr) return;
   const int x = i % p.width;
   const int y = i / p.width;
-  atomicAdd(&c->sum_x, static_cast<unsigned long long>(x));
-  atomicAdd(&c->sum_y, static_cast<unsigned long long>(y));
+  atomicAdd(&c->sum_x, static_cast<core::Key>(x));
+  atomicAdd(&c->sum_y, static_cast<core::Key>(y));
   atomicMin(&c->min_x, x);
   atomicMin(&c->min_y, y);
   atomicMax(&c->max_x, x);
@@ -250,7 +251,8 @@ __global__ void examine_kernel(Image image, Params p, const Candidate* candidate
       counts->candidates < core::kMaxCandidates ? counts->candidates : core::kMaxCandidates;
   if (s >= found) return;  // The whole warp.
   const WarpLanes lanes{static_cast<int>(threadIdx.x) % core::kLanes};
-  const CandidateResult result = core::examine(lanes, candidates[s], image, p, codes, scratch[warp]);
+  const CandidateResult result =
+      core::examine(lanes, candidates[s], image, p, codes, scratch[warp]);
   if (lanes.lane == 0) results[s] = result;
 }
 
@@ -319,9 +321,9 @@ class CudaBackend final : public DetectorBackend {
     const auto pixels = static_cast<std::size_t>(p.width) * p.height;
     const auto tiles = static_cast<std::size_t>(p.tiles_x) * p.tiles_y;
     tile_range_kernel<<<blocks_for(tiles), kBlock, 0, stream>>>(image, p, tile_lo_.get(),
-                                                                 tile_hi_.get());
-    neighborhood_kernel<<<blocks_for(tiles), kBlock, 0, stream>>>(
-        p, tile_lo_.get(), tile_hi_.get(), near_lo_.get(), near_hi_.get());
+                                                                tile_hi_.get());
+    neighborhood_kernel<<<blocks_for(tiles), kBlock, 0, stream>>>(p, tile_lo_.get(), tile_hi_.get(),
+                                                                  near_lo_.get(), near_hi_.get());
     threshold_kernel<<<blocks_for(pixels), kBlock, 0, stream>>>(image, p, near_lo_.get(),
                                                                 near_hi_.get(), labels_.get());
     union_kernel<<<blocks_for(pixels), kBlock, 0, stream>>>(p, labels_.get());
@@ -350,10 +352,10 @@ class CudaBackend final : public DetectorBackend {
     const std::uint32_t total = host_counts_.get()->candidates;
     const std::uint32_t examined = total < core::kMaxCandidates ? total : core::kMaxCandidates;
     if (examined > 0) {
-      cuda_check(cudaMemcpyAsync(host_results_.get(), results_.get(),
-                                 examined * sizeof(CandidateResult), cudaMemcpyDeviceToHost,
-                                 stream),
-                 "cudaMemcpyAsync(results)");
+      cuda_check(
+          cudaMemcpyAsync(host_results_.get(), results_.get(), examined * sizeof(CandidateResult),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpyAsync(results)");
       cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
     }
     return collect_markers({host_results_.get(), examined}, total - examined);
