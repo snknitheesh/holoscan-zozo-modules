@@ -46,6 +46,32 @@ struct Resolution {
   int height;
 };
 
+__global__ void empty_kernel() {}
+
+// The time of one host round trip, as each ICP iteration makes one: a kernel,
+// a small copy back to pinned memory, and a stream synchronization.
+double round_trip_us() {
+  double* host = nullptr;
+  double* device = nullptr;
+  holoscan::icp::test::cuda_check(cudaMallocHost(reinterpret_cast<void**>(&host), 256), "pinned");
+  holoscan::icp::test::cuda_check(cudaMalloc(reinterpret_cast<void**>(&device), 256), "device");
+  constexpr int kTrips = 1000;
+  std::chrono::steady_clock::time_point start;
+  for (int trip = -100; trip < kTrips; ++trip) {
+    if (trip == 0) start = std::chrono::steady_clock::now();
+    empty_kernel<<<1, 1>>>();
+    holoscan::icp::test::cuda_check(cudaMemcpyAsync(host, device, 256, cudaMemcpyDeviceToHost),
+                                    "copy");
+    holoscan::icp::test::cuda_check(cudaStreamSynchronize(nullptr), "sync");
+  }
+  const double us =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() /
+      kTrips;
+  cudaFreeHost(host);
+  cudaFree(device);
+  return us;
+}
+
 double percentile(std::vector<double> values, double fraction) {
   std::sort(values.begin(), values.end());
   const auto index = static_cast<std::size_t>(fraction * static_cast<double>(values.size() - 1U));
@@ -67,7 +93,9 @@ int main(int argc, char** argv) try {
             << " frames per resolution, point-to-plane, voxel " << voxel * 100.0F
             << " cm, correspondences 10 cm to " << std::max(3.0F, 150.0F * voxel)
             << " cm, normals within 3 voxels\n"
-            << std::fixed;
+            << std::fixed << std::setprecision(1)
+            << "icp_benchmark: host round trip (kernel, copy, synchronize) " << round_trip_us()
+            << " us\n";
   // The demo's settings.
   IcpOptions options;
   options.max_correspondence_distance = 0.10F;
