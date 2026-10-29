@@ -1,0 +1,83 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Fiducial Detection",
+    "description": "Renders synthetic scenes of ArUco markers and of a ChArUco board, detects them with holoscan-fiducials' ArucoDetectorOp and CharucoDetectorOp on every backend, checks each marker, chessboard corner and pose against ground truth, and shows the first detector's results on a HoloViz display. Also runs on a V4L2 camera.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-fiducials demo, with synthetic ArUco and ChArUco sources checked against ground truth, a V4L2 camera source and a HoloViz overlay."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Pose Estimation",
+      "Fiducial Markers",
+      "Calibration",
+      "CUDA"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "V4L2 camera",
+          "description": "A camera offering YUYV, for the camera mode only.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "fiducials"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Detect markers and a ChArUco board in rendered scenes with every backend and with the one auto picks, check them against ground truth, and display the markers' detections when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/fiducial_detection\" --scene both --backend all,auto --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "camera": {
+        "description": "Detect a 5x7 DICT_4X4_50 ChArUco board (4 cm squares, 3 cm markers) in a live V4L2 camera on the GPU, and display it. Local only: CI does not run it.",
+        "run": {
+          "command": "\"<holohub_app_bin>/fiducial_detection\" --source camera --scene charuco --count 0 --display true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic frames of six markers and 30 of a ChArUco board through every backend and auto, every marker, chessboard corner and pose verified against ground truth; on a CI runner, auto must pick cuda.",
+        "run": {
+          "command": "\"<holohub_app_bin>/fiducial_detection\" --scene both --backend all,auto --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
