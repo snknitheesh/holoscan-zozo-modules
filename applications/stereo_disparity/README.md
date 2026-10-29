@@ -174,7 +174,8 @@ With `-DBUILD_TESTING=ON`, `ctest` runs the demo: the synthetic scene through ev
 confidence map; a recording of the synthetic scene, written by a test fixture with its true depth,
 through the reader, the recording source, configured and per-frame geometry and the camera-depth
 check; the four real clips through every backend and per-frame geometry, skipped (reported as
-skipped by CTest) when `HOLOSCAN_TEST_DATA` is not set; the exit statuses for invalid options; that
+skipped by CTest) when `HOLOSCAN_TEST_DATA` is not set, as in CI, where every test makes its own
+data; the exit statuses for invalid options; that
 the display graph compiles; and a run without managed signal handling. `tests/host/` tests the
 recording reader without the SDK.
 
