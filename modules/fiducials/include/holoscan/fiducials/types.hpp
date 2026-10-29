@@ -109,6 +109,9 @@ void validate_options(const DetectorOptions& options);
 inline constexpr std::size_t kMaxMarkersPerFrame = 256;
 
 // What a frame lost to a detector's fixed capacities; all zero unless the frame was too busy.
+// Past the candidate capacity, the cpu backend keeps the first candidates in scan order and the
+// cuda backend whichever its threads reach first, so which markers such a frame misses differs
+// between them, and on the GPU from run to run.
 struct Overflow {
   std::uint32_t candidates{};  // Dark regions past the detector's capacity, not examined.
   std::uint32_t markers{};     // Markers found past kMaxMarkersPerFrame.

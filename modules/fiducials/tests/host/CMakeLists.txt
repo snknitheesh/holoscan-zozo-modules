@@ -27,15 +27,13 @@ add_library(
   "${_module}/src/synthetic_scene.cpp"
   "${_module}/src/types.cpp"
 )
-set_source_files_properties(
-  "${_module}/src/cpu_detector.cpp"
-  PROPERTIES COMPILE_OPTIONS -ffp-contract=off
-)
 target_include_directories(
   fiducials_host_core
   PUBLIC "${_module}/include" "${_module}/src" "${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 target_compile_features(fiducials_host_core PUBLIC cxx_std_20)
+# As in the module: no FMA contraction where detection_core.hpp is compiled.
+target_compile_options(fiducials_host_core PRIVATE -ffp-contract=off)
 set_target_properties(fiducials_host_core PROPERTIES CXX_EXTENSIONS OFF)
 
 foreach(

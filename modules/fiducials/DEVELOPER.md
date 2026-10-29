@@ -47,11 +47,15 @@ chessboard corners differently:
   the CPU (`core::SerialLanes`). Each lane takes its share (edge samples, cells, dictionary markers,
   window pixels), and the shares are added in the warp butterfly's order on both. Run serially in
   one GPU thread, these steps took ten times as long as on the CPU.
-- No transcendental functions run in either backend, and the CUDA file is built with
-  `--fmad=false` and the CPU file with `-ffp-contract=off`, so both round alike.
+- No transcendental functions run in either backend, and the library is built without FMA
+  contraction (`--fmad=false` for device code, `-ffp-contract=off` for all host code), so both
+  round alike. It must be the whole library: the core's inline functions are emitted by every file
+  that uses them, and the linker keeps any one copy.
 
 `fiducials_backends` checks the result: the same markers, corners and chessboard corners, to the bit.
-A change to `detection_core.hpp` must keep it so.
+A change to `detection_core.hpp` must keep it so. The one exception is a frame with more than 4096
+candidates: the CPU examines the first in scan order, the GPU whichever its threads reach first, so
+which markers such a frame misses differs, and on the GPU from run to run.
 
 ## Conventions
 
