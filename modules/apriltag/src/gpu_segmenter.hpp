@@ -22,9 +22,21 @@
 
 namespace holoscan::apriltag {
 
+// @throws std::runtime_error naming `what`, the error, and the GPU's free
+//         memory, unless `status` is cudaSuccess. A GPU that other processes
+//         have nearly filled fails in several guises: cudaMalloc's out of
+//         memory, a kernel launch's out of memory (lazy module loading), and
+//         CUB's "invalid device ordinal"; the free memory tells them apart.
 inline void cuda_check(cudaError_t status, const char* what) {
   if (status != cudaSuccess) {
-    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+    std::string message = std::string(what) + ": " + cudaGetErrorString(status);
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+      message += " (GPU memory: " + std::to_string(free_bytes >> 20U) + " MiB free of " +
+                 std::to_string(total_bytes >> 20U) + " MiB)";
+    }
+    throw std::runtime_error(message);
   }
 }
 
