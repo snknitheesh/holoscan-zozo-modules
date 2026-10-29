@@ -20,7 +20,7 @@ set_tests_properties(icp_op PROPERTIES LABELS "icp;gpu" TIMEOUT 600)
 
 # Odometry's time per frame at three resolutions, which the run prints; it fails only if
 # frames fail to register.
-add_executable(icp_benchmark icp_benchmark.cpp)
+add_executable(icp_benchmark icp_benchmark.cu)
 target_link_libraries(icp_benchmark PRIVATE holoscan::icp)
 
 add_test(NAME icp_benchmark COMMAND icp_benchmark)
