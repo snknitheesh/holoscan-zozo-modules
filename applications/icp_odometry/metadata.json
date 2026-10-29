@@ -1,0 +1,74 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "ICP Odometry",
+    "description": "Depth odometry with holoscan-icp's IcpOp: a synthetic depth camera moves along a known path through a room, holoscan-point-cloud's DepthToPointCloudOp turns its depth images into point clouds, and IcpOp registers each cloud to the one before on the GPU and accumulates the pose. The estimated trajectory is checked against the true one, and a HoloViz window can show both and the current alignment.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-icp demo, with a synthetic moving depth camera, frame-to-frame ICP odometry checked against the true path, and a HoloViz view of the trajectories and the alignment."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Registration",
+      "Odometry",
+      "Depth"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "icp"
+        },
+        {
+          "name": "point-cloud"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Track a 640x480 synthetic depth camera around its 300-frame path in real time, checking the trajectory against the truth; shows it in a HoloViz window when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/icp_odometry\"",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 150 frames of a 320x240 synthetic depth camera around its whole closed path, point-to-plane; passes when every frame converges and the final pose is within 2% of the path length and 1.5 degrees of the truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/icp_odometry\" --width 320 --height 240 --count 150 --period-ms 2 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}

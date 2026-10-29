@@ -13,6 +13,7 @@ module source whose path is [`modules/`](modules/).
 | Module | CMake package and targets | C++ namespace | What it does |
 | --- | --- | --- | --- |
 | [holoscan-apriltag](modules/apriltag/) | `holoscan-apriltag`: `holoscan::apriltag`, `holoscan::apriltag_overlay` | `holoscan::apriltag` | AprilTag detection and 6-DoF poses on the CPU, the GPU (CUDA) or the PVA (VPI 4), and a HoloViz overlay. Demo: [AprilTag Detection](applications/apriltag_detection/) |
+| [holoscan-icp](modules/icp/) | `holoscan-icp`: `holoscan::icp` | `holoscan::icp` | Point-cloud registration with iterative closest point on the GPU, point-to-point and point-to-plane, for pairs of clouds, a stored map, or frame-to-frame depth odometry. Demo: [ICP Odometry](applications/icp_odometry/) |
 | [holoscan-point-cloud](modules/point-cloud/) | `holoscan-point-cloud`: `holoscan::point_cloud` | `holoscan::point_cloud` | Depth images to organized, optionally colored point clouds, and point clouds to z-buffered depth and color images, on the GPU. Demos: [Depth to Point Cloud](applications/depth_to_point_cloud/), [Point Cloud to Depth](applications/point_cloud_to_depth/) |
 | [holoscan-yolo26](modules/yolo26/) | `holoscan-yolo26`: `holoscan::yolo26`, `holoscan::yolo26_overlay` | `holoscan::yolo26` | End-to-end YOLO26 object detection on the GPU: CUDA letterbox, TensorRT through HoloInfer and GPU decode, and a HoloViz overlay. The AGPL-3.0 model is not included; a tool exports it. Demo: [YOLO26 Detection](applications/yolo26_detection/) |
 
