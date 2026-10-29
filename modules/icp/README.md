@@ -123,17 +123,22 @@ matching samples to samples, it tends to hold back the motion.
 ## Timings
 
 Depth odometry per frame, point-to-plane, on the synthetic room along its path: subsampling,
-normals, grids and every iteration, until the result is on the host. Voxels of 2 cm, correspondences
-from 10 cm to 3 cm, normals within 6 cm; `icp_benchmark` measures it, and prints it in every CI run.
+normals, grids and every iteration, until the result is on the host. Correspondences from 10 cm
+down to 3 cm (4.5 cm with 3 cm voxels), normals within three voxels; the mean over 150 frames.
+`icp_benchmark` measures it, and every CI run prints it (in the uploaded CTest log).
 
-| Resolution | x86, RTX 5090 | Jetson Orin | Jetson Thor |
-| --- | --- | --- | --- |
-| 320x240 | 1.7 ms | ORIN_320 | THOR_320 |
-| 640x480 | 3.8 ms | ORIN_640 | THOR_640 |
-| 1280x720 | 7.2 ms | ORIN_1280 | THOR_1280 |
+| Resolution | x86, RTX 5090, 2 cm voxels | 3 cm | Jetson Orin, 2 cm | 3 cm | Jetson Thor, 2 cm | 3 cm |
+| --- | --- | --- | --- | --- | --- | --- |
+| 320x240 | 1.7 ms | 1.3 ms | 9.1 ms | 5.8 ms | in CI | in CI |
+| 640x480 | 3.6 ms | 1.9 ms | 30.3 ms | 10.6 ms | in CI | in CI |
+| 1280x720 | 6.6 ms | 2.4 ms | 63.5 ms | 15.1 ms | in CI | in CI |
 
-The time grows with the points left after subsampling (about 57 000, 117 000 and 143 000 here) and
-with the iterations a frame needs.
+The time grows with the points left after subsampling (57 000, 117 000 and 143 000 with 2 cm
+voxels; 37 000, 57 000 and 58 000 with 3 cm) and with the iterations a frame needs (18 to 33). The
+Orin is 5 to 10 times slower than the RTX 5090; on it, 3 cm voxels make 640x480 and 1280x720 real
+time. They cost accuracy when the camera moves less than a voxel per frame, though: around the same
+path in 300 frames instead of 150, 3 cm voxels drift 2.6% at 640x480 and 7.7% at 1280x720, against
+0.45% and 1.7% for 2 cm.
 
 ## Use it in your graph
 
@@ -203,7 +208,7 @@ The tests generate all their data:
 | --- | --- | --- |
 | `icp_registration` | GPU | Known rigid transforms, small to large, recovered by both methods on three scenes (a room, objects on a floor, a corner) with noise and partial overlap; Huber and Tukey against outliers; failures reported (no overlap, too few iterations, no target, an empty source, a bad guess); bit-identical repeated runs on one instance and on another on another stream; the GPU against the CPU reference on a small cloud; odometry drift around a closed path; option validation |
 | `icp_op` | GPU | `IcpOp` through the SDK's operator test harness: pairs from host and device memory, float32 and float64 initial guesses, the aligned cloud against the transform, a stored target, odometry poses against the truth, a failed registration still reported, the capture time on every output, and unusable inputs and settings rejected |
-| `icp_benchmark` | GPU | Odometry's time per frame at 320x240, 640x480 and 1280x720, printed; fails only if frames fail to register |
+| `icp_benchmark`, `icp_benchmark_coarse` | GPU | Odometry's time per frame at 320x240, 640x480 and 1280x720 with 2 cm and 3 cm voxels, printed; fails only if frames fail to register |
 | `icp_host` | none | The rigid transform helpers and the 6x6 solve (also built on their own by the hosted CI job, from [`tests/host/`](tests/host/)) |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
