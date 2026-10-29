@@ -44,7 +44,11 @@ cudaError_t IcpOdometry::track(const float* points, std::uint32_t count, cudaStr
   // The registration maps this frame into the previous one: previous_from_current.
   const bool failed = step.result.status == IcpStatus::kTooFewCorrespondences ||
                       step.result.status == IcpStatus::kDegenerate;
-  motion_ = failed ? initial : step.result.transform;
+  if (failed) {
+    // The guess stands in for the motion, in the result as in the pose.
+    step.result.transform = initial;
+  }
+  motion_ = step.result.transform;
   pose_ = compose(pose_, motion_);
   step.pose = pose_;
   ++frames_;

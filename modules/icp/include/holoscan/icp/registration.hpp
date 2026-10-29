@@ -8,9 +8,9 @@
 // How it works, per call:
 //   1. Each cloud's non-finite points are dropped and, with a voxel size, one
 //      point of each occupied voxel is kept, picked by a hash of its index.
-//   2. The target's points are sorted into a uniform grid of cubic cells as
-//      wide as the correspondence distance, so every point within that
-//      distance of a query is in the 27 cells around it. For point-to-plane,
+//   2. The target's points are sorted into a uniform grid of cubic cells a
+//      little wider than the correspondence distance, so every point within
+//      that distance of a query is in the 27 cells around it. For point-to-plane,
 //      each target point gets a normal from the principal axes of its
 //      neighbors within the normal radius.
 //   3. Each iteration, one kernel moves every source point by the current
@@ -171,8 +171,9 @@ struct OdometryStep {
 // relative transforms accumulate into a pose relative to the first frame.
 // The initial guess for each frame is the previous frame's motion (constant
 // velocity) or the identity. A frame whose registration fails with too few
-// correspondences or degenerate equations keeps the guess as its motion; one
-// that only runs out of iterations keeps its estimate.
+// correspondences or degenerate equations keeps the guess as its motion, and
+// its result's transform is the guess; one that only runs out of iterations
+// keeps its estimate.
 class IcpOdometry {
  public:
   // @throws std::invalid_argument if `options` is not valid.

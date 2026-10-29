@@ -515,8 +515,10 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("transform kernel", status));
     }
-    if (stream == own_stream_) {
-      // The runtime knows nothing of this stream; finish before the output goes.
+    // The runtime knows nothing of the operator's own stream, and the next
+    // frame's copy into the staging buffer, which the kernel reads for host
+    // input, may go on another stream: finish before the output goes.
+    if (stream == own_stream_ || !on_gpu(source_tensor)) {
       if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
         return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
       }
