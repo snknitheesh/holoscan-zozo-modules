@@ -210,11 +210,9 @@ ReferenceResult reference_icp(const std::vector<float>& source_xyz,
   Matrix4 transform = initial;
   for (int iteration = 0; iteration < iterations; ++iteration) {
     const auto sums = associate(source, target, normals, options, transform);
-    const auto step = detail::solve_normal_equations(sums);
-    if (!step) break;
-    transform = compose(
-        transform_from({(*step)[0], (*step)[1], (*step)[2]}, {(*step)[3], (*step)[4], (*step)[5]}),
-        transform);
+    double x[6];
+    if (!detail::solve_normal_equations(sums.data(), x)) break;
+    transform = compose(transform_from({x[0], x[1], x[2]}, {x[3], x[4], x[5]}), transform);
   }
   const auto sums = associate(source, target, normals, options, transform);
   ReferenceResult result;

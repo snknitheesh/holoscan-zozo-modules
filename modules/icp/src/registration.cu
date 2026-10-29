@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -151,7 +150,7 @@ struct GridView {
   const std::uint64_t* keys{};
   const std::uint32_t* starts{};
   const std::uint32_t* order{};
-  std::uint32_t cells{};
+  const std::uint32_t* cells{};  // In device memory.
   float inv_cell{};
 };
 
@@ -160,7 +159,8 @@ struct GridView {
 template <typename Visit>
 __device__ inline void for_each_nearby(const GridView& grid, float3 p, Visit&& visit) {
   int3 c;
-  if (grid.cells == 0U || !cell_of(p, grid.inv_cell, c)) {
+  const std::uint32_t cells = *grid.cells;
+  if (cells == 0U || !cell_of(p, grid.inv_cell, c)) {
     return;
   }
   const int x_low = max(c.x - 1, -kAxisOffset);
@@ -170,8 +170,8 @@ __device__ inline void for_each_nearby(const GridView& grid, float3 p, Visit&& v
     for (int y = c.y - 1; y <= c.y + 1; ++y) {
       if (y < -kAxisOffset || y >= kAxisOffset) continue;
       const std::uint64_t high = pack_key(x_high, y, z);
-      for (std::uint32_t cell = lower_bound(grid.keys, grid.cells, pack_key(x_low, y, z));
-           cell < grid.cells && grid.keys[cell] <= high; ++cell) {
+      for (std::uint32_t cell = lower_bound(grid.keys, cells, pack_key(x_low, y, z));
+           cell < cells && grid.keys[cell] <= high; ++cell) {
         for (std::uint32_t j = grid.starts[cell]; j < grid.starts[cell + 1U]; ++j) {
           visit(grid.order[j]);
         }
@@ -190,20 +190,24 @@ __device__ inline float3 cross(float3 a, float3 b) {
 
 // ---- Kernels ----------------------------------------------------------------
 
-// Each point's voxel or cell key, kInvalidKey if it has none, and its index.
-__global__ void key_kernel(const float3* points, std::uint32_t count, float inv_cell,
-                           std::uint64_t* keys, std::uint32_t* indices) {
+// Each of `capacity` points' voxel or cell key, kInvalidKey if it has none or
+// lies beyond `count` (all are points without a count), and its index.
+__global__ void key_kernel(const float3* points, const std::uint32_t* count, std::uint32_t capacity,
+                           float inv_cell, std::uint64_t* keys, std::uint32_t* indices) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) return;
+  if (i >= capacity) return;
   int3 c;
-  keys[i] = cell_of(points[i], inv_cell, c) ? pack_key(c.x, c.y, c.z) : kInvalidKey;
+  const bool point = count == nullptr || i < *count;
+  keys[i] = point && cell_of(points[i], inv_cell, c) ? pack_key(c.x, c.y, c.z) : kInvalidKey;
   indices[i] = i;
 }
 
-// Drops the run of invalid keys, which sorts last, from the run count.
-__global__ void valid_runs_kernel(const std::uint64_t* unique_keys, std::uint32_t* runs) {
+// Drops the run of invalid keys, which sorts last, from the runs.
+__global__ void valid_runs_kernel(const std::uint64_t* unique_keys, std::uint32_t* run_counts,
+                                  std::uint32_t* runs) {
   const std::uint32_t n = *runs;
   if (n > 0U && unique_keys[n - 1U] == kInvalidKey) {
+    run_counts[n - 1U] = 0U;
     *runs = n - 1U;
   }
 }
@@ -224,10 +228,10 @@ __host__ __device__ inline std::uint32_t mix(std::uint32_t x) {
 // which ICP would align with the other cloud's lattice instead of the
 // surfaces; a pseudo-random member is spread over the voxel like the points.
 __global__ void representative_kernel(const float3* points, const std::uint32_t* order,
-                                      const std::uint32_t* starts, std::uint32_t voxels,
-                                      float3* out) {
+                                      const std::uint32_t* starts, const std::uint32_t* voxels,
+                                      std::uint32_t capacity, float3* out) {
   const std::uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= voxels) return;
+  if (v >= capacity || v >= *voxels) return;
   const std::uint32_t begin = starts[v];
   const std::uint32_t end = starts[v + 1U];
   std::uint32_t best = order[begin];
@@ -297,10 +301,11 @@ __device__ inline bool smallest_eigenvector(double a00, double a01, double a02, 
 
 // Each point's normal from its neighbors within `radius` (at least 3, itself
 // included), facing the origin; NaN where there is none.
-__global__ void normal_kernel(const float3* points, std::uint32_t count, GridView grid,
-                              float radius, float3* normals) {
+__global__ void normal_kernel(const float3* points, const std::uint32_t* count,
+                              std::uint32_t capacity, GridView grid, float radius,
+                              float3* normals) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) return;
+  if (i >= capacity || i >= *count) return;
   const float3 p = points[i];
   const float r2 = radius * radius;
   double n = 0.0;
@@ -363,14 +368,30 @@ __device__ inline float3 apply(const DeviceTransform& m, float3 p) {
                      m.r[6] * p.x + m.r[7] * p.y + m.r[8] * p.z + m.t[2]);
 }
 
+// The iterations' state, in device memory: the step kernel updates it, and
+// the host reads it once per batch of iterations.
+struct LoopState {
+  double transform[16];
+  // The previous pass's RMSE and correspondences, -1 after a distance change.
+  double previous_rmse;
+  double previous_count;
+  int level;       // The correspondence distance's index, coarse to fine.
+  int iterations;  // Updates applied.
+  int status;      // An IcpStatus, when finished.
+  int finished;
+};
+
 struct AssociateParams {
   const float3* source{};
-  std::uint32_t source_count{};
+  const std::uint32_t* source_count{};
   const float3* target{};
   const float3* normals{};  // Point-to-plane only.
-  GridView grid;
-  DeviceTransform transform{};
-  float max_distance2{};
+  GridView grids[kMaxLevels];
+  float max_distance2[kMaxLevels]{};
+  const LoopState* state{};
+  // The distance level to use; -1 for the state's. With one, the pass runs
+  // even when the iterations have finished: the final evaluation.
+  int level{-1};
   bool point_to_plane{};
   RobustKernel kernel{RobustKernel::kNone};
   float scale{};
@@ -429,17 +450,33 @@ __device__ inline void add_row(Sums& s, float3 a, float3 b, float r, float w) {
 __global__ void associate_kernel(AssociateParams params, float* partials) {
   using Reduce = cub::BlockReduce<Sums, kBlock>;
   __shared__ typename Reduce::TempStorage storage;
+  __shared__ DeviceTransform transform;
+  const LoopState& state = *params.state;
+  if (params.level < 0 && state.finished != 0) {
+    return;  // Done: the rest of the batch does nothing.
+  }
+  const int level = params.level < 0 ? state.level : params.level;
+  if (threadIdx.x == 0) {
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        transform.r[3 * row + col] = static_cast<float>(state.transform[4 * row + col]);
+      }
+      transform.t[row] = static_cast<float>(state.transform[4 * row + 3]);
+    }
+  }
+  __syncthreads();
+  const GridView& grid = params.grids[level];
   Sums s;
 #pragma unroll
   for (int k = 0; k < kSums; ++k) s.v[k] = 0.0F;
 
+  const std::uint32_t count = *params.source_count;
   const std::uint32_t stride = gridDim.x * blockDim.x;
-  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < params.source_count;
-       i += stride) {
-    const float3 p = apply(params.transform, params.source[i]);
-    float best = params.max_distance2;
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += stride) {
+    const float3 p = apply(transform, params.source[i]);
+    float best = params.max_distance2[level];
     std::uint32_t match = ~0U;
-    for_each_nearby(params.grid, p, [&](std::uint32_t j) {
+    for_each_nearby(grid, p, [&](std::uint32_t j) {
       const float3 d = sub(params.target[j], p);
       const float d2 = dot(d, d);
       if (d2 < best || (d2 == best && j < match)) {
@@ -472,12 +509,74 @@ __global__ void associate_kernel(AssociateParams params, float* partials) {
 }
 
 // Sums the blocks' partials in block order, in double: one thread per sum.
-__global__ void total_kernel(const float* partials, int blocks, double* totals) {
+// Does nothing once the iterations have finished, unless `final`.
+__global__ void total_kernel(const float* partials, int blocks, const LoopState* state, bool final,
+                             double* totals) {
   const int k = threadIdx.x;
-  if (k >= kSums) return;
+  if (k >= kSums || (!final && state->finished != 0)) return;
   double sum = 0.0;
   for (int b = 0; b < blocks; ++b) sum += partials[b * kSums + k];
   totals[k] = sum;
+}
+
+struct StepParams {
+  double min_correspondences{};
+  double relative_rmse_epsilon{};
+  double translation_epsilon{};
+  double rotation_epsilon{};
+  int max_iterations{};
+  int finest{};
+};
+
+// One iteration's decision, on one thread: give up without enough
+// correspondences; move to a finer distance, or finish, once nothing changes
+// or an update is small enough; otherwise solve the normal equations and
+// update the transform.
+__global__ void step_kernel(const double* totals, StepParams p, LoopState* state) {
+  LoopState& s = *state;
+  if (s.finished != 0) return;
+  // Converged at this distance: on to the next, or done at the finest.
+  const auto settle = [&]() {
+    if (s.level == p.finest) {
+      s.status = static_cast<int>(IcpStatus::kConverged);
+      s.finished = 1;
+      return;
+    }
+    ++s.level;
+    s.previous_rmse = -1.0;
+    s.previous_count = -1.0;
+  };
+  const double matches = totals[kCount];
+  if (matches < p.min_correspondences) {
+    s.status = static_cast<int>(IcpStatus::kTooFewCorrespondences);
+    s.finished = 1;
+    return;
+  }
+  const double rmse = sqrt(totals[kSquaredDistance] / matches);
+  // Nothing changes any more: the same correspondences at the same error.
+  if (matches == s.previous_count &&
+      fabs(rmse - s.previous_rmse) <= p.relative_rmse_epsilon * rmse) {
+    settle();
+    return;
+  }
+  s.previous_rmse = rmse;
+  s.previous_count = matches;
+  double x[6];
+  if (!detail::solve_normal_equations(totals, x)) {
+    s.status = static_cast<int>(IcpStatus::kDegenerate);
+    s.finished = 1;
+    return;
+  }
+  detail::apply_step(x, s.transform);
+  ++s.iterations;
+  if (sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) <= p.rotation_epsilon &&
+      sqrt(x[3] * x[3] + x[4] * x[4] + x[5] * x[5]) <= p.translation_epsilon) {
+    settle();
+  }
+  if (s.finished == 0 && s.iterations >= p.max_iterations) {
+    s.status = static_cast<int>(IcpStatus::kMaxIterations);
+    s.finished = 1;
+  }
 }
 
 __global__ void transform_kernel(const float* in, float* out, std::uint64_t count,
@@ -508,20 +607,24 @@ struct Grid {
   DeviceBuffer keys;    // uint64 per cell.
   DeviceBuffer starts;  // uint32 per cell, plus one.
   DeviceBuffer order;   // uint32 per point: indices by cell.
-  std::uint32_t cells{};
+  DeviceBuffer cells;   // uint32: the occupied cells.
   float cell{};
 
   [[nodiscard]] GridView view() const {
     return GridView{keys.as<std::uint64_t>(), starts.as<std::uint32_t>(), order.as<std::uint32_t>(),
-                    cells, 1.0F / cell};
+                    cells.as<std::uint32_t>(), 1.0F / cell};
   }
 };
 
-// A prepared cloud: finite points, subsampled, and normals when needed.
+// A prepared cloud: finite points, subsampled, and normals when needed. Its
+// point count stays on the GPU, so that preparing it needs no round trip to
+// the host; `capacity`, the points it came from, bounds it, and sizes every
+// launch over it, so that the sums' order depends only on the input.
 struct Cloud {
   DeviceBuffer points;   // float3.
   DeviceBuffer normals;  // float3, point-to-plane targets only.
-  std::uint32_t count{};
+  DeviceBuffer count;    // uint32.
+  std::uint32_t capacity{};
 };
 
 }  // namespace
@@ -531,18 +634,27 @@ struct IcpRegistration::Impl {
   Cloud target;
   Cloud source;
   // The correspondence distances, coarse to fine, and the target's grid for
-  // each, built when first needed.
+  // each.
   std::array<float, kMaxLevels> distances{};
   int levels{1};
   std::array<Grid, kMaxLevels> grids;
-  std::array<bool, kMaxLevels> grid_ready{};
   Grid normal_grid;  // The target's, cells normal_radius wide, when that differs.
   bool has_target{};
+  // The passes the last registration took, to size the first batch of the next.
+  int last_passes{};
 
   // Scratch.
-  DeviceBuffer keys_in, keys_out, indices_in, run_counts, cub_temp, partials, totals, runs;
-  double* host_totals{};       // Pinned, kSums.
-  std::uint32_t* host_runs{};  // Pinned, one.
+  DeviceBuffer keys_in, keys_out, indices_in, run_counts, cub_temp, partials, totals, state;
+  DeviceBuffer scratch_order, scratch_unique, scratch_starts, scratch_cells;
+
+  // What the host reads back, in pinned memory.
+  struct Mirror {
+    LoopState state;
+    double totals[kSums];
+    std::uint32_t source_count;
+    std::uint32_t target_count;
+  };
+  Mirror* mirror{};
 
   explicit Impl(IcpOptions o) : options(std::move(o)) {
     const float finest = options.min_correspondence_distance > 0.0F
@@ -557,8 +669,7 @@ struct IcpRegistration::Impl {
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
   ~Impl() {
-    if (host_totals != nullptr) cudaFreeHost(host_totals);
-    if (host_runs != nullptr) cudaFreeHost(host_runs);
+    if (mirror != nullptr) cudaFreeHost(mirror);
   }
 
   [[nodiscard]] float normal_radius() const {
@@ -567,11 +678,8 @@ struct IcpRegistration::Impl {
   }
 
   cudaError_t ensure_host() {
-    if (host_totals == nullptr) {
-      ICP_TRY(cudaMallocHost(reinterpret_cast<void**>(&host_totals), kSums * sizeof(double)));
-    }
-    if (host_runs == nullptr) {
-      ICP_TRY(cudaMallocHost(reinterpret_cast<void**>(&host_runs), sizeof(std::uint32_t)));
+    if (mirror == nullptr) {
+      ICP_TRY(cudaMallocHost(reinterpret_cast<void**>(&mirror), sizeof(Mirror)));
     }
     return cudaSuccess;
   }
@@ -586,14 +694,16 @@ struct IcpRegistration::Impl {
     return algorithm(cub_temp.data, bytes);
   }
 
-  // Sorts `count` points by their cell key into keys_out and `order`, and
-  // finds the runs of equal keys: the unique valid keys into `unique_keys`
-  // and their starts into `starts`. Returns the number of runs in `runs_out`.
-  cudaError_t sort_into_cells(const float3* points, std::uint32_t count, float cell,
-                              DeviceBuffer& order, DeviceBuffer& unique_keys, DeviceBuffer& starts,
-                              std::uint32_t& runs_out, cudaStream_t stream) {
-    runs_out = 0;
-    const std::size_t n = std::max<std::uint32_t>(count, 1U);
+  // Sorts the first `capacity` points (those before `*count`, or all without
+  // a count) by their cell key into `order`, and finds the runs of equal
+  // keys: the unique valid keys into `unique_keys`, their starts into
+  // `starts`, and their number into `cells`, all on the GPU. Nothing waits for
+  // the GPU.
+  cudaError_t sort_into_cells(const float3* points, const std::uint32_t* count,
+                              std::uint32_t capacity, float cell, DeviceBuffer& order,
+                              DeviceBuffer& unique_keys, DeviceBuffer& starts, DeviceBuffer& cells,
+                              cudaStream_t stream) {
+    const std::size_t n = std::max<std::uint32_t>(capacity, 1U);
     ICP_TRY(keys_in.reserve(n * sizeof(std::uint64_t), stream));
     ICP_TRY(keys_out.reserve(n * sizeof(std::uint64_t), stream));
     ICP_TRY(indices_in.reserve(n * sizeof(std::uint32_t), stream));
@@ -601,14 +711,16 @@ struct IcpRegistration::Impl {
     ICP_TRY(unique_keys.reserve(n * sizeof(std::uint64_t), stream));
     ICP_TRY(run_counts.reserve(n * sizeof(std::uint32_t), stream));
     ICP_TRY(starts.reserve((n + 1U) * sizeof(std::uint32_t), stream));
-    ICP_TRY(runs.reserve(sizeof(std::uint32_t), stream));
-    if (count == 0U) {
-      return cudaMemsetAsync(starts.data, 0, sizeof(std::uint32_t), stream);
+    ICP_TRY(cells.reserve(sizeof(std::uint32_t), stream));
+    ICP_TRY(cudaMemsetAsync(starts.data, 0, sizeof(std::uint32_t), stream));
+    if (capacity == 0U) {
+      return cudaMemsetAsync(cells.data, 0, sizeof(std::uint32_t), stream);
     }
-    key_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
-        points, count, 1.0F / cell, keys_in.as<std::uint64_t>(), indices_in.as<std::uint32_t>());
+    key_kernel<<<blocks_for(capacity), kBlock, 0, stream>>>(points, count, capacity, 1.0F / cell,
+                                                            keys_in.as<std::uint64_t>(),
+                                                            indices_in.as<std::uint32_t>());
     ICP_TRY(cudaGetLastError());
-    const int items = static_cast<int>(count);
+    const int items = static_cast<int>(capacity);
     ICP_TRY(cub_run(
         [&](void* temp, std::size_t& bytes) {
           return cub::DeviceRadixSort::SortPairs(
@@ -616,99 +728,74 @@ struct IcpRegistration::Impl {
               indices_in.as<std::uint32_t>(), order.as<std::uint32_t>(), items, 0, 64, stream);
         },
         stream));
+    // Counts past the last run stay 0, so the scan over all of them is exact.
+    ICP_TRY(cudaMemsetAsync(run_counts.data, 0, n * sizeof(std::uint32_t), stream));
     ICP_TRY(cub_run(
         [&](void* temp, std::size_t& bytes) {
           return cub::DeviceRunLengthEncode::Encode(
               temp, bytes, keys_out.as<std::uint64_t>(), unique_keys.as<std::uint64_t>(),
-              run_counts.as<std::uint32_t>(), runs.as<std::uint32_t>(), items, stream);
+              run_counts.as<std::uint32_t>(), cells.as<std::uint32_t>(), items, stream);
         },
         stream));
-    valid_runs_kernel<<<1, 1, 0, stream>>>(unique_keys.as<std::uint64_t>(),
-                                           runs.as<std::uint32_t>());
+    valid_runs_kernel<<<1, 1, 0, stream>>>(
+        unique_keys.as<std::uint64_t>(), run_counts.as<std::uint32_t>(), cells.as<std::uint32_t>());
     ICP_TRY(cudaGetLastError());
-    ICP_TRY(cudaMemcpyAsync(host_runs, runs.data, sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                            stream));
-    ICP_TRY(cudaStreamSynchronize(stream));
-    runs_out = *host_runs;
-    ICP_TRY(cudaMemsetAsync(starts.data, 0, sizeof(std::uint32_t), stream));
-    if (runs_out == 0U) {
-      return cudaSuccess;
-    }
-    const int run_items = static_cast<int>(runs_out);
     return cub_run(
         [&](void* temp, std::size_t& bytes) {
           return cub::DeviceScan::InclusiveSum(temp, bytes, run_counts.as<std::uint32_t>(),
-                                               starts.as<std::uint32_t>() + 1, run_items, stream);
+                                               starts.as<std::uint32_t>() + 1, items, stream);
         },
         stream);
   }
 
   // Drops non-finite points and, with a voxel size, keeps one point of each
-  // voxel.
+  // voxel. Nothing waits for the GPU.
   cudaError_t prepare(const float* points, std::uint32_t count, Cloud& cloud, cudaStream_t stream) {
-    cloud.count = 0;
+    cloud.capacity = count;
     const std::size_t n = std::max<std::uint32_t>(count, 1U);
     ICP_TRY(cloud.points.reserve(n * sizeof(float3), stream));
+    ICP_TRY(cloud.count.reserve(sizeof(std::uint32_t), stream));
     if (count == 0U) {
-      return cudaSuccess;
+      return cudaMemsetAsync(cloud.count.data, 0, sizeof(std::uint32_t), stream);
     }
     const auto* in = reinterpret_cast<const float3*>(points);
     if (options.voxel_size > 0.0F) {
-      DeviceBuffer& order = scratch_order;
-      DeviceBuffer& unique_keys = scratch_unique;
-      DeviceBuffer& starts = scratch_starts;
-      std::uint32_t voxels = 0;
-      ICP_TRY(sort_into_cells(in, count, options.voxel_size, order, unique_keys, starts, voxels,
-                              stream));
-      if (voxels > 0U) {
-        representative_kernel<<<blocks_for(voxels), kBlock, 0, stream>>>(
-            in, order.as<std::uint32_t>(), starts.as<std::uint32_t>(), voxels,
-            cloud.points.as<float3>());
-        ICP_TRY(cudaGetLastError());
-      }
-      cloud.count = voxels;
-      return cudaSuccess;
+      ICP_TRY(sort_into_cells(in, nullptr, count, options.voxel_size, scratch_order, scratch_unique,
+                              scratch_starts, scratch_cells, stream));
+      representative_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+          in, scratch_order.as<std::uint32_t>(), scratch_starts.as<std::uint32_t>(),
+          scratch_cells.as<std::uint32_t>(), count, cloud.points.as<float3>());
+      ICP_TRY(cudaGetLastError());
+      return cudaMemcpyAsync(cloud.count.data, scratch_cells.data, sizeof(std::uint32_t),
+                             cudaMemcpyDeviceToDevice, stream);
     }
-    ICP_TRY(runs.reserve(sizeof(std::uint32_t), stream));
     const int items = static_cast<int>(count);
-    ICP_TRY(cub_run(
+    return cub_run(
         [&](void* temp, std::size_t& bytes) {
           return cub::DeviceSelect::If(temp, bytes, in, cloud.points.as<float3>(),
-                                       runs.as<std::uint32_t>(), items, Finite{}, stream);
+                                       cloud.count.as<std::uint32_t>(), items, Finite{}, stream);
         },
-        stream));
-    ICP_TRY(cudaMemcpyAsync(host_runs, runs.data, sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                            stream));
-    ICP_TRY(cudaStreamSynchronize(stream));
-    cloud.count = *host_runs;
-    return cudaSuccess;
+        stream);
   }
 
   cudaError_t build_grid(const Cloud& cloud, float cell, Grid& g, cudaStream_t stream) {
     g.cell = cell;
-    return sort_into_cells(cloud.points.as<float3>(), cloud.count, cell, g.order, g.keys, g.starts,
-                           g.cells, stream);
+    return sort_into_cells(cloud.points.as<float3>(), cloud.count.as<std::uint32_t>(),
+                           cloud.capacity, cell, g.order, g.keys, g.starts, g.cells, stream);
   }
 
-  // The target's grid for distance level `level`.
-  cudaError_t grid_for(int level, cudaStream_t stream) {
-    if (!grid_ready[level]) {
-      ICP_TRY(build_grid(target, distances[level] * kCellMargin, grids[level], stream));
-      grid_ready[level] = true;
-    }
-    return cudaSuccess;
-  }
-
-  // Builds the target's first grid, and its normals for point-to-plane.
+  // Builds the target's grid for every distance and, for point-to-plane, its
+  // normals. Nothing waits for the GPU.
   cudaError_t index_target(cudaStream_t stream) {
-    grid_ready.fill(false);
-    ICP_TRY(grid_for(0, stream));
+    for (int level = 0; level < levels; ++level) {
+      ICP_TRY(build_grid(target, distances[level] * kCellMargin, grids[level], stream));
+    }
     if (options.method != IcpMethod::kPointToPlane) {
       return cudaSuccess;
     }
-    ICP_TRY(
-        target.normals.reserve(std::max<std::uint32_t>(target.count, 1U) * sizeof(float3), stream));
-    if (target.count == 0U) {
+    ICP_TRY(target.normals.reserve(std::max<std::uint32_t>(target.capacity, 1U) * sizeof(float3),
+                                   stream));
+    if (target.capacity == 0U) {
       return cudaSuccess;
     }
     const float radius = normal_radius();
@@ -717,49 +804,103 @@ struct IcpRegistration::Impl {
       ICP_TRY(build_grid(target, radius * kCellMargin, normal_grid, stream));
       neighbors = &normal_grid;
     }
-    normal_kernel<<<blocks_for(target.count), kBlock, 0, stream>>>(
-        target.points.as<float3>(), target.count, neighbors->view(), radius,
-        target.normals.as<float3>());
+    normal_kernel<<<blocks_for(target.capacity), kBlock, 0, stream>>>(
+        target.points.as<float3>(), target.count.as<std::uint32_t>(), target.capacity,
+        neighbors->view(), radius, target.normals.as<float3>());
     return cudaGetLastError();
   }
 
-  // One association pass at `transform` and distance level `level`: the
-  // sums, on the host.
-  cudaError_t associate(const Matrix4& transform, int level, std::array<double, kSums>& sums,
-                        cudaStream_t stream) {
-    sums.fill(0.0);
-    if (source.count == 0U || target.count == 0U) {
-      return cudaSuccess;
-    }
-    ICP_TRY(grid_for(level, stream));
+  // Queues one association pass and its sum into `totals`: at the state's
+  // distance (`level` -1), skipped once the iterations have finished, or at
+  // `level` regardless.
+  cudaError_t queue_pass(int level, cudaStream_t stream) {
     const int blocks =
-        static_cast<int>(std::min<std::uint32_t>(blocks_for(source.count), kMaxReduceBlocks));
-    ICP_TRY(partials.reserve(static_cast<std::size_t>(blocks) * kSums * sizeof(float), stream));
-    ICP_TRY(totals.reserve(kSums * sizeof(double), stream));
+        static_cast<int>(std::min<std::uint32_t>(blocks_for(source.capacity), kMaxReduceBlocks));
     AssociateParams params;
     params.source = source.points.as<float3>();
-    params.source_count = source.count;
+    params.source_count = source.count.as<std::uint32_t>();
     params.target = target.points.as<float3>();
     params.point_to_plane = options.method == IcpMethod::kPointToPlane;
     params.normals = params.point_to_plane ? target.normals.as<float3>() : nullptr;
-    params.grid = grids[level].view();
-    params.transform = to_device(transform);
-    params.max_distance2 = distances[level] * distances[level];
+    for (int l = 0; l < levels; ++l) {
+      params.grids[l] = grids[l].view();
+      params.max_distance2[l] = distances[l] * distances[l];
+    }
+    params.state = state.as<LoopState>();
+    params.level = level;
     params.kernel = options.robust_kernel;
     params.scale = options.robust_scale;
     associate_kernel<<<blocks, kBlock, 0, stream>>>(params, partials.as<float>());
     ICP_TRY(cudaGetLastError());
-    total_kernel<<<1, kSums, 0, stream>>>(partials.as<float>(), blocks, totals.as<double>());
-    ICP_TRY(cudaGetLastError());
-    ICP_TRY(cudaMemcpyAsync(host_totals, totals.data, kSums * sizeof(double),
-                            cudaMemcpyDeviceToHost, stream));
-    ICP_TRY(cudaStreamSynchronize(stream));
-    std::copy(host_totals, host_totals + kSums, sums.begin());
-    return cudaSuccess;
+    total_kernel<<<1, kSums, 0, stream>>>(partials.as<float>(), blocks, state.as<LoopState>(),
+                                          level >= 0, totals.as<double>());
+    return cudaGetLastError();
   }
 
-  // Scratch for voxel subsampling.
-  DeviceBuffer scratch_order, scratch_unique, scratch_starts;
+  // Runs the iterations from `initial` and the final evaluation, leaving the
+  // state, the final sums and both clouds' point counts in `mirror`. The host
+  // waits for the GPU once per batch of iterations, and once at the end.
+  cudaError_t iterate(const Matrix4& initial, cudaStream_t stream) {
+    const int blocks =
+        static_cast<int>(std::min<std::uint32_t>(blocks_for(source.capacity), kMaxReduceBlocks));
+    ICP_TRY(partials.reserve(static_cast<std::size_t>(std::max(blocks, 1)) * kSums * sizeof(float),
+                             stream));
+    ICP_TRY(totals.reserve(kSums * sizeof(double), stream));
+    ICP_TRY(state.reserve(sizeof(LoopState), stream));
+    LoopState& start = mirror->state;
+    std::copy(initial.begin(), initial.end(), start.transform);
+    start.previous_rmse = -1.0;
+    start.previous_count = -1.0;
+    start.level = 0;
+    start.iterations = 0;
+    start.status = static_cast<int>(IcpStatus::kMaxIterations);
+    start.finished = 0;
+    ICP_TRY(cudaMemcpyAsync(state.data, &start, sizeof(LoopState), cudaMemcpyHostToDevice, stream));
+
+    const StepParams step{.min_correspondences = static_cast<double>(options.min_correspondences),
+                          .relative_rmse_epsilon = options.relative_rmse_epsilon,
+                          .translation_epsilon = options.translation_epsilon,
+                          .rotation_epsilon = options.rotation_epsilon,
+                          .max_iterations = options.max_iterations,
+                          .finest = levels - 1};
+    // Each pass either updates the transform or moves to a finer distance,
+    // so this many passes always finish. The first batch is as long as the
+    // last registration took, the rest are short; passes past the end do
+    // nothing.
+    const int budget = options.max_iterations + levels;
+    int queued = 0;
+    int batch = std::clamp(last_passes + 1, 4, budget);
+    if (source.capacity != 0U) {
+      while (queued < budget) {
+        batch = std::min(batch, budget - queued);
+        for (int pass = 0; pass < batch; ++pass) {
+          ICP_TRY(queue_pass(-1, stream));
+          step_kernel<<<1, 1, 0, stream>>>(totals.as<double>(), step, state.as<LoopState>());
+          ICP_TRY(cudaGetLastError());
+        }
+        queued += batch;
+        ICP_TRY(cudaMemcpyAsync(&mirror->state, state.data, sizeof(LoopState),
+                                cudaMemcpyDeviceToHost, stream));
+        ICP_TRY(cudaStreamSynchronize(stream));
+        if (mirror->state.finished != 0) break;
+        batch = 8;
+      }
+      last_passes = mirror->state.iterations + mirror->state.level + 1;
+      // The fitness and error at the final transform, at the finest distance.
+      ICP_TRY(queue_pass(levels - 1, stream));
+      ICP_TRY(cudaMemcpyAsync(mirror->totals, totals.data, kSums * sizeof(double),
+                              cudaMemcpyDeviceToHost, stream));
+    } else {
+      std::fill(std::begin(mirror->totals), std::end(mirror->totals), 0.0);
+      mirror->state.status = static_cast<int>(IcpStatus::kTooFewCorrespondences);
+      mirror->state.finished = 1;
+    }
+    ICP_TRY(cudaMemcpyAsync(&mirror->source_count, source.count.data, sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream));
+    ICP_TRY(cudaMemcpyAsync(&mirror->target_count, target.count.data, sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream));
+    return cudaStreamSynchronize(stream);
+  }
 };
 
 namespace {
@@ -832,8 +973,18 @@ const IcpOptions& IcpRegistration::options() const noexcept { return impl_->opti
 
 bool IcpRegistration::has_target() const noexcept { return impl_->has_target; }
 
-std::uint32_t IcpRegistration::target_points() const noexcept {
-  return impl_->has_target ? impl_->target.count : 0U;
+cudaError_t IcpRegistration::target_points(cudaStream_t stream, std::uint32_t& count) {
+  Impl& impl = *impl_;
+  count = 0;
+  if (!impl.has_target) {
+    return cudaSuccess;
+  }
+  ICP_TRY(impl.ensure_host());
+  ICP_TRY(cudaMemcpyAsync(&impl.mirror->target_count, impl.target.count.data, sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost, stream));
+  ICP_TRY(cudaStreamSynchronize(stream));
+  count = impl.mirror->target_count;
+  return cudaSuccess;
 }
 
 cudaError_t IcpRegistration::set_target(const float* points, std::uint32_t count,
@@ -843,7 +994,6 @@ cudaError_t IcpRegistration::set_target(const float* points, std::uint32_t count
   if (count > kMaxCount || (count != 0U && points == nullptr)) {
     return cudaErrorInvalidValue;
   }
-  ICP_TRY(impl.ensure_host());
   ICP_TRY(impl.prepare(points, count, impl.target, stream));
   ICP_TRY(impl.index_target(stream));
   impl.has_target = true;
@@ -854,8 +1004,6 @@ cudaError_t IcpRegistration::promote_source_to_target(cudaStream_t stream) {
   Impl& impl = *impl_;
   impl.has_target = false;
   std::swap(impl.target, impl.source);
-  impl.source.count = 0;
-  ICP_TRY(impl.ensure_host());
   ICP_TRY(impl.index_target(stream));
   impl.has_target = true;
   return cudaSuccess;
@@ -864,7 +1012,6 @@ cudaError_t IcpRegistration::promote_source_to_target(cudaStream_t stream) {
 cudaError_t IcpRegistration::align(const float* points, std::uint32_t count, const Matrix4& initial,
                                    cudaStream_t stream, IcpResult& result) {
   Impl& impl = *impl_;
-  const IcpOptions& o = impl.options;
   result = IcpResult{};
   result.transform = initial;
   if (count > kMaxCount || (count != 0U && points == nullptr) || !is_rigid_shaped(initial)) {
@@ -872,74 +1019,26 @@ cudaError_t IcpRegistration::align(const float* points, std::uint32_t count, con
   }
   ICP_TRY(impl.ensure_host());
   ICP_TRY(impl.prepare(points, count, impl.source, stream));
-  result.source_points = impl.source.count;
-  result.target_points = impl.has_target ? impl.target.count : 0U;
   if (!impl.has_target) {
+    ICP_TRY(cudaMemcpyAsync(&impl.mirror->source_count, impl.source.count.data,
+                            sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+    ICP_TRY(cudaStreamSynchronize(stream));
+    result.source_points = impl.mirror->source_count;
     return cudaSuccess;
   }
-
-  Matrix4 transform = initial;
-  std::array<double, kSums> sums{};
-  double previous_rmse = -1.0;
-  double previous_count = -1.0;
-  int level = 0;
-  const int finest = impl.levels - 1;
-  IcpStatus status = IcpStatus::kMaxIterations;
-  // Converged at this distance: on to the next, or done at the finest.
-  const auto settle = [&]() {
-    if (level == finest) {
-      status = IcpStatus::kConverged;
-      return true;
-    }
-    ++level;
-    previous_rmse = -1.0;
-    previous_count = -1.0;
-    return false;
-  };
-  for (int iteration = 0; iteration < o.max_iterations;) {
-    ICP_TRY(impl.associate(transform, level, sums, stream));
-    const double matches = sums[kCount];
-    if (matches < static_cast<double>(o.min_correspondences)) {
-      status = IcpStatus::kTooFewCorrespondences;
-      break;
-    }
-    const double rmse = std::sqrt(sums[kSquaredDistance] / matches);
-    // Nothing changes any more: the same correspondences at the same error.
-    if (matches == previous_count &&
-        std::fabs(rmse - previous_rmse) <= o.relative_rmse_epsilon * rmse) {
-      if (settle()) break;
-      continue;
-    }
-    previous_rmse = rmse;
-    previous_count = matches;
-    const std::optional<std::array<double, 6>> step = detail::solve_normal_equations(sums);
-    if (!step) {
-      status = IcpStatus::kDegenerate;
-      break;
-    }
-    const std::array<double, 3> rotation{(*step)[0], (*step)[1], (*step)[2]};
-    const std::array<double, 3> translation{(*step)[3], (*step)[4], (*step)[5]};
-    transform = compose(transform_from(rotation, translation), transform);
-    result.iterations = ++iteration;
-    const double moved_rotation = std::sqrt(rotation[0] * rotation[0] + rotation[1] * rotation[1] +
-                                            rotation[2] * rotation[2]);
-    const double moved_translation =
-        std::sqrt(translation[0] * translation[0] + translation[1] * translation[1] +
-                  translation[2] * translation[2]);
-    if (moved_rotation <= o.rotation_epsilon && moved_translation <= o.translation_epsilon) {
-      if (settle()) break;
-    }
-  }
-
-  // The fitness and error at the final transform, at the finest distance.
-  ICP_TRY(impl.associate(transform, finest, sums, stream));
-  result.transform = transform;
-  result.correspondences = static_cast<std::uint32_t>(sums[kCount]);
-  result.fitness =
-      impl.source.count == 0U ? 0.0 : sums[kCount] / static_cast<double>(impl.source.count);
-  result.rmse = sums[kCount] > 0.0 ? std::sqrt(sums[kSquaredDistance] / sums[kCount]) : 0.0;
+  ICP_TRY(impl.iterate(initial, stream));
+  const Impl::Mirror& m = *impl.mirror;
+  std::copy(std::begin(m.state.transform), std::end(m.state.transform), result.transform.begin());
+  result.iterations = m.state.iterations;
+  result.source_points = m.source_count;
+  result.target_points = m.target_count;
+  const double matches = m.totals[kCount];
+  result.correspondences = static_cast<std::uint32_t>(matches);
+  result.fitness = m.source_count == 0U ? 0.0 : matches / static_cast<double>(m.source_count);
+  result.rmse = matches > 0.0 ? std::sqrt(m.totals[kSquaredDistance] / matches) : 0.0;
+  auto status = static_cast<IcpStatus>(m.state.status);
   if (status == IcpStatus::kConverged &&
-      sums[kCount] < static_cast<double>(o.min_correspondences)) {
+      matches < static_cast<double>(impl.options.min_correspondences)) {
     status = IcpStatus::kTooFewCorrespondences;
   }
   result.status = status;

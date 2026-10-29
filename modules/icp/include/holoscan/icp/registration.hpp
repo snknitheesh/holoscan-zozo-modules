@@ -120,9 +120,13 @@ struct IcpResult {
 // Clouds are `count` packed float32 x, y, z triplets in CUDA device memory;
 // non-finite points are ignored. Coordinates must be within 2^20 voxels (or
 // grid cells) of the origin; points beyond are ignored. Calls are ordered on
-// `stream` and return when their result is on the host. One instance is not
-// thread-safe; its device memory grows to the largest clouds it has seen and
-// is freed when it is destroyed.
+// `stream`. set_target() and promote_source_to_target() only queue work;
+// align() returns when its result is on the host, having waited for the GPU
+// once per batch of iterations and once at the end: the iterations' solve
+// and convergence test run on the GPU, so they need no round trip each. One
+// instance is not thread-safe; its device memory grows to the largest clouds
+// it has seen and is freed when it is destroyed, and its buffers may be
+// reused only once its last call's work is done.
 class IcpRegistration {
  public:
   // @throws std::invalid_argument if `options` is not valid.
@@ -136,14 +140,16 @@ class IcpRegistration {
   [[nodiscard]] const IcpOptions& options() const noexcept;
 
   // Replaces the target: subsamples it, builds its grid and, for
-  // point-to-plane, estimates its normals.
+  // point-to-plane, estimates its normals. It only queues the work: keep
+  // `points` unchanged until `stream` has done it (align() waits for it).
   [[nodiscard]] cudaError_t set_target(const float* points, std::uint32_t count,
                                        cudaStream_t stream);
   // Makes the source of the last align() the target, without preparing it
   // again: the step from one frame to the next of odometry.
   [[nodiscard]] cudaError_t promote_source_to_target(cudaStream_t stream);
   [[nodiscard]] bool has_target() const noexcept;
-  [[nodiscard]] std::uint32_t target_points() const noexcept;
+  // The target's points after preparation, into `count`; waits for `stream`.
+  [[nodiscard]] cudaError_t target_points(cudaStream_t stream, std::uint32_t& count);
 
   // Aligns the source to the target from `initial`, which maps source points
   // into the target's frame. Without a target, the result is unconverged

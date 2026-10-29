@@ -28,7 +28,10 @@ cudaError_t IcpOdometry::track(const float* points, std::uint32_t count, cudaStr
         status != cudaSuccess) {
       return status;
     }
-    step.result.target_points = registration_.target_points();
+    if (const cudaError_t status = registration_.target_points(stream, step.result.target_points);
+        status != cudaSuccess) {
+      return status;
+    }
     step.result.source_points = step.result.target_points;
     step.pose = pose_;
     step.first = true;

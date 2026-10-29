@@ -6,11 +6,11 @@
 // equations, which must give the exact step for a linear problem and refuse
 // one with no solution.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
-#include <optional>
 #include <string>
 
 #include <holoscan/icp/rigid_transform.hpp>
@@ -95,22 +95,36 @@ void solve() {
       sums[detail::kJtr + row] += j[row] * r;
     }
   }
-  const std::optional<std::array<double, 6>> step = detail::solve_normal_equations(sums);
-  check(step.has_value(), "a well-posed system is solved");
-  if (step) {
-    for (int k = 0; k < 6; ++k) {
-      check(std::fabs((*step)[k] - truth[k]) < 1e-7, "component " + std::to_string(k));
-    }
+  double step[6];
+  check(detail::solve_normal_equations(sums.data(), step), "a well-posed system is solved");
+  for (int k = 0; k < 6; ++k) {
+    check(std::fabs(step[k] - truth[k]) < 1e-7, "component " + std::to_string(k));
   }
   check(detail::upper_index(0, 0) == 0 && detail::upper_index(0, 5) == 5 &&
             detail::upper_index(1, 1) == 6 && detail::upper_index(5, 5) == 20,
         "the upper triangle is indexed row by row");
   // No equations at all, and non-finite sums, have no solution.
-  check(!detail::solve_normal_equations(std::array<double, detail::kSums>{}).has_value(),
-        "an empty system is refused");
+  const std::array<double, detail::kSums> empty{};
+  check(!detail::solve_normal_equations(empty.data(), step), "an empty system is refused");
   std::array<double, detail::kSums> nan_sums = sums;
   nan_sums[detail::kJtr] = std::nan("");
-  check(!detail::solve_normal_equations(nan_sums).has_value(), "a non-finite system is refused");
+  check(!detail::solve_normal_equations(nan_sums.data(), step), "a non-finite system is refused");
+}
+
+// The GPU's update of the transform is the public helpers' exp(step) * T.
+void update() {
+  const Matrix4 start = transform_from({0.2, -0.1, 0.3}, {0.5, -1.0, 2.0});
+  for (const double scale : {1e-10, 1e-3, 0.4}) {
+    const double step[6] = {scale, -2.0 * scale, 0.5 * scale, 0.1, -0.2, 0.3};
+    double m[16];
+    std::copy(start.begin(), start.end(), m);
+    detail::apply_step(step, m);
+    const Matrix4 expected =
+        compose(transform_from({step[0], step[1], step[2]}, {step[3], step[4], step[5]}), start);
+    Matrix4 got{};
+    std::copy(m, m + 16, got.begin());
+    check(near(got, expected, 1e-12), "apply_step at scale " + std::to_string(scale));
+  }
 }
 
 }  // namespace
@@ -118,6 +132,7 @@ void solve() {
 int main() {
   transforms();
   solve();
+  update();
   std::cout << (failures == 0 ? "icp_host_test: all passed" : "icp_host_test: FAILED") << '\n';
   return failures == 0 ? 0 : 1;
 }
