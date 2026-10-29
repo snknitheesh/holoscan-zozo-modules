@@ -120,6 +120,7 @@ void run(int width, int height, int iterations) {
   ground.max_iterations = 256;
   pf::OutlierFilter outliers;
   pf::OutlierParams statistical{.k = 8, .std_multiplier = 2.0F, .search_radius = 0.1F};
+  pf::OutlierParams near{.k = 8, .std_multiplier = 2.0F, .search_radius = 0.04F};
   pf::OutlierParams radius{.mode = pf::OutlierMode::kRadius, .radius = 0.05F, .min_neighbors = 3};
 
   struct Case {
@@ -161,6 +162,11 @@ void run(int width, int height, int iterations) {
       {"OutlierRemovalOp (statistical, k 8, 10 cm)",
        [&] {
          check(outliers.filter(xyz, n, statistical, keep, stream), "statistical");
+         organized();
+       }},
+      {"OutlierRemovalOp (statistical, k 8, 4 cm)",
+       [&] {
+         check(outliers.filter(xyz, n, near, keep, stream), "statistical");
          organized();
        }},
       {"OutlierRemovalOp (radius, 5 cm, 3)",
