@@ -1,0 +1,73 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "PCL Filters",
+    "description": "Filters point clouds on the GPU with holoscan-pcl-filters: a synthetic depth camera over a known scene is deprojected by holoscan-point-cloud's DepthToPointCloudOp, cropped, cleared of outliers and of the ground (RANSAC) and voxel-downsampled, every frame checked against the scene's truth, and the voxels shown in HoloViz.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-pcl-filters demo, with a synthetic scene, a ground-truth reporter and a HoloViz view."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Depth",
+      "3D"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "point-cloud"
+        },
+        {
+          "name": "pcl-filters"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Filter 300 frames of the synthetic scene, check each against its truth, and show the voxels above the ground when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/pcl_filters\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic 640x480 frames through the crop box, radius outlier removal, RANSAC ground removal and a 2 cm voxel grid; the plane, the ground, objects and outliers left, and the voxel count checked against the truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/pcl_filters\" --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
