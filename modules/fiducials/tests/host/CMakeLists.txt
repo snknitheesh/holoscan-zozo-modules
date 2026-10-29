@@ -38,12 +38,13 @@ target_include_directories(
 target_compile_features(fiducials_host_core PUBLIC cxx_std_20)
 set_target_properties(fiducials_host_core PROPERTIES CXX_EXTENSIONS OFF)
 
-foreach(_test IN ITEMS dictionary marker_detection charuco pose overlay_drawing backend_resolution)
+foreach(
+  _test
+  IN
+  ITEMS dictionary marker_detection charuco pose overlay_drawing backend_resolution
+)
   add_executable(fiducials_${_test}_test ${_test}_test.cpp)
   target_link_libraries(fiducials_${_test}_test PRIVATE fiducials_host_core)
   add_test(NAME fiducials_${_test} COMMAND fiducials_${_test}_test)
-  set_tests_properties(
-    fiducials_${_test}
-    PROPERTIES LABELS "fiducials;host" TIMEOUT 600
-  )
+  set_tests_properties(fiducials_${_test} PROPERTIES LABELS "fiducials;host" TIMEOUT 600)
 endforeach()

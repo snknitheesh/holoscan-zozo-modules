@@ -32,13 +32,13 @@ std::vector<std::array<int, 2>> marker_squares(const CharucoBoard& board) {
 
 // As OpenCV 4.12's CharucoBoard lays them out.
 void check_geometry() {
-  CharucoBoardConfig config{.squares_x = 5, .squares_y = 4, .square_length = 0.04,
-                            .marker_length = 0.03};
+  CharucoBoardConfig config{
+      .squares_x = 5, .squares_y = 4, .square_length = 0.04, .marker_length = 0.03};
   const CharucoBoard board(config);
   VERIFY(board.marker_count() == 10 && board.corner_count() == 12);
-  VERIFY((marker_squares(board) == std::vector<std::array<int, 2>>{
-                                       {1, 0}, {3, 0}, {0, 1}, {2, 1}, {4, 1},
-                                       {1, 2}, {3, 2}, {0, 3}, {2, 3}, {4, 3}}));
+  VERIFY((marker_squares(board) ==
+          std::vector<std::array<int, 2>>{
+              {1, 0}, {3, 0}, {0, 1}, {2, 1}, {4, 1}, {1, 2}, {3, 2}, {0, 3}, {2, 3}, {4, 3}}));
   const auto m0 = board.marker_corners(0);
   VERIFY(std::abs(m0[0][0] - 0.045) < 1e-12 && std::abs(m0[0][1] - 0.005) < 1e-12);
   VERIFY(std::abs(m0[2][0] - 0.075) < 1e-12 && std::abs(m0[2][1] - 0.035) < 1e-12);
@@ -48,9 +48,9 @@ void check_geometry() {
   const auto pair = board.corner_markers(0);
   VERIFY(pair.size() == 2 && pair[0] == 0 && pair[1] == 2);
   config.legacy_pattern = true;
-  VERIFY((marker_squares(CharucoBoard(config)) == std::vector<std::array<int, 2>>{
-                                                      {0, 0}, {2, 0}, {4, 0}, {1, 1}, {3, 1},
-                                                      {0, 2}, {2, 2}, {4, 2}, {1, 3}, {3, 3}}));
+  VERIFY((marker_squares(CharucoBoard(config)) ==
+          std::vector<std::array<int, 2>>{
+              {0, 0}, {2, 0}, {4, 0}, {1, 1}, {3, 1}, {0, 2}, {2, 2}, {4, 2}, {1, 3}, {3, 3}}));
   // With an odd number of rows the legacy layout is the same as today's.
   config.squares_y = 3;
   const auto legacy_odd = marker_squares(CharucoBoard(config));
@@ -86,14 +86,26 @@ void check_board(const CharucoBoardConfig& config, const std::string& what, doub
 
 void check_boards() {
   check_board({}, "5x7 DICT_4X4_50", 0.06);
-  check_board({.squares_x = 8, .squares_y = 6, .square_length = 0.03, .marker_length = 0.022,
+  check_board({.squares_x = 8,
+               .squares_y = 6,
+               .square_length = 0.03,
+               .marker_length = 0.022,
                .dictionary = "DICT_5X5_100"},
               "8x6 DICT_5X5_100", 0.06);
-  check_board({.squares_x = 7, .squares_y = 5, .square_length = 0.04, .marker_length = 0.03,
-               .dictionary = "DICT_6X6_250", .legacy_pattern = false, .first_marker_id = 30},
+  check_board({.squares_x = 7,
+               .squares_y = 5,
+               .square_length = 0.04,
+               .marker_length = 0.03,
+               .dictionary = "DICT_6X6_250",
+               .legacy_pattern = false,
+               .first_marker_id = 30},
               "7x5 DICT_6X6_250 from id 30", 0.06);
-  check_board({.squares_x = 6, .squares_y = 8, .square_length = 0.035, .marker_length = 0.026,
-               .dictionary = "DICT_4X4_100", .legacy_pattern = true},
+  check_board({.squares_x = 6,
+               .squares_y = 8,
+               .square_length = 0.035,
+               .marker_length = 0.026,
+               .dictionary = "DICT_4X4_100",
+               .legacy_pattern = true},
               "6x8 DICT_4X4_100 legacy", 0.06);
 }
 
@@ -105,8 +117,11 @@ void check_other_boards() {
   VERIFY(view.corners.empty() && view.markers.empty() && !view.pose);
   VERIFY(view.quality.coverage == 0.0);
 
-  CharucoBoardConfig legacy{.squares_x = 6, .squares_y = 8, .square_length = 0.035,
-                            .marker_length = 0.026, .legacy_pattern = true};
+  CharucoBoardConfig legacy{.squares_x = 6,
+                            .squares_y = 8,
+                            .square_length = 0.035,
+                            .marker_length = 0.026,
+                            .legacy_pattern = true};
   const SyntheticScene legacy_scene = make_board_scene(legacy, 3, kWidth, kHeight);
   legacy.legacy_pattern = false;
   CornerStats stats;
@@ -161,8 +176,8 @@ void check_occlusion() {
 
 // A board running off the image: the corners inside it are found, none wrong.
 void check_cut_board() {
-  const CharucoBoardConfig config{.squares_x = 8, .squares_y = 6, .square_length = 0.04,
-                                  .marker_length = 0.03};
+  const CharucoBoardConfig config{
+      .squares_x = 8, .squares_y = 6, .square_length = 0.04, .marker_length = 0.03};
   const CharucoBoard board(config);
   SyntheticScene scene = make_board_scene(config, 2, kWidth, kHeight);
   scene.board->pose.translation[0] += 0.5 * scene.board->pose.translation[2];  // To the right.

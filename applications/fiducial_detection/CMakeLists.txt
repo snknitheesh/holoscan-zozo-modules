@@ -33,8 +33,7 @@ add_executable(fiducial_detection src/main.cpp)
 target_link_libraries(fiducial_detection PRIVATE fiducial_detection_ops)
 target_compile_definitions(
   fiducial_detection
-  PRIVATE
-    FIDUCIAL_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${FIDUCIAL_DETECTION_ENABLE_VISUALIZATION}>
+  PRIVATE FIDUCIAL_DETECTION_ENABLE_VISUALIZATION=$<BOOL:${FIDUCIAL_DETECTION_ENABLE_VISUALIZATION}>
 )
 if(FIDUCIAL_DETECTION_ENABLE_VISUALIZATION)
   target_link_libraries(

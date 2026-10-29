@@ -46,8 +46,8 @@ struct SyntheticScene {
   std::vector<SceneMarker> markers;
   std::optional<SceneBoard> board;
   std::vector<Occluder> occluders;
-  double blur_sigma{};   // Gaussian blur, pixels.
-  double noise_sigma{};  // Gaussian noise, gray levels.
+  double blur_sigma{};    // Gaussian blur, pixels.
+  double noise_sigma{};   // Gaussian noise, gray levels.
   std::uint32_t seed{1};  // For the noise.
   bool mirrored{};        // Flipped left to right after rendering; the truth is not.
 };

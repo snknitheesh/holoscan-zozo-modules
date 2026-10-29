@@ -8,6 +8,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace holoscan::fiducials {
 namespace {
@@ -60,8 +61,8 @@ void unite(std::vector<std::int32_t>& labels, std::int32_t a, std::int32_t b) {
 core::Params make_params(const DetectorOptions& options, int width, int height) {
   validate_options(options);
   if (width < 16 || height < 16 || width > core::kMaxImageSide || height > core::kMaxImageSide) {
-    throw std::invalid_argument("image sides must be 16 to " +
-                                std::to_string(core::kMaxImageSide) + " pixels");
+    throw std::invalid_argument("image sides must be 16 to " + std::to_string(core::kMaxImageSide) +
+                                " pixels");
   }
   const Dictionary dictionary(options.dictionary);
   core::Params p{};
@@ -151,7 +152,8 @@ CpuDetector::CpuDetector(const DetectorOptions& options, int width, int height)
 void CpuDetector::check(const GrayImageView& image) const {
   if (image.location != MemoryLocation::kHost || image.width != params_.width ||
       image.height != params_.height || image.data == nullptr) {
-    throw std::invalid_argument("cpu backend: the image is not of the configured size and location");
+    throw std::invalid_argument(
+        "cpu backend: the image is not of the configured size and location");
   }
 }
 

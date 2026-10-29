@@ -29,17 +29,17 @@ constexpr int kWidth = 1280;
 constexpr int kHeight = 720;
 
 void check_dictionaries() {
-  for (const char* name :
-       {"DICT_4X4_50", "DICT_5X5_100", "DICT_6X6_250", "DICT_7X7_1000", "DICT_ARUCO_ORIGINAL",
-        "DICT_ARUCO_MIP_36h12", "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9", "DICT_APRILTAG_36h10",
-        "DICT_APRILTAG_36h11"}) {
+  for (const char* name : {"DICT_4X4_50", "DICT_5X5_100", "DICT_6X6_250", "DICT_7X7_1000",
+                           "DICT_ARUCO_ORIGINAL", "DICT_ARUCO_MIP_36h12", "DICT_APRILTAG_16h5",
+                           "DICT_APRILTAG_25h9", "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11"}) {
     MarkerStats stats;
     for (std::uint32_t frame = 0; frame < 6; ++frame) {
       const SyntheticScene scene = make_marker_scene(name, frame * 7, kWidth, kHeight);
       stats.add(scene, test::detect_scene(scene));
     }
     stats.print(name);
-    VERIFY_MSG(stats.missed == 0 && stats.extra == 0, std::string(name) + ": every marker, no other");
+    VERIFY_MSG(stats.missed == 0 && stats.extra == 0,
+               std::string(name) + ": every marker, no other");
     VERIFY_MSG(stats.mean_corner_px() < 0.06 && stats.max_corner_px < 0.3,
                std::string(name) + ": sub-pixel corners");
     VERIFY_MSG(stats.max_translation < 0.005 && stats.max_rotation_deg < 1.0,
@@ -79,9 +79,9 @@ Occluder cover(const SyntheticScene& scene, const SceneMarker& marker, bool corn
                     150};
   }
   // A band across the middle, clear of the border.
-  return Occluder{{mix(c[0], c[3], 0.35), mix(c[1], c[2], 0.35), mix(c[1], c[2], 0.6),
-                   mix(c[0], c[3], 0.6)},
-                  128};
+  return Occluder{
+      {mix(c[0], c[3], 0.35), mix(c[1], c[2], 0.35), mix(c[1], c[2], 0.6), mix(c[0], c[3], 0.6)},
+      128};
 }
 
 // A partly covered marker is missed or found with its own id, never taken for another; the
@@ -201,10 +201,10 @@ void check_border() {
   SyntheticScene scene = make_marker_scene("DICT_5X5_100", 0, kWidth, kHeight);
   scene.markers.clear();
   const double half = 0.5 * scene.intrinsics.fx * 0.1;  // Pixels from a marker's center to a side.
-  scene.markers.push_back(frontal(scene, 3, 3.0 + half, 300));                 // 3 px from left.
+  scene.markers.push_back(frontal(scene, 3, 3.0 + half, 300));                // 3 px from left.
   scene.markers.push_back(frontal(scene, 4, 640, kHeight - 1 - 3.0 - half));  // 3 px from bottom.
-  scene.markers.push_back(frontal(scene, 5, kWidth - 1, 300));                 // Cut in half.
-  scene.markers.push_back(frontal(scene, 6, 400, -0.3 * half));                // Mostly cut.
+  scene.markers.push_back(frontal(scene, 5, kWidth - 1, 300));                // Cut in half.
+  scene.markers.push_back(frontal(scene, 6, 400, -0.3 * half));               // Mostly cut.
   const std::vector<Marker> found = test::detect_scene(scene);
   std::set<int> ids;
   for (const Marker& m : found) ids.insert(m.id);

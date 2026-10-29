@@ -57,8 +57,8 @@ fiducial_app_test(fiducial_app_failed_run 1 "missed=18 .*verdict=FAIL"
 add_test(
   NAME fiducial_app_stopped
   COMMAND
-    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=frames=[0-9]+/1000 .*verdict=STOPPED"
-    -P "${_run_and_match}" -- sh -c
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=frames=[0-9]+/1000 .*verdict=STOPPED" -P
+    "${_run_and_match}" -- sh -c
     "\"$1\" --scene aruco --count 1000 --period-ms 10 --display false & sleep 3 && kill -TERM $! && wait $!"
     sh $<TARGET_FILE:fiducial_detection>
 )

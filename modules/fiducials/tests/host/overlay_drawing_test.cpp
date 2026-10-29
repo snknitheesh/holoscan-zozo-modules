@@ -42,8 +42,8 @@ void check_marker_and_corner() {
   Canvas c;
   draw_marker(c.canvas(), {{{40, 20}, {80, 20}, {80, 60}, {40, 60}}});
   VERIFY(c.at(60, 60) == kYellow && c.at(80, 40) == kYellow);
-  VERIFY(c.at(43, 23) == kRed);       // The first corner's mark.
-  VERIFY(c.at(60, 40) == kClear);     // Inside stays clear.
+  VERIFY(c.at(43, 23) == kRed);    // The first corner's mark.
+  VERIFY(c.at(60, 40) == kClear);  // Inside stays clear.
   draw_corner(c.canvas(), {150, 50});
   VERIFY(c.at(146, 50) == kMagenta && c.at(150, 46) == kMagenta && c.at(147, 47) == kClear);
 }

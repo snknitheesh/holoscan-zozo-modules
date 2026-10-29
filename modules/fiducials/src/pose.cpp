@@ -218,8 +218,8 @@ std::optional<Pose> initial_pose(std::span<const Point2> target_xy,
   // Undo the normalizations: H = Tb^-1 Hn Ta.
   const Matrix3 ta{a[0], 0, -a[0] * a[1], 0, a[0], -a[0] * a[2], 0, 0, 1};
   const Matrix3 tb_inv{1 / b[0], 0, b[1], 0, 1 / b[0], b[2], 0, 0, 1};
-  const Matrix3 h =
-      multiply(tb_inv, multiply({hn[0], hn[1], hn[2], hn[3], hn[4], hn[5], hn[6], hn[7], hn[8]}, ta));
+  const Matrix3 h = multiply(
+      tb_inv, multiply({hn[0], hn[1], hn[2], hn[3], hn[4], hn[5], hn[6], hn[7], hn[8]}, ta));
   const Vector3 h1{h[0], h[3], h[6]};
   const Vector3 h2{h[1], h[4], h[7]};
   const Vector3 h3{h[2], h[5], h[8]};

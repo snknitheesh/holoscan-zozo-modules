@@ -27,7 +27,7 @@ namespace fiducial_app {
 
 // What the synthetic frames show.
 struct SceneKind {
-  bool board{};                        // A ChArUco board, or loose markers.
+  bool board{};                           // A ChArUco board, or loose markers.
   std::string dictionary{"DICT_4X4_50"};  // The markers' (unused for a board).
   holoscan::fiducials::CharucoBoardConfig board_config;
 };

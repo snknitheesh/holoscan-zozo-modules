@@ -132,10 +132,7 @@ if(HOLOSCAN_FIDUCIALS_BUILD_OVERLAY)
   add_library(holoscan_fiducials_overlay src/fiducial_overlay_op.cpp src/image_output.cpp)
   add_library(holoscan::fiducials_overlay ALIAS holoscan_fiducials_overlay)
   target_compile_features(holoscan_fiducials_overlay PUBLIC cxx_std_20)
-  target_include_directories(
-    holoscan_fiducials_overlay
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
-  )
+  target_include_directories(holoscan_fiducials_overlay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(
     holoscan_fiducials_overlay
     PUBLIC holoscan_fiducials

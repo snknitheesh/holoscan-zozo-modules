@@ -137,9 +137,9 @@ class TallyOp final : public holoscan::Operator<> {
     if (!message) return holoscan::make_unexpected(std::move(message).error());
     tally_->what += tally_->frames == 0 ? message->backend : "";
     ++tally_->frames;
-    const bool complete = message->board ? message->board->corners.size() == 24U &&
-                                               message->board->has_pose
-                                         : message->markers.size() == 6U;
+    const bool complete = message->board
+                              ? message->board->corners.size() == 24U && message->board->has_pose
+                              : message->markers.size() == 6U;
     tally_->complete += complete ? 1U : 0U;
     if (tally_->frames == kFrames && remaining_->fetch_sub(1) == 1) context.request_completion();
     return {};
@@ -167,12 +167,13 @@ int main() {
   for (const fd::Backend backend : backends) {
     const std::string name(fd::backend_name(backend));
     auto aruco = graph.op<fd::ArucoDetectorOp>(
-        "aruco_" + name, fd::ArucoDetectorConfig{.backend = backend,
-                                                 .intrinsics = scene.intrinsics,
-                                                 .marker_length = 0.1});
+        "aruco_" + name,
+        fd::ArucoDetectorConfig{
+            .backend = backend, .intrinsics = scene.intrinsics, .marker_length = 0.1});
     auto charuco = graph.op<fd::CharucoDetectorOp>(
-        "charuco_" + name, fd::CharucoDetectorConfig{
-                               .backend = backend, .board = kBoard, .intrinsics = scene.intrinsics});
+        "charuco_" + name,
+        fd::CharucoDetectorConfig{
+            .backend = backend, .board = kBoard, .intrinsics = scene.intrinsics});
     auto aruco_tally = tallies.emplace_back(std::make_shared<Tally>(Tally{.what = "aruco "}));
     auto charuco_tally = tallies.emplace_back(std::make_shared<Tally>(Tally{.what = "charuco "}));
     auto aruco_sink = graph.op<TallyOp>("tally_aruco_" + name, aruco_tally, remaining);

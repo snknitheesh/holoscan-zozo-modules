@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,9 @@
 #endif
 
 namespace holoscan::fiducials::core {
+
+// 64 bits as CUDA's 64-bit atomics take them.
+using Key = unsigned long long;  // NOLINT(runtime/int)
 
 // Most candidates a frame examines; components past it are counted, not examined.
 inline constexpr std::uint32_t kMaxCandidates = 4096;
@@ -94,21 +98,21 @@ struct Params {
 struct Candidate {
   std::int32_t root;  // Its component's label: the lowest pixel index in it.
   std::uint32_t pixels;
-  unsigned long long sum_x;
-  unsigned long long sum_y;
+  Key sum_x;
+  Key sum_y;
   std::int32_t min_x;
   std::int32_t min_y;
   std::int32_t max_x;
   std::int32_t max_y;
-  unsigned long long far0;      // c0: farthest from the centroid.
-  unsigned long long far2;      // c2: farthest from c0.
-  unsigned long long side_pos;  // c1 or c3: farthest from c0-c2 on the positive side.
-  unsigned long long side_neg;  // The other one.
+  Key far0;      // c0: farthest from the centroid.
+  Key far2;      // c2: farthest from c0.
+  Key side_pos;  // c1 or c3: farthest from c0-c2 on the positive side.
+  Key side_neg;  // The other one.
 };
 
 // What examining a candidate found.
 struct CandidateResult {
-  std::int32_t marker;   // 1 when the candidate is a marker of the dictionary, else 0.
+  std::int32_t marker;  // 1 when the candidate is a marker of the dictionary, else 0.
   std::int32_t id;
   std::int32_t hamming;  // Bits corrected.
   double corners[4][2];  // In the marker's order: top-left, top-right, bottom-right, bottom-left.
@@ -123,10 +127,10 @@ FIDUCIALS_HD inline void init_candidate(Candidate& c, std::int32_t root) {
   c.far0 = c.far2 = c.side_pos = c.side_neg = 0;
 }
 
-FIDUCIALS_HD inline unsigned long long make_key(std::uint32_t value, std::uint32_t index) {
-  return (static_cast<unsigned long long>(value) << 32U) | (0xFFFFFFFFU - index);
+FIDUCIALS_HD inline Key make_key(std::uint32_t value, std::uint32_t index) {
+  return (static_cast<Key>(value) << 32U) | (0xFFFFFFFFU - index);
 }
-FIDUCIALS_HD inline std::uint32_t key_index(unsigned long long key) {
+FIDUCIALS_HD inline std::uint32_t key_index(Key key) {
   return 0xFFFFFFFFU - static_cast<std::uint32_t>(key & 0xFFFFFFFFU);
 }
 
@@ -157,9 +161,9 @@ FIDUCIALS_HD inline void tile_range(const Image& image, int tile_size, int tx, i
 }
 
 // Tile (tx, ty)'s range widened to its 3 x 3 tile neighborhood, from the per-tile ranges.
-FIDUCIALS_HD inline void neighborhood_range(const std::uint8_t* tile_lo, const std::uint8_t* tile_hi,
-                                            int tiles_x, int tiles_y, int tx, int ty,
-                                            std::uint8_t& lo, std::uint8_t& hi) {
+FIDUCIALS_HD inline void neighborhood_range(const std::uint8_t* tile_lo,
+                                            const std::uint8_t* tile_hi, int tiles_x, int tiles_y,
+                                            int tx, int ty, std::uint8_t& lo, std::uint8_t& hi) {
   lo = 255;
   hi = 0;
   for (int y = ty - 1; y <= ty + 1; ++y) {
@@ -179,8 +183,7 @@ FIDUCIALS_HD inline bool is_dark(int value, int lo, int hi, int min_contrast) {
 // ---- 3. Quad passes ------------------------------------------------------------------------
 
 // The keys each pass offers for pixel (x, y), index `index`, of candidate `c`.
-FIDUCIALS_HD inline unsigned long long far0_key(const Candidate& c, int x, int y,
-                                                std::uint32_t index) {
+FIDUCIALS_HD inline Key far0_key(const Candidate& c, int x, int y, std::uint32_t index) {
   const double cx = static_cast<double>(c.sum_x) / c.pixels;
   const double cy = static_cast<double>(c.sum_y) / c.pixels;
   const double dx = x - cx;
@@ -197,8 +200,7 @@ FIDUCIALS_HD inline unsigned long long far0_key(const Candidate& c, int x, int y
   return make_key(bits, index);
 }
 
-FIDUCIALS_HD inline unsigned long long far2_key(const Candidate& c, int width, int x, int y,
-                                                std::uint32_t index) {
+FIDUCIALS_HD inline Key far2_key(const Candidate& c, int width, int x, int y, std::uint32_t index) {
   const std::uint32_t c0 = key_index(c.far0);
   const std::int64_t dx = x - static_cast<std::int64_t>(c0 % width);
   const std::int64_t dy = y - static_cast<std::int64_t>(c0 / width);
@@ -243,7 +245,7 @@ struct Moments {
   int points;
 };
 FIDUCIALS_HD inline Moments operator+(const Moments& a, const Moments& b) {
-  return {a.w + b.w,   a.x + b.x,   a.y + b.y,           a.xx + b.xx,
+  return {a.w + b.w,   a.x + b.x,   a.y + b.y,          a.xx + b.xx,
           a.xy + b.xy, a.yy + b.yy, a.points + b.points};
 }
 
@@ -271,10 +273,10 @@ struct SerialLanes {
   }
   // The smallest of the lanes' keys.
   template <typename Part>
-  unsigned long long min(const Part& part) const {
-    unsigned long long best = ~0ULL;
+  Key min(const Part& part) const {
+    Key best = ~0ULL;
     for (int lane = 0; lane < kLanes; ++lane) {
-      const unsigned long long key = part(lane);
+      const Key key = part(lane);
       best = key < best ? key : best;
     }
     return best;
@@ -368,8 +370,8 @@ FIDUCIALS_HD inline Moments edge_point(const Image& image, const double (&a)[2],
 // Fits the edge from a to b (as for edge_point); false with too few edge points.
 template <typename Lanes>
 FIDUCIALS_HD_NOINLINE inline bool fit_edge(const Lanes& lanes, const Image& image,
-                                           const double (&a)[2], const double (&b)[2],
-                                           double range, int min_contrast, Line& line) {
+                                           const double (&a)[2], const double (&b)[2], double range,
+                                           int min_contrast, Line& line) {
   const double ex = b[0] - a[0];
   const double ey = b[1] - a[1];
   const double length = sqrt(ex * ex + ey * ey);
@@ -501,8 +503,7 @@ FIDUCIALS_HD inline void apply(const double (&h)[9], double x, double y, double&
 template <typename Lanes>
 FIDUCIALS_HD_NOINLINE inline bool read_code(const Lanes& lanes, const Image& image,
                                             const double (&q)[4][2], int marker_size,
-                                            int min_contrast, double* values,
-                                            std::uint64_t& code) {
+                                            int min_contrast, double* values, std::uint64_t& code) {
   const int cells = marker_size + 2;
   double h[9];
   if (!square_homography(q, static_cast<double>(cells), h)) return false;
@@ -572,17 +573,14 @@ FIDUCIALS_HD_NOINLINE inline bool read_code(const Lanes& lanes, const Image& ima
 // turns. `rotated` holds each marker's code turned 0, 1, 2 and 3 quarter turns clockwise. Ties
 // go to the lowest id and turn.
 template <typename Lanes>
-FIDUCIALS_HD_NOINLINE inline unsigned long long identify(const Lanes& lanes, std::uint64_t code,
-                                                         const std::uint64_t* rotated, int count) {
+FIDUCIALS_HD_NOINLINE inline Key identify(const Lanes& lanes, std::uint64_t code,
+                                          const std::uint64_t* rotated, int count) {
   return lanes.min([&](int lane) {
-    unsigned long long best = ~0ULL;
+    Key best = ~0ULL;
     for (int marker = lane; marker < count; marker += kLanes) {
       for (int r = 0; r < 4; ++r) {
-        const auto distance =
-            static_cast<unsigned long long>(popcount64(code ^ rotated[marker * 4 + r]));
-        const unsigned long long key =
-            (distance << 20U) | (static_cast<unsigned long long>(marker) << 2U) |
-            static_cast<unsigned long long>(r);
+        const auto distance = static_cast<Key>(popcount64(code ^ rotated[marker * 4 + r]));
+        const Key key = (distance << 20U) | (static_cast<Key>(marker) << 2U) | static_cast<Key>(r);
         best = key < best ? key : best;
       }
     }
@@ -658,7 +656,7 @@ FIDUCIALS_HD inline CandidateResult examine(const Lanes& lanes, const Candidate&
     if (!valid_quad(q, p.min_marker_px)) return result;
     if (!read_code(lanes, image, q, p.marker_size, p.min_contrast, scratch, code)) return result;
   }
-  const unsigned long long best = identify(lanes, code, rotated, p.dictionary_count);
+  const Key best = identify(lanes, code, rotated, p.dictionary_count);
   const int distance = static_cast<int>(best >> 20U);
   if (distance > p.max_hamming) return result;
   const int turns = static_cast<int>(best & 3U);
@@ -685,8 +683,8 @@ FIDUCIALS_HD inline bool is_saddle(const Image& image, double x, double y, doubl
                                    int min_contrast) {
   constexpr int kSamples = 16;
   // cos of 2 pi k / 16 for k = 0 .. 4; the rest follow by symmetry.
-  constexpr double kCos[5] = {1.0, 0.92387953251128674, 0.70710678118654752,
-                              0.38268343236508977, 0.0};
+  constexpr double kCos[5] = {1.0, 0.92387953251128674, 0.70710678118654752, 0.38268343236508977,
+                              0.0};
   radius = radius < 1.5 ? 1.5 : radius;
   double values[kSamples];
   double lo = 255.0;
@@ -726,8 +724,8 @@ FIDUCIALS_HD inline bool is_saddle(const Image& image, double x, double y, doubl
 // is_saddle). `scratch` holds kScratch doubles the lanes share.
 template <typename Lanes>
 FIDUCIALS_HD_NOINLINE inline bool refine_saddle(const Lanes& lanes, const Image& image,
-                                                int half_window, int min_contrast,
-                                                double* scratch, double& x, double& y) {
+                                                int half_window, int min_contrast, double* scratch,
+                                                double& x, double& y) {
   constexpr int kIterations = 40;
   constexpr double kEpsilon = 0.001;
   if (half_window < 1 || half_window > kMaxHalfWindow) return false;

@@ -138,9 +138,7 @@ def main() -> None:
         if not np.array_equal(grids(name), cells[table][:count]):
             sys.exit(f"{name} is not the first {count} markers of its table")
         correction = (min_distance(cells[table]) - 1) // 2 if apriltag else d.maxCorrectionBits
-        out.write(
-            f'      {{"{name}", {d.markerSize}, {count}, {correction}, {table}.data()}},\n'
-        )
+        out.write(f'      {{"{name}", {d.markerSize}, {count}, {correction}, {table}.data()}},\n')
     out.write("  }};\n  return kTables;\n}\n\n}  // namespace holoscan::fiducials\n")
 
 

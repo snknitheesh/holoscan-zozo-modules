@@ -80,8 +80,8 @@ constexpr std::uint32_t kCameraBuffers = 4;
 
 // Opens `config.device` with YUYV at the configured size; returns the descriptor and the pitch.
 int open_camera(const CameraSourceConfig& config, std::size_t& pitch) {
-  if (config.width <= 0 || config.height <= 0 || config.width % 2 != 0 ||
-      config.width > kMaxSide || config.height > kMaxSide) {
+  if (config.width <= 0 || config.height <= 0 || config.width % 2 != 0 || config.width > kMaxSide ||
+      config.height > kMaxSide) {
     throw std::invalid_argument("the camera size needs an even width and sides up to " +
                                 std::to_string(kMaxSide));
   }
@@ -108,8 +108,7 @@ int open_camera(const CameraSourceConfig& config, std::size_t& pitch) {
       format.fmt.pix.height != static_cast<std::uint32_t>(config.height)) {
     close(fd);
     throw std::invalid_argument(config.device + " does not offer YUYV at " +
-                                std::to_string(config.width) + "x" +
-                                std::to_string(config.height));
+                                std::to_string(config.width) + "x" + std::to_string(config.height));
   }
   pitch = format.fmt.pix.bytesperline;
   return fd;
@@ -138,9 +137,10 @@ SceneSourceOp::SceneSourceOp(SceneSourceConfig config) : config_(std::move(confi
 }
 
 void SceneSourceOp::setup(holoscan::OperatorSpec& spec) {
-  rgb_output(spec, image,
-             config_.device_output ? holoscan::MemoryKind::kCudaDevice : holoscan::MemoryKind::kHost,
-             config_.width, config_.height);
+  rgb_output(
+      spec, image,
+      config_.device_output ? holoscan::MemoryKind::kCudaDevice : holoscan::MemoryKind::kHost,
+      config_.width, config_.height);
 }
 
 holoscan::Contract SceneSourceOp::contract() const {
@@ -168,7 +168,8 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
     const cudaError_t copied =
         cudaMemcpyAsync(writer->data_as<std::uint8_t>(), pixels.data(), pixels.size(),
                         cudaMemcpyHostToDevice, context.cuda_stream().get());
-    if (copied != cudaSuccess) return holoscan::make_unexpected(failure(cudaGetErrorString(copied)));
+    if (copied != cudaSuccess)
+      return holoscan::make_unexpected(failure(cudaGetErrorString(copied)));
     if (auto committed = std::move(*writer).commit(); !committed) {
       return holoscan::make_unexpected(std::move(committed).error());
     }
@@ -186,8 +187,9 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
   holoscan::schema::ImageT descriptor = rgb_descriptor(config_.width, config_.height);
   descriptor.header = std::make_shared<holoscan::schema::HeaderT>();
   descriptor.header->device_sequence = std::uint64_t{emitted_} + 1U;
-  auto emitted = image.emit_tensor(std::move(*loan), descriptor,
-                                   holoscan::EmitOptions{.capture_time = context.activation_time()});
+  auto emitted =
+      image.emit_tensor(std::move(*loan), descriptor,
+                        holoscan::EmitOptions{.capture_time = context.activation_time()});
   if (emitted) {
     ++emitted_;
     return {};
@@ -277,7 +279,8 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
   // Frames that queued up while we were busy are stale: keep only the newest.
   for (v4l2_buffer newer = buffer; xioctl(fd_, VIDIOC_DQBUF, &newer) == 0; buffer = newer) {
     if (xioctl(fd_, VIDIOC_QBUF, &buffer) != 0) {
-      return holoscan::make_unexpected(failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
+      return holoscan::make_unexpected(
+          failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
     }
   }
   // The frame's capture time on the graph's clock: now, less its age on the monotonic clock
@@ -296,9 +299,9 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
       .shape = std::array<std::int64_t, 3>{config_.height, config_.width, 3}, .dtype = kUInt8});
   if (!loan) {
     emitted = holoscan::make_unexpected(std::move(loan).error());
-  } else if (auto committed = loan->write_host_and_commit(
-                 [&](const holoscan::TensorOutputWriteGuard& writer)
-                     -> holoscan::expected<void, holoscan::Error> {
+  } else if (auto committed =
+                 loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
+                                                 -> holoscan::expected<void, holoscan::Error> {
                    yuyv_to_rgb(yuyv, pitch_, config_.width, config_.height,
                                writer.data_as<std::uint8_t>());
                    return {};

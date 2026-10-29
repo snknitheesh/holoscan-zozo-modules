@@ -47,7 +47,8 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
   report.truncated_frames += message.truncated ? 1U : 0U;
   report.detect_ms.push_back(message.detect_time_us / 1000.0F);
   if (config_.truth) {
-    if (auto verified = verify(message); !verified) return verified;
+    auto verified = verify(message);
+    if (!verified) return verified;
   }
   if (!finished_ && config_.expected_frames != 0 && report.frames >= config_.expected_frames) {
     finished_ = true;
@@ -61,9 +62,9 @@ holoscan::expected<void, holoscan::Error> ReportOp::verify(
   // The source's frame number, not the detector's count, so a frame lost on the way cannot
   // shift every later frame's ground truth.
   if (message.device_sequence == 0) {
-    return holoscan::make_unexpected(holoscan::Error{
-        holoscan::ErrorCode::kInvalidArgument,
-        "ReportOp: ground truth needs images numbered by header.device_sequence"});
+    return holoscan::make_unexpected(
+        holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
+                        "ReportOp: ground truth needs images numbered by header.device_sequence"});
   }
   Report& report = *config_.report;
   report.verified = true;
@@ -117,8 +118,8 @@ holoscan::expected<void, holoscan::Error> ReportOp::verify(
       continue;
     }
     ++matched;
-    const bool off = corner_error(std::hypot(corner.image[0] - it->image[0],
-                                             corner.image[1] - it->image[1]));
+    const bool off =
+        corner_error(std::hypot(corner.image[0] - it->image[0], corner.image[1] - it->image[1]));
     const bool elsewhere = std::abs(corner.board[0] - it->board[0]) > 1e-6 ||
                            std::abs(corner.board[1] - it->board[1]) > 1e-6;
     report.misplaced += off || elsewhere ? 1U : 0U;

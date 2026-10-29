@@ -9,7 +9,9 @@
 #include <numbers>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <holoscan/fiducials/dictionary.hpp>
 #include <holoscan/fiducials/pose.hpp>
@@ -170,8 +172,8 @@ double trace(const SyntheticScene& scene, const std::vector<Target>& all,
     const double dx = s * ray[0] - t[0];
     const double dy = s * ray[1] - t[1];
     const double dz = s * ray[2] - t[2];
-    const double painted = all[i].paint(r[0] * dx + r[3] * dy + r[6] * dz,
-                                        r[1] * dx + r[4] * dy + r[7] * dz);
+    const double painted =
+        all[i].paint(r[0] * dx + r[3] * dy + r[6] * dz, r[1] * dx + r[4] * dy + r[7] * dz);
     if (painted < 0.0) continue;
     nearest = s;
     value = painted;
@@ -207,8 +209,8 @@ void blur(std::vector<double>& image, int width, int height, double sigma) {
     for (int x = 0; x < width; ++x) {
       double sum = 0.0;
       for (int i = -radius; i <= radius; ++i) {
-        sum += kernel[i + radius] * image[static_cast<std::size_t>(y) * width +
-                                          std::clamp(x + i, 0, width - 1)];
+        sum += kernel[i + radius] *
+               image[static_cast<std::size_t>(y) * width + std::clamp(x + i, 0, width - 1)];
       }
       temp[static_cast<std::size_t>(y) * width + x] = sum;
     }
@@ -246,8 +248,7 @@ SyntheticScene make_marker_scene(const std::string& dictionary, std::uint32_t fr
     SceneMarker marker;
     marker.id = (i * count) / 6 + 1;
     marker.length = 0.10;
-    marker.pose.rotation =
-        multiply(rotation_y(yaw), multiply(rotation_x(pitch), rotation_z(roll)));
+    marker.pose.rotation = multiply(rotation_y(yaw), multiply(rotation_x(pitch), rotation_z(roll)));
     marker.pose.translation = {kAnchors[i][0] * width / focal * depth,
                                kAnchors[i][1] * height / focal * depth, depth};
     scene.markers.push_back(marker);
@@ -263,13 +264,12 @@ SyntheticScene make_board_scene(const CharucoBoardConfig& config, std::uint32_t 
   const double board_w = config.squares_x * config.square_length;
   const double board_h = config.squares_y * config.square_length;
   // About half the image's height, from the board's larger side.
-  const double depth =
-      scene.intrinsics.fx * std::max(board_w, board_h) / (0.55 * height) * (1.0 + 0.1 * std::sin(0.9 * t));
-  const Pose pose{
-      .rotation = multiply(rotation_y(0.6 * std::sin(t)),
-                           multiply(rotation_x(0.45 * std::cos(1.3 * t)),
-                                    rotation_z(0.4 * std::sin(0.7 * t)))),
-      .translation = {0.0, 0.0, depth}};
+  const double depth = scene.intrinsics.fx * std::max(board_w, board_h) / (0.55 * height) *
+                       (1.0 + 0.1 * std::sin(0.9 * t));
+  const Pose pose{.rotation = multiply(rotation_y(0.6 * std::sin(t)),
+                                       multiply(rotation_x(0.45 * std::cos(1.3 * t)),
+                                                rotation_z(0.4 * std::sin(0.7 * t)))),
+                  .translation = {0.0, 0.0, depth}};
   // Center the board on the optical axis, then move it a little.
   const auto& r = pose.rotation;
   const double cx = 0.5 * board_w;
@@ -386,8 +386,8 @@ TruthCounts match_markers(const SyntheticScene& scene, std::span<const Marker> f
     const auto corners = marker_truth(scene, truth);
     MarkerMatch match{marker, truth, {}, std::nullopt, std::nullopt};
     for (int c = 0; c < 4; ++c) {
-      match.corner_errors[c] = std::hypot(marker.corners[c][0] - corners[c][0],
-                                          marker.corners[c][1] - corners[c][1]);
+      match.corner_errors[c] =
+          std::hypot(marker.corners[c][0] - corners[c][0], marker.corners[c][1] - corners[c][1]);
     }
     if (marker.pose) {
       const auto& t = truth.pose.translation;

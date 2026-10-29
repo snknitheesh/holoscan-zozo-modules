@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>

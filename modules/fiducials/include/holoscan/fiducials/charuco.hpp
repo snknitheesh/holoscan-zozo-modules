@@ -22,8 +22,8 @@ namespace holoscan::fiducials {
 inline constexpr std::size_t kMaxCharucoCorners = 1024;
 
 struct CharucoBoardConfig {
-  int squares_x{5};  // Squares along the board's x (its width), 2..64.
-  int squares_y{7};  // Squares along its y (its height), 2..64.
+  int squares_x{5};            // Squares along the board's x (its width), 2..64.
+  int squares_y{7};            // Squares along its y (its height), 2..64.
   double square_length{0.04};  // Meters.
   double marker_length{0.03};  // Meters across a marker's black border; less than a square.
   std::string dictionary{"DICT_4X4_50"};
@@ -62,7 +62,7 @@ class CharucoBoard {
 
  private:
   CharucoBoardConfig config_;
-  std::vector<std::array<int, 2>> squares_;     // Per marker index.
+  std::vector<std::array<int, 2>> squares_;    // Per marker index.
   std::vector<std::array<int, 2>> neighbors_;  // Per corner: its two markers.
 };
 
@@ -85,9 +85,9 @@ struct CharucoQuality {
 
 // One frame's view of a board: the observation a calibration takes.
 struct CharucoObservation {
-  std::vector<Marker> markers;          // The board's markers found, by id.
-  std::vector<CharucoCorner> corners;   // By id.
-  std::optional<Pose> pose;             // The board frame in the camera frame.
+  std::vector<Marker> markers;         // The board's markers found, by id.
+  std::vector<CharucoCorner> corners;  // By id.
+  std::optional<Pose> pose;            // The board frame in the camera frame.
   CharucoQuality quality;
 };
 
@@ -97,16 +97,17 @@ struct CharucoOptions {
   int min_markers{2};
 };
 
-// Moves each seed to the chessboard corner within its window; nullopt where there is none.
-using SaddleRefiner =
-    std::function<std::vector<std::optional<Point2>>(std::span<const SaddleSeed> seeds)>;
+// Where each seed's chessboard corner is; nullopt where there is none.
+using Saddles = std::vector<std::optional<Point2>>;
+// Moves each seed to the chessboard corner within its window.
+using SaddleRefiner = std::function<Saddles(std::span<const SaddleSeed>)>;
 
 // The observation of `board` in a width x height image whose markers are `markers`: each
 // corner predicted from its markers, refined by `refine`, and with intrinsics, the board's pose.
 [[nodiscard]] CharucoObservation observe_charuco(const CharucoBoard& board,
                                                  std::span<const Marker> markers,
-                                                 const SaddleRefiner& refine, int width,
-                                                 int height, const CharucoOptions& options,
+                                                 const SaddleRefiner& refine, int width, int height,
+                                                 const CharucoOptions& options,
                                                  const std::optional<CameraIntrinsics>& intrinsics);
 
 }  // namespace holoscan::fiducials

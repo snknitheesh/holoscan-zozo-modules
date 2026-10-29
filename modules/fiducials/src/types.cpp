@@ -7,6 +7,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <holoscan/fiducials/dictionary.hpp>
 
