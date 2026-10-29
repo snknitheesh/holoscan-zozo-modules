@@ -1,0 +1,96 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// The fiducial detectors' output message: the markers found in one frame and, from
+// CharucoDetectorOp, the board's chessboard corners and pose. Compatible edits keep the root
+// name, file identifier and explicit field ids, and only append fields.
+namespace holoscan.fiducials.schema;
+
+struct Point2f {
+  x: float;
+  y: float;
+}
+
+struct Point3f {
+  x: float;
+  y: float;
+  z: float;
+}
+
+// A target's frame in the camera frame: row-major rotation, translation in meters. Camera:
+// x right, y down, z forward. Target: x right, y down as printed, z into the target.
+struct Pose {
+  rotation: [float:9];
+  translation: [float:3];
+  // Root mean square reprojection error of the points the pose was fitted to, pixels.
+  reprojection_error: float;
+}
+
+struct Marker {
+  id: int;
+  // Bits corrected while decoding.
+  hamming: int;
+  // Outer corners of the black border, pixels (pixel centers at integers): top-left,
+  // top-right, bottom-right, bottom-left as printed.
+  corners: [Point2f:4];
+  // pose is valid only when has_pose is true.
+  has_pose: bool;
+  pose: Pose;
+}
+
+struct CharucoCorner {
+  // (squares_x - 1) * row + column of the inner chessboard corners.
+  id: int;
+  // Where it is in the image, pixels (pixel centers at integers), sub-pixel.
+  image: Point2f;
+  // Where it is on the board, meters: origin at the board's top-left corner, x along
+  // squares_x, y along squares_y (down), z into the board.
+  board: Point3f;
+}
+
+// One frame's view of a ChArUco board.
+table CharucoView {
+  squares_x: int (id: 0);
+  squares_y: int (id: 1);
+  square_length: float (id: 2);
+  marker_length: float (id: 3);
+  legacy_pattern: bool (id: 4);
+  first_marker_id: int (id: 5);
+  // The chessboard corners found, by id.
+  corners: [CharucoCorner] (id: 6);
+  // The board frame in the camera frame; valid only when has_pose is true.
+  has_pose: bool (id: 7);
+  pose: Pose (id: 8);
+  // Quality: corners and board markers found of all, and the convex hull of the corners
+  // found as a fraction of the image's area.
+  corners_total: int (id: 9);
+  markers_found: int (id: 10);
+  markers_total: int (id: 11);
+  coverage: float (id: 12);
+}
+
+table FiducialDetections {
+  // Frames the detector has processed before this one in this run.
+  frame: ulong (id: 0);
+  // The image header's device_sequence: its source's sample number, or 0 when the source
+  // numbers none.
+  device_sequence: ulong (id: 1);
+  image_width: int (id: 2);
+  image_height: int (id: 3);
+  // The backend and dictionary that produced the detections.
+  backend: string (id: 4);
+  dictionary: string (id: 5);
+  // Time spent detecting, from receiving the image to having results on the host.
+  detect_time_us: float (id: 6);
+  // At most 256 markers, by id; from CharucoDetectorOp, the board's markers only.
+  markers: [Marker] (id: 7);
+  // Markers found beyond the message's capacity and not reported.
+  dropped: int (id: 8);
+  // The detector ran out of candidate capacity, so markers in this frame may be missing.
+  truncated: bool (id: 9);
+  // From CharucoDetectorOp: the board's view; absent from ArucoDetectorOp.
+  board: CharucoView (id: 10);
+}
+
+root_type FiducialDetections;
+file_identifier "FIDU";

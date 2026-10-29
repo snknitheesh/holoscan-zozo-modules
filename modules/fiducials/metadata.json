@@ -1,0 +1,68 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-fiducials",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "ArUco marker and ChArUco board detection on the CPU or the GPU (CUDA), with sub-pixel corners, 6-DoF poses, ChArUco corner observations for camera calibration, and a HoloViz overlay.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::fiducials"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Pose Estimation",
+      "Fiducial Markers",
+      "Calibration",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/fiducials",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "ArucoDetectorOp",
+      "CharucoDetectorOp",
+      "FiducialOverlayOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for the cuda backend. The cpu backend needs none."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-fiducials",
+      "install_commands": [
+        "sudo apt install ./holoscan-fiducials_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
