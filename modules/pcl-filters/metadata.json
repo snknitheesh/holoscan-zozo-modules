@@ -1,0 +1,69 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-pcl-filters",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Point-cloud filters on the GPU for organized or unorganized XYZ clouds with optional colors, in holoscan-point-cloud's layout: a deterministic voxel grid (centroid or first point, mean colors), a crop box and pass-through or range filter with an optional transform, RANSAC ground removal with the plane's coefficients (or a height threshold), and statistical or radius outlier removal over a GPU grid. Clouds stay organized, removed points NaN, or come out packed.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::pcl_filters"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Filtering",
+      "3D",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/pcl-filters",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "VoxelDownsampleOp",
+      "CropBoxOp",
+      "GroundRemovalOp",
+      "OutlierRemovalOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-pcl-filters",
+      "install_commands": [
+        "sudo apt install ./holoscan-pcl-filters_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
