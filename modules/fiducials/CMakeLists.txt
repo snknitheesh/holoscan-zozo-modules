@@ -96,10 +96,16 @@ add_library(
   src/types.cpp
 )
 add_library(holoscan::fiducials ALIAS holoscan_fiducials)
-# No FMA contraction where detection_core.hpp runs, so the backends round alike.
-set_source_files_properties(src/cuda_backend.cu PROPERTIES COMPILE_OPTIONS --fmad=false)
-set_source_files_properties(src/cpu_detector.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 target_compile_features(holoscan_fiducials PUBLIC cxx_std_20 PRIVATE cuda_std_20)
+# No FMA contraction anywhere detection_core.hpp is compiled, device or host, so the backends
+# round alike: its inline functions are emitted in several files, and the linker keeps one copy.
+target_compile_options(
+  holoscan_fiducials
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+)
 target_include_directories(
   holoscan_fiducials
   PUBLIC

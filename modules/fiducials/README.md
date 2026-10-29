@@ -75,8 +75,9 @@ Each `FiducialDetections` message ([schema](schemas/fiducial_detections.fbs)) ho
 number, the image header's `device_sequence`, the image size, the backend that ran, the dictionary,
 the detection time, and per marker its id, corrected bits, four corners and, when known, its pose.
 A message carries at most 256 markers: `dropped` counts the rest, and `truncated` says the detector
-ran out of candidate capacity (4096 dark regions a frame), so markers may be missing; the operator
-then also logs a warning, at most every five seconds. From `CharucoDetectorOp`, `board` holds the
+ran out of candidate capacity (4096 dark regions a frame), so markers may be missing (which ones
+can differ between the backends, and from run to run on the GPU); the operator then also logs a
+warning, at most every five seconds. From `CharucoDetectorOp`, `board` holds the
 board's parameters, the chessboard corners (`id`, `image` in pixels, `board` in meters), its pose,
 and the quality: `corners_total`, `markers_found`, `markers_total`, and `coverage`, the convex hull
 of the corners found as a fraction of the image. `markers_of()` and `board_of()` in
@@ -141,7 +142,8 @@ the ids agree with OpenCV's, and the corners and poses with `holoscan-apriltag`'
 Both backends run the same code for every step ([`src/detection_core.hpp`](src/detection_core.hpp)):
 the CUDA backend in kernels, a warp per candidate and per chessboard corner, the CPU backend in
 loops that add a warp's lanes in the warp's order. They find the same markers and corners, to the
-bit; the tests check it. The CPU path needs no OpenCV, so the module builds anywhere the SDK does.
+bit, except on frames over the candidate capacity; the tests check it. The CPU path needs no
+OpenCV, so the module builds anywhere the SDK does.
 
 The detector thresholds each pixel against the middle of the darkest and brightest values in the
 3 x 3 tiles around it, joins dark pixels into 8-connected components, and takes each component's
@@ -196,8 +198,8 @@ the mean over 20 frames (`fiducials_backends` prints it):
 | --- | --- | --- |
 | x86_64, RTX 5090, `cuda` | 1.3 ms | 1.7 ms |
 | x86_64, `cpu` | 6.6 ms | 6.9 ms |
-| Jetson Orin, `cuda` | ORIN_CUDA_MARKERS | ORIN_CUDA_BOARD |
-| Jetson Orin, `cpu` | ORIN_CPU_MARKERS | ORIN_CPU_BOARD |
+| Jetson AGX Orin, `cuda` | 4.9 ms | 5.9 ms |
+| Jetson AGX Orin, `cpu` | 16.0 ms | 17.4 ms |
 
 ## Use it in your graph
 
