@@ -1,0 +1,70 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// StereoCameraOp's calibration message: the camera's calibration, sent with
+// every frame and stamped like its images, and the source's own number and
+// timestamp for the frame. Compatible edits keep the root name, file identifier
+// and explicit field ids, and only append fields.
+namespace holoscan.stereo_camera.schema;
+
+// As holoscan::stereo_camera::DistortionModel.
+enum DistortionModel : byte {
+  NONE = 0,
+  BROWN_CONRADY = 1,
+  MODIFIED_BROWN_CONRADY = 2,
+  INVERSE_BROWN_CONRADY = 3,
+  KANNALA_BRANDT4 = 4,
+  FTHETA = 5,
+  RATIONAL_POLYNOMIAL = 6,
+}
+
+// p_B = rotation * p_A + translation: row-major rotation, translation in metres.
+struct RigidTransform {
+  rotation: [double:9];
+  translation: [double:3];
+}
+
+// Image size, pinhole intrinsics in pixels (pixel centers at integers) and
+// distortion.
+table CameraModel {
+  width: int (id: 0);
+  height: int (id: 1);
+  fx: double (id: 2);
+  fy: double (id: 3);
+  cx: double (id: 4);
+  cy: double (id: 5);
+  distortion_model: DistortionModel (id: 6);
+  // At most 8 coefficients, as the model takes them; none means no distortion.
+  distortion: [double] (id: 7);
+}
+
+table StereoCalibration {
+  // The source's number for the frame: 0, 1, 2, ... in a recording.
+  frame: ulong (id: 0);
+  // The source's timestamp for the frame, in nanoseconds of its own clock.
+  timestamp_ns: long (id: 1);
+  // The camera's sample number, or 0 when it has none.
+  device_sequence: ulong (id: 2);
+  // The backend: "realsense", "v4l2-sbs" or "playback".
+  backend: string (id: 3);
+  left: CameraModel (id: 4);
+  right: CameraModel (id: 5);
+  // From the left eye's frame to the right eye's.
+  right_from_left: RigidTransform (id: 6);
+  // The images are rectified: undistorted, rows aligned between the eyes.
+  rectified: bool (id: 7);
+  // The RGB camera, when the operator sends rgb images; absent otherwise.
+  rgb: CameraModel (id: 8);
+  rgb_from_left: RigidTransform (id: 9);
+  // The depth image, when the operator sends depth images; absent otherwise.
+  depth: CameraModel (id: 10);
+  depth_from_left: RigidTransform (id: 11);
+  // Metres per unit of the uint16 depth values.
+  depth_scale: double (id: 12);
+  camera_name: string (id: 13);
+  camera_serial: string (id: 14);
+  camera_firmware: string (id: 15);
+}
+
+root_type StereoCalibration;
+file_identifier "STCL";

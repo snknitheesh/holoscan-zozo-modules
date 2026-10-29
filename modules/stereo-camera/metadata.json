@@ -1,0 +1,79 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-stereo-camera",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Stereo cameras as Holoscan sources: StereoCameraOp sends each frame's left and right images, optionally an RGB image and a depth image, and the camera's calibration, from an Intel RealSense (librealsense, factory calibration, projector on or off), a side-by-side V4L2 camera with a calibration file, a recording that plays back without the camera's driver, or any camera through its own source. Includes a recorder and a synthetic camera with known disparity.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::stereo_camera"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Camera",
+      "RealSense",
+      "Depth"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/stereo-camera",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "StereoCameraOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for images in device memory."
+        },
+        {
+          "name": "Stereo camera",
+          "description": "An Intel RealSense, or a V4L2 camera that sends both eyes side by side, for the live backends; recordings need none.",
+          "required": false
+        }
+      ],
+      "libraries": [
+        {
+          "name": "librealsense",
+          "description": "librealsense2-dev 2.50 or later, for the realsense backend, which is built only when it is installed.",
+          "url": "https://github.com/IntelRealSense/librealsense",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-stereo-camera",
+      "install_commands": [
+        "sudo apt install ./holoscan-stereo-camera_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

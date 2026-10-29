@@ -1,0 +1,102 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Stereo Camera",
+    "description": "Runs holoscan-stereo-camera's StereoCameraOp from an Intel RealSense, a side-by-side V4L2 camera or a recording, checks every frame's left, right, RGB and depth images and calibration, and can show the images in a HoloViz window. A synthetic recording with known disparity makes a run that needs no camera.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-stereo-camera demo, with the realsense, v4l2-sbs and playback backends, a reporter that checks every frame and the synthetic camera's images, and a HoloViz display of the left, right and RGB images."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Camera",
+      "RealSense"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Intel RealSense",
+          "description": "A RealSense with two infrared cameras, for the realsense mode, which needs the module built with librealsense, and a display for its window.",
+          "required": false
+        },
+        {
+          "name": "Side-by-side stereo camera",
+          "description": "A V4L2 camera that sends both eyes in one YUYV or gray frame, such as a ZED, with its calibration file, for the v4l2-sbs mode.",
+          "required": false
+        }
+      ],
+      "data": [
+        {
+          "name": "Stereo camera recording",
+          "description": "A recording in the module's format, for the playback mode: stereo_camera_record writes one from a camera.",
+          "url": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/stereo-camera#recordings"
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "stereo-camera"
+        }
+      ]
+    },
+    "default_mode": "realsense",
+    "modes": {
+      "realsense": {
+        "description": "Show the first RealSense's infrared pair and color image, projector on, for 300 frames, checking every frame and printing the factory calibration.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_camera\" --source realsense --count 300 --print-calibration true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "v4l2-sbs": {
+        "description": "Show a side-by-side V4L2 camera at /dev/video0, 2560x720 YUYV, with the calibration file in the data directory, for 300 frames.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_camera\" --source v4l2-sbs --device /dev/video0 --width 2560 --height 720 --calibration \"<holohub_data_dir>/stereo_camera/calibration.json\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "playback": {
+        "description": "Play the recording in the data directory once, checking every frame.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_camera\" --source playback --recording \"<holohub_data_dir>/stereo_camera/recording\" --print-calibration true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check without a camera or data: a synthetic recording with known disparity, written at run time, played through StereoCameraOp with rgb and depth, every image checked against the synthetic camera.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_camera\" --source playback --synthetic synthetic_recording --count 30 --period-ms 5 --display false",
+          "workdir": "holohub_app_bin",
+          "timeout": 300
+        }
+      }
+    }
+  }
+}
