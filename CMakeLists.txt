@@ -122,8 +122,68 @@ function(holoscan_zozo_modules_add folder)
   set_property(GLOBAL APPEND PROPERTY HOLOSCAN_ZOZO_MODULES_ADDED "${name}")
 endfunction()
 
-# Every folder in modules/ but a hidden one is a module, as CI sees them; in name order,
-# so that a module may use one whose name sorts before its own.
+# Adds modules/<folder>/ after the modules it depends on: each entry of its
+# module.dependencies without a `source` names one, by folder, as CI reads them. A name
+# that is not a module here, or a cycle, fails the configure.
+function(holoscan_zozo_modules_visit folder)
+  get_property(state GLOBAL PROPERTY "HOLOSCAN_ZOZO_MODULES_VISIT_${folder}")
+  if(state STREQUAL "done")
+    return()
+  endif()
+  get_property(path GLOBAL PROPERTY HOLOSCAN_ZOZO_MODULES_VISITING)
+  if(state STREQUAL "visiting")
+    list(APPEND path "${folder}")
+    list(JOIN path " -> " cycle)
+    message(FATAL_ERROR "Modules depend on each other in a cycle: ${cycle}")
+  endif()
+  set_property(GLOBAL PROPERTY "HOLOSCAN_ZOZO_MODULES_VISIT_${folder}" visiting)
+  set_property(GLOBAL APPEND PROPERTY HOLOSCAN_ZOZO_MODULES_VISITING "${folder}")
+
+  set(metadata_file "${CMAKE_CURRENT_SOURCE_DIR}/modules/${folder}/metadata.json")
+  if(EXISTS "${metadata_file}")
+    file(READ "${metadata_file}" metadata)
+    string(JSON count ERROR_VARIABLE error LENGTH "${metadata}" module dependencies)
+    if(NOT error AND count GREATER 0)
+      math(EXPR last "${count} - 1")
+      foreach(index RANGE ${last})
+        string(
+          JSON source
+          ERROR_VARIABLE no_source
+          TYPE "${metadata}"
+          module
+          dependencies
+          ${index}
+          source
+        )
+        if(NOT no_source)
+          continue() # Has a source: from another repository, not ordered here.
+        endif()
+        string(JSON dependency GET "${metadata}" module dependencies ${index} name)
+        if(
+          dependency MATCHES "^\\."
+          OR NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/modules/${dependency}"
+        )
+          message(
+            FATAL_ERROR
+            "${metadata_file}: module.dependencies names '${dependency}', which is not a"
+            " module in modules/ and has no source"
+          )
+        endif()
+        holoscan_zozo_modules_visit("${dependency}")
+      endforeach()
+    endif()
+  endif()
+
+  holoscan_zozo_modules_add("${folder}")
+  get_property(path GLOBAL PROPERTY HOLOSCAN_ZOZO_MODULES_VISITING)
+  list(POP_BACK path)
+  set_property(GLOBAL PROPERTY HOLOSCAN_ZOZO_MODULES_VISITING "${path}")
+  set_property(GLOBAL PROPERTY "HOLOSCAN_ZOZO_MODULES_VISIT_${folder}" done)
+endfunction()
+
+# Every folder in modules/ but a hidden one is a module, as CI sees them. Each is added
+# after the modules it depends on, so that it may use their targets; otherwise in name
+# order.
 file(
   GLOB _holoscan_zozo_modules_folders
   LIST_DIRECTORIES true
@@ -133,7 +193,7 @@ file(
 list(SORT _holoscan_zozo_modules_folders)
 foreach(_folder IN LISTS _holoscan_zozo_modules_folders)
   if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/modules/${_folder}" AND NOT _folder MATCHES "^\\.")
-    holoscan_zozo_modules_add("${_folder}")
+    holoscan_zozo_modules_visit("${_folder}")
   endif()
 endforeach()
 

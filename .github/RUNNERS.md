@@ -5,16 +5,61 @@ requires (see [Repository settings](#repository-settings)):
 
 | Check | Runs on | What it does |
 | --- | --- | --- |
-| `Lint` | GitHub-hosted `ubuntu-24.04` | [prek](https://prek.j178.dev) (the hooks in `.pre-commit-config.yaml`), actionlint, the CI driver's unit tests, and every module's and demo's SDK-free tests (`tests/host/`) |
+| `Lint` | GitHub-hosted `ubuntu-24.04` | Selects what to test (see [What a run tests](#what-a-run-tests)); then [prek](https://prek.j178.dev) (the hooks in `.pre-commit-config.yaml`), actionlint, the CI driver's unit tests, and the selected modules' and demos' SDK-free tests (`tests/host/`) |
 | `x86 GPU` | Self-hosted, labels `self-hosted, linux, x64, gpu` | `ci.py sdk --platform x86_64` in the CI image |
 | `Jetson Thor` | Self-hosted, labels `self-hosted, linux, arm64, jetson, thor` | `ci.py sdk --platform jetson` in the CI image |
 | `Jetson Orin` | Self-hosted, labels `self-hosted, linux, arm64, jetson, orin` | `ci.py sdk --platform jetson` in the CI image |
 | `CI result` | GitHub-hosted `ubuntu-24.04` | Always runs, after the others; fails unless every one of them succeeded |
 
-`ci.py sdk` builds each module, runs its full test suite, installs it, and builds and runs a
-consumer project against the installed package; then it builds each demo against the installed
-modules, runs its tests and runs its finite `ci` mode, which is stopped after
-`modes.ci.run.timeout` seconds (default 900). Any failure fails the job.
+`ci.py sdk` builds each selected module, in dependency order, runs its full test suite, installs
+it, and builds and runs a consumer project against the installed package; then it builds each
+selected demo against the installed modules, runs its tests and runs its finite `ci` mode, which is
+stopped after `modes.ci.run.timeout` seconds (default 900). Any failure fails the job.
+
+## What a run tests
+
+The `Lint` job's first step, `ci.py select`, decides what every job of the run tests, and its log
+says what it selected and why (also shown as a notice on the run's summary page).
+
+| Run | What it tests |
+| --- | --- |
+| Pull request | What it changes, compared with its base from their merge base (below) |
+| Push to `main` | Everything |
+| Nightly, 03:00 UTC (`schedule`) | Everything, with `HOLOSCAN_CI_NIGHTLY=1` |
+| Manual (`workflow_dispatch`) | Everything; with the `base` input (a commit SHA, or `origin/<branch>`), what changed since it; with `nightly`, as the nightly run |
+
+For a pull request, each changed file selects:
+
+- in `modules/<m>/`: module `m`, every module that depends on it, directly or not, and every demo
+  that uses any of them. The modules these depend on are built and installed too, without running
+  their tests;
+- in `applications/<a>/`: demo `a`; the modules it uses are built and installed, without their
+  tests;
+- a Markdown file (`*.md`) outside `.github/` that still exists: nothing;
+- anything else, such as `.github/`, the root `CMakeLists.txt`, `cmake/`, the CI image, the
+  requirements, `.pre-commit-config.yaml`, `LICENSE`, or a folder that is no longer a module or
+  demo: **everything**, since what it affects is not known.
+
+The dependencies come from the modules' and demos' `metadata.json`; see
+[modules/README.md](../modules/README.md) and [applications/README.md](../applications/README.md).
+
+When a pull request selects nothing to build, as for documentation only, the three GPU jobs still
+run and pass, so that their required checks report, but on a GitHub-hosted runner that skips every
+step: no GPU runner is used. Their `runs-on` picks the runner from the `Lint` job's output.
+
+To test everything for a pull request, run the workflow by hand on its branch (**Actions > CI >
+Run workflow**, `base` left empty). Its checks report on the branch's head commit under the same
+names. To see what a pull request would test, run it with `base` set to `origin/main`, or locally:
+
+```bash
+python3 .github/scripts/ci.py select --changed-since origin/main
+```
+
+The nightly run, from `main`, is the full test on every lane, and its `HOLOSCAN_CI_NIGHTLY=1`
+(`0` in every other run) is for tests too slow, or needing models too large, for every pull
+request: such a test checks it and skips itself (CTest's `SKIP_RETURN_CODE`, for example) when it
+is `0`. A failed nightly run shows on the Actions page and in GitHub's notifications for failed
+scheduled runs, sent to whoever last changed the schedule.
 
 The GPU jobs all build the same image, [`docker/Dockerfile`](docker/Dockerfile), on the runner for
 its own architecture with `docker buildx build`, and tag it `holoscan-modules-ci:local` (Docker's
@@ -55,12 +100,16 @@ Debian packages; see [RELEASING.md](RELEASING.md).
 The repository is public and the GPU runners are machines on a private network, so:
 
 - The GPU jobs never run automatically for a pull request from a fork. They run for pushes to
-  `main`, for manual runs, and for pull requests whose branch is in this repository. A fork's pull
+  `main`, for the nightly run, for manual runs, and for pull requests whose branch is in this
+  repository. A fork's pull
   request gets only `Lint`, and `CI result` fails with an error saying that the GPU jobs did not
   run; to test it on the GPUs, a maintainer reviews the code and pushes it to a branch of this
   repository.
 - `ci.yml` has `permissions: contents: read`, never uses `pull_request_target`, and checks out
-  with `persist-credentials: false`, so the build cannot push or read secrets.
+  with `persist-credentials: false`, so the build cannot push or read secrets. The nightly run
+  is `main`'s own code with the same permissions, and runs only in this repository: a fork that
+  turns on its scheduled workflows skips every job. The manual run's `base` input reaches the
+  scripts only through an environment variable, never pasted into a command.
 - `container.yml` and `release.yml` are the only workflows that can write, and neither runs for a
   pull request.
   - `container.yml` runs only for a push to `main` that changes the image, a `v*` tag, or a

@@ -43,6 +43,13 @@
         }
       ]
     },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "apriltag"
+        }
+      ]
+    },
     "default_mode": "synthetic",
     "modes": {
       "synthetic": {

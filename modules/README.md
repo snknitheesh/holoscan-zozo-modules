@@ -19,9 +19,29 @@ skipped. A module must have:
   passes the install prefix in `CMAKE_PREFIX_PATH`), links its targets and registers at least one
   CTest test that runs them.
 
-CI builds and installs the modules in name order, and each module's build gets the install prefix
-in `CMAKE_PREFIX_PATH`, so a module may `find_package` another module of this collection only if
-that module's name sorts before its own.
+A module that uses another module of this collection declares it in `module.dependencies`, by the
+other module's folder name, with no `source` (which is how the Holoscan CLI finds a module in
+`modules/<name>/`):
+
+```json
+"dependencies": [
+  {
+    "name": "point-cloud"
+  }
+]
+```
+
+CI builds and installs the modules in dependency order, each after those it declares (otherwise in
+name order), and each module's build gets the install prefix in `CMAKE_PREFIX_PATH`, so a module
+may `find_package` the modules it declares. A name that is not a folder here, or modules that depend
+on each other in a cycle, fail CI, as does a CMake file that finds `holoscan-<name>` of a module
+not declared. An entry with a `source` block is a module from another repository; CI leaves it to
+the module's CMake.
+
+A pull request runs the GPU tests of a module only when it changes something in the module's
+folder or in a module it depends on, other than its Markdown files; see
+[What a run tests](../.github/RUNNERS.md#what-a-run-tests). That is why the declaration matters:
+an undeclared dependency would let a change break this module untested.
 
 The GPU jobs set `HOLOSCAN_CI_PLATFORM` to `x86_64` or `jetson` for the tests, so a test can
 require what holds only on one platform, such as the Jetson's PVA.
@@ -103,8 +123,9 @@ endif()
 option(HOLOSCAN_APRILTAG_BUILD_OVERLAY "Build AprilTagOverlayOp" ${_overlay_default})
 ```
 
-The root builds the modules in name order, as CI does. A module that depends on another module of
-this collection links that module's `holoscan::` targets when they are defined
+The root adds each module after the modules its `module.dependencies` names, and fails on a cycle
+or a name that is not a module here, as CI does. A module that depends on another module of this
+collection links that module's `holoscan::` targets when they are defined
 (`if(TARGET holoscan::<other>)`), and otherwise finds its installed package.
 
 ## Releases and `binary_packages`

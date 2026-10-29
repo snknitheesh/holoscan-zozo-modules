@@ -18,6 +18,26 @@ being skipped. A demo must have:
 - `CMakeLists.txt`, a standalone CMake project. CI configures it with the modules' install prefix in
   `CMAKE_PREFIX_PATH` and `-DBUILD_TESTING=ON`, builds it, runs its CTest tests if it has any, and
   then runs the `ci` mode.
+- In `metadata.json`, every module it uses, in `dependencies.modules`, by the module's folder name
+  in `modules/`, which is where the Holoscan CLI looks for it:
+
+  ```json
+  "dependencies": {
+    "modules": [
+      {
+        "name": "point-cloud"
+      }
+    ]
+  }
+  ```
+
+  CI fails when the demo's CMake files find a `holoscan-<name>` package of a module it does not
+  declare, or when it declares a name that is not a module.
+
+A pull request runs a demo when it changes something in the demo's folder, other than its Markdown
+files, or in a module it uses, or one those depend on. CI then builds and installs the modules it
+uses first, and runs their tests only if the pull request selected them too. See
+[What a run tests](../.github/RUNNERS.md#what-a-run-tests), which also says how to run every test.
 
 Optionally, `tests/host/` is a standalone CMake project for tests that need no Holoscan SDK, CUDA
 or GPU; the hosted `Lint` job runs it.
