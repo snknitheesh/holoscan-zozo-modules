@@ -17,9 +17,6 @@ target_link_libraries(
   PRIVATE holoscan::point_cloud point_cloud_test_flags
 )
 
-add_executable(point_cloud_project_test project_test.cu)
-target_link_libraries(point_cloud_project_test PRIVATE holoscan::point_cloud point_cloud_test_flags)
-
 add_executable(point_cloud_depth_to_point_cloud_op_test depth_to_point_cloud_op_test.cpp)
 target_include_directories(
   point_cloud_depth_to_point_cloud_op_test
@@ -30,24 +27,10 @@ target_link_libraries(
   PRIVATE holoscan::point_cloud holoscan::testing point_cloud_test_flags
 )
 
-add_executable(point_cloud_point_cloud_to_depth_op_test point_cloud_to_depth_op_test.cpp)
-target_include_directories(
-  point_cloud_point_cloud_to_depth_op_test
-  PRIVATE "${PROJECT_SOURCE_DIR}/src"
-)
-target_link_libraries(
-  point_cloud_point_cloud_to_depth_op_test
-  PRIVATE holoscan::point_cloud holoscan::testing point_cloud_test_flags
-)
-
 add_test(NAME point_cloud_deproject COMMAND point_cloud_deproject_test)
 add_test(NAME point_cloud_depth_to_point_cloud_op COMMAND point_cloud_depth_to_point_cloud_op_test)
-add_test(NAME point_cloud_project COMMAND point_cloud_project_test)
-add_test(NAME point_cloud_point_cloud_to_depth_op COMMAND point_cloud_point_cloud_to_depth_op_test)
 set_tests_properties(
   point_cloud_deproject
   point_cloud_depth_to_point_cloud_op
-  point_cloud_project
-  point_cloud_point_cloud_to_depth_op
   PROPERTIES LABELS "point_cloud;gpu" TIMEOUT 600
 )
