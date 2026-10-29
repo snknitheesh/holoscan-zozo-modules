@@ -1,0 +1,9 @@
+holoscan-recorder
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-recorder uses the following open source software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
