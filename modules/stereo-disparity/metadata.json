@@ -1,0 +1,78 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-stereo-disparity",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Disparity, depth and confidence from any rectified stereo pair (MONO8 or color, in host or GPU memory) with NVIDIA VPI 4's stereo disparity estimator on the GPU (CUDA), or on the Optical Flow Accelerator and the PVA of Jetson Orin and Thor, with the pair's geometry configured or taken as a message.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::stereo_disparity"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Depth",
+      "CUDA",
+      "VPI"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/stereo-disparity",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "StereoDisparityOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for the cuda backend and the operator's kernels."
+        },
+        {
+          "name": "OFA",
+          "description": "The Optical Flow Accelerator of Jetson Orin or Thor, for the ofa and pva backends (pva also uses the PVA). x86_64 hosts have none.",
+          "required": false
+        }
+      ],
+      "libraries": [
+        {
+          "name": "NVIDIA VPI",
+          "version": "4.1",
+          "description": "Runs the stereo disparity estimator on every backend."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-stereo-disparity",
+      "install_commands": [
+        "sudo apt install ./holoscan-stereo-disparity_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

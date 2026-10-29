@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-stereo-disparity) defines:
+#   holoscan::stereo_disparity  StereoDisparityOp, the geometry message, the backends' rules
+#                               and the synthetic scene
+# VPI is linked privately into the library, so a consumer needs its runtime, not its package.
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-stereo-disparity-targets.cmake")
+
+check_required_components(holoscan-stereo-disparity)

@@ -1,0 +1,82 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Stereo Disparity",
+    "description": "Disparity and depth from a rectified stereo pair with holoscan-stereo-disparity's StereoDisparityOp on every VPI backend the platform has, from a synthetic scene checked against ground truth or from a recorded camera clip checked against the camera's own depth, shown colorized on a HoloViz display.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-stereo-disparity demo, with a synthetic source checked against ground truth, a recording player checked against the camera's depth, and a HoloViz display."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Depth",
+      "VPI"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "OFA",
+          "description": "The Optical Flow Accelerator of Jetson Orin or Thor, for the ofa and pva backends.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "stereo-disparity"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Match 300 frames of a rendered scene with every backend the platform has and with auto, check them against ground truth, and show the first backend's disparity when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_disparity\" --backend all,auto --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "recording": {
+        "description": "Play a recorded RealSense clip from $HOLOSCAN_TEST_DATA/stereo-camera/, show its disparity, and compare the depth with the camera's own. Choose another clip with --run-args.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_disparity\" --source recording --clip d585_720p_emitter_on --backend all --loop true --count 600",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic frames through every backend the platform has and auto, verified against ground truth; on a CI runner, auto must choose ofa on a Jetson and cuda on x86_64.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stereo_disparity\" --backend all,auto --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
