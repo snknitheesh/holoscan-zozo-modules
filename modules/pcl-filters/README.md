@@ -46,7 +46,8 @@ The output layout is each operator's `layout` setting:
   organized, so pixel neighbors stay neighbors, and nothing waits for the GPU.
 - `OutputLayout::kDense`: `[M, 3]` of the kept points in their input order; `M` is the count. The
   size is known only once the filter has run, so the operator waits for its GPU work once per
-  frame, about 0.2 ms, before allocating the output.
+  frame (tens of microseconds on a discrete GPU, up to 0.2 ms on an Orin) before allocating
+  the output.
 
 `VoxelDownsampleOp`'s output is always dense. With colors, an operator runs once per cloud when the
 colors with exactly the same capture time have arrived, as `DepthToPointCloudOp` sends them.
@@ -208,7 +209,7 @@ test time:
 | Voxel grid, both modes, with colors | CPU reference (stable sort, double sums) | Same voxel count, same order, same centroids bit for bit, same colors |
 | Statistical outliers | Brute-force k nearest neighbors | Every mean distance identical, threshold within 1e-9, every decision identical |
 | Radius outliers | Brute force | Every decision identical |
-| Ground plane, refined | The scene's true plane, pitches 15 to 40 degrees | Within 0.2 degrees and 3 mm (typically 0.01 degrees and 0.5 mm); under 0.5 % of the ground left, over 93 % of object points kept |
+| Ground plane, refined | The scene's true plane, pitches 15 to 40 degrees | Within 0.2 degrees and 3 mm (measured: under 0.02 degrees and 0.4 mm); under 0.5 % of the ground left, over 93 % of object points kept |
 | Outlier rates on the 640x480 scene | The scene's labels | Statistical (k 8, 2 deviations): 98 % of flying pixels removed, 96 % of surface points kept; radius (3 cm, 3): 98 % removed, 99.3 % kept |
 
 The crop box, voxel grid and outlier kernels are compiled without fused multiply-adds, so they
@@ -221,7 +222,23 @@ Each filter as its operator runs it (the filter, then an organized output, or fo
 the wait for the count), on organized clouds of the synthetic scene, mean milliseconds of GPU time
 over 100 runs; `pcl_filters_benchmark` measures it.
 
-PERFORMANCE_TABLE
+| Filter | RTX 5090, 640x480 | RTX 5090, 1280x720 | Orin, 640x480 | Orin, 1280x720 |
+| --- | --- | --- | --- | --- |
+| CropBoxOp (organized) | 0.007 | 0.012 | 0.097 | 0.238 |
+| CropBoxOp (dense) | 0.020 | 0.025 | 0.187 | 0.386 |
+| VoxelDownsampleOp (2 cm) | 0.118 | 0.210 | 1.286 | 2.266 |
+| VoxelDownsampleOp (5 cm) | 0.221 | 0.632 | 1.215 | 3.590 |
+| GroundRemovalOp (RANSAC, 256 iterations) | 0.287 | 0.338 | 0.844 | 1.915 |
+| OutlierRemovalOp (statistical, k 8, 10 cm) | 1.566 | 5.299 | 12.569 | 48.468 |
+| OutlierRemovalOp (statistical, k 8, 4 cm) | 1.303 | 3.266 | 15.063 | 42.031 |
+| OutlierRemovalOp (radius, 5 cm, 3) | 0.296 | 0.828 | 1.338 | 4.807 |
+
+The x86_64 machine has an RTX 5090; the Orin is a Jetson AGX Orin developer kit (64 GB) with JetPack 7.2,
+in the power mode it was set to. A dense output costs the wait for the count: a few tens of microseconds on the
+discrete GPU, about 0.1 to 0.2 ms on the Orin. The statistical mode is the costly one: every flying
+pixel searches every ring of cells for its neighbors, one binary search per cell, and a warp waits
+for its slowest point. For a real-time pipeline prefer the radius mode, which stops counting at
+`min_neighbors`; it removes the same flying pixels here.
 
 ## Requirements
 
