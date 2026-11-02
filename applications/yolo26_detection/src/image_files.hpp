@@ -70,6 +70,12 @@ void write_ppm(const std::filesystem::path& path, int width, int height,
 void draw_boxes(std::span<std::uint8_t> rgb, int width, int height,
                 std::span<const BoxDetection> detections, int thickness = 2);
 
+// Fills each instance of a label image (0 for none, 1 + the detection's index
+// otherwise) half-transparently in its detection's box color, onto packed RGB8
+// pixels of the same size.
+void draw_masks(std::span<std::uint8_t> rgb, std::span<const std::int32_t> labels,
+                std::span<const BoxDetection> detections);
+
 // Decodes JPEG files with nvJPEG into GPU memory. One decoder per thread.
 class JpegDecoder {
  public:

@@ -16,8 +16,9 @@ endif()
 
 project(
   holoscan_yolo26
-  VERSION 1.0.0
-  DESCRIPTION "End-to-end YOLO26 object detection on the GPU with TensorRT, and its HoloViz overlay"
+  VERSION 1.1.0
+  DESCRIPTION
+    "End-to-end YOLO26 object detection and instance segmentation on the GPU with TensorRT, and their HoloViz overlays"
   LANGUAGES CXX CUDA
 )
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -34,17 +35,20 @@ else()
   set(BUILD_SHARED_LIBS ON)
   option(HOLOSCAN_YOLO26_BUILD_TESTING "Build the module's tests in the including project" OFF)
 endif()
-# The repository root lists the operators asked for; without Yolo26OverlayOp, the overlay,
-# and so Holoscan Visualization, is left out.
+# The repository root lists the operators asked for; without either overlay, the overlay
+# library, and so Holoscan Visualization, is left out.
 set(_overlay_default ON)
 if(DEFINED HOLOSCAN_ZOZO_MODULES_OPERATORS)
-  if(NOT "Yolo26OverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS)
+  if(
+    NOT "Yolo26OverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS
+    AND NOT "Yolo26SegmentationOverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS
+  )
     set(_overlay_default OFF)
   endif()
 endif()
 option(
   HOLOSCAN_YOLO26_BUILD_OVERLAY
-  "Build Yolo26OverlayOp (needs Holoscan Visualization)"
+  "Build Yolo26OverlayOp and Yolo26SegmentationOverlayOp (needs Holoscan Visualization)"
   ${_overlay_default}
 )
 
@@ -63,21 +67,29 @@ endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
 
-# holoscan::yolo26: Yolo26DetectionOp, its letterbox and decode kernels, and the stub
-# model and synthetic scenes for tests.
+# holoscan::yolo26: Yolo26DetectionOp and Yolo26SegmentationOp, their letterbox, decode
+# and mask kernels, and the stub models and synthetic scenes for tests.
 add_library(
   holoscan_yolo26
   src/decode.cu
   src/letterbox.cpp
   src/letterbox.cu
+  src/masks.cu
+  src/model_runtime.cpp
   src/stub_model.cpp
   src/synthetic_scene.cpp
   src/yolo26_detection_op.cpp
+  src/yolo26_segmentation_op.cpp
 )
 add_library(holoscan::yolo26 ALIAS holoscan_yolo26)
 # Without fused multiply-adds the kernels compute bit for bit what the host computes
 # from the same expressions, so the tests compare them exactly.
-set_source_files_properties(src/decode.cu src/letterbox.cu PROPERTIES COMPILE_OPTIONS -fmad=false)
+set_source_files_properties(
+  src/decode.cu
+  src/letterbox.cu
+  src/masks.cu
+  PROPERTIES COMPILE_OPTIONS -fmad=false
+)
 target_compile_features(holoscan_yolo26 PUBLIC cxx_std_20 PRIVATE cuda_std_20)
 target_compile_options(
   holoscan_yolo26
@@ -107,7 +119,8 @@ set_target_properties(
 )
 set(_targets holoscan_yolo26)
 
-# holoscan::yolo26_overlay: Yolo26OverlayOp, which draws detections as HoloViz layers.
+# holoscan::yolo26_overlay: Yolo26OverlayOp and Yolo26SegmentationOverlayOp, which draw
+# detections, and instance masks, as HoloViz layers.
 if(HOLOSCAN_YOLO26_BUILD_OVERLAY)
   add_library(holoscan_yolo26_overlay src/yolo26_overlay_op.cpp)
   add_library(holoscan::yolo26_overlay ALIAS holoscan_yolo26_overlay)

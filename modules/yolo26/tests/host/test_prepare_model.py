@@ -59,14 +59,18 @@ def onnx_model(
     output_dims: list[int | str],
     names: str | None = COCO_NAMES,
     initializer: str | None = None,
+    protos_dims: list[int | str] | None = None,
 ) -> bytes:
-    """A ModelProto with one graph input and output, and optional metadata."""
+    """A ModelProto with one graph input, one output (two with `protos_dims`, as a
+    segmentation model has), and optional metadata."""
     graph = _field(11, _value_info("images", input_dims))
     if initializer:
         # An initializer listed among the inputs, as older exporters do.
         graph += _field(5, _field(8, initializer.encode()) + _field(9, b"\0" * 4))
         graph += _field(11, _value_info(initializer, [1]))
     graph += _field(12, _value_info("output0", output_dims))
+    if protos_dims is not None:
+        graph += _field(12, _value_info("output1", protos_dims))
     model = _field(1, 9) + _field(7, graph)
     if names is not None:
         model += _field(14, _field(1, b"names") + _field(2, names.encode()))
@@ -121,8 +125,12 @@ class PrepareModelTest(unittest.TestCase):
         path.write_bytes(onnx_model([1, 3, 640, 640], [1, 300, 6], initializer="const"))
         info = prepare_model.read_model_info(path)
         self.assertEqual(info.input_shape, [1, 3, 640, 640])
-        self.assertEqual(info.output_shape, [1, 300, 6])
+        self.assertEqual(info.output_shapes, [[1, 300, 6]])
         self.assertEqual(info.names, ["person", "bicycle", "traffic light"])
+        path.write_bytes(onnx_model([1, 3, 640, 640], [1, 300, 38], protos_dims=[1, 32, 160, 160]))
+        self.assertEqual(
+            prepare_model.read_model_info(path).output_shapes, [[1, 300, 38], [1, 32, 160, 160]]
+        )
 
     def test_symbolic_dimensions_read_as_minus_one(self) -> None:
         path = self.root / "model.onnx"
@@ -137,13 +145,36 @@ class PrepareModelTest(unittest.TestCase):
                 prepare_model.read_model_info(path)
 
     def test_check_model(self) -> None:
-        good = prepare_model.ModelInfo([1, 3, 640, 640], [1, 300, 6], ["a"])
+        good = prepare_model.ModelInfo([1, 3, 640, 640], [[1, 300, 6]], ["a"])
         prepare_model.check_model(good, 640)
         with self.assertRaisesRegex(prepare_model.PreparationError, r"not \[1, 3, 320, 320\]"):
             prepare_model.check_model(good, 320)
-        one_to_many = prepare_model.ModelInfo([1, 3, 640, 640], [1, 84, 8400], ["a"])
+        one_to_many = prepare_model.ModelInfo([1, 3, 640, 640], [[1, 84, 8400]], ["a"])
         with self.assertRaisesRegex(prepare_model.PreparationError, "nms=False"):
             prepare_model.check_model(one_to_many, 640)
+
+    def test_check_segmentation_model(self) -> None:
+        def info(*shapes: list[int]) -> prepare_model.ModelInfo:
+            return prepare_model.ModelInfo([1, 3, 640, 640], list(shapes), ["a"])
+
+        good = info([1, 300, 38], [1, 32, 160, 160])
+        prepare_model.check_model(good, 640, "segment")
+        # Either order of the outputs.
+        prepare_model.check_model(info([1, 32, 160, 160], [1, 300, 38]), 640, "segment")
+        with self.assertRaisesRegex(prepare_model.PreparationError, "--task segment"):
+            prepare_model.check_model(good, 640, "detect")
+        for bad in (
+            info([1, 300, 6]),  # A detection model.
+            info([1, 300, 37], [1, 32, 160, 160]),  # Coefficients and prototypes disagree.
+            info([1, 300, 38], [1, 32, 80, 80]),  # Not a quarter of the input.
+            info([1, 116, 8400], [1, 32, 160, 160]),  # Not end to end.
+            info([1, 300, 6 + 65], [1, 65, 160, 160]),  # More coefficients than the op takes.
+        ):
+            with (
+                self.subTest(bad.output_shapes),
+                self.assertRaisesRegex(prepare_model.PreparationError, "segmentation model"),
+            ):
+                prepare_model.check_model(bad, 640, "segment")
 
     @mock.patch.dict(os.environ)
     def test_exports_local_weights(self) -> None:
@@ -185,9 +216,50 @@ class PrepareModelTest(unittest.TestCase):
         onnx = self.output / "custom.onnx"
         onnx.write_bytes(onnx_model([1, 3, 640, 640], [1, 100, 6]))
         self.assertEqual(self.run_main(*arguments)[0], 0)
-        self.assertEqual(prepare_model.read_model_info(onnx).output_shape, [1, 100, 6])
+        self.assertEqual(prepare_model.read_model_info(onnx).output_shapes, [[1, 100, 6]])
         self.assertEqual(self.run_main(*arguments, "--force")[0], 0)
-        self.assertEqual(prepare_model.read_model_info(onnx).output_shape, [1, 300, 6])
+        self.assertEqual(prepare_model.read_model_info(onnx).output_shapes, [[1, 300, 6]])
+
+    def test_exports_a_segmentation_model(self) -> None:
+        segmentation = onnx_model([1, 3, 640, 640], [1, 300, 38], protos_dims=[1, 32, 160, 160])
+        yolo = fake_yolo(self.root, segmentation)
+        arguments = ["--output", str(self.output), "--weights", str(self.weights)]
+        arguments += ["--yolo", str(yolo), "--no-samples"]
+        status, error = self.run_main(*arguments, "--task", "segment")
+        self.assertEqual(status, 0, error)
+        self.assertEqual(
+            prepare_model.read_model_info(self.output / "custom.onnx").output_shapes,
+            [[1, 300, 38], [1, 32, 160, 160]],
+        )
+        # A segmentation export is not a detection model, and the reverse.
+        status, error = self.run_main(*arguments, "--force")
+        self.assertEqual(status, 1)
+        self.assertIn("--task segment", error)
+        yolo = fake_yolo(self.root, onnx_model([1, 3, 640, 640], [1, 300, 6]))
+        status, error = self.run_main(*arguments[:-3], "--yolo", str(yolo), "--no-samples",
+                                      "--task", "segment", "--force")  # fmt: skip
+        self.assertEqual(status, 1)
+        self.assertIn("segmentation model", error)
+
+    def test_task_follows_the_model(self) -> None:
+        def resolve(*arguments: str) -> tuple[str, str]:
+            return prepare_model.resolve_task(
+                prepare_model.parse_arguments(["--output", "x", *arguments])
+            )
+
+        self.assertEqual(resolve(), ("detect", "yolo26n"))
+        self.assertEqual(resolve("--task", "segment"), ("segment", "yolo26n-seg"))
+        self.assertEqual(resolve("--model", "yolo26s-seg"), ("segment", "yolo26s-seg"))
+        self.assertEqual(resolve("--model", "yolo26m"), ("detect", "yolo26m"))
+        for arguments in (("--model", "yolo26n-seg", "--task", "detect"),
+                          ("--model", "yolo26n", "--task", "segment")):  # fmt: skip
+            with self.subTest(arguments), self.assertRaises(prepare_model.PreparationError):
+                resolve(*arguments)
+
+    def test_every_pinned_model_has_a_digest(self) -> None:
+        for size in "nsmlx":
+            for name in (f"yolo26{size}", f"yolo26{size}-seg"):
+                self.assertRegex(prepare_model.WEIGHTS_SHA256[name], r"^[0-9a-f]{64}$")
 
     def test_rejects_exports_the_operator_cannot_run(self) -> None:
         cases = {
@@ -239,6 +311,26 @@ class PrepareModelTest(unittest.TestCase):
             status, error = self.run_main("--output", str(self.output), "--imgsz", size)
             self.assertEqual(status, 1)
             self.assertIn("multiple of 32", error)
+
+    def test_pinned_segmentation_weights_are_downloaded(self) -> None:
+        source = self.root / "served"
+        source.mkdir()
+        (source / "yolo26n-seg.pt").write_bytes(b"pinned seg weights")
+        digest = hashlib.sha256(b"pinned seg weights").hexdigest()
+        yolo = fake_yolo(
+            self.root, onnx_model([1, 3, 640, 640], [1, 300, 38], protos_dims=[1, 32, 160, 160])
+        )
+        with (
+            mock.patch.object(prepare_model, "WEIGHTS_URL", source.as_uri() + "/{name}.pt"),
+            mock.patch.dict(prepare_model.WEIGHTS_SHA256, {"yolo26n-seg": digest}),
+        ):
+            status, error = self.run_main(
+                "--output", str(self.output), "--task", "segment", "--yolo", str(yolo),
+                "--no-samples",
+            )  # fmt: skip
+        self.assertEqual(status, 0, error)
+        self.assertTrue((self.output / "yolo26n-seg.onnx").is_file())
+        self.assertTrue((self.output / "yolo26n-seg.labels.txt").is_file())
 
     def test_pinned_weights_are_downloaded_and_checked(self) -> None:
         source = self.root / "served"

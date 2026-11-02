@@ -16,7 +16,18 @@
 // with scores below kStubMaxFillerScore, as a model's low-confidence tail.
 // A synthetic image with one red and one blue rectangle on a gray background
 // therefore yields their two boxes, through the letterbox, TensorRT and the
-// decode, and swapped red and blue channels swap their classes. No Holoscan.
+// decode, and swapped red and blue channels swap their classes.
+//
+// Its segmentation variant has the tensors of an end-to-end YOLO26
+// segmentation export: `output0` float32 [1, kStubRows, 6 + kStubMaskChannels]
+// and `output1` float32 [1, kStubMaskChannels, S / 4, S / 4]. Prototype c is,
+// over each 4 x 4 input cell, the mean of class c's channel's excess over
+// green, less one half: positive where class c's pixels dominate the cell.
+// Class c's row has coefficient 1 for prototype c and 0 for the others, so
+// each of the two detections' masks is the silhouette of its class's pixels,
+// to within a few input pixels at its edges. The remaining prototypes are -1,
+// and the low-score rows have coefficient 1 for the last of them only, so
+// their masks are empty. No Holoscan.
 
 #pragma once
 
@@ -29,6 +40,9 @@ inline constexpr int kStubRows = 300;
 inline constexpr int kStubClasses = 2;
 inline constexpr float kStubScores[kStubClasses] = {0.9F, 0.8F};
 inline constexpr float kStubMaxFillerScore = 0.2F;
+inline constexpr int kStubMaskChannels = 32;
+// Input pixels per prototype pixel, along each axis.
+inline constexpr int kStubProtoStride = 4;
 
 // The serialized ONNX model (opset 13) for a size x size input.
 // @throws std::invalid_argument for a size outside the letterbox's range.
@@ -40,5 +54,13 @@ inline constexpr float kStubMaxFillerScore = 0.2F;
 // engine cached beside it stays valid as long as the file does not change.
 // @throws std::runtime_error if the file cannot be written.
 std::filesystem::path write_stub_model(const std::filesystem::path& directory, int size);
+
+// The segmentation variant, as stub_model_onnx().
+[[nodiscard]] std::string stub_segmentation_model_onnx(int size);
+
+// Writes the segmentation variant to `directory`/yolo26_seg_stub_<size>.onnx,
+// as write_stub_model() does.
+std::filesystem::path write_stub_segmentation_model(const std::filesystem::path& directory,
+                                                    int size);
 
 }  // namespace holoscan::yolo26

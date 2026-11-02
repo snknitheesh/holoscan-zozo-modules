@@ -3,9 +3,11 @@
 //
 // YOLO26 Detection: images in, object detections out, on the GPU. A source
 // (synthetic frames with known detections, JPEG and PPM files, or a webcam)
-// feeds Yolo26DetectionOp, whose detections a reporter checks, prints, times
-// and optionally draws onto the images, which it writes as PPM files. A
-// HoloViz window can show the frames with their detections drawn over them.
+// feeds Yolo26DetectionOp, or with --task segment Yolo26SegmentationOp,
+// whose detections (and masks) a reporter checks, prints, times and
+// optionally draws onto the images, which it writes as PPM files. A HoloViz
+// window can show the frames with their detections drawn over them, or
+// HoloViz can render them offscreen, where each render is checked.
 
 #include <algorithm>
 #include <atomic>
@@ -40,17 +42,20 @@
 #if YOLO26_DETECTION_ENABLE_VISUALIZATION
 #include <holoscan/visualization/holoviz_op.hpp>
 #include <holoscan/yolo26/yolo26_overlay_op.hpp>
+#include <holoscan/yolo26/yolo26_segmentation_overlay_op.hpp>
 #endif
 
 #include <holoscan/yolo26/stub_model.hpp>
 #include <holoscan/yolo26/synthetic_scene.hpp>
 #include <holoscan/yolo26/yolo26_detection_op.hpp>
+#include <holoscan/yolo26/yolo26_segmentation_op.hpp>
 
 #include "detection_report_op.hpp"
 #include "edges.hpp"
 #include "expectations.hpp"
 #include "image_files.hpp"
 #include "image_sources.hpp"
+#include "render_check_op.hpp"
 
 namespace {
 
@@ -62,7 +67,11 @@ constexpr std::string_view kAppName = "yolo26_detection";
 constexpr std::string_view kStubModel = "stub";
 
 enum class Source { kSynthetic, kFiles, kCamera };
-enum class DisplayMode { kAuto, kOn, kOff };
+enum class DisplayMode { kAuto, kOn, kOff, kOffscreen };
+enum class Task { kDetect, kSegment };
+
+// The masks' opacity in the display.
+constexpr std::uint8_t kMaskAlpha = 110;
 
 struct Options {
   Source source{Source::kSynthetic};
@@ -77,10 +86,13 @@ struct Options {
   std::optional<int> height;
   y26::PixelFormat encoding{y26::PixelFormat::kRgb8};
   bool host_input{false};
+  Task task{Task::kDetect};
   std::string model;
   int input_size{640};
   float score_threshold{0.25F};
-  int max_detections{300};
+  // 300 to detect, 32 to segment, unless set.
+  std::optional<int> max_detections;
+  std::optional<float> mask_threshold;
   std::optional<int> num_classes;
   bool fp16{false};
   std::filesystem::path labels_file;
@@ -171,6 +183,16 @@ Options parse_args(int argc, char** argv) {
       opts.encoding = parse_encoding(value);
     } else if (option == "--host-input") {
       opts.host_input = parse_bool(value, option);
+    } else if (option == "--task") {
+      if (value == "detect") {
+        opts.task = Task::kDetect;
+      } else if (value == "segment") {
+        opts.task = Task::kSegment;
+      } else {
+        throw std::invalid_argument("--task must be detect or segment");
+      }
+    } else if (option == "--mask-threshold") {
+      opts.mask_threshold = parse_number<float>(value, option);
     } else if (option == "--model") {
       opts.model = value;
     } else if (option == "--input-size") {
@@ -199,6 +221,7 @@ Options parse_args(int argc, char** argv) {
       opts.startup_timeout_seconds = parse_number<std::uint32_t>(value, option);
     } else if (option == "--display") {
       opts.display = value == "auto"             ? DisplayMode::kAuto
+                     : value == "offscreen"      ? DisplayMode::kOffscreen
                      : parse_bool(value, option) ? DisplayMode::kOn
                                                  : DisplayMode::kOff;
     } else if (option == "--compile-only") {
@@ -215,13 +238,17 @@ void usage(const char* argv0) {
       << "Usage: " << argv0
       << " --model PATH|stub [options]\n"
          "Model:\n"
+         "  --task detect|segment      Detect objects, or segment them too with a YOLO26\n"
+         "                             segmentation model (default: detect)\n"
          "  --model PATH|stub          An end-to-end YOLO26 .onnx export (its TensorRT engine is\n"
          "                             built once and cached beside it) or a TensorRT engine;\n"
          "                             'stub' writes and uses a stand-in model with known\n"
-         "                             detections, which needs no download\n"
+         "                             detections (and masks), which needs no download\n"
          "  --input-size N             The model's input side, a multiple of 32 (default: 640)\n"
          "  --score-threshold F        Minimum score in [0, 1] (default: 0.25)\n"
-         "  --max-detections N         Detections kept per image (default: 300)\n"
+         "  --max-detections N         Detections kept per image (default: 300; segment: 32)\n"
+         "  --mask-threshold F         Mask probability a pixel needs, in (0, 1) (segment;\n"
+         "                             default: 0.5)\n"
          "  --num-classes N            The model's classes (default: 80; stub: 2)\n"
          "  --fp16 true|false          Build the engine with FP16 allowed (default: false)\n"
          "  --labels FILE              Class names, one per line, for printing\n"
@@ -248,9 +275,12 @@ void usage(const char* argv0) {
          "  --expect-iou F             Overlap an expected box needs (default: 0.8)\n"
          "  --image-dir DIR            Write each frame with its boxes as\n"
          "                             DIR/detections_NNNNNN.ppm\n"
-         "  --display auto|true|false  Show the frames with their detections in a HoloViz\n"
+         "  --display auto|true|false|offscreen\n"
+         "                             Show the frames with their detections in a HoloViz\n"
          "                             window, for synthetic frames and the camera (default:\n"
-         "                             auto, on for the camera when a display is available)\n"
+         "                             auto, on for the camera when a display is available);\n"
+         "                             offscreen renders synthetic frames with the stub model\n"
+         "                             into GPU memory and checks every render\n"
          "  --compile-only true|false  Build and check the graph without running it\n"
          "  --timeout-seconds N        Fail when no result arrives for N seconds plus two\n"
          "                             source periods (default: 120)\n"
@@ -260,6 +290,12 @@ void usage(const char* argv0) {
 }
 
 bool is_stub(const Options& opts) { return opts.model == kStubModel; }
+
+bool segment(const Options& opts) { return opts.task == Task::kSegment; }
+
+int max_detections(const Options& opts) {
+  return opts.max_detections.value_or(segment(opts) ? 32 : 300);
+}
 
 // Synthetic frames, or the camera's once validate() has set its size.
 int frame_width(const Options& opts) { return opts.width.value_or(1280); }
@@ -296,8 +332,35 @@ y26::Yolo26DetectionConfig detection_config(const Options& opts) {
                              : std::filesystem::path(opts.model),
       .input_size = opts.input_size,
       .score_threshold = opts.score_threshold,
-      .max_detections = opts.max_detections,
+      .max_detections = max_detections(opts),
       .num_classes = opts.num_classes.value_or(is_stub(opts) ? y26::kStubClasses : 80),
+      .fp16 = opts.fp16};
+}
+
+// The segmenter's settings, for images up to the largest the source gives;
+// the stub's model path is filled in by execute().
+y26::Yolo26SegmentationConfig segmentation_config(const Options& opts) {
+  int width = frame_width(opts);
+  int height = frame_height(opts);
+  if (opts.source == Source::kFiles) {
+    width = 1;
+    height = 1;
+    for (const auto& file : opts.image_files) {
+      const app::ImageFileInfo info = app::read_image_info(file);
+      width = std::max(width, info.width);
+      height = std::max(height, info.height);
+    }
+  }
+  return y26::Yolo26SegmentationConfig{
+      .model = is_stub(opts) ? std::filesystem::path("yolo26_seg_stub.onnx")
+                             : std::filesystem::path(opts.model),
+      .input_size = opts.input_size,
+      .score_threshold = opts.score_threshold,
+      .max_detections = max_detections(opts),
+      .num_classes = opts.num_classes.value_or(is_stub(opts) ? y26::kStubClasses : 80),
+      .mask_threshold = opts.mask_threshold.value_or(0.5F),
+      .max_image_width = width,
+      .max_image_height = height,
       .fp16 = opts.fp16};
 }
 
@@ -406,7 +469,14 @@ void validate(Options& opts) {
                                   (error ? " (" + error.message() + ")" : ""));
     }
   }
-  y26::validate_config(detection_config(opts));
+  if (segment(opts)) {
+    y26::validate_config(segmentation_config(opts));
+  } else {
+    if (opts.mask_threshold) {
+      throw std::invalid_argument("--mask-threshold needs --task segment");
+    }
+    y26::validate_config(detection_config(opts));
+  }
 
   // The display: on for the camera when a display is available, unless set.
   if (opts.display == DisplayMode::kAuto) {
@@ -414,6 +484,17 @@ void validate(Options& opts) {
                            display_available()
                        ? DisplayMode::kOn
                        : DisplayMode::kOff;
+  }
+  if (opts.display == DisplayMode::kOffscreen) {
+    if (opts.source != Source::kSynthetic || !is_stub(opts) ||
+        opts.encoding != y26::PixelFormat::kRgb8) {
+      throw std::invalid_argument(
+          "--display offscreen renders rgb8 synthetic frames with --model stub, whose renders "
+          "it checks");
+    }
+    if (!YOLO26_DETECTION_ENABLE_VISUALIZATION) {
+      throw std::invalid_argument("--display needs a build with visualization enabled");
+    }
   }
   if (opts.display == DisplayMode::kOn) {
     if (opts.source == Source::kFiles || opts.encoding != y26::PixelFormat::kRgb8) {
@@ -442,10 +523,17 @@ using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holosc
 
 int execute(const Options& opts, SignalDomain& signals) {
   y26::Yolo26DetectionConfig detection = detection_config(opts);
+  y26::Yolo26SegmentationConfig segmentation = segmentation_config(opts);
   if (is_stub(opts)) {
     // Written to the working directory, where its engine is cached beside it.
-    detection.model = y26::write_stub_model(std::filesystem::current_path(), opts.input_size);
+    if (segment(opts)) {
+      segmentation.model =
+          y26::write_stub_segmentation_model(std::filesystem::current_path(), opts.input_size);
+    } else {
+      detection.model = y26::write_stub_model(std::filesystem::current_path(), opts.input_size);
+    }
   }
+  const int capacity = max_detections(opts);
 
   holoscan::Graph graph{std::string(kAppName)};
   // Frames the run expects; 0 for a camera that runs until stopped.
@@ -475,7 +563,26 @@ int execute(const Options& opts, SignalDomain& signals) {
   } else {
     image_out = &graph.op<app::CameraSourceOp>("source", camera_source_config(opts))->image;
   }
-  auto detector = graph.op<y26::Yolo26DetectionOp>("detector", detection);
+  // The detector's outputs: Yolo26DetectionOp's, or Yolo26SegmentationOp's,
+  // which add the masks and the label image.
+  struct DetectorPorts {
+    const holoscan::Input<holoscan::schema::ImageT>* image;
+    const holoscan::Output<holoscan::Tensor>* boxes;
+    const holoscan::Output<holoscan::Tensor>* scores;
+    const holoscan::Output<holoscan::Tensor>* class_ids;
+    const holoscan::Output<holoscan::Tensor>* count;
+    const holoscan::Output<holoscan::Tensor>* masks;
+    const holoscan::Output<holoscan::Tensor>* label_image;
+  } detector{};
+  if (segment(opts)) {
+    auto op = graph.op<y26::Yolo26SegmentationOp>("detector", segmentation);
+    detector = DetectorPorts{&op->image, &op->boxes, &op->scores,     &op->class_ids,
+                             &op->count, &op->masks, &op->label_image};
+  } else {
+    auto op = graph.op<y26::Yolo26DetectionOp>("detector", detection);
+    detector = DetectorPorts{&op->image, &op->boxes, &op->scores, &op->class_ids,
+                             &op->count, nullptr,    nullptr};
+  }
 
   std::optional<app::SyntheticTruth> truth;
   if (opts.source == Source::kSynthetic && opts.verify.value_or(false)) {
@@ -486,7 +593,8 @@ int execute(const Options& opts, SignalDomain& signals) {
       "report", app::DetectionReportConfig{.report = report,
                                            .expected_frames = frames,
                                            .realtime = realtime,
-                                           .max_detections = opts.max_detections,
+                                           .max_detections = capacity,
+                                           .segmentation = segment(opts),
                                            .truth = truth,
                                            .files = opts.source == Source::kFiles
                                                         ? opts.image_files
@@ -502,58 +610,18 @@ int execute(const Options& opts, SignalDomain& signals) {
   // detections; the reporter pairs them with their frame by capture time, so
   // its images keep a few frames.
   const holoscan::ConnectionOptions edge = realtime ? app::newest() : app::lossless();
-  graph.add_flow(*image_out, detector->image, edge);
-  app::connect_detections(graph, detector, reporter, edge);
+  graph.add_flow(*image_out, *detector.image, edge);
+  graph.add_flow(*detector.boxes, reporter->boxes, edge);
+  graph.add_flow(*detector.scores, reporter->scores, edge);
+  graph.add_flow(*detector.class_ids, reporter->class_ids, edge);
+  graph.add_flow(*detector.count, reporter->count, edge);
+  if (segment(opts)) {
+    graph.add_flow(*detector.masks, reporter->masks, edge);
+    graph.add_flow(*detector.label_image, reporter->label_image, edge);
+  }
   if (!opts.image_dir.empty()) {
     graph.add_flow(*image_out, reporter->image, realtime ? app::recent_frames() : app::lossless());
   }
-
-#if YOLO26_DETECTION_ENABLE_VISUALIZATION
-  if (opts.display == DisplayMode::kOn) {
-    namespace viz = holoscan::visualization;
-    const auto width = static_cast<std::uint32_t>(frame_width(opts));
-    const auto height = static_cast<std::uint32_t>(frame_height(opts));
-    viz::LayerStack layers;
-    layers.add_image_layer("video", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8Unorm,
-                                                        .max_width = width,
-                                                        .max_height = height});
-    // HoloViz blends RGBA image layers by their alpha, so the boxes go over the video.
-    layers.add_image_layer("boxes", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8A8Unorm,
-                                                        .max_width = width,
-                                                        .max_height = height});
-    layers.add_text_layer(
-        "labels",
-        viz::TextLayerDesc{.max_glyphs = 2U * static_cast<std::uint32_t>(opts.max_detections) *
-                                         y26::kOverlayLabelBytes,
-                           .normalized_coordinates = true});
-    // Draw when the boxes arrive, over the newest image, which is theirs;
-    // triggering on the image would draw the previous frame's boxes.
-    const auto max_input_age =
-        std::max(4 * std::chrono::milliseconds(opts.period_ms), std::chrono::milliseconds{250});
-    auto visualizer = graph.op<viz::HolovizOp>(
-        "holoviz", std::move(layers),
-        viz::WindowSinkDesc{.title = "YOLO26 Detection", .width = width, .height = height},
-        viz::FrameTrigger{viz::LayerTrigger{1}}, max_input_age);
-    auto overlay = graph.op<y26::Yolo26OverlayOp>(
-        "overlay", y26::Yolo26OverlayConfig{.width = frame_width(opts),
-                                            .height = frame_height(opts),
-                                            .max_detections = opts.max_detections,
-                                            .labels = opts.labels});
-    // Real time in either mode: the display keeps the newest sample and never
-    // holds back the detector. Its video is a layer that does not trigger a
-    // frame, which HoloViz pairs with the boxes by taking the newest image no
-    // newer than them: that image must still be queued when the boxes arrive,
-    // or it falls back to an older one, so it keeps a few frames.
-    graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames());
-    graph.add_flow(detector->boxes, overlay->boxes, app::newest());
-    graph.add_flow(detector->scores, overlay->scores, app::newest());
-    graph.add_flow(detector->class_ids, overlay->class_ids, app::newest());
-    graph.add_flow(detector->count, overlay->count, app::newest());
-    graph.add_flow(overlay->overlay, visualizer->image_layer_input(1), app::newest());
-    graph.add_flow(overlay->labels, visualizer->tensor_layer_input(2), app::newest());
-  }
-#endif
-  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // GPU outputs are on device 0.
   holoscan::CompileOptions compile_options;
@@ -563,8 +631,102 @@ int execute(const Options& opts, SignalDomain& signals) {
                                               .output_port = std::move(port),
                                               .device = holoscan::DeviceId{0}});
   };
+  auto render_report = std::make_shared<app::RenderReport>();
+#if YOLO26_DETECTION_ENABLE_VISUALIZATION
+  if (opts.display == DisplayMode::kOn || opts.display == DisplayMode::kOffscreen) {
+    namespace viz = holoscan::visualization;
+    const bool offscreen = opts.display == DisplayMode::kOffscreen;
+    const auto width = static_cast<std::uint32_t>(frame_width(opts));
+    const auto height = static_cast<std::uint32_t>(frame_height(opts));
+    viz::LayerStack layers;
+    layers.add_image_layer("video", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8Unorm,
+                                                        .max_width = width,
+                                                        .max_height = height});
+    // HoloViz blends RGBA image layers by their alpha, so the boxes (and
+    // masks) go over the video.
+    layers.add_image_layer("boxes", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8A8Unorm,
+                                                        .max_width = width,
+                                                        .max_height = height});
+    layers.add_text_layer(
+        "labels", viz::TextLayerDesc{.max_glyphs = 2U * static_cast<std::uint32_t>(capacity) *
+                                                   y26::kOverlayLabelBytes,
+                                     .normalized_coordinates = true});
+    viz::SinkDesc sink =
+        viz::WindowSinkDesc{.title = segment(opts) ? "YOLO26 Segmentation" : "YOLO26 Detection",
+                            .width = width,
+                            .height = height};
+    if (offscreen) {
+      sink = viz::CudaSinkDesc{
+          .width = width, .height = height, .format = viz::ImageFormat::kR8G8B8A8Unorm};
+    }
+    // Draw when the boxes arrive, over the newest image, which is theirs;
+    // triggering on the image would draw the previous frame's boxes.
+    const auto max_input_age =
+        std::max(4 * std::chrono::milliseconds(opts.period_ms), std::chrono::milliseconds{250});
+    auto visualizer =
+        graph.op<viz::HolovizOp>("holoviz", std::move(layers), std::move(sink),
+                                 viz::FrameTrigger{viz::LayerTrigger{1}}, max_input_age);
+    // Real time in either mode: the display keeps the newest sample and never
+    // holds back the detector. Its video is a layer that does not trigger a
+    // frame, which HoloViz pairs with the boxes by taking the newest image no
+    // newer than them: that image must still be queued when the boxes arrive,
+    // or it falls back to an older one, so it keeps a few frames.
+    graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames());
+    const holoscan::Output<holoscan::schema::ImageT>* overlay_image = nullptr;
+    const holoscan::Output<holoscan::Tensor>* overlay_labels = nullptr;
+    if (segment(opts)) {
+      auto overlay = graph.op<y26::Yolo26SegmentationOverlayOp>(
+          "overlay", y26::Yolo26SegmentationOverlayConfig{.width = frame_width(opts),
+                                                          .height = frame_height(opts),
+                                                          .max_detections = capacity,
+                                                          .labels = opts.labels,
+                                                          .mask_alpha = kMaskAlpha});
+      graph.add_flow(*detector.boxes, overlay->boxes, app::newest());
+      graph.add_flow(*detector.scores, overlay->scores, app::newest());
+      graph.add_flow(*detector.class_ids, overlay->class_ids, app::newest());
+      graph.add_flow(*detector.count, overlay->count, app::newest());
+      graph.add_flow(*detector.label_image, overlay->label_image, app::newest());
+      overlay_image = &overlay->overlay;
+      overlay_labels = &overlay->labels;
+    } else {
+      auto overlay = graph.op<y26::Yolo26OverlayOp>(
+          "overlay", y26::Yolo26OverlayConfig{.width = frame_width(opts),
+                                              .height = frame_height(opts),
+                                              .max_detections = capacity,
+                                              .labels = opts.labels});
+      graph.add_flow(*detector.boxes, overlay->boxes, app::newest());
+      graph.add_flow(*detector.scores, overlay->scores, app::newest());
+      graph.add_flow(*detector.class_ids, overlay->class_ids, app::newest());
+      graph.add_flow(*detector.count, overlay->count, app::newest());
+      overlay_image = &overlay->overlay;
+      overlay_labels = &overlay->labels;
+    }
+    graph.add_flow(*overlay_image, visualizer->image_layer_input(1), app::newest());
+    graph.add_flow(*overlay_labels, visualizer->tensor_layer_input(2), app::newest());
+    if (offscreen) {
+      // Every render is checked; one the check is still busy with gives way
+      // to the newest.
+      auto render_check = graph.op<app::RenderCheckOp>(
+          "render_check", app::RenderCheckConfig{.report = render_report,
+                                                 .width = frame_width(opts),
+                                                 .height = frame_height(opts),
+                                                 .frames = frames,
+                                                 .masks = segment(opts),
+                                                 .mask_alpha = kMaskAlpha,
+                                                 .image_dir = opts.image_dir});
+      graph.add_flow(visualizer->output(), render_check->rendered, app::newest());
+      on_gpu("holoviz", "output");
+    }
+  }
+#endif
+  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+
   for (const char* port : {"boxes", "scores", "class_ids", "count"}) {
     on_gpu("detector", port);
+  }
+  if (segment(opts)) {
+    on_gpu("detector", "masks");
+    on_gpu("detector", "label_image");
   }
   if (opts.source == Source::kFiles || (opts.source == Source::kSynthetic && !opts.host_input)) {
     on_gpu("source", "image");
@@ -592,7 +754,11 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cerr << "; an interrupt ends the process without a report\n";
   }
   // Build the TensorRT engine now rather than in start(): see prepare_engine().
-  y26::prepare_engine(detection);
+  if (segment(opts)) {
+    y26::prepare_engine(segmentation);
+  } else {
+    y26::prepare_engine(detection);
+  }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
   // The run times out when no result arrives for this long. Before the first
   // one, the detector may still be building its engine. The sums cannot
@@ -654,9 +820,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   // In real time, the frames that came while the detector or the reporter
   // was busy are skipped; the last one must arrive.
   const bool all_frames = realtime ? report->last_frame_id == frames : report->frames == frames;
+  // Offscreen, at least one render arrived, and each showed a frame right.
+  const std::uint32_t renders = render_report->renders.load();
+  const bool renders_passed = opts.display != DisplayMode::kOffscreen ||
+                              (renders != 0 && render_report->matched == renders);
   const bool passed = !timed_out_after && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted && all_frames &&
-                      report->passed() && !none_found;
+                      report->passed() && !none_found && renders_passed;
   const std::vector<double>& latencies = report->latencies_ms;
   double mean = 0.0;
   for (const double value : latencies) {
@@ -685,6 +855,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (report->verified) {
     std::cout << " truth: missed=" << report->missed << " extra=" << report->extra
               << " max_edge_error_px=" << report->max_edge_error;
+  }
+  if (report->masks_verified) {
+    std::cout << " masks: missed=" << report->mask_misses << " min_iou=" << report->min_mask_iou
+              << " label_errors=" << report->label_errors;
+  }
+  if (opts.display == DisplayMode::kOffscreen) {
+    std::cout << " renders=" << renders << " renders_matched=" << render_report->matched;
   }
   if (report->expected != 0) {
     std::cout << " expected: matched=" << report->matched << '/' << report->expected;

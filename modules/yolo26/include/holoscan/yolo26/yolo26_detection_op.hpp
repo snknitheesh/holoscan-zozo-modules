@@ -126,9 +126,6 @@ class Yolo26DetectionOp final : public holoscan::Operator<> {
  private:
   struct Engine;
 
-  [[nodiscard]] holoscan::expected<const std::uint8_t*, holoscan::Error> stage(
-      const holoscan::Tensor& tensor, int width, int height, int channels, std::size_t pitch,
-      cudaStream_t stream);
   void release() noexcept;
   // Warns, once per run, if a finished frame had more detections than the
   // outputs hold.

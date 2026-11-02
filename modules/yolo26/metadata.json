@@ -2,9 +2,9 @@
   "$schema": "urn:holoscan:module:v2",
   "module": {
     "name": "holoscan-yolo26",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "support_level": "community",
-    "description": "End-to-end YOLO26 object detection on the GPU: a CUDA letterbox, TensorRT through the SDK's HoloInfer, and a GPU decode into boxes, scores, classes and a count; and a HoloViz overlay of the detections. The model is not included: a tool exports it with a separately installed Ultralytics (AGPL-3.0).",
+    "description": "End-to-end YOLO26 object detection and instance segmentation on the GPU: a CUDA letterbox, TensorRT through the SDK's HoloInfer, and a GPU decode into boxes, scores, classes and a count, and for segmentation models per-instance masks and a label image at the image's size; and HoloViz overlays of the detections and masks. The models are not included: a tool exports them with a separately installed Ultralytics (AGPL-3.0).",
     "authors": [
       {
         "name": "zozo",
@@ -31,6 +31,7 @@
     "tags": [
       "Computer Vision and Perception",
       "Object Detection",
+      "Instance Segmentation",
       "YOLO",
       "TensorRT",
       "CUDA",
@@ -40,7 +41,9 @@
     "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
     "operator_names": [
       "Yolo26DetectionOp",
-      "Yolo26OverlayOp"
+      "Yolo26OverlayOp",
+      "Yolo26SegmentationOp",
+      "Yolo26SegmentationOverlayOp"
     ],
     "requirements": {
       "hardware": [
@@ -51,8 +54,8 @@
       ],
       "data": [
         {
-          "name": "YOLO26 (Ultralytics, AGPL-3.0)",
-          "description": "Not part of this module. Its tools/prepare_model.py downloads pinned weights and exports them to ONNX with the separately installed Ultralytics tool. The tests use a stub model that the module writes itself.",
+          "name": "YOLO26 and YOLO26-seg (Ultralytics, AGPL-3.0)",
+          "description": "Not part of this module. Its tools/prepare_model.py downloads pinned detection or segmentation weights and exports them to ONNX with the separately installed Ultralytics tool. The tests use stub models that the module writes itself.",
           "url": "https://github.com/ultralytics/assets/releases/tag/v8.4.0",
           "version": "v8.4.0"
         }
@@ -62,7 +65,7 @@
     "binary_packages": {
       "debian": "holoscan-yolo26",
       "install_commands": [
-        "sudo apt install ./holoscan-yolo26_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-yolo26_1.1.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

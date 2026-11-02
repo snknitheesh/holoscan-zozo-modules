@@ -349,6 +349,159 @@ yolo26_real_test(yolo26_real_coco_loop "frames=50/50 .*expected: matched=150/150
   --loop true --count 50 --period-ms 5
 )
 
+# Segmentation, with the stub segmentation model: every detection checked against the
+# frame's known ones, every mask against its rectangle, and the label image against the
+# masks, in the encodings, memory, shapes and input sizes above; the masks drawn into
+# files; the stub's two masks printed for image files.
+add_test(
+  NAME yolo26_seg_stub_setup
+  COMMAND yolo26_detection --task segment --model stub --count 1 --period-ms 1
+)
+set_tests_properties(yolo26_seg_stub_setup PROPERTIES FIXTURES_SETUP yolo26_seg_stub)
+set(
+  _seg
+  --task
+  segment
+  --model
+  stub
+  --period-ms
+  5
+)
+set(_masks "masks: missed=0 min_iou=0\\.9[0-9]* label_errors=0\nyolo26_detection: verdict=PASS")
+yolo26_app_test(yolo26_app_segment 0 "frames=20/20 detections=40 .*truth: missed=0 extra=0 .*${_masks}"
+  ${_seg} --count 20
+)
+yolo26_app_test(yolo26_app_segment_bgr8 0 "${_masks}" ${_seg} --count 20 --encoding bgr8)
+yolo26_app_test(yolo26_app_segment_rgba8_host 0 "${_masks}"
+  ${_seg} --count 20 --encoding rgba8 --host-input true
+)
+yolo26_app_test(yolo26_app_segment_bgra8_tall 0 "${_masks}"
+  ${_seg} --count 20 --encoding bgra8 --width 720 --height 1280
+)
+yolo26_app_test(yolo26_app_segment_odd_padding 0 "${_masks}"
+  ${_seg} --count 20 --width 1000 --height 333
+)
+yolo26_app_test(yolo26_app_segment_small 0 "masks: missed=0 .*label_errors=0\n.*verdict=PASS"
+  ${_seg} --count 20 --width 64 --height 48
+)
+yolo26_app_test(yolo26_app_segment_input_320 0 "${_masks}"
+  ${_seg} --count 20 --width 1920 --height 1080 --input-size 320
+)
+# Too small a capacity drops the second detection, and its mask, of every frame.
+yolo26_app_test(yolo26_app_segment_capacity_too_small 1 "missed=20 extra=0 .*verdict=FAIL"
+  ${_seg} --count 20 --max-detections 1
+)
+# A mask threshold above every mask value of the stub empties the masks.
+yolo26_app_test(yolo26_app_segment_mask_threshold_too_high 1
+  "masks: missed=40 .*verdict=FAIL" ${_seg} --count 20 --mask-threshold 0.7
+)
+set(_seg_images "${CMAKE_CURRENT_BINARY_DIR}/seg_images")
+add_test(
+  NAME yolo26_app_segment_image_dir
+  COMMAND
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=0 "-DEXPECT_OUTPUT=files_written=3 .*verdict=PASS"
+    "-DMAKE_DIRECTORY=${_seg_images}" -P "${_run_and_match}" -- $<TARGET_FILE:yolo26_detection>
+    ${_seg} --count 3 --image-dir "${_seg_images}"
+)
+yolo26_app_test(yolo26_app_segment_files 0
+  "scene_0\\.jpg: 2 detections\n  class 0 \\(0\\) 0\\.900 \\[[^]]*\\] mask [1-9][0-9]+ px\n  class 1 .* mask [1-9][0-9]+ px\n.*expected: matched=6/6\nyolo26_detection: verdict=PASS"
+  ${_seg} --source files --images "${_files}" --expect "${_files}/expected.csv" --expect-iou 0.9
+)
+set_tests_properties(
+  yolo26_app_segment
+  yolo26_app_segment_bgr8
+  yolo26_app_segment_rgba8_host
+  yolo26_app_segment_bgra8_tall
+  yolo26_app_segment_odd_padding
+  yolo26_app_segment_small
+  yolo26_app_segment_capacity_too_small
+  yolo26_app_segment_mask_threshold_too_high
+  yolo26_app_segment_image_dir
+  PROPERTIES FIXTURES_REQUIRED yolo26_seg_stub
+)
+set_tests_properties(
+  yolo26_app_segment_files
+  PROPERTIES FIXTURES_REQUIRED "yolo26_seg_stub;yolo26_images"
+)
+set_tests_properties(yolo26_app_segment_input_320 PROPERTIES RESOURCE_LOCK yolo26_seg_stub_320)
+yolo26_app_test(yolo26_app_rejects_mask_threshold_without_segment 2
+  "^error: --mask-threshold needs --task segment" ${_stub} --mask-threshold 0.5
+)
+yolo26_app_test(yolo26_app_rejects_mask_threshold 2 "^error: mask_threshold must be in"
+  ${_seg} --mask-threshold 1
+)
+yolo26_app_test(yolo26_app_rejects_task 2 "^error: --task must be detect or segment"
+  ${_stub} --task classify
+)
+yolo26_app_test(yolo26_app_rejects_offscreen_with_files 2 "^error: --display offscreen renders"
+  ${_seg} --source files --images "${_files}" --display offscreen
+)
+set_tests_properties(
+  yolo26_app_rejects_offscreen_with_files
+  PROPERTIES FIXTURES_REQUIRED yolo26_images
+)
+yolo26_app_test(yolo26_app_rejects_offscreen_without_stub 2 "^error: --display offscreen renders"
+  --model "${_junk}" --display offscreen
+)
+if(YOLO26_DETECTION_ENABLE_VISUALIZATION)
+  # HoloViz renders offscreen into GPU memory, and every render is checked: the frame's
+  # boxes in their class colors at its rectangles' edges, and the frame, with the masks
+  # blended over it when segmenting, at their centers.
+  # The verdict passes only when every render matched.
+  set(_renders "renders=[1-9][0-9]* renders_matched=[1-9][0-9]*\nyolo26_detection: verdict=PASS")
+  yolo26_app_test(yolo26_app_segment_offscreen 0 "masks: missed=0 .*${_renders}"
+    ${_seg} --count 20 --period-ms 10 --display offscreen
+  )
+  yolo26_app_test(yolo26_app_offscreen 0 "truth: missed=0 extra=0 .*${_renders}"
+    ${_stub} --count 20 --period-ms 10 --display offscreen
+  )
+  yolo26_app_test(yolo26_app_segment_display_plan 0 "^yolo26_detection: plan=OK\n*$"
+    ${_seg} --display true --compile-only true
+  )
+  set_tests_properties(yolo26_app_segment_offscreen PROPERTIES FIXTURES_REQUIRED yolo26_seg_stub)
+  set_tests_properties(yolo26_app_offscreen PROPERTIES FIXTURES_REQUIRED yolo26_stub)
+endif()
+
+# The real YOLO26n-seg model on the COCO image: the cats, the remote and the couch that
+# Ultralytics' own predictor finds in it with a score above 0.4, boxes overlapping its by
+# an IoU of at least 0.9, and masks of about its sizes. (Its fifth detection, a remote
+# at 0.263, is too near the threshold to require.) Skipped (exit 77) unless prepare_model.py
+# --task segment has written the model to YOLO26_DATA_DIR.
+set(_seg_model "${YOLO26_DATA_DIR}/yolo26n-seg.onnx")
+set(_coco_seg_expected "${CMAKE_CURRENT_BINARY_DIR}/coco_seg_expected.csv")
+file(
+  WRITE "${_coco_seg_expected}"
+  "# Ultralytics 8.4 with ONNX Runtime, retina masks: cat 0.904 (52726 px), cat 0.845\n"
+  "# (60667 px), remote 0.834 (4518 px), couch 0.437 (183211 px), remote 0.263 (2165 px)\n"
+  "000000039769.jpg,15,10.69,54.13,318.05,466.18\n"
+  "000000039769.jpg,15,340.75,24.42,640.00,373.89\n"
+  "000000039769.jpg,65,40.08,72.81,176.71,118.01\n"
+  "000000039769.jpg,57,0.00,1.76,640.00,477.57\n"
+)
+function(yolo26_real_segment_test name output)
+  add_test(
+    NAME ${name}
+    COMMAND
+      ${CMAKE_COMMAND} -DEXPECT_EXIT=0 "-DEXPECT_OUTPUT=${output}"
+      "-DSKIP_UNLESS_EXISTS=${_seg_model}|${_coco}" -P "${_run_and_match}" --
+      $<TARGET_FILE:yolo26_detection> --task segment --model "${_seg_model}" --labels
+      "${YOLO26_DATA_DIR}/yolo26n-seg.labels.txt" --source files --images "${_coco}" --expect
+      "${_coco_seg_expected}" --expect-iou 0.9 ${ARGN}
+  )
+  set_tests_properties(
+    ${name}
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 RUN_SERIAL TRUE
+  )
+endfunction()
+set(
+  _seg_cats
+  "cat \\(15\\) 0\\.90[0-9] [^\n]* mask 52[67][0-9][0-9] px\n  cat \\(15\\) 0\\.84[0-9] [^\n]* mask 60[5-7][0-9][0-9] px\n  remote \\(65\\) 0\\.83[0-9] [^\n]* mask 4[45][0-9][0-9] px\n"
+)
+yolo26_real_segment_test(yolo26_real_coco_segment "${_seg_cats}.*expected: matched=4/4\n.*verdict=PASS")
+yolo26_real_segment_test(yolo26_real_coco_segment_fp16 "expected: matched=4/4\n.*verdict=PASS"
+  --fp16 true
+)
+
 get_property(_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _tests)
   get_test_property(${_test} TIMEOUT _timeout)

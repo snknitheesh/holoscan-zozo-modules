@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// The two CUDA kernels around an end-to-end YOLO26 model, usable without a
+// The CUDA kernels around an end-to-end YOLO26 model, usable without a
 // Holoscan graph:
 //
 // - the letterbox, which writes an image into the model's input;
@@ -9,9 +9,12 @@
 //   threshold, maps their corners back to the image and compacts them, in
 //   model order, into fixed-capacity outputs. The model emits a fixed number
 //   of rows, [x1, y1, x2, y2, score, class], with corners in letterboxed input
-//   pixels and no suppression left to do.
+//   pixels and no suppression left to do;
+// - for a segmentation model, the decode that also gathers each kept row's
+//   mask coefficients, and the mask decode, which turns them and the model's
+//   prototype masks into instance masks and a label image at the image's size.
 //
-// Yolo26DetectionOp runs both around TensorRT.
+// Yolo26DetectionOp and Yolo26SegmentationOp run them around TensorRT.
 
 #pragma once
 
@@ -80,5 +83,72 @@ struct DecodeOutputs {
 // keep their order.
 cudaError_t launch_decode(const float* rows, const DecodeParams& params,
                           const DecodeOutputs& outputs, cudaStream_t stream);
+
+// Segmentation. An end-to-end YOLO26 segmentation model gives two outputs:
+// rows of [x1, y1, x2, y2, score, class, c_0 .. c_M-1], the detection's six
+// fields followed by M mask coefficients, and M prototype masks of
+// proto_height x proto_width (a quarter of the input side). An instance's
+// mask is where the sum over m of c_m * prototype_m, upsampled bilinearly to
+// the image, exceeds a threshold, cropped to the instance's box.
+
+// Most mask coefficients per row (YOLO26 models have 32).
+inline constexpr int kMaxMaskChannels = 64;
+// Largest prototype mask side.
+inline constexpr int kMaxProtoSide = kMaxInputSize;
+
+// The decode of segmentation rows: as launch_decode() for the rows' first six
+// fields, with rows of 6 + mask_channels floats, and the mask coefficients of
+// each detection written to `coefficients`: capacity x mask_channels floats in
+// GPU memory, a detection's in its slot, zero in the slots from `count` on.
+cudaError_t launch_segmentation_decode(const float* rows, const DecodeParams& params,
+                                       int mask_channels, const DecodeOutputs& outputs,
+                                       float* coefficients, cudaStream_t stream);
+
+struct MaskParams {
+  // Detection slots: the length of `boxes` and `coefficients`, and of `masks`.
+  int capacity{};
+  int mask_channels{};
+  int proto_width{};
+  int proto_height{};
+  // A pixel belongs to an instance when the mask's value there, a logit,
+  // exceeds this: 0 is a probability of one half.
+  float logit_threshold{};
+  // The input's letterbox; the masks have its source size.
+  Letterbox letterbox;
+};
+
+// GPU inputs: the model's prototypes (mask_channels x proto_height x
+// proto_width floats), and launch_segmentation_decode()'s coefficients, boxes
+// (in image pixels) and count, which is read on the GPU.
+struct MaskInputs {
+  const float* protos{};
+  const float* coefficients{};
+  const float* boxes{};
+  const std::int32_t* count{};
+};
+
+// GPU outputs, each optional:
+// - `masks`: capacity x height x width uint8, the source image's size: 1 where
+//   the detection in that slot covers the pixel, 0 elsewhere and in the slots
+//   from `count` on;
+// - `labels`: height x width int32: 0 where no instance covers the pixel,
+//   otherwise 1 + the slot of the first (best) detection that does.
+// `logits` is scratch of capacity x proto_height x proto_width floats.
+struct MaskOutputs {
+  std::uint8_t* masks{};
+  std::int32_t* labels{};
+  float* logits{};
+};
+
+// Decodes the instance masks on `stream`. Each detection's mask logits are
+// its coefficients times the prototypes, at the prototypes' resolution. Each
+// image pixel (x, y) inside a detection's box (x1 <= x < x2, y1 <= y < y2)
+// samples them at its center as the letterbox placed it in the input:
+// input u = pad_left + (x + 0.5) * resized_width / width (v likewise), then
+// prototype p = u * proto_width / size - 0.5, bilinearly with the edges
+// clamped (as PyTorch's interpolate without align_corners), and belongs to
+// the detection when the sample exceeds the threshold.
+cudaError_t launch_masks(const MaskInputs& inputs, const MaskParams& params,
+                         const MaskOutputs& outputs, cudaStream_t stream);
 
 }  // namespace holoscan::yolo26

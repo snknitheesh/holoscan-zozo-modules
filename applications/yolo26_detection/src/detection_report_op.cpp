@@ -101,6 +101,10 @@ void DetectionReportOp::setup(holoscan::OperatorSpec& spec) {
   if (!config_.image_dir.empty()) {
     spec.input(image, "image").queue_depth(2U);
   }
+  if (config_.segmentation) {
+    spec.input(masks, "masks").queue_depth(2U);
+    spec.input(label_image, "label_image").queue_depth(2U);
+  }
 }
 
 holoscan::Contract DetectionReportOp::contract() const {
@@ -109,6 +113,10 @@ holoscan::Contract DetectionReportOp::contract() const {
   if (!config_.image_dir.empty()) {
     ports.emplace_back(image);
   }
+  if (config_.segmentation) {
+    ports.emplace_back(masks);
+    ports.emplace_back(label_image);
+  }
   result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
   result.input(boxes, holoscan::Exact{});
   result.input(scores, holoscan::Exact{});
@@ -116,6 +124,10 @@ holoscan::Contract DetectionReportOp::contract() const {
   result.input(count, holoscan::Exact{});
   if (!config_.image_dir.empty()) {
     result.input(image, holoscan::Exact{});
+  }
+  if (config_.segmentation) {
+    result.input(masks, holoscan::Exact{});
+    result.input(label_image, holoscan::Exact{});
   }
   return result;
 }
@@ -205,6 +217,25 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
   report.last_frame_id = frame_id;
   report.detections += detections.size();
 
+  // The masks come to the host only for what reads them: the truth, the
+  // printout and the written images.
+  masks_.reset();
+  if (config_.segmentation) {
+    auto masks_sample = masks.receive();
+    auto labels_sample = label_image.receive();
+    if (!masks_sample) return holoscan::make_unexpected(std::move(masks_sample).error());
+    if (!labels_sample) return holoscan::make_unexpected(std::move(labels_sample).error());
+    const bool printing = config_.print && !config_.files.empty() && frame_id != 0 &&
+                          frame_id <= config_.files.size();
+    if (config_.truth || printing || !config_.image_dir.empty()) {
+      if (auto fetched =
+              fetch_masks(context, masks_sample->data, labels_sample->data, detections.size());
+          !fetched) {
+        return fetched;
+      }
+    }
+  }
+
   if (config_.truth && frame_id != 0) {
     const SyntheticTruth& truth = *config_.truth;
     const SyntheticScene scene =
@@ -217,6 +248,9 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
     report.missed += match.missed;
     report.extra += match.extra;
     report.max_edge_error = std::max(report.max_edge_error, match.max_edge_error);
+    if (masks_) {
+      check_masks(scene, detections);
+    }
   }
 
   if (!config_.files.empty() && frame_id != 0) {
@@ -234,10 +268,17 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
       std::ostringstream out;
       out << std::fixed << "yolo26_detection: " << name << ": " << detections.size()
           << (detections.size() == 1 ? " detection\n" : " detections\n");
-      for (const BoxDetection& d : detections) {
+      for (std::size_t k = 0; k < detections.size(); ++k) {
+        const BoxDetection& d = detections[k];
         out << "  " << label(d.class_id) << " (" << d.class_id << ") " << std::setprecision(3)
             << d.score << std::setprecision(1) << " [" << d.x1 << ", " << d.y1 << ", " << d.x2
-            << ", " << d.y2 << "]\n";
+            << ", " << d.y2 << "]";
+        if (masks_) {
+          const std::size_t pixels = static_cast<std::size_t>(masks_->width) * masks_->height;
+          const auto* mask = masks_->masks.data() + k * pixels;
+          out << " mask " << std::count(mask, mask + pixels, std::uint8_t{1}) << " px";
+        }
+        out << '\n';
       }
       std::cout << out.str() << std::flush;
     }
@@ -266,6 +307,79 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::process(
   return {};
 }
 
+holoscan::expected<void, holoscan::Error> DetectionReportOp::fetch_masks(
+    holoscan::ExecutionContext& context, const holoscan::Tensor& masks_tensor,
+    const holoscan::Tensor& labels_tensor, std::size_t detections) {
+  const std::span<const std::int64_t> shape = labels_tensor.shape_span();
+  if (shape.size() != 2 || shape[0] < 1 || shape[1] < 1) {
+    return holoscan::make_unexpected(invalid("the label image must be [height, width]"));
+  }
+  Masks m{.width = static_cast<int>(shape[1]), .height = static_cast<int>(shape[0])};
+  const std::array<std::int64_t, 2> label_shape{shape[0], shape[1]};
+  const std::array<std::int64_t, 3> mask_shape{config_.max_detections, shape[0], shape[1]};
+  if (auto fetched = fetch(labels_tensor, label_shape, context.cuda_stream(), m.labels); !fetched) {
+    return fetched;
+  }
+  if (auto fetched = fetch(masks_tensor, mask_shape, context.cuda_stream(), m.masks); !fetched) {
+    return fetched;
+  }
+  // Only the detections' masks are needed past here.
+  m.masks.resize(detections * static_cast<std::size_t>(m.width) * m.height);
+  masks_ = std::move(m);
+  return {};
+}
+
+// Each detection's mask against its class's rectangle, and the label image
+// against the masks: each pixel names the first detection whose mask covers
+// it.
+void DetectionReportOp::check_masks(const SyntheticScene& scene,
+                                    const std::vector<BoxDetection>& detections) {
+  DetectionReport& report = *config_.report;
+  const Masks& m = *masks_;
+  if (m.width != scene.width || m.height != scene.height) {
+    ++report.mask_misses;
+    return;
+  }
+  report.masks_verified = true;
+  const std::size_t pixels = static_cast<std::size_t>(m.width) * m.height;
+  for (std::size_t k = 0; k < detections.size(); ++k) {
+    const auto c = static_cast<std::size_t>(detections[k].class_id);
+    if (c >= scene.rects.size()) {
+      ++report.mask_misses;
+      continue;
+    }
+    const auto& rect = scene.rects[c];
+    const std::uint8_t* mask = m.masks.data() + k * pixels;
+    std::size_t both = 0;
+    std::size_t either = 0;
+    for (int y = 0; y < m.height; ++y) {
+      for (int x = 0; x < m.width; ++x) {
+        const bool in_rect = x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1;
+        const bool in_mask = mask[static_cast<std::size_t>(y) * m.width + x] != 0;
+        both += in_rect && in_mask;
+        either += in_rect || in_mask;
+      }
+    }
+    const float iou = either == 0 ? 0.0F : static_cast<float>(both) / static_cast<float>(either);
+    report.min_mask_iou = std::min(report.min_mask_iou, iou);
+    // The letterbox blurs a rectangle's edges by about a pixel; that weighs
+    // more on small ones.
+    const bool small = std::min(rect.x1 - rect.x0, rect.y1 - rect.y0) < 24;
+    if (iou < (small ? 0.8F : 0.9F)) {
+      ++report.mask_misses;
+    }
+  }
+  for (std::size_t p = 0; p < pixels; ++p) {
+    std::int32_t first = 0;
+    for (std::size_t k = 0; k < detections.size() && first == 0; ++k) {
+      if (m.masks[k * pixels + p] != 0) {
+        first = static_cast<std::int32_t>(k) + 1;
+      }
+    }
+    report.label_errors += m.labels[p] != first;
+  }
+}
+
 holoscan::expected<void, holoscan::Error> DetectionReportOp::write_image(
     holoscan::ExecutionContext& context, const holoscan::schema::ImageT& frame,
     std::uint64_t frame_id, const std::vector<BoxDetection>& detections) {
@@ -288,6 +402,9 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::write_image(
   }
   std::vector<std::uint8_t> rgb =
       to_rgb(pixels_.data(), static_cast<std::size_t>(width) * n, width, height, *format);
+  if (masks_ && masks_->width == width && masks_->height == height) {
+    draw_masks(rgb, masks_->labels, detections);
+  }
   draw_boxes(rgb, width, height, detections);
   // Numbered by frame id, six digits at least.
   std::string number = std::to_string(frame_id);

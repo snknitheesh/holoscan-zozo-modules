@@ -242,12 +242,34 @@ std::vector<std::uint8_t> to_rgb(const std::uint8_t* pixels, std::size_t pitch, 
   return rgb;
 }
 
-void draw_boxes(std::span<std::uint8_t> rgb, int width, int height,
-                std::span<const BoxDetection> detections, int thickness) {
+namespace {
+
+const std::array<std::uint8_t, 3>& class_color(std::int32_t class_id) {
   static constexpr std::array<std::array<std::uint8_t, 3>, 6> kColors{
       {{255, 56, 56}, {56, 255, 56}, {56, 128, 255}, {255, 214, 0}, {255, 56, 255}, {0, 230, 230}}};
+  return kColors[static_cast<std::size_t>(std::abs(class_id)) % kColors.size()];
+}
+
+}  // namespace
+
+void draw_masks(std::span<std::uint8_t> rgb, std::span<const std::int32_t> labels,
+                std::span<const BoxDetection> detections) {
+  for (std::size_t p = 0; p < labels.size() && 3 * p + 2 < rgb.size(); ++p) {
+    const std::int32_t label = labels[p];
+    if (label < 1 || static_cast<std::size_t>(label) > detections.size()) {
+      continue;
+    }
+    const auto& color = class_color(detections[static_cast<std::size_t>(label) - 1U].class_id);
+    for (std::size_t c = 0; c < 3; ++c) {
+      rgb[3 * p + c] = static_cast<std::uint8_t>((rgb[3 * p + c] + color[c] + 1) / 2);
+    }
+  }
+}
+
+void draw_boxes(std::span<std::uint8_t> rgb, int width, int height,
+                std::span<const BoxDetection> detections, int thickness) {
   for (const BoxDetection& d : detections) {
-    const auto& color = kColors[static_cast<std::size_t>(std::abs(d.class_id)) % kColors.size()];
+    const auto& color = class_color(d.class_id);
     const int x0 = std::clamp(static_cast<int>(std::floor(d.x1)), 0, width - 1);
     const int y0 = std::clamp(static_cast<int>(std::floor(d.y1)), 0, height - 1);
     const int x1 = std::clamp(static_cast<int>(std::ceil(d.x2)) - 1, 0, width - 1);
