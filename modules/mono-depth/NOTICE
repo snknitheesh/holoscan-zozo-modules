@@ -1,0 +1,54 @@
+holoscan-mono-depth
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-mono-depth uses the following NVIDIA software. It contains no Depth Anything
+weights and no PyTorch or Hugging Face code.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK, HoloInfer included; not
+redistributed.
+
+NVIDIA TensorRT and the CUDA Toolkit
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's licenses, installed with them. Used through the installed SDK and CUDA;
+not redistributed.
+
+It includes the following third-party data:
+
+Turbo colormap (include/holoscan/mono_depth/colormap.hpp)
+Copyright 2019 Google LLC. Designed by Anton Mikhailov.
+Licensed under Apache-2.0
+(https://gist.github.com/mikhailov-work/ee72ba4191942acecc03fe6da94fc73f). Its
+published 256-entry table, rounded to 8 bits per channel.
+
+The models are NOT part of holoscan-mono-depth. tools/prepare_model.py (installed as
+share/holoscan-mono-depth/prepare_model.py) downloads a pinned checkpoint from Hugging
+Face, checks its SHA-256 digest, and exports it with a separately installed PyTorch
+and Hugging Face Transformers. The checkpoints and their licenses:
+
+- small (the default): depth-anything/Depth-Anything-V2-Small-hf, revision
+  5426e4f0f36572d16453bbda7a8389317b1bef99. Licensed under Apache-2.0 by its
+  authors (the model card's license, and the Depth Anything V2 repository's
+  "Depth-Anything-V2-Small model is under the Apache-2.0 license").
+- base and large: depth-anything/Depth-Anything-V2-Base-hf (revision
+  b1958afc87fb45a9e3746cb387596094de553ed8) and Depth-Anything-V2-Large-hf
+  (revision 7581137eff8d4e94f6e796d3baea0e9fa79b22d2). Licensed under CC-BY-NC-4.0:
+  NON-COMMERCIAL USE ONLY. The tool exports them only with
+  --accept-non-commercial-license.
+- metric-indoor-small and metric-outdoor-small:
+  depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf (revision
+  8078d68a9c75a972131914f6afd0c1723be0da7f) and
+  depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf (revision
+  fd2c22027eaf20374204f14099b8341e1925ad39), fine-tuned on Hypersim and Virtual
+  KITTI 2. These Transformers conversions carry no license tag; the same authors
+  publish the original checkpoints (Depth-Anything-V2-Metric-Hypersim-Small and
+  Depth-Anything-V2-Metric-VKITTI-Small) under Apache-2.0.
+
+Depth Anything V2: Lihe Yang, Bingyi Kang, Zilong Huang, Zhen Zhao, Xiaogang Xu,
+Jiashi Feng, Hengshuang Zhao. "Depth Anything V2", arXiv:2406.09414, 2024.
+https://github.com/DepthAnything/Depth-Anything-V2
+
+The terms that apply to a model you export, and to anything you build or distribute
+with it, are yours to review.
