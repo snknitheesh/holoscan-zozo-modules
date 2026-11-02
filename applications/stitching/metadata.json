@@ -1,0 +1,82 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Stitching",
+    "description": "Four synthetic fisheye cameras on a rig driving through a checkered world, stitched by holoscan-stitching's StitchOp into a bird's-eye surround view and a 360-degree panorama, shown by HoloViz in a window or rendered offscreen, with every output checked against the ground truth rendered directly from the world.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-stitching demo, with a synthetic surround rig, a bird's-eye view and a panorama, a HoloViz window or offscreen render, and checks against the ground truth."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stitching",
+      "Panorama",
+      "Surround View"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Display",
+          "description": "For the window mode only; the offscreen and ci modes need none.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "stitching"
+        }
+      ]
+    },
+    "default_mode": "window",
+    "modes": {
+      "window": {
+        "description": "Live: four 1280x720 fisheye cameras at 30 frames per second, a 1024x1024 bird's-eye view and a 4096x1024 cylindrical panorama, shown in a HoloViz window until it is closed.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stitching\" --display window",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "offscreen": {
+        "description": "HoloViz renders offscreen into CUDA memory: 60 frames, each output checked against the ground truth and each render checked.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stitching\" --count 60 --period-ms 10 --display offscreen",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 frames of the moving rig with different camera exposures and exposure compensation, a 1024x1024 bird's-eye view and a 4096x1024 panorama, each checked against the ground truth: PSNR, coverage, brightness and every checkerboard corner within 1 pixel.",
+        "run": {
+          "command": "\"<holohub_app_bin>/stitching\" --count 30 --period-ms 10 --exposure true --camera-gains 1,0.85,1.15,0.95 --display none",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
