@@ -5,6 +5,8 @@
 // frames of the synthetic raw camera as 12-bit BAYER_RGGB in host memory,
 // IspOp turns them into RGB8 on the GPU, one sink checks every image against
 // the camera's truth (PSNR), another that each histogram row counts every pixel.
+// IspOp cannot send a refused output again, so the source keeps one frame in
+// flight: it sends the next once both sinks have counted the last.
 
 #include <algorithm>
 #include <array>
@@ -48,9 +50,13 @@ isp::SyntheticRawConfig camera(std::uint32_t frame) {
   return config;
 }
 
-// kFrames raw frames, uint16 in host memory, then idle.
+// kFrames raw frames, uint16 in host memory, then idle; each once the sinks
+// have counted the one before (`counted` goes up by two per frame).
 class RawSourceOp final : public holoscan::Operator<> {
  public:
+  explicit RawSourceOp(std::shared_ptr<const std::atomic<std::uint32_t>> counted)
+      : counted_(std::move(counted)) {}
+
   void setup(holoscan::OperatorSpec& spec) override {
     spec.output(raw, "raw")
         .produces_tensor(holoscan::TensorOutputSpec{
@@ -77,7 +83,7 @@ class RawSourceOp final : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    if (emitted_ >= kFrames) {
+    if (emitted_ >= kFrames || counted_->load(std::memory_order_acquire) < 2U * emitted_) {
       return {};
     }
     const std::array<std::int64_t, 2> shape{kHeight, kWidth};
@@ -115,10 +121,12 @@ class RawSourceOp final : public holoscan::Operator<> {
   holoscan::Output<holoscan::schema::ImageT> raw;
 
  private:
+  std::shared_ptr<const std::atomic<std::uint32_t>> counted_;
   std::uint32_t emitted_{};
 };
 
 struct Tally {
+  std::atomic<std::uint32_t> counted{};  // Frames counted by either sink.
   std::uint32_t frames{};
   double worst_psnr{99.0};
   std::uint32_t stats_frames{};
@@ -180,6 +188,7 @@ class ImageCheckOp final : public holoscan::Operator<> {
     }
     const double psnr = 10.0 * std::log10(255.0 * 255.0 * 3.0 * kWidth * kHeight / squared);
     tally_->worst_psnr = std::min(tally_->worst_psnr, psnr);
+    tally_->counted.fetch_add(1U, std::memory_order_release);
     if (++tally_->frames == kFrames) {
       finish(*remaining_, context);
     }
@@ -226,6 +235,7 @@ class HistogramCheckOp final : public holoscan::Operator<> {
       for (int b = 0; b < isp::kHistogramBins; ++b) sum += counts[row * isp::kHistogramBins + b];
       tally_->bad_histograms += sum == std::uint64_t{kWidth} * kHeight ? 0U : 1U;
     }
+    tally_->counted.fetch_add(1U, std::memory_order_release);
     if (++tally_->stats_frames == kFrames) {
       finish(*remaining_, context);
     }
@@ -261,14 +271,15 @@ class DropOp final : public holoscan::Operator<> {
 
 int main() {
   holoscan::Graph graph{"isp_consumer"};
-  auto source = graph.op<RawSourceOp>("source");
+  auto tally = std::make_shared<Tally>();
+  auto source = graph.op<RawSourceOp>(
+      "source", std::shared_ptr<const std::atomic<std::uint32_t>>(tally, &tally->counted));
   isp::IspOpConfig config;
   config.params = isp::synthetic_isp_params(camera(0));
   config.stats = true;
   config.max_width = kWidth;
   config.max_height = kHeight;
   auto processor = graph.op<isp::IspOp>("isp", config);
-  auto tally = std::make_shared<Tally>();
   auto remaining = std::make_shared<std::atomic<int>>(2);
   auto image_check = graph.op<ImageCheckOp>("image_check", tally, remaining);
   auto histogram_check = graph.op<HistogramCheckOp>("histogram_check", tally, remaining);
