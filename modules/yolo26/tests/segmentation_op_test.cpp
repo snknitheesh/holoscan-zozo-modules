@@ -421,6 +421,9 @@ int run_real(const std::filesystem::path& model) {
                                           .max_detections = 20,
                                           .max_image_width = 1280,
                                           .max_image_height = 1280};
+          // Build the engine before the run, as the operator asks: on a Jetson the
+          // build takes minutes, longer than the harness lets a run start.
+          prepare_engine(config);
           auto h = holoscan::testing::create_operator_test<Yolo26SegmentationOp>(config);
           std::vector<std::pair<int, int>> sizes;
           for (const test::StopSign& sign : signs) {
@@ -447,7 +450,7 @@ int run_real(const std::filesystem::path& model) {
             });
             const std::string what = std::to_string(signs[i].width) + "x" +
                                      std::to_string(signs[i].height) + " r" +
-                                     std::to_string(signs[i].radius);
+                                     std::to_string(static_cast<int>(signs[i].radius));
             VERIFY_MSG(sign != d.end() && sign->score >= 0.5F, what + ": no stop sign found");
             if (sign == d.end()) continue;
             const auto k = static_cast<std::size_t>(sign - d.begin());
