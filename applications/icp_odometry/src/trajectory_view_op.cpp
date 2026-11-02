@@ -309,34 +309,8 @@ holoscan::expected<void, holoscan::Error> TrajectoryViewOp::compute(
   const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*pose_sample);
   const int width = view_width(config_.camera);
   const int height = view_height(config_.camera);
-  auto image_loan = view.allocate_tensor(holoscan::TensorLoanRequest{
-      .shape = std::array<std::int64_t, 3>{height, width, 4}, .dtype = kUInt8});
-  if (!image_loan) return holoscan::make_unexpected(std::move(image_loan).error());
-  if (auto written =
-          image_loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                                -> holoscan::expected<void, holoscan::Error> {
-            auto* rgba = writer.data_as<std::uint8_t>();
-            for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height; ++i) {
-              rgba[4 * i] = kBackground[0];
-              rgba[4 * i + 1] = kBackground[1];
-              rgba[4 * i + 2] = kBackground[2];
-              rgba[4 * i + 3] = 255;
-            }
-            draw_trajectories(rgba);
-            draw_alignment(rgba);
-            return {};
-          });
-      !written) {
-    return written;
-  }
-  holoscan::schema::ImageT image;
-  image.width = width;
-  image.height = height;
-  image.encoding = holoscan::schema::ImageEncoding_RGBA8;
-  if (auto sent = view.emit_tensor(std::move(*image_loan), image, emit); !sent) {
-    return sent;
-  }
-
+  // The labels go first: the image triggers HoloViz's frame, which takes the
+  // newest labels already there, so this frame's must not come after it.
   const icp::TransformError error = icp::transform_error(
       estimated, icp::compose(icp::rigid_inverse(first_truth_), world_from_camera));
   char lines[kViewLabelRows][kViewLabelBytes + 1];
@@ -363,7 +337,35 @@ holoscan::expected<void, holoscan::Error> TrajectoryViewOp::compute(
       !written) {
     return written;
   }
-  return labels.emit(std::move(*label_loan), emit);
+  if (auto sent = labels.emit(std::move(*label_loan), emit); !sent) {
+    return sent;
+  }
+
+  auto image_loan = view.allocate_tensor(holoscan::TensorLoanRequest{
+      .shape = std::array<std::int64_t, 3>{height, width, 4}, .dtype = kUInt8});
+  if (!image_loan) return holoscan::make_unexpected(std::move(image_loan).error());
+  if (auto written =
+          image_loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
+                                                -> holoscan::expected<void, holoscan::Error> {
+            auto* rgba = writer.data_as<std::uint8_t>();
+            for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height; ++i) {
+              rgba[4 * i] = kBackground[0];
+              rgba[4 * i + 1] = kBackground[1];
+              rgba[4 * i + 2] = kBackground[2];
+              rgba[4 * i + 3] = 255;
+            }
+            draw_trajectories(rgba);
+            draw_alignment(rgba);
+            return {};
+          });
+      !written) {
+    return written;
+  }
+  holoscan::schema::ImageT image;
+  image.width = width;
+  image.height = height;
+  image.encoding = holoscan::schema::ImageEncoding_RGBA8;
+  return view.emit_tensor(std::move(*image_loan), image, emit);
 }
 
 }  // namespace icp_odometry_app
