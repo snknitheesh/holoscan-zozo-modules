@@ -63,8 +63,8 @@ endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
 
-# holoscan::yolo26: Yolo26DetectionOp, its letterbox and decode kernels, and the stub
-# model and synthetic scenes for tests.
+# holoscan::yolo26: Yolo26DetectionOp and Yolo26SegmentationOp, their letterbox, decode
+# and mask kernels, and the stub models and synthetic scenes for tests.
 add_library(
   holoscan_yolo26
   src/decode.cu
@@ -75,6 +75,7 @@ add_library(
   src/stub_model.cpp
   src/synthetic_scene.cpp
   src/yolo26_detection_op.cpp
+  src/yolo26_segmentation_op.cpp
 )
 add_library(holoscan::yolo26 ALIAS holoscan_yolo26)
 # Without fused multiply-adds the kernels compute bit for bit what the host computes

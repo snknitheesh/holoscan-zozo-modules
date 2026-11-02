@@ -3,8 +3,9 @@
 //
 // The module's host-only pieces, without the SDK, CUDA or a GPU: the letterbox
 // geometry, as the Ultralytics LetterBox computes it, for wide and tall images
-// with even and odd padding; the stub model file; the synthetic scenes; and the
-// matching of detections to their truth.
+// with even and odd padding; the stub model files, for detection and for
+// segmentation; the synthetic scenes; and the matching of detections to their
+// truth.
 //
 // Usage: yolo26_host_test DIR (a scratch folder for the files)
 
@@ -122,6 +123,27 @@ void check_stub_model_file() {
                        std::filesystem::directory_iterator{}) == 1);
 }
 
+// The segmentation variant: another model, with the prototypes' output, in a
+// file of its own beside the detection one.
+void check_stub_segmentation_model_file() {
+  const std::string model = stub_segmentation_model_onnx(640);
+  VERIFY(model == stub_segmentation_model_onnx(640));
+  VERIFY(model != stub_segmentation_model_onnx(320) && model != stub_model_onnx(640));
+  VERIFY(model.find("output1") != std::string::npos &&
+         model.find("AveragePool") != std::string::npos);
+  VERIFY(stub_model_onnx(640).find("output1") == std::string::npos);
+  VERIFY(test::throws<std::invalid_argument>([] { (void)stub_segmentation_model_onnx(4128); }));
+  const auto folder = g_directory / "seg_stub";
+  std::filesystem::remove_all(folder);
+  std::filesystem::create_directories(folder);
+  const auto detection = write_stub_model(folder, 640);
+  const auto path = write_stub_segmentation_model(folder, 640);
+  VERIFY(path == folder / "yolo26_seg_stub_640.onnx" && path != detection);
+  std::ifstream in(path, std::ios::binary);
+  const std::string content{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  VERIFY(content == model);
+}
+
 void check_scene() {
   for (const auto& [w, h] : {std::pair{64, 48}, std::pair{1280, 720}, std::pair{333, 1000}}) {
     for (std::uint32_t frame = 0; frame < 60; ++frame) {
@@ -169,6 +191,7 @@ int main(int argc, char** argv) {
       {"iou and edge error", yd::check_iou},
       {"truth matching", yd::check_match_truth},
       {"stub model file", yd::check_stub_model_file},
+      {"stub segmentation model file", yd::check_stub_segmentation_model_file},
       {"synthetic scene", yd::check_scene},
   });
 }
