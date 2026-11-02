@@ -95,16 +95,17 @@ int run(int iterations, int max_dims) {
       // A surface to mesh and ray cast: a quarter of the orbit.
       constexpr std::uint32_t kOrbit = 40;
       for (std::uint32_t i = 0; i < kOrbit; i += 4) {
+        // The frame is rendered on the default stream: the last integration
+        // must be done reading it first.
+        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
         ht::test::render(frame, ht::SceneKind::kTabletop, i, kOrbit, ht::test::kNoise);
         cuda_check(volume.integrate(ht::test::depth_image(frame), nullptr, frame.pose,
                                     ht::test::integrate_params(frame), stream),
                    "integrate");
       }
-      const double integrate = time_ms(iterations, stream, [&] {
-        cuda_check(volume.integrate(ht::test::depth_image(frame), nullptr, frame.pose,
-                                    ht::test::integrate_params(frame), stream),
-                   "integrate");
-      });
+      // The mesh and the ray cast of the scene after the quarter orbit, before
+      // the integration is timed on the last frame over and over.
+      cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       const std::size_t pixels = static_cast<std::size_t>(width) * height;
       Device<float> depth(pixels);
       Device<float> normals(pixels * 3);
@@ -127,6 +128,11 @@ int run(int iterations, int max_dims) {
                                 counts.get()};
       const double mesh = time_ms(iterations, stream, [&] {
         cuda_check(extractor.extract(volume, out, stream), "extract");
+      });
+      const double integrate = time_ms(iterations, stream, [&] {
+        cuda_check(volume.integrate(ht::test::depth_image(frame), nullptr, frame.pose,
+                                    ht::test::integrate_params(frame), stream),
+                   "integrate");
       });
       const std::vector<std::uint32_t> c = counts.host();
       std::printf(
