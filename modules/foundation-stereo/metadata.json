@@ -1,0 +1,74 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-foundation-stereo",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Learned stereo disparity and depth on the GPU with NVIDIA's Fast-FoundationStereo through TensorRT (HoloInfer): a rectified left and right image in, CUDA resize and normalization, the model, and the disparity resized and rescaled back to the image, with optional depth in meters. Its ports match the classic stereo matcher's, so either can replace the other. The model is not included: a tool fetches or exports it, under NVIDIA's licenses.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::foundation_stereo"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Depth",
+      "TensorRT",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/foundation-stereo",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "FoundationStereoOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10. The 480x736 model takes about 0.8 GB of GPU memory."
+        }
+      ],
+      "data": [
+        {
+          "name": "C-Fast-FoundationStereo (NVIDIA Open Model Agreement)",
+          "description": "Not part of this module. Its tools/prepare_model.py downloads NVIDIA's pinned 480x736 ONNX export, or exports a checkpoint with the upstream Fast-FoundationStereo code, which is licensed for non-commercial research use only. The tests use a stub model that the module writes itself.",
+          "url": "https://huggingface.co/nvidia/c-fast-foundationstereo",
+          "version": "53a84e28a368f37e699776250215fcb450d6a109"
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-foundation-stereo",
+      "install_commands": [
+        "sudo apt install ./holoscan-foundation-stereo_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
