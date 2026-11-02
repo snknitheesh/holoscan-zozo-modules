@@ -1,0 +1,76 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-sam3",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Promptable concept segmentation with Meta's SAM 3 on the GPU: a CUDA resize and normalization into the encoder's input, SAM 3's image encoder once per image and its prompt decoder once per prompt, both TensorRT engines run through the SDK's HoloInfer, and CUDA kernels that rank every prompt's instances and upsample their masks to the image, as masks, scores, boxes, prompt ids and a label image; and a HoloViz overlay. Prompts are noun phrases, whose text embeddings a tool precomputes, exemplar boxes, or both. The model is not included: it is under the SAM License and gated on Hugging Face, and a tool exports it to ONNX with the user's own access.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::sam3"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Segmentation",
+      "Instance Segmentation",
+      "Open Vocabulary",
+      "TensorRT",
+      "CUDA",
+      "Robotics"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/sam3",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "Sam3SegmentationOp",
+      "Sam3OverlayOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10, and about 2 GiB of GPU memory free for SAM 3's FP16 engines."
+        }
+      ],
+      "data": [
+        {
+          "name": "SAM 3 (SAM License, gated)",
+          "description": "Not part of this module. Its tools/prepare_model.py downloads the pinned checkpoint from Hugging Face with the user's own access token, after the user has requested access and accepted the SAM License there, and exports it to ONNX with a separately installed PyTorch and Transformers. The tests use a stub model that the module writes itself.",
+          "url": "https://huggingface.co/facebook/sam3/tree/3c879f39826c281e95690f02c7821c4de09afae7",
+          "version": "3c879f39826c281e95690f02c7821c4de09afae7"
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-sam3",
+      "install_commands": [
+        "sudo apt install ./holoscan-sam3_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

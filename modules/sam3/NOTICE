@@ -1,0 +1,53 @@
+holoscan-sam3
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-sam3 uses the following NVIDIA software. It contains no SAM 3 weights and no
+code of SAM 3, PyTorch or Hugging Face.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK, HoloInfer included; not
+redistributed.
+
+NVIDIA TensorRT and the CUDA Toolkit
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's licenses, installed with them. Used through the installed SDK and CUDA;
+not redistributed.
+
+The model is NOT part of holoscan-sam3. tools/prepare_model.py (installed as
+share/holoscan-sam3/prepare_model.py) downloads a pinned checkpoint from Hugging Face
+with the user's own access token, checks every file's SHA-256 digest, and exports it
+with a separately installed PyTorch and Hugging Face Transformers:
+
+- SAM 3: facebook/sam3, revision 3c879f39826c281e95690f02c7821c4de09afae7
+  (https://huggingface.co/facebook/sam3). Meta's Segment Anything Model 3, its image
+  and text encoders, detector and mask decoder.
+- License: the SAM License, last updated November 19, 2025, by Meta Platforms, Inc.
+  (the checkpoint's LICENSE file, which the tool copies to SAM_LICENSE beside the
+  export). It grants a non-exclusive, worldwide, non-transferable, royalty-free
+  license to use, reproduce, distribute, copy, create derivative works of and modify
+  the SAM Materials, under its terms, among them: a copy of the license with any SAM
+  Materials or derivative works you distribute; acknowledgment of SAM in research you
+  publish with it; compliance with applicable laws and trade controls, and no use for
+  military, warfare, nuclear or espionage purposes, or for guns or illegal weapons;
+  no reverse engineering. Read the full license before you use the model.
+- Access: the Hugging Face repository is gated. Each user requests access and accepts
+  the license on https://huggingface.co/facebook/sam3; the tool refuses to run without
+  --accept-sam-license, and downloads only with the user's own token.
+
+The exported ONNX files and prompt tables are derivative works of the SAM Materials,
+under the SAM License, not under Apache-2.0. This repository distributes none of them.
+
+The export follows the SAM 3 port in Hugging Face Transformers
+(https://github.com/huggingface/transformers, src/transformers/models/sam3), licensed
+under Apache-2.0, which the tool calls in the user's environment; no code of it is
+copied here.
+
+SAM 3: Nicolas Carion, Laura Gustafson, Yuan-Ting Hu, Shoubhik Debnath, Ronghang Hu,
+Didac Suris, Chaitanya Ryali, Kalyan Vasudev Alwala, Haitham Khedr, Andrew Huang, et
+al. "SAM 3: Segment Anything with Concepts", arXiv:2511.16719, 2025.
+https://github.com/facebookresearch/sam3
+
+The terms that apply to a model you export, and to anything you build or distribute
+with it, are yours to review.
