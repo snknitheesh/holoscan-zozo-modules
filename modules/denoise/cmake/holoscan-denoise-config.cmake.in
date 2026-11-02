@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-denoise) defines:
+#   holoscan::denoise          DenoiseOp, ExposureFusionOp, the Denoiser, ExposureFusion and
+#                              ToneMapper they run, and the synthetic scenes
+#   holoscan-denoise_WITH_VPI  Whether the vpi backend was built
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-denoise-targets.cmake")
+
+set(holoscan-denoise_WITH_VPI @HOLOSCAN_DENOISE_VPI@)
+check_required_components(holoscan-denoise)

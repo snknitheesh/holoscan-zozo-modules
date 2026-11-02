@@ -1,0 +1,73 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-denoise",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "GPU image denoising and dynamic-range extension: bilateral and non-local-means spatial filters with motion-adaptive temporal filtering on CUDA, VPI 4's temporal noise reduction on the VIC or CUDA, Mertens exposure fusion of 2 or 3 brackets, and a global tone map for high-bit-depth frames.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::denoise"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Image Processing",
+      "Denoising",
+      "HDR",
+      "Camera",
+      "CUDA",
+      "VPI"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/denoise",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "DenoiseOp",
+      "ExposureFusionOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "VIC",
+          "description": "The Video Image Compositor of Jetson Orin or Thor, which runs VPI's temporal noise reduction for the vpi backend when present. Elsewhere VPI runs it on CUDA.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-denoise",
+      "install_commands": [
+        "sudo apt install ./holoscan-denoise_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
