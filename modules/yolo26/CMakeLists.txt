@@ -70,6 +70,7 @@ add_library(
   src/decode.cu
   src/letterbox.cpp
   src/letterbox.cu
+  src/model_runtime.cpp
   src/stub_model.cpp
   src/synthetic_scene.cpp
   src/yolo26_detection_op.cpp
