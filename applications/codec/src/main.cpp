@@ -40,6 +40,7 @@
 #include <holoscan/time/realtime_clock.hpp>
 #include <holoscan/visualization/holoviz_op.hpp>
 
+#include "benchmark.hpp"
 #include "report_op.hpp"
 #include "test_source_op.hpp"
 
@@ -66,6 +67,8 @@ struct Options {
   std::filesystem::path render_file;
   double min_psnr{0.0};
   std::uint32_t timeout_seconds{60};
+  // Frames per measurement of the --benchmark mode; 0 runs the graph instead.
+  std::uint32_t benchmark{0};
   bool help{false};
 };
 
@@ -155,6 +158,8 @@ Options parse_args(int argc, char** argv) {
       opts.render_file = value;
     } else if (option == "--min-psnr") {
       opts.min_psnr = parse_number<double>(value, option);
+    } else if (option == "--benchmark") {
+      opts.benchmark = parse_number<std::uint32_t>(value, option);
     } else if (option == "--timeout-seconds") {
       opts.timeout_seconds = parse_number<std::uint32_t>(value, option);
     } else {
@@ -191,7 +196,11 @@ void usage(const char* argv0) {
          "                             window when there is a display, else none)\n"
          "  --render-file FILE         Offscreen: write the last rendered frame here (PPM)\n"
          "  --min-psnr DB              Fail on a decoded frame below this PSNR (default: 0, off)\n"
-         "  --timeout-seconds N        Fail when no frame comes for N seconds (default: 60)\n";
+         "  --timeout-seconds N        Fail when no frame comes for N seconds (default: 60)\n"
+         "Benchmark:\n"
+         "  --benchmark N              Instead of the graph, time N frames of encoding and\n"
+         "                             decoding at 1080p and 2160p for each codec, and print\n"
+         "                             frames per second\n";
 }
 
 void validate(Options& opts) {
@@ -459,12 +468,17 @@ int main(int argc, char** argv) {
       usage(argv[0]);
       return 0;
     }
-    validate(opts);
+    if (opts.benchmark == 0) {
+      validate(opts);
+    }
   } catch (const std::exception& error) {
     std::cerr << kAppName << ": " << error.what() << "\n(--help lists the options)\n";
     return 2;
   }
   try {
+    if (opts.benchmark != 0) {
+      return app::run_benchmark(opts.benchmark);
+    }
     return execute(opts, signals);
   } catch (const std::exception& error) {
     std::cerr << kAppName << ": " << error.what() << '\n';

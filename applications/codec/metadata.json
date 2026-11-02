@@ -67,11 +67,18 @@
         }
       },
       "ci": {
-        "description": "Finite headless check: 60 frames through H.265 at a constant QP of 25, every frame decoded, in order, with its timestamp, at a PSNR of 34 dB or more. (The demo's tests also run H.264 and the offscreen render.)",
+        "description": "Finite headless check: 60 frames through H.265 at a constant QP of 25, every frame decoded, in order, with its timestamp, at a PSNR of 34 dB or more; then the encode and decode throughput at 1080p and 2160p, printed. (The demo's tests also run H.264 and the offscreen render.)",
         "run": {
-          "command": "\"<holohub_app_bin>/codec_demo\" --display none --codec h265 --rate-control cqp --qp 25 --count 60 --period-ms 10 --min-psnr 34",
+          "command": "sh -c '\"<holohub_app_bin>/codec_demo\" --display none --codec h265 --rate-control cqp --qp 25 --count 60 --period-ms 10 --min-psnr 34 && \"<holohub_app_bin>/codec_demo\" --benchmark 120'",
           "workdir": "holohub_app_bin",
           "timeout": 300
+        }
+      },
+      "benchmark": {
+        "description": "Encode and decode 300 frames at 1920x1080 and 3840x2160 with H.264 and H.265 on the backend auto picks, and print frames per second.",
+        "run": {
+          "command": "\"<holohub_app_bin>/codec_demo\" --benchmark 300",
+          "workdir": "holohub_app_bin"
         }
       }
     }

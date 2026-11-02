@@ -1,33 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Encode and decode throughput of VideoEncoder and VideoDecoder at 1920x1080 and 3840x2160, for
-// each codec, on the backend `auto` picks: frames of the test video already in device memory,
-// encoded one after another as a low-latency stream, then the access units decoded, after ten
-// untimed frames that build and warm up the sessions. Each figure is frames per second of the
-// whole call: color conversion, the hardware, and the copies in and out. Prints a table; exits 77
-// (skipped) when no backend can encode and decode here.
+// The demo's --benchmark mode: encode and decode throughput of VideoEncoder and VideoDecoder at
+// 1920x1080 and 3840x2160, for each codec, on the backend `auto` picks: frames of the test video
+// already in device memory, encoded one after another as a low-latency stream, then the access
+// units decoded, after ten untimed frames that build and warm up the sessions. Each figure is
+// frames per second of the whole call: color conversion, the hardware, and the copies in and out.
+// Prints a table; exits 77 (skipped) when no backend can encode and decode here.
 //
 //   codec_benchmark [--frames N] [--bitrate-1080p BPS] [--bitrate-2160p BPS]
+
+#include "benchmark.hpp"
 
 #include <cuda_runtime_api.h>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <holoscan/codec/test_video.hpp>
 #include <holoscan/codec/video_codec.hpp>
 
+namespace codec_app {
 namespace {
 
-using holoscan::codec::Backend;
 using holoscan::codec::Codec;
 
 struct Size {
@@ -117,27 +117,8 @@ Result measure(Codec codec, const Size& size, std::uint32_t frames) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  std::uint32_t frames = 120;
-  std::vector<Size> sizes{{1920, 1080, 8'000'000}, {3840, 2160, 20'000'000}};
-  for (int i = 1; i + 1 < argc; i += 2) {
-    const std::string_view option{argv[i]};
-    const auto value = static_cast<std::uint32_t>(std::strtoul(argv[i + 1], nullptr, 10));
-    if (option == "--frames") {
-      frames = value;
-    } else if (option == "--bitrate-1080p") {
-      sizes[0].bitrate = value;
-    } else if (option == "--bitrate-2160p") {
-      sizes[1].bitrate = value;
-    } else {
-      std::cerr << "unknown option " << option << '\n';
-      return 2;
-    }
-  }
-  if (frames == 0) {
-    std::cerr << "--frames must be positive\n";
-    return 2;
-  }
+int run_benchmark(std::uint32_t frames) {
+  const std::vector<Size> sizes{{1920, 1080, 8'000'000}, {3840, 2160, 20'000'000}};
   int measured = 0;
   int failed = 0;
   std::printf("%-5s %-10s %-18s %12s %12s %10s\n", "codec", "size", "backend (enc/dec)",
@@ -177,3 +158,5 @@ int main(int argc, char** argv) {
   }
   return 0;
 }
+
+}  // namespace codec_app

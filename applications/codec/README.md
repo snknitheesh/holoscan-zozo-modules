@@ -50,6 +50,7 @@ In a container, `NVIDIA_DRIVER_CAPABILITIES` must include `video` (the repositor
 | `--render-file FILE` | none | Offscreen: the last rendered frame, as PPM |
 | `--min-psnr DB` | 0 (off) | Fail on a decoded frame below this |
 | `--timeout-seconds N` | 60 | Fail when no frame comes for this long |
+| `--benchmark N` | off | Instead of the graph, time N frames of encoding and decoding at 1080p and 2160p for each codec, and print frames per second |
 
 A finite run (`--count`) is lossless and checks every frame in order, and passes only when all of
 them came, every check held, and offscreen, when at least 80 % of the rendered frames show both
@@ -69,7 +70,8 @@ window is real time: frames the encoder is too busy for are skipped, never acces
 | --- | --- |
 | `window` | Real time, H.264 at 8 Mbit/s, in a window until it is closed |
 | `offscreen` | 120 frames of H.265 rendered offscreen and checked, the last one written to `codec_render.ppm` |
-| `ci` | 60 frames of H.265 at QP 25, every frame decoded, in order, with its timestamp, at 34 dB or more |
+| `ci` | 60 frames of H.265 at QP 25, every frame decoded, in order, with its timestamp, at 34 dB or more; then `--benchmark 120` |
+| `benchmark` | `--benchmark 300`: the throughput table of the [module's README](../../modules/codec/README.md#quality-and-speed) |
 
 ## Tests
 

@@ -13,7 +13,7 @@ find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io visualizatio
 find_package(holoscan-codec 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
-add_executable(codec_demo src/main.cpp src/report_op.cpp src/test_source_op.cpp)
+add_executable(codec_demo src/benchmark.cpp src/main.cpp src/report_op.cpp src/test_source_op.cpp)
 target_compile_features(codec_demo PRIVATE cxx_std_20)
 target_link_libraries(
   codec_demo
