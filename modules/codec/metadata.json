@@ -1,0 +1,68 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-codec",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Hardware H.264 and H.265 video encoding and decoding of GPU images: NVENC and NVDEC through the Video Codec SDK on discrete GPUs and Jetson Thor, and through the V4L2 codec devices on Jetson Orin.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::codec"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Video",
+      "Encoding",
+      "Decoding",
+      "Streaming",
+      "Recording",
+      "NVENC",
+      "NVDEC"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/codec",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "VideoEncoderOp",
+      "VideoDecoderOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU with NVENC and NVDEC",
+          "description": "A GPU with the video engines and a driver that provides libnvidia-encode and libnvcuvid (in a container, NVIDIA_DRIVER_CAPABILITIES must include video); or Jetson Orin with its /dev/v4l2-nvenc and /dev/v4l2-nvdec devices."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-codec",
+      "install_commands": [
+        "sudo apt install ./holoscan-codec_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
