@@ -1,0 +1,67 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-normals",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Surface normals and planes of point clouds on the GPU, in holoscan-point-cloud's layout: per-point normals oriented toward a viewpoint and curvature by PCA of each point's neighborhood (an image window for organized clouds, a GPU grid k-nearest or radius search for any cloud), and multi-plane segmentation by RANSAC with normal agreement, plane after plane, with each plane's coefficients, centroid and inlier count and a per-point label image, optionally merging coplanar planes.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::normals"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Segmentation",
+      "3D",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/normals",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "NormalEstimationOp",
+      "PlaneSegmentationOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-normals",
+      "install_commands": [
+        "sudo apt install ./holoscan-normals_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
