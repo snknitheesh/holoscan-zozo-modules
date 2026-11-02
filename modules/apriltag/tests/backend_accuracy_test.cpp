@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,7 @@
 #include <holoscan/apriltag/pose.hpp>
 #include <holoscan/apriltag/synthetic_scene.hpp>
 
+#include "gpu_segmenter.hpp"
 #include "gray_converter.hpp"
 #include "test_support.hpp"
 
@@ -369,6 +371,20 @@ void check_auto(const char* platform) {
               facts.cuda_device);
 }
 
+// A CUDA failure says how much GPU memory was free, so that a GPU filled by
+// other processes is told apart from a fault of the backend.
+void check_cuda_errors_name_free_memory() {
+  try {
+    cuda_check(cudaErrorMemoryAllocation, "cudaMalloc");
+    VERIFY_MSG(false, "cuda_check throws");
+  } catch (const std::runtime_error& error) {
+    const std::string message = error.what();
+    VERIFY_MSG(message.starts_with("cudaMalloc: out of memory (GPU memory: ") &&
+                   message.find(" MiB free of ") != std::string::npos,
+               "the error names the free memory: " + message);
+  }
+}
+
 }  // namespace
 }  // namespace holoscan::apriltag
 
@@ -398,6 +414,8 @@ int main() {
         {std::string(holoscan::apriltag::backend_name(backend)) + " tags cut by the edge",
          [=] { holoscan::apriltag::check_edge_tags(backend); }});
   }
+  cases.push_back({"cuda errors name the free GPU memory",
+                   holoscan::apriltag::check_cuda_errors_name_free_memory});
   cases.push_back({"cuda more edges than its buffers hold", holoscan::apriltag::check_dense_edges});
   cases.push_back({"cuda more quads than it decodes", holoscan::apriltag::check_quad_overflow});
   cases.push_back(
