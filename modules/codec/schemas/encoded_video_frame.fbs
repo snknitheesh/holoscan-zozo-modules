@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// One encoded video frame: an H.264 or H.265 access unit of an Annex-B byte stream, as
+// VideoEncoderOp emits it and VideoDecoderOp takes it. Compatible edits keep the root name, file
+// identifier and explicit field ids, and only append fields.
+include "tensor.fbs";
+include "header.fbs";
+
+namespace holoscan.codec.schema;
+
+enum VideoCodec : byte {
+  H264 = 0,
+  H265 = 1,
+}
+
+table EncodedVideoFrame {
+  // The encoded image's header, unchanged: its stamp, frame id, capture time and sequence.
+  header: holoscan.schema.Header (id: 0);
+  codec: VideoCodec (id: 1);
+  // The image encoded. A stream codes even sizes only, so an odd side is coded one pixel larger
+  // and the decoder crops it back to this.
+  width: int32 (id: 2);
+  height: int32 (id: 3);
+  // Presentation time in nanoseconds: the image header's capture_timestamp_ns, else the sample's
+  // capture time, else the frame's index at the encoder's frame rate.
+  pts: int64 (id: 4);
+  // An IDR picture with its parameter sets (VPS for H.265, SPS, PPS): decoding can start here.
+  keyframe: bool (id: 5);
+  // Frames the encoder coded before this one since its stream started; 0 for each keyframe that
+  // starts a new stream (the first frame, and the first after a size change).
+  frame_index: ulong (id: 6);
+  // The access unit: uint8 [bytes], start codes included, in host memory.
+  data: holoscan.schema.Tensor (id: 7);
+}
+
+root_type EncodedVideoFrame;
+file_identifier "HCEV";
