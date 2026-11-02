@@ -27,7 +27,13 @@ flowchart LR
 
 ## Demo
 
-Videos of the demo on synthetic input and on real input go in [tests/video](tests/video).
+- [Synthetic scene](tests/video/yolo26_detection_synthetic.mp4) (12 s): the `ci` mode's synthetic
+  frames with the stub model: a red, a blue, a green and a white rectangle moving on a gray
+  background. `Yolo26OverlayOp` boxes and labels the red one as class 0 and the blue one as class 1;
+  the green and white ones are distractors and get no box.
+
+The video is the frames HoloViz rendered, recorded one by one rather than captured from the screen.
+A video on real input is still to come.
 
 ## Requirements
 

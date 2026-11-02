@@ -16,7 +16,14 @@ flowchart LR
 
 ## Demo
 
-Videos of the demo on synthetic input and on real input go in [tests/video](tests/video).
+- [Synthetic camera](tests/video/depth_to_point_cloud_synthetic.mp4) (12 s): the synthetic depth
+  camera's color and depth images (left; the depth in false color, black where it is missing), and
+  the colored point cloud `DepthToPointCloudOp` makes from them, seen from a moving viewpoint
+  (right): a tilted plane with a dome, its holes and the too-far patch left out.
+
+The demo itself has no window: for the video, its images and clouds were drawn into one frame per
+cloud, rendered by HoloViz offscreen and recorded one by one rather than captured from the screen.
+A video on real input is still to come.
 
 ## Requirements
 
