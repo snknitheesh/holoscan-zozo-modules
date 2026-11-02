@@ -1,0 +1,71 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Denoise",
+    "description": "Renders a noisy low-light video with a moving disc and three exposure brackets of a high-dynamic-range scene, denoises the video with holoscan-denoise's DenoiseOp and fuses the brackets with its ExposureFusionOp, checks the PSNR gain, the trail behind the disc and the fused shadows and highlights against ground truth, and shows noisy beside denoised and the brackets beside the fused image in HoloViz.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-denoise demo, with synthetic noisy and bracketed sources checked against ground truth, a HoloViz view and an offscreen render check."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Image Processing",
+      "Denoising",
+      "HDR",
+      "CUDA",
+      "VPI"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "denoise"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Denoise 300 frames of the 1280x720 low-light scene with the temporal and bilateral filters and fuse 300 sets of brackets, check each against ground truth, and show them when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/denoise\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 frames at 640x360 with a scene cut at frame 15, every settled frame gaining at least 5 dB PSNR, no trail behind the moving disc, and every fused image keeping the shadow and the window unclipped.",
+        "run": {
+          "command": "\"<holohub_app_bin>/denoise\" --count 30 --period-ms 10 --width 640 --height 360 --cut-frame 15 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
