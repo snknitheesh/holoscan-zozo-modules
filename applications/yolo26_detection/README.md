@@ -27,13 +27,13 @@ flowchart LR
 
 ## Demo
 
-- [Synthetic scene](tests/video/yolo26_detection_synthetic.mp4) (12 s): the `ci` mode's synthetic
-  frames with the stub model: a red, a blue, a green and a white rectangle moving on a gray
-  background. `Yolo26OverlayOp` boxes and labels the red one as class 0 and the blue one as class 1;
-  the green and white ones are distractors and get no box.
+- [Real video](tests/video/yolo26_detection_real.mp4) (18 s): a phone video of an apple, an orange
+  and a banana moved by hand, run through the yolo26n base model in the demo's pipeline: the file
+  source, `Yolo26DetectionOp`, `Yolo26OverlayOp` and HoloViz. Each fruit, and the hand, is boxed and
+  labelled with its COCO class and score.
 
-The video is the frames HoloViz rendered, recorded one by one rather than captured from the screen.
-A video on real input is still to come.
+The video is HoloViz's offscreen output, its rendered frames recorded one by one rather than
+captured from the screen.
 
 ## Requirements
 
