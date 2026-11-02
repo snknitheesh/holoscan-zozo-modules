@@ -236,27 +236,28 @@ the dark patches to quantization after the white balance gains).
 
 ## Performance
 
-Mean GPU time per frame over 100 frames, 12-bit raw in, RGB8 out, from CUDA events;
-`isp_benchmark` measures it. "Plain" is black level, manual white balance, demosaic, colour matrix
+Mean GPU time per frame over 100 frames (300 on the Orin, the better of two runs), 12-bit raw in,
+RGB8 out, from CUDA events; `isp_benchmark` measures it. "Plain" is black level, manual white balance, demosaic, colour matrix
 and sRGB; "full" adds lens shading, the gray world estimate, sharpening, histograms and statistics.
 
 | Frame | Demosaic | Stages | RTX 5090 | Orin |
 | --- | --- | --- | --- | --- |
-| 1920x1080 | bilinear | plain | 0.017 ms | ORIN_1 |
-| 1920x1080 | bilinear | full | 0.090 ms | ORIN_2 |
-| 1920x1080 | Malvar-He-Cutler | plain | 0.019 ms | ORIN_3 |
-| 1920x1080 | Malvar-He-Cutler | full | 0.092 ms | ORIN_4 |
-| 3840x2160 | bilinear | plain | 0.064 ms | ORIN_5 |
-| 3840x2160 | bilinear | full | 0.226 ms | ORIN_6 |
-| 3840x2160 | Malvar-He-Cutler | plain | 0.073 ms | ORIN_7 |
-| 3840x2160 | Malvar-He-Cutler | full | 0.237 ms | ORIN_8 |
+| 1920x1080 | bilinear | plain | 0.017 ms | 0.354 ms |
+| 1920x1080 | bilinear | full | 0.090 ms | 1.080 ms |
+| 1920x1080 | Malvar-He-Cutler | plain | 0.019 ms | 0.400 ms |
+| 1920x1080 | Malvar-He-Cutler | full | 0.092 ms | 1.074 ms |
+| 3840x2160 | bilinear | plain | 0.064 ms | 1.354 ms |
+| 3840x2160 | bilinear | full | 0.226 ms | 3.741 ms |
+| 3840x2160 | Malvar-He-Cutler | plain | 0.073 ms | 1.575 ms |
+| 3840x2160 | Malvar-He-Cutler | full | 0.237 ms | 4.018 ms |
 
-The cpu backend, one thread of the x86_64 machine, takes 24 ms (bilinear) and 38 ms
-(Malvar-He-Cutler) for a plain 1920x1080 frame, 52 and 64 ms full. The x86_64 machine has an RTX
-5090, shared with other work during the runs; the Orin is a Jetson AGX Orin developer kit (64 GB)
-with JetPack 7.2, in the power mode it was set to, also running other jobs. The plain pipeline is
+The cpu backend, on one thread, takes 24 ms (bilinear) and 38 ms (Malvar-He-Cutler) for a plain
+1920x1080 frame on the x86_64 machine, 52 and 64 ms full; 70 and 93 ms plain on the Orin. The
+x86_64 machine has an RTX 5090, shared with other work during the runs; the Orin is a Jetson AGX
+Orin developer kit (64 GB) with JetPack 7.2 in MAXN, also running other jobs. The plain pipeline is
 bound by memory: it reads each sample and writes each pixel once. The full one adds a read of the
-raw frame for the white balance estimate and of the output for the histograms.
+raw frame for the white balance estimate, a read of the output for the histograms, and the
+sharpening's second stage in the tile.
 
 ## Requirements
 
