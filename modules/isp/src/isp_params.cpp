@@ -206,8 +206,9 @@ void validate_raw(const RawImageView& raw, const IspParams& params) {
   if (raw.pitch < raw_row_bytes(raw.format, raw.width)) {
     throw std::invalid_argument("raw image pitch is shorter than a row");
   }
-  if (raw.format == RawFormat::kUint16 && raw.pitch % 2U != 0U) {
-    throw std::invalid_argument("raw image pitch must be even for uint16 samples");
+  if (raw.format == RawFormat::kUint16 &&
+      (raw.pitch % 2U != 0U || reinterpret_cast<std::uintptr_t>(raw.data) % 2U != 0U)) {
+    throw std::invalid_argument("uint16 raw samples must be aligned to 2 bytes, rows too");
   }
   const int max_bits = raw.format == RawFormat::kUint8   ? 8
                        : raw.format == RawFormat::kRaw10 ? 10
