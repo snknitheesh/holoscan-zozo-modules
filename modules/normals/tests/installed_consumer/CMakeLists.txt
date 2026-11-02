@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+
+# Uses the INSTALLED package, as another project would: put its prefix on
+# CMAKE_PREFIX_PATH (the Debian package installs to /usr, which CMake searches).
+cmake_minimum_required(VERSION 4.0)
+project(holoscan_normals_consumer LANGUAGES CXX)
+enable_testing()
+
+find_package(holoscan-normals 1.0 REQUIRED CONFIG)
+message(STATUS "Found holoscan-normals ${holoscan-normals_VERSION} in ${holoscan-normals_DIR}")
+
+add_executable(normals_consumer main.cpp)
+target_link_libraries(normals_consumer PRIVATE holoscan::normals)
+set_target_properties(normals_consumer PROPERTIES CXX_EXTENSIONS OFF)
+
+add_test(NAME normals_installed_consumer COMMAND normals_consumer)
+set_tests_properties(
+  normals_installed_consumer
+  PROPERTIES PASS_REGULAR_EXPRESSION "normals_consumer: PASS" TIMEOUT 300
+)
