@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-isp) defines:
+#   holoscan::isp  IspOp, IspPipeline with its CUDA and CPU backends, and the synthetic raw
+#                  camera
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-isp-targets.cmake")
+
+check_required_components(holoscan-isp)
