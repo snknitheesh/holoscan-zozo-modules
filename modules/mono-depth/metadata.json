@@ -1,0 +1,74 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-mono-depth",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Monocular depth estimation on the GPU: a CUDA resize and normalization into the model's input, TensorRT through the SDK's HoloInfer, and a CUDA resample of the output back onto the image, as relative inverse depth, optional metric depth and an optional colorized image for HoloViz. Made for Depth Anything V2 Small (Apache-2.0), which is not included: a tool exports it to ONNX.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::mono_depth"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Depth Estimation",
+      "Monocular Depth",
+      "TensorRT",
+      "CUDA",
+      "Robotics"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/mono-depth",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "MonoDepthOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10."
+        }
+      ],
+      "data": [
+        {
+          "name": "Depth Anything V2 Small (Apache-2.0)",
+          "description": "Not part of this module. Its tools/prepare_model.py downloads the pinned checkpoint from Hugging Face and exports it to ONNX with a separately installed PyTorch and Transformers. The Base and Large checkpoints it can also export are CC-BY-NC-4.0, for non-commercial use only. The tests use a stub model that the module writes itself.",
+          "url": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/tree/5426e4f0f36572d16453bbda7a8389317b1bef99",
+          "version": "5426e4f0f36572d16453bbda7a8389317b1bef99"
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-mono-depth",
+      "install_commands": [
+        "sudo apt install ./holoscan-mono-depth_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

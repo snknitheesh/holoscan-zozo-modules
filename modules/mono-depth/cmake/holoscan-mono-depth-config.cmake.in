@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-mono-depth) defines:
+#   holoscan::mono_depth                 MonoDepthOp, prepare_engine(), its kernels, and the
+#                                        stub model, synthetic scene and host references
+#   holoscan-mono-depth_PREPARE_MODEL    The installed prepare_model.py, which exports
+#                                        Depth Anything V2 checkpoints to ONNX
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+  inference
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-mono-depth-targets.cmake")
+
+set(holoscan-mono-depth_PREPARE_MODEL "@PACKAGE_HOLOSCAN_MONO_DEPTH_PREPARE_MODEL@")
+check_required_components(holoscan-mono-depth)
