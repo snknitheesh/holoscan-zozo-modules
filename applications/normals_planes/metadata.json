@@ -1,0 +1,73 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Normals and Planes",
+    "description": "Surface normals and planes on the GPU with holoscan-normals: a synthetic depth camera in a known room is deprojected by holoscan-point-cloud's DepthToPointCloudOp, NormalEstimationOp estimates every point's normal and curvature and PlaneSegmentationOp finds the planes and labels every pixel, every frame checked against the room's truth, and HoloViz shows the normals color-mapped beside the plane labels.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-normals demo, with a synthetic room, a ground-truth reporter and a HoloViz view."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Segmentation",
+      "3D"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "point-cloud"
+        },
+        {
+          "name": "normals"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Estimate the normals and planes of 300 frames of the synthetic room, check each against its truth, and show the normals and planes when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/normals_planes\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic 640x480 frames; the normals' angle error on the inside of every surface, the curvature of the sphere against the flat surfaces, and the floor, both walls and the table top among the planes, checked against the truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/normals_planes\" --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
