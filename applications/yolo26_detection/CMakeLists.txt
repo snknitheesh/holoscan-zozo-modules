@@ -20,11 +20,11 @@ if(BUILD_TESTING)
   list(APPEND _holoscan_components testing)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
-find_package(holoscan-yolo26 1.0 REQUIRED CONFIG COMPONENTS ${_yolo26_components})
+find_package(holoscan-yolo26 1.1 REQUIRED CONFIG COMPONENTS ${_yolo26_components})
 find_package(CUDAToolkit REQUIRED)
 
 # The image sources (synthetic, files, V4L2 camera), the image files, the expected
-# detections and the reporter.
+# detections, the reporter and the check of offscreen renders.
 add_library(
   yolo26_detection_ops
   STATIC
@@ -32,6 +32,7 @@ add_library(
   src/expectations.cpp
   src/image_files.cpp
   src/image_sources.cpp
+  src/render_check_op.cpp
 )
 target_compile_features(yolo26_detection_ops PUBLIC cxx_std_20)
 target_include_directories(yolo26_detection_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
