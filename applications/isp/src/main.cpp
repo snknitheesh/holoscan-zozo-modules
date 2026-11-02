@@ -220,7 +220,7 @@ isp::SyntheticRawConfig camera_of(const Options& opts) {
   camera.bit_depth = opts.bits;
   // About 6 % of full scale, as sensors have, slightly different per channel.
   const float black = std::round(0.0625F * static_cast<float>((1 << opts.bits) - 1));
-  const float step = std::max(1.0F, black / 32.0F);
+  const float step = std::floor(black / 32.0F);
   camera.black_levels = {black, black + step, black, black + 2.0F * step};
   camera.vignetting = 0.4F;
   camera.kind = opts.scene;
