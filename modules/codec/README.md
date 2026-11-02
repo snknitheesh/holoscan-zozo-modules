@@ -131,7 +131,8 @@ measures it; the test's threshold per setting is the first column:
 | `kCbr` 8 Mbit/s | 36 / 32 dB | 40.5 dB, 5.2 Mbit/s | 39.9 dB, 4.4 Mbit/s | 41.5 dB, 3.5 Mbit/s | 41.3 dB, 4.2 Mbit/s |
 | `kVbr` 2 Mbit/s | 28 / 19 dB | 30.5 dB, 1.8 Mbit/s | 30.0 dB, 1.6 Mbit/s | 37.4 dB, 1.7 Mbit/s | 32.1 dB, 1.2 Mbit/s |
 
-With a bitrate, the worst frame is taken after the first five, as the stream's first keyframe
+Jetson Thor (`kNvcodec`, in its CI lane) measures within 1 dB of the RTX 5090 at every
+setting. With a bitrate, the worst frame is taken after the first five, as the stream's first keyframe
 must fit one frame's worth of bits; easy content takes less than the target. The RGB to NV12
 conversion alone, at QP 0, gives about 51 dB.
 
@@ -139,22 +140,22 @@ Throughput of `VideoEncoder` and `VideoDecoder` (the demo's `--benchmark` mode),
 whole call (color conversion, the hardware, and the copies in and out), one stream at a time, low
 latency, 8 Mbit/s at 1080p and 20 Mbit/s at 2160p:
 
-| | x86_64 (RTX 5090) encode | decode | Jetson Orin encode | decode |
-| --- | --- | --- | --- | --- |
-| H.264 1920x1080 | 700 | 2200 | 67 to 162 | 28 to 63 |
-| H.264 3840x2160 | 203 | 676 | 30 to 34 | 16 to 28 |
-| H.265 1920x1080 | 895 | 2120 | 50 to 134 | 43 to 63 |
-| H.265 3840x2160 | 467 | 629 | 30 to 35 | 22 to 31 |
+| | x86_64 (RTX 5090) encode | decode | Jetson Thor encode | decode | Jetson Orin encode | decode |
+| --- | --- | --- | --- | --- | --- | --- |
+| H.264 1920x1080 | 700 | 2200 | 172 | 419 | 48 to 162 | 28 to 63 |
+| H.264 3840x2160 | 203 | 676 | 79 | 273 | 30 to 39 | 16 to 34 |
+| H.265 1920x1080 | 895 | 2120 | 190 | 418 | 50 to 152 | 43 to 81 |
+| H.265 3840x2160 | 467 | 629 | 124 | 274 | 30 to 37 | 22 to 31 |
 
 The Orin figures (AGX Orin 64 GB, MAXN) vary from run to run with the CPU and engine clocks,
-which JetPack scales on demand; the ranges are those of five runs. Its V4L2 path costs a copy into
+which JetPack scales on demand; the ranges are those of six runs, one of them in CI. Thor's are
+from its CI lane. Its V4L2 path costs a copy into
 the encoder's buffers on the way in, and a VIC conversion and a copy on the way out, with a poll of
 the device queues for each frame.
 
 On the RTX 5090, encoding takes 1 to 3 % of the GPU's SMs (the color conversion) while NVENC runs
 at 32 % (1080p H.264) to 63 % (2160p H.265) of one engine's capacity; decoding takes 1 to 4 % of
-the SMs, NVDEC about 48 %. The demo's `ci` mode prints these figures in every CI lane, Jetson Thor's
-included.
+the SMs, NVDEC about 48 %. The demo's `ci` mode prints these figures in every CI lane.
 
 ## Use it in your graph
 
