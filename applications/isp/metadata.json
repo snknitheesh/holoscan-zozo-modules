@@ -1,0 +1,70 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "ISP",
+    "description": "Turns raw Bayer frames of a synthetic sensor (a moving colour checker scene with known black levels, white balance and vignetting, 8 to 16 bits or packed RAW10/RAW12) into RGB on the GPU with holoscan-isp's IspOp, checks every frame's PSNR against ground truth, and shows the raw mosaic beside the processed image in HoloViz.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-isp demo, with a synthetic raw source checked against ground truth, a raw and processed HoloViz view, and an offscreen render check."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Image Signal Processing",
+      "Camera",
+      "CUDA"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "isp"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Process 300 frames of the synthetic 1280x720 12-bit sensor, check each against ground truth, and show the raw mosaic beside the processed image when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/isp\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic 640x480 12-bit frames through IspOp with the Malvar-He-Cutler demosaic, every frame's PSNR against ground truth above 28 dB and every histogram complete.",
+        "run": {
+          "command": "\"<holohub_app_bin>/isp\" --count 30 --period-ms 10 --width 640 --height 480 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}

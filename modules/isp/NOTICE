@@ -1,0 +1,16 @@
+holoscan-isp
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-isp uses the following open source software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+The demosaic filters follow H. S. Malvar, L. He and R. Cutler, "High-quality linear
+interpolation for demosaicing of Bayer-patterned color images", ICASSP 2004; the
+implementation is this module's own.
+
+The colour checker values are the commonly published sRGB values of the 24-patch
+ColorChecker chart; ColorChecker is a trademark of X-Rite, Incorporated.
