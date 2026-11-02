@@ -241,16 +241,16 @@ sensor moving 1 cm a frame; mean milliseconds of GPU time over 200 runs (100 on 
 
 | Step | Map | RTX 5090, 640x480 | RTX 5090, 1280x720 | Orin, 640x480 | Orin, 1280x720 |
 | --- | --- | --- | --- | --- | --- |
-| Map update (fused) | 200x200, 5 cm | 0.058 | 0.117 | ORIN | ORIN |
-| Map update (fused) | 500x500, 2 cm | 0.054 | 0.080 | ORIN | ORIN |
-| Map update (highest point) | 200x200 | 0.057 | 0.117 | ORIN | ORIN |
-| Map update (highest point) | 500x500 | 0.054 | 0.079 | ORIN | ORIN |
-| Traversability (5x5 plane fit) | 200x200 | 0.009 | 0.008 | ORIN | ORIN |
-| Traversability (5x5 plane fit) | 500x500 | 0.012 | 0.010 | ORIN | ORIN |
-| Elevation and cost images | 500x500 | 0.009 | 0.008 | ORIN | ORIN |
+| Map update (fused) | 200x200, 5 cm | 0.058 | 0.117 | 0.296 | 0.881 |
+| Map update (fused) | 500x500, 2 cm | 0.054 | 0.080 | 0.414 | 0.968 |
+| Map update (highest point) | 200x200 | 0.057 | 0.117 | 0.290 | 0.880 |
+| Map update (highest point) | 500x500 | 0.054 | 0.079 | 0.406 | 0.962 |
+| Traversability (5x5 plane fit) | 200x200 | 0.009 | 0.008 | 0.030 | 0.029 |
+| Traversability (5x5 plane fit) | 500x500 | 0.012 | 0.010 | 0.104 | 0.096 |
+| Elevation and cost images | 500x500 | 0.009 | 0.008 | 0.057 | 0.054 |
 
 The x86_64 machine has an RTX 5090; the Orin is a Jetson AGX Orin developer kit (64 GB) with JetPack
-7.2, in the power mode it was set to. The update is the sort of the points by cell and one pass per
+7.2 in MAXN. The results, accuracy included, are the same on both. The update is the sort of the points by cell and one pass per
 cell; it grows with the points, and with the most crowded cell, whose points one thread sums, which
 is why 1280x720 into 5 cm cells costs more than into 2 cm cells. The traversability's time grows
 with the known cells.
