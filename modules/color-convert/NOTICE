@@ -1,0 +1,14 @@
+holoscan-color-convert
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-color-convert uses the following open source and NVIDIA software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+NVIDIA VPI 4 (optional, for the vic backend)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's license, installed with VPI as /opt/nvidia/vpi4/doc/VPI_EULA.txt. Linked
+from the installed VPI; not redistributed.
