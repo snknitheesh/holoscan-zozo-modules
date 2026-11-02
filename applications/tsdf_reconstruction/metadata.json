@@ -1,0 +1,70 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "TSDF Reconstruction",
+    "description": "Dense 3D reconstruction on the GPU with holoscan-tsdf: a synthetic RGB-D camera circles a known tabletop scene with known poses, TsdfIntegrateOp integrates every frame into a TSDF volume, and TsdfMeshOp ray casts the volume from each pose and extracts its mesh every N frames. Every ray cast is checked against the scene's exact depth and every mesh against its exact surfaces, and HoloViz shows the input depth beside the shaded ray cast.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-tsdf demo, with a synthetic RGB-D camera, ground-truth reporters, a HoloViz view and a PLY export."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "3D Reconstruction",
+      "Depth",
+      "Mesh"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with about 300 MiB free for the default 256^3 volume and its mesh."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "tsdf"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Reconstruct the tabletop scene over two orbits (240 frames at 640x480 into a 256^3 volume), meshing every 30 frames, check each ray cast and mesh against the truth, and show the depth and the ray cast when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/tsdf_reconstruction\" --count 240",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: one orbit of 60 synthetic 640x480 frames into a 256^3 volume, meshing every 20 frames; every ray cast's depth error and coverage and every mesh's vertex error against the scene's exact surfaces.",
+        "run": {
+          "command": "\"<holohub_app_bin>/tsdf_reconstruction\" --count 60 --orbit 60 --mesh-every 20 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
