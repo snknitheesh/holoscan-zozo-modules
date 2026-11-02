@@ -1,0 +1,79 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Codec",
+    "description": "Encodes a synthetic camera's frames with holoscan-codec's VideoEncoderOp, decodes them with VideoDecoderOp, checks each decoded frame against the one sent (PSNR, order, timestamps) and the bitrate, and shows the original and the decoded frame side by side on a HoloViz display, in a window or offscreen.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-codec demo, with a synthetic source, a PSNR and bitrate report, and a HoloViz display in a window or offscreen."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Video",
+      "Encoding",
+      "Decoding",
+      "Streaming",
+      "NVENC",
+      "NVDEC"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU with NVENC and NVDEC",
+          "description": "A GPU with the video engines, or Jetson Orin with its V4L2 codec devices; see the module's README."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "codec"
+        }
+      ]
+    },
+    "default_mode": "window",
+    "modes": {
+      "window": {
+        "description": "Encode and decode 1280x720 frames in real time with H.264 at 8 Mbit/s, showing the original and the decoded frame side by side with the bitrate and PSNR, until the window closes.",
+        "run": {
+          "command": "\"<holohub_app_bin>/codec_demo\" --display window",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "offscreen": {
+        "description": "Render 120 frames side by side offscreen with H.265, check every rendered frame, and write the last one to codec_render.ppm.",
+        "run": {
+          "command": "\"<holohub_app_bin>/codec_demo\" --display offscreen --codec h265 --count 120 --render-file codec_render.ppm",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 60 frames through H.265 at a constant QP of 25, every frame decoded, in order, with its timestamp, at a PSNR of 34 dB or more. (The demo's tests also run H.264 and the offscreen render.)",
+        "run": {
+          "command": "\"<holohub_app_bin>/codec_demo\" --display none --codec h265 --rate-control cqp --qp 25 --count 60 --period-ms 10 --min-psnr 34",
+          "workdir": "holohub_app_bin",
+          "timeout": 300
+        }
+      }
+    }
+  }
+}
