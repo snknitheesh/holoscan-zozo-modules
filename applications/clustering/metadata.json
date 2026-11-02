@@ -1,0 +1,73 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Clustering",
+    "description": "Splits point clouds into objects on the GPU with holoscan-clustering: a synthetic depth camera over boxes and spheres on a removed ground is deprojected by holoscan-point-cloud's DepthToPointCloudOp and clustered by EuclideanClusterOp, every frame checked against the scene's truth, and the clusters shown color-coded with their boxes in HoloViz.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-clustering demo, with a synthetic scene, a ground-truth reporter and a HoloViz view."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Segmentation",
+      "3D"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "point-cloud"
+        },
+        {
+          "name": "clustering"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Cluster 300 frames of the synthetic scene, check each against its truth, and show the clusters with their boxes when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/clustering\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 30 synthetic 640x480 frames clustered with a 2.5 cm tolerance; the number of clusters, the adjusted Rand index of the labels, each object's cluster, centroid and box checked against the truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/clustering\" --count 30 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
