@@ -34,17 +34,20 @@ else()
   set(BUILD_SHARED_LIBS ON)
   option(HOLOSCAN_YOLO26_BUILD_TESTING "Build the module's tests in the including project" OFF)
 endif()
-# The repository root lists the operators asked for; without Yolo26OverlayOp, the overlay,
-# and so Holoscan Visualization, is left out.
+# The repository root lists the operators asked for; without either overlay, the overlay
+# library, and so Holoscan Visualization, is left out.
 set(_overlay_default ON)
 if(DEFINED HOLOSCAN_ZOZO_MODULES_OPERATORS)
-  if(NOT "Yolo26OverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS)
+  if(
+    NOT "Yolo26OverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS
+    AND NOT "Yolo26SegmentationOverlayOp" IN_LIST HOLOSCAN_ZOZO_MODULES_OPERATORS
+  )
     set(_overlay_default OFF)
   endif()
 endif()
 option(
   HOLOSCAN_YOLO26_BUILD_OVERLAY
-  "Build Yolo26OverlayOp (needs Holoscan Visualization)"
+  "Build Yolo26OverlayOp and Yolo26SegmentationOverlayOp (needs Holoscan Visualization)"
   ${_overlay_default}
 )
 
@@ -115,7 +118,8 @@ set_target_properties(
 )
 set(_targets holoscan_yolo26)
 
-# holoscan::yolo26_overlay: Yolo26OverlayOp, which draws detections as HoloViz layers.
+# holoscan::yolo26_overlay: Yolo26OverlayOp and Yolo26SegmentationOverlayOp, which draw
+# detections, and instance masks, as HoloViz layers.
 if(HOLOSCAN_YOLO26_BUILD_OVERLAY)
   add_library(holoscan_yolo26_overlay src/yolo26_overlay_op.cpp)
   add_library(holoscan::yolo26_overlay ALIAS holoscan_yolo26_overlay)

@@ -12,7 +12,8 @@
 // image against the masks, empty slots past the count, and the capture time
 // and frame id on all six outputs; the score and mask thresholds and the
 // capacity; an image size that changes; and the images, models and settings
-// it must reject.
+// it must reject. And, when it is built, Yolo26SegmentationOverlayOp: masks
+// filled in their class's color, boxes and labels over them.
 //
 // With --real MODEL, the real YOLO26 segmentation model instead, on rendered
 // stop signs: the sign must be found, and its mask must overlap the octagon
@@ -49,6 +50,10 @@
 #include "operator_support.hpp"
 #include "stop_sign.hpp"
 #include "test_support.hpp"
+#if HOLOSCAN_YOLO26_WITH_OVERLAY
+#include <holoscan/visualization/holoviz_op.hpp>
+#include <holoscan/yolo26/yolo26_segmentation_overlay_op.hpp>
+#endif
 
 namespace holoscan::yolo26 {
 namespace {
@@ -453,6 +458,113 @@ int run_real(const std::filesystem::path& model) {
         }}});
 }
 
+#if HOLOSCAN_YOLO26_WITH_OVERLAY
+// `values` as a host tensor of `shape` and `dtype`.
+template <typename T>
+holoscan::Tensor host_tensor(const std::vector<T>& values, std::vector<std::int64_t> shape,
+                             DLDataType dtype) {
+  std::vector<std::uint8_t> bytes(values.size() * sizeof(T));
+  std::memcpy(bytes.data(), values.data(), bytes.size());
+  return *image_tensor(std::move(bytes), std::move(shape), Memory::kHost, dtype);
+}
+
+constexpr std::chrono::nanoseconds kOverlayCaptured = std::chrono::milliseconds(4321);
+namespace viz = holoscan::visualization;
+using Rgba = std::array<std::uint8_t, 4>;
+
+// Two detections of three slots in a 200x100 image, and a label image with
+// instance 1 on [10, 60) x [10, 50), instance 2 on [100, 150) x [50, 90),
+// and a stray 3, past the count, at [0, 5) x [95, 100). Its two layers, or
+// nothing if the run failed; with `label_shape`, a label image of that shape.
+using ImageSnapshot = holoscan::testing::SchemaSnapshot<holoscan::schema::ImageT>;
+using OverlayLayers = std::pair<ImageSnapshot, TensorSnapshot>;
+
+std::optional<OverlayLayers> run_overlay(std::int32_t n,
+                                         std::vector<std::int64_t> label_shape = {100, 200},
+                                         const std::string& failure = "") {
+  std::vector<std::int32_t> label_image(static_cast<std::size_t>(label_shape[0] * label_shape[1]));
+  if (label_shape == std::vector<std::int64_t>{100, 200}) {
+    for (int y = 0; y < 100; ++y) {
+      for (int x = 0; x < 200; ++x) {
+        std::int32_t& v = label_image[static_cast<std::size_t>(y) * 200 + x];
+        if (x >= 10 && x < 60 && y >= 10 && y < 50) v = 1;
+        if (x >= 100 && x < 150 && y >= 50 && y < 90) v = 2;
+        if (x < 5 && y >= 95) v = 3;
+      }
+    }
+  }
+  auto h = holoscan::testing::create_operator_test<Yolo26SegmentationOverlayOp>(
+      Yolo26SegmentationOverlayConfig{
+          .width = 200, .height = 100, .max_detections = 3, .labels = {"person"}});
+  namespace ht = holoscan::testing;
+  h.push_frame(ht::frame_at(
+      kOverlayCaptured,
+      ht::input("boxes",
+                host_tensor(std::vector<float>{10, 10, 60, 50, 100, 50, 150, 90, 0, 0, 200, 100},
+                            {3, 4}, {kDLFloat, 32, 1})),
+      ht::input("scores",
+                host_tensor(std::vector<float>{0.9F, 0.6F, 0.1F}, {3}, {kDLFloat, 32, 1})),
+      ht::input("class_ids", host_tensor(std::vector<std::int32_t>{0, 1, 0}, {3}, {kDLInt, 32, 1})),
+      ht::input("count", host_tensor(std::vector<std::int32_t>{n}, {1}, {kDLInt, 32, 1})),
+      ht::input("label_image", host_tensor(label_image, label_shape, {kDLInt, 32, 1}))));
+  h.capture_snapshot<holoscan::schema::ImageT>("overlay");
+  h.capture_snapshot<holoscan::Tensor>("labels");
+  const auto result = h.run();
+  if (!failure.empty()) {
+    VERIFY_MSG(!result.ok() && result.describe_failure().find(failure) != std::string::npos,
+               "expected '" + failure + "' in: " + result.describe_failure());
+    return std::nullopt;
+  }
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return std::nullopt;
+  return std::pair{result.snapshot<holoscan::schema::ImageT>("overlay"),
+                   result.snapshot<holoscan::Tensor>("labels")};
+}
+
+Rgba pixel(const TensorSnapshot& image, int x, int y) {
+  const auto* p = reinterpret_cast<const std::uint8_t*>(image.bytes().data()) + (y * 200 + x) * 4;
+  return {p[0], p[1], p[2], p[3]};
+}
+
+// The instances filled in their class's color at the masks' opacity, the
+// boxes opaque over them, and a label each, as Yolo26OverlayOp's.
+void check_overlay() {
+  const auto out = run_overlay(2);
+  if (!out) return;
+  const auto& [overlay, labels] = *out;
+  VERIFY(overlay.sample_metadata().capture_timestamp_ns == kOverlayCaptured.count() &&
+         labels.sample_metadata().capture_timestamp_ns == kOverlayCaptured.count());
+  VERIFY(overlay.metadata().encoding == holoscan::schema::ImageEncoding_RGBA8);
+  const auto& image = overlay.tensor(holoscan::schema::ImageTensorFields::data);
+  VERIFY(image.shape() == (std::vector<std::int64_t>{100, 200, 4}));
+  constexpr Rgba kClass0Fill{230, 25, 75, 110};
+  constexpr Rgba kClass1Fill{60, 180, 75, 110};
+  constexpr Rgba kClass0Box{230, 25, 75, 255};
+  constexpr Rgba kClass1Box{60, 180, 75, 255};
+  constexpr Rgba kClear{0, 0, 0, 0};
+  VERIFY(pixel(image, 30, 30) == kClass0Fill && pixel(image, 120, 70) == kClass1Fill);
+  VERIFY(pixel(image, 10, 30) == kClass0Box && pixel(image, 149, 70) == kClass1Box);
+  VERIFY(pixel(image, 80, 30) == kClear && pixel(image, 2, 97) == kClear);
+  VERIFY(labels.shape() ==
+         (std::vector<std::int64_t>{
+             6, static_cast<std::int64_t>(viz::kTextRunHeaderBytes + kOverlayLabelBytes)}));
+  std::string first(reinterpret_cast<const char*>(labels.bytes().data()) +
+                        viz::kTextRunHeaderBytes + viz::kTextRunHeaderBytes + kOverlayLabelBytes,
+                    kOverlayLabelBytes);
+  first.erase(std::min(first.find('\0'), first.size()));
+  VERIFY_MSG(first == "person 0.90", "label '" + first + "'");
+}
+
+// No detections: fully transparent, even where the label image says
+// otherwise. A label image of another size fails.
+void check_overlay_empty_and_mismatch() {
+  if (const auto out = run_overlay(0)) {
+    const auto bytes = out->first.tensor(holoscan::schema::ImageTensorFields::data).bytes();
+    VERIFY(std::all_of(bytes.begin(), bytes.end(), [](std::byte b) { return b == std::byte{0}; }));
+  }
+  (void)run_overlay(2, {50, 200}, "the label image must be int32 [100, 200]");
+}
+#endif
 
 }  // namespace
 }  // namespace holoscan::yolo26
@@ -486,5 +598,10 @@ int main(int argc, char** argv) {
       {"rejects unusable images and models", yd::check_rejects},
       {"rejects unusable settings", yd::check_rejects_settings},
   };
+#if HOLOSCAN_YOLO26_WITH_OVERLAY
+  cases.push_back({"overlay masks, boxes and labels", yd::check_overlay});
+  cases.push_back(
+      {"overlay without detections, and of the wrong size", yd::check_overlay_empty_and_mismatch});
+#endif
   return yd::test::run(cases);
 }
