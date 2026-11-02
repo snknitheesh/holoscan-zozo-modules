@@ -222,8 +222,20 @@ std::vector<ImageSnapshot> run_decoder(const VideoDecoderConfig& config,
   return result.snapshots<holoscan::schema::ImageT>("image");
 }
 
+// The frames here are at most 800x600: smaller pools than the default 1920x1080, on a GPU other
+// processes share.
+constexpr int kMaxWidth = 800;
+constexpr int kMaxHeight = 600;
+
+VideoDecoderConfig decoder_config(PixelFormat format = PixelFormat::kRgb8) {
+  return VideoDecoderConfig{
+      .output_format = format, .max_width = kMaxWidth, .max_height = kMaxHeight};
+}
+
 VideoEncoderConfig encoder_config(Codec codec, std::uint32_t gop = 30) {
   VideoEncoderConfig config;
+  config.max_width = kMaxWidth;
+  config.max_height = kMaxHeight;
   config.settings.codec = codec;
   config.settings.rate_control = RateControl::kConstQp;
   config.settings.qp = 22;
@@ -267,9 +279,7 @@ void check_round_trip(Codec codec) {
   std::filesystem::remove(file);
 
   for (const PixelFormat format : {PixelFormat::kRgb8, PixelFormat::kNv12, PixelFormat::kBgra8}) {
-    VideoDecoderConfig decoder;
-    decoder.output_format = format;
-    const auto decoded = run_decoder(decoder, as_input(frames));
+    const auto decoded = run_decoder(decoder_config(format), as_input(frames));
     VERIFY_MSG(decoded.size() == kFrames, std::string(pixel_format_name(format)) + ": " +
                                               std::to_string(decoded.size()) + " images");
     for (std::uint32_t i = 0; i < decoded.size(); ++i) {
@@ -330,7 +340,7 @@ void check_inputs(Codec codec) {
     }
     const auto frames = run_encoder(encoder_config(codec), images, c.device);
     VERIFY_MSG(frames.size() == 3, name + ": " + std::to_string(frames.size()) + " frames");
-    const auto decoded = run_decoder(VideoDecoderConfig{}, as_input(frames));
+    const auto decoded = run_decoder(decoder_config(), as_input(frames));
     VERIFY_MSG(decoded.size() == 3, name + ": " + std::to_string(decoded.size()) + " images");
     for (std::uint32_t i = 0; i < decoded.size(); ++i) {
       const holoscan::schema::ImageT meta = decoded[i].metadata();
@@ -357,7 +367,7 @@ void check_size_change(Codec codec) {
     VERIFY(meta.frame_index == i % 4);
     VERIFY(meta.width == (i < 4 ? 640 : 800));
   }
-  const auto decoded = run_decoder(VideoDecoderConfig{}, as_input(frames));
+  const auto decoded = run_decoder(decoder_config(), as_input(frames));
   VERIFY_MSG(decoded.size() == 8, std::to_string(decoded.size()) + " images across the change");
   for (std::uint32_t i = 0; i < decoded.size(); ++i) {
     VERIFY(decoded[i].metadata().width == (i < 4 ? 640 : 800));
@@ -380,7 +390,7 @@ void check_stream_edges(Codec codec) {
   schema::EncodedVideoFrameT empty = inputs[4];
   empty.data = host_tensor({}, {0});
   inputs.insert(inputs.begin() + 4, empty);
-  const auto decoded = run_decoder(VideoDecoderConfig{}, inputs);
+  const auto decoded = run_decoder(decoder_config(), inputs);
   VERIFY_MSG(decoded.size() == 4, std::to_string(decoded.size()) + " images");
   for (std::uint32_t i = 0; i < decoded.size(); ++i) {
     VERIFY(decoded[i].metadata().header->capture_timestamp_ns ==
