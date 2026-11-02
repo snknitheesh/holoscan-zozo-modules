@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 4.0)
 project(holoscan_yolo26_consumer LANGUAGES CXX)
 enable_testing()
 
-find_package(holoscan-yolo26 1.0 REQUIRED CONFIG)
+find_package(holoscan-yolo26 1.1 REQUIRED CONFIG)
 message(
   STATUS
   "Found holoscan-yolo26 ${holoscan-yolo26_VERSION} in ${holoscan-yolo26_DIR}"
@@ -18,14 +18,20 @@ find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 add_executable(yolo26_consumer main.cpp)
 target_link_libraries(yolo26_consumer PRIVATE holoscan::yolo26)
 
-# A graph with the stub model, which the consumer writes to its working directory.
+# Graphs with the stub models, which the consumer writes to its working directory.
 add_test(
   NAME yolo26_installed_consumer
-  COMMAND yolo26_consumer
+  COMMAND yolo26_consumer detect
+  WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+add_test(
+  NAME yolo26_installed_segmentation_consumer
+  COMMAND yolo26_consumer segment
   WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 set_tests_properties(
   yolo26_installed_consumer
+  yolo26_installed_segmentation_consumer
   PROPERTIES PASS_REGULAR_EXPRESSION "yolo26_consumer: PASS" TIMEOUT 600
 )
 

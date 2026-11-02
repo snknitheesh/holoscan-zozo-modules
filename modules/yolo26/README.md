@@ -1,12 +1,14 @@
 # holoscan-yolo26
 
-A Holoscan SDK 5 Module for end-to-end YOLO26 object detection on the GPU. `Yolo26DetectionOp` takes
-an image and emits the objects in it as GPU tensors: boxes in the image's own pixels, a score and a
-class for each, and their count. Inside, a CUDA kernel letterboxes the image into the model's
-input, the SDK's TensorRT inference library (HoloInfer) runs the model, and a second kernel turns
-its output into detections. YOLO26 needs no non-maximum suppression, so nothing else runs.
-`Yolo26OverlayOp` turns the detections into HoloViz layers. The
-[YOLO26 Detection demo](../../applications/yolo26_detection/) runs both end to end.
+A Holoscan SDK 5 Module for end-to-end YOLO26 object detection and instance segmentation on the GPU.
+`Yolo26DetectionOp` takes an image and emits the objects in it as GPU tensors: boxes in the image's
+own pixels, a score and a class for each, and their count. Inside, a CUDA kernel letterboxes the
+image into the model's input, the SDK's TensorRT inference library (HoloInfer) runs the model, and a
+second kernel turns its output into detections. YOLO26 needs no non-maximum suppression, so nothing
+else runs. `Yolo26SegmentationOp` does the same with a YOLO26 segmentation model (YOLO26n-seg and its
+larger siblings), and also emits each detection's mask at the image's size, one per detection and as
+a label image. `Yolo26OverlayOp` and `Yolo26SegmentationOverlayOp` turn them into HoloViz layers.
+The [YOLO26 Detection demo](../../applications/yolo26_detection/) runs them end to end.
 
 > **The model is AGPL-3.0, and it is not part of this module.** YOLO26 weights and the Ultralytics
 > software that exports them are licensed under the
@@ -20,13 +22,13 @@ its output into detections. YOLO26 needs no non-maximum suppression, so nothing 
 
 | | |
 | --- | --- |
-| CMake package | `find_package(holoscan-yolo26 [COMPONENTS overlay])` |
+| CMake package | `find_package(holoscan-yolo26 1.1 [COMPONENTS overlay])` |
 | Targets | `holoscan::yolo26`, `holoscan::yolo26_overlay` |
 | Headers | `<holoscan/yolo26/...>` |
 | C++ namespace | `holoscan::yolo26` |
 | Debian package | `holoscan-yolo26` |
 | Model tool | `tools/prepare_model.py`, installed as `share/holoscan-yolo26/prepare_model.py` |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7; Jetson AGX Orin, JetPack 7.2) |
 
 ## Operators
 
@@ -81,6 +83,34 @@ The operator uses HoloInfer directly rather than the SDK's `InferenceOp`, which 
 with its own activation time and no frame id: the decode needs each image's letterbox, and every
 output must keep the image's capture time.
 
+### `Yolo26SegmentationOp`
+
+| Port | Direction | Type |
+| --- | --- | --- |
+| `image` | in | As `Yolo26DetectionOp`'s, at most `max_image_width` x `max_image_height` |
+| `boxes`, `scores`, `class_ids`, `count` | out | As `Yolo26DetectionOp`'s, `max_detections` long |
+| `masks` | out | `holoscan::Tensor`: uint8 `[max_detections, H, W]`, the image's size; per detection, 1 where its mask covers the pixel and 0 elsewhere; all 0 from `count` on; GPU memory |
+| `label_image` | out | `holoscan::Tensor`: int32 `[H, W]`; 0 where no mask covers the pixel, otherwise 1 + the index of the best detection whose mask does (masks overlap; this gives each pixel to one instance); GPU memory |
+
+The six outputs carry the image's capture time and frame id and go out as `Yolo26DetectionOp`'s do;
+pair them with `OnAligned`, and connect a live source with drop-oldest edges. Its model, engine
+cache, `prepare_engine(const Yolo26SegmentationConfig&)` and threading are as above.
+
+| `Yolo26SegmentationConfig` | Default | Meaning |
+| --- | --- | --- |
+| `model` | none | An `.onnx` end-to-end YOLO26 segmentation export, or a TensorRT engine built for this GPU |
+| `input_size`, `score_threshold`, `num_classes`, `pad_value`, `fp16`, `cuda_graphs`, `build_workspace_bytes` | as `Yolo26DetectionConfig` | |
+| `max_detections` | `32` | Capacity of the outputs, 1..1024: the masks per image; further detections are dropped, the lowest scores first, with a warning once per run |
+| `mask_threshold` | `0.5` | A pixel belongs to an instance when its mask probability exceeds this, in `(0, 1)`; Ultralytics uses 0.5 |
+| `max_image_width`, `max_image_height` | `1920`, `1080` | The largest image, which sizes the `masks` and `label_image` outputs; a larger image fails its frame |
+
+The `masks` output holds `max_detections x H x W` bytes per frame, 66 MB for 32 detections at
+1920x1080, and the runtime keeps a few in its pool: size `max_detections` and the largest image to
+what the application needs. `start()` fails, naming the problem, when the model does not take
+`[1, 3, S, S]` or give `[1, N, 6 + M]` rows and `[1, M, S/4, S/4]` prototypes in float32, with `M` at
+most 64; a detection model given to it, or a segmentation model given to `Yolo26DetectionOp`, is
+refused with what each operator needs.
+
 ### `Yolo26OverlayOp`
 
 | Port | Direction | Type |
@@ -95,6 +125,19 @@ both stamped with the frame's capture time, so a HoloViz `FrameTrigger` on the b
 each frame's labels and boxes together over the image they came from. Keep at least four images
 queued on the HoloViz image edge, so that the frame's image is still there when its detections
 arrive; the demo shows the full wiring.
+
+### `Yolo26SegmentationOverlayOp`
+
+| Port | Direction | Type |
+| --- | --- | --- |
+| `boxes`, `scores`, `class_ids`, `count`, `label_image` | in | `Yolo26SegmentationOp`'s outputs, in GPU or host memory; the label image of the configured size |
+| `labels` | out | As `Yolo26OverlayOp`'s |
+| `overlay` | out | `holoscan::schema::ImageT`: a HoloViz RGBA8 image layer; each instance's pixels in its class's color at `mask_alpha` opacity, the boxes opaque over them, transparent elsewhere |
+
+`Yolo26SegmentationOverlayConfig` is `Yolo26OverlayConfig`'s fields (its `max_detections` the
+segmenter's, 32 by default) and `mask_alpha`, the masks' opacity (110 of 255 by default). It is
+wired as `Yolo26OverlayOp` is, with the label image as a fifth input. It copies the label image to
+the host each frame (4 bytes a pixel) and colors it there, as the overlay draws on the host.
 
 ## What it computes
 
@@ -116,11 +159,29 @@ On the COCO image the demo's tests use, the detections match those of Ultralytic
 running the same ONNX file with ONNX Runtime to within 0.002 in score and 0.1 pixel in each box
 edge.
 
+A segmentation export gives two outputs: rows of `[x1, y1, x2, y2, score, class, c_0 .. c_M-1]`,
+the six detection fields and `M` = 32 mask coefficients, and `M` prototype masks of
+`S/4 x S/4`. The decode keeps rows as above and copies each kept row's coefficients to its slot. A
+mask kernel then computes each detection's mask logits, its coefficients times the prototypes,
+at the prototypes' resolution, and for each image pixel `(x, y)` inside the detection's box
+(`x1 <= x < x2`, `y1 <= y < y2`) samples them at the pixel's center as the letterbox placed it,
+`u = pad_left + (x + 0.5) * resized_width / W` (`v` likewise), at prototype coordinate
+`u * (S/4) / S - 0.5`, bilinearly with the edges clamped, as PyTorch's `interpolate` without
+`align_corners` does. The pixel belongs to the detection when the sample exceeds
+`log(t / (1 - t))` for the mask threshold `t` (0 for 0.5). This is Ultralytics' `retina_masks`
+decode, upsampled straight to the image rather than to the input and then to the image. The label
+image gives each pixel to the first, best-scoring, detection whose mask covers it.
+
+On the same COCO image, YOLO26n-seg's five instances (two cats, two remotes and the couch) match
+Ultralytics' predictor's, with or without `retina_masks`: boxes by an IoU of at least 0.9996 and
+masks by at least 0.9999, at most 12 of 183,211 pixels apart. With an FP16 engine, masks still
+overlap Ultralytics' FP32 ones by at least 0.996.
+
 ## Use it in your graph
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
-find_package(holoscan-yolo26 1.0 REQUIRED CONFIG)
+find_package(holoscan-yolo26 1.1 REQUIRED CONFIG)
 target_link_libraries(my_app PRIVATE holoscan::yolo26)   # add holoscan::yolo26_overlay for the overlay
 ```
 
@@ -149,6 +210,22 @@ for (const char* port : {"boxes", "scores", "class_ids", "count"}) {
 const auto plan = holoscan::compile(graph, std::move(options));
 y26::prepare_engine(config);   // Before the run: see above.
 const int status = holoscan::run(plan);   // Adopts `signals`.
+```
+
+Segmentation is the same, with `Yolo26SegmentationOp`, its config, and two more GPU outputs to
+bind and connect:
+
+```cpp
+#include <holoscan/yolo26/yolo26_segmentation_op.hpp>
+
+const y26::Yolo26SegmentationConfig config{.model = "/data/yolo26n-seg.onnx",
+                                           .max_detections = 16,
+                                           .max_image_width = 1280,
+                                           .max_image_height = 720};
+auto segmenter = graph.op<y26::Yolo26SegmentationOp>("segmenter", config);
+graph.add_flow(segmenter->masks, consumer->masks);              // uint8 [16, H, W]
+graph.add_flow(segmenter->label_image, consumer->label_image);  // int32 [H, W]
+// ... boxes, scores, class_ids and count as above; bind all six to device 0.
 ```
 
 ### Lossless or real time
@@ -182,20 +259,23 @@ A consumer that pairs the detections with their image by capture time, as `OnAli
 the image over a deeper drop-oldest edge, so that the image is still queued when its detections
 arrive, a detector's latency later; the demo keeps four frames.
 
-The kernels need no Holoscan graph: `<holoscan/yolo26/kernels.hpp>` has `launch_letterbox()` and
-`launch_decode()`, and `<holoscan/yolo26/letterbox.hpp>` the letterbox geometry, which needs no CUDA
-either. For tests, `<holoscan/yolo26/stub_model.hpp>` writes the stand-in model, an ONNX network
-with the tensors of an end-to-end YOLO26 export that "detects" red (class 0) and blue (class 1)
+The kernels need no Holoscan graph: `<holoscan/yolo26/kernels.hpp>` has `launch_letterbox()`,
+`launch_decode()`, `launch_segmentation_decode()` and `launch_masks()`, and
+`<holoscan/yolo26/letterbox.hpp>` the letterbox geometry, which needs no CUDA either. For tests,
+`<holoscan/yolo26/stub_model.hpp>` writes the stand-in models, ONNX networks with the tensors of
+end-to-end YOLO26 and YOLO26-seg exports that "detect" (and segment) red (class 0) and blue (class 1)
 regions, and `<holoscan/yolo26/synthetic_scene.hpp>` renders frames with a red and a blue rectangle
 and checks detections against them.
 
 ## Prepare the model
 
-`Yolo26DetectionOp` needs YOLO26 exported to ONNX with its end-to-end head. `prepare_model.py`
-downloads the pinned `yolo26n.pt` from the Ultralytics release
+`Yolo26DetectionOp` needs YOLO26 exported to ONNX with its end-to-end head, and
+`Yolo26SegmentationOp` YOLO26-seg likewise. `prepare_model.py` downloads the pinned `yolo26n.pt`
+(with `--task segment`, `yolo26n-seg.pt`) from the Ultralytics release
 [v8.4.0](https://github.com/ultralytics/assets/releases/tag/v8.4.0) and checks its SHA-256 digest,
 exports it with the Ultralytics `yolo` command (`format=onnx nms=False`), checks the export's input
-and output, and writes `yolo26n.onnx` and `yolo26n.labels.txt`. It also downloads, and checks, the
+and outputs for the task's operator, and writes `yolo26n.onnx` and `yolo26n.labels.txt` (or
+`yolo26n-seg.onnx` and `yolo26n-seg.labels.txt`). It also downloads, and checks, the
 COCO validation image `000000039769.jpg`, which the demo uses and which is subject to the COCO terms
 of use (the Terms of Use page at [cocodataset.org](https://cocodataset.org/)), into `images/`;
 `--no-samples` skips it. The script only runs the `yolo` command; it does not import Ultralytics.
@@ -211,12 +291,14 @@ python3 -m venv ~/ultralytics-venv
 ~/ultralytics-venv/bin/pip install ultralytics onnx onnxslim onnxruntime
 python3 modules/yolo26/tools/prepare_model.py --output data/yolo26_detection \
   --yolo ~/ultralytics-venv/bin/yolo
+python3 modules/yolo26/tools/prepare_model.py --output data/yolo26_detection --task segment \
+  --yolo ~/ultralytics-venv/bin/yolo
 ```
 
 From the installed module, run `/usr/share/holoscan-yolo26/prepare_model.py` (or
 `<prefix>/share/holoscan-yolo26/prepare_model.py`); CMake projects find its path in
-`holoscan-yolo26_PREPARE_MODEL`. Pass `--model yolo26s` (or `m`, `l`, `x`) for a larger pinned
-model, `--weights your_model.pt` to export your own trained weights instead (without a digest to
+`holoscan-yolo26_PREPARE_MODEL`. Pass `--model yolo26s` (or `m`, `l`, `x`; `yolo26s-seg` and so
+on to segment, which implies `--task segment`) for a larger pinned model, `--weights your_model.pt` to export your own trained weights instead (without a digest to
 check), `--imgsz` for another input size, and `--force` to export again over an existing model.
 
 ## Security
@@ -248,26 +330,32 @@ cmake --install build/yolo26 --prefix "$PWD/install"
 
 | CMake option | Default | |
 | --- | --- | --- |
-| `HOLOSCAN_YOLO26_BUILD_OVERLAY` | `ON`; from the repository root, `OFF` unless `Yolo26OverlayOp` is asked for | Build `holoscan::yolo26_overlay` (needs Holoscan Visualization) |
+| `HOLOSCAN_YOLO26_BUILD_OVERLAY` | `ON`; from the repository root, `OFF` unless `Yolo26OverlayOp` or `Yolo26SegmentationOverlayOp` is asked for | Build `holoscan::yolo26_overlay`, both overlays (needs Holoscan Visualization) |
+| `HOLOSCAN_YOLO26_SEG_MODEL` | `<repository>/data/yolo26_detection/yolo26n-seg.onnx` | The real segmentation model for `yolo26_segmentation_real`, which is skipped without it |
 | `BUILD_TESTING` | `OFF` | Build the tests, when the module is the top-level project |
 | `HOLOSCAN_YOLO26_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
-The tests need no download: the stub model stands in for YOLO26.
+The tests need no download: the stub models stand in for YOLO26 and YOLO26-seg, except
+`yolo26_segmentation_real`, which is skipped unless the real model has been prepared.
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `yolo26_letterbox` | GPU | The letterbox kernel against a host evaluation, bit for bit, for every encoding, with padded rows, downscaling and upscaling; pixel centers aligned, channels in RGB order, the padding in place and alpha ignored |
 | `yolo26_decode` | GPU | The decode kernel against a host decode: the threshold and its boundary, invalid and non-finite classes, scores and corners, clamping, order, capacity, the count and the zeroed slots, inputs larger than one block, and letterboxes padded on either axis |
 | `yolo26_operators` | GPU | Both operators through the SDK's operator test harness, with the stub model and TensorRT: every encoding, from GPU, host and pinned memory, wide, tall and small images, input sizes of 640 and 320, changing image sizes, mislabeled channels (which swap the classes), the threshold and the capacity, provenance on every output, unusable images, settings and models; the overlay's boxes, labels and their position, and a clear overlay without detections |
-| `yolo26_host` | Nothing | The letterbox geometry for wide and tall images, even and odd padding, half-to-even rounding and tiny and huge images; the stub model file; the synthetic scenes and the truth matching |
-| `yolo26_prepare_model` | Python | `prepare_model.py` without Ultralytics or the network: reading and checking exports, checksums, a failed or missing exporter, and reuse of prepared files |
+| `yolo26_masks` | GPU | The segmentation decode against the detection decode of the same rows, with each slot's coefficients; the mask kernels against a host decode of their definition (prototypes times coefficients, upsampled through the letterbox, cropped and thresholded), mask for mask and label for label, for random smooth prototypes, coefficients and boxes on wide, tall, odd and upscaled images, other thresholds, mask counts and more boxes than one block stages at a time; the letterbox inversion on its own (a rectangle of input pixels comes back to the image); overlapping masks and the label image; empty and over-full counts; either output alone; rejected arguments |
+| `yolo26_segmentation_operator` | GPU | `Yolo26SegmentationOp` through the operator test harness with the stub segmentation model: every encoding, from GPU, host and pinned memory, wide, tall, odd, upscaled and changing images, input sizes 640 and 320; the detections against the scene, each mask against its rectangle (IoU at least 0.9, and every pixel more than the prototypes' resolution from an edge right), masks inside their boxes, empty past the count, the label image against the masks, provenance on all six outputs; the score and mask thresholds and the capacity; images too large, detection and segmentation models given to the wrong operator, a model for another input size, unusable settings; `Yolo26SegmentationOverlayOp`'s fills, boxes and labels |
+| `yolo26_segmentation_real` | GPU, the real model | YOLO26n-seg on four rendered stop signs (COCO class 11) of several sizes, in wide and tall images: each found, with a score of at least 0.5, and its mask overlapping the octagon by an IoU of at least 0.9 (0.979 to 0.987 measured, as Ultralytics' own 0.977 to 0.990). Skipped unless the model exists |
+| `yolo26_host` | Nothing | The letterbox geometry for wide and tall images, even and odd padding, half-to-even rounding and tiny and huge images; the stub model files; the synthetic scenes and the truth matching |
+| `yolo26_prepare_model` | Python | `prepare_model.py` without Ultralytics or the network: reading and checking detection and segmentation exports, the task the model implies, checksums, a failed or missing exporter, and reuse of prepared files |
 
 `yolo26_host` and `yolo26_prepare_model` are also a project of their own in
 [`tests/host/`](tests/host/), which the hosted CI job builds and runs.
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a small graph that runs `Yolo26DetectionOp` with the stub model on synthetic
-frames and checks every frame's detections, and a run of the installed `prepare_model.py`. Build it
+installed package: small graphs that run `Yolo26DetectionOp` and `Yolo26SegmentationOp` with the
+stub models on synthetic frames and check every frame's detections (and masks and label image),
+and a run of the installed `prepare_model.py`. Build it
 with the install prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
@@ -280,9 +368,9 @@ holoscan --project-root modules/yolo26 package holoscan-yolo26 --language cpp \
 ```
 
 `--language cpp` selects the module rather than its package entry, which has the same name. This
-builds for every major GPU architecture and writes `holoscan-yolo26_1.0.0_<arch>.deb` to the current
+builds for every major GPU architecture and writes `holoscan-yolo26_1.1.0_<arch>.deb` to the current
 directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
-`apt install ./holoscan-yolo26_1.0.0_<arch>.deb` needs NVIDIA's CUDA repository. It holds no model.
+`apt install ./holoscan-yolo26_1.1.0_<arch>.deb` needs NVIDIA's CUDA repository. It holds no model.
 
 ## Performance
 

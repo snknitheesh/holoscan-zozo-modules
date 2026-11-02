@@ -16,8 +16,9 @@ endif()
 
 project(
   holoscan_yolo26
-  VERSION 1.0.0
-  DESCRIPTION "End-to-end YOLO26 object detection on the GPU with TensorRT, and its HoloViz overlay"
+  VERSION 1.1.0
+  DESCRIPTION
+    "End-to-end YOLO26 object detection and instance segmentation on the GPU with TensorRT, and their HoloViz overlays"
   LANGUAGES CXX CUDA
 )
 set(CMAKE_CXX_EXTENSIONS OFF)
