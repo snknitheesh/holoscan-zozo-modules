@@ -1,0 +1,72 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-color-convert",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Colour conversion and resizing of camera images in one GPU pass: NV12, NV16, I420, YUYV, UYVY, RGB, BGR, RGBA, BGRA, MONO and 16-bit formats with the BT.601, BT.709 and BT.2020 matrices in full or limited range; nearest, bilinear and area resizing with crop and letterbox; on CUDA or, on Jetson, the VIC through VPI 4.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::color_convert"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Image Processing",
+      "Color Conversion",
+      "Camera",
+      "CUDA",
+      "VPI"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/color-convert",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "ColorConvertOp",
+      "ResizeOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "VIC",
+          "description": "The Video Image Compositor of Jetson Orin or Thor, used by the vic backend, which is opt-in.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-color-convert",
+      "install_commands": [
+        "sudo apt install ./holoscan-color-convert_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

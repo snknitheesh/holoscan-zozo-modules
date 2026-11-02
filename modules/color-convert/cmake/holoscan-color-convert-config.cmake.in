@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-color-convert) defines:
+#   holoscan::color_convert           ColorConvertOp, ResizeOp, the Converter and its CPU
+#                                     reference
+#   holoscan-color-convert_WITH_VPI   Whether the vic backend was built
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-color-convert-targets.cmake")
+
+set(holoscan-color-convert_WITH_VPI @HOLOSCAN_COLOR_CONVERT_VPI@)
+check_required_components(holoscan-color-convert)
