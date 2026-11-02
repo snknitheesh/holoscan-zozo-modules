@@ -1,0 +1,73 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Height Map",
+    "description": "A 2.5D elevation map and its traversability on the GPU with holoscan-height-map: a synthetic depth camera drives over a course with a ramp, steps, a box and a pit; holoscan-point-cloud's DepthToPointCloudOp deprojects each depth image, HeightMapOp maps the clouds with the camera's pose into a window that follows it, and TraversabilityOp computes slope, step height and a cost; every map is checked against the course's truth, and HoloViz shows the elevation beside the cost.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-height-map demo, with a synthetic terrain camera, a ground-truth reporter and a HoloViz view."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Mapping",
+      "Navigation"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "point-cloud"
+        },
+        {
+          "name": "height-map"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Map 300 frames of the synthetic camera driving over the course, check each map against its truth, and show the elevation and cost when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/height_map\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 60 synthetic 640x480 frames into a 200x200 map that follows the camera; the elevation error away from height jumps, the ramp's slope, the steps' heights, the box's lethal rim, the free ground's cost and the window's position, checked against the truth.",
+        "run": {
+          "command": "\"<holohub_app_bin>/height_map\" --count 60 --period-ms 10 --display false",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}

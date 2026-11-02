@@ -1,0 +1,68 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-height-map",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "2.5D elevation maps of point clouds on the GPU, in holoscan-point-cloud's layout: a fixed-size grid, fixed in the map frame or following the sensor's pose cell by cell, with per-cell elevation (highest, mean, or a variance-weighted Kalman estimate integrated over time), variance, point count, lowest and highest point and time since update, height and range limits and a clearing and decay policy; and traversability from the elevation: slope and roughness from a local plane fit, step height, a 0 to 1 cost and an unknown mask; with color images of the elevation and cost for HoloViz.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::height_map"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Point Cloud",
+      "Mapping",
+      "Navigation",
+      "3D",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/height-map",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "HeightMapOp",
+      "TraversabilityOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-height-map",
+      "install_commands": [
+        "sudo apt install ./holoscan-height-map_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
