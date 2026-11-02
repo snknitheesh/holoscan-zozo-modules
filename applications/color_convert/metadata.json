@@ -1,0 +1,81 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Color Convert",
+    "description": "A synthetic camera's NV12 or YUYV frames converted to RGBA by holoscan-color-convert's ColorConvertOp and letterboxed by its ResizeOp in the same pass, shown by HoloViz in a window or rendered offscreen, with every output and render checked against the module's CPU reference.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-color-convert demo, with a synthetic NV12/YUYV camera, ColorConvertOp and ResizeOp on the cuda, vic or auto backend, a HoloViz window or offscreen render, and checks against the CPU reference."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Image Processing",
+      "Color Conversion",
+      "Camera"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Display",
+          "description": "For the window mode only; the offscreen and ci modes need none.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "color-convert"
+        }
+      ]
+    },
+    "default_mode": "window",
+    "modes": {
+      "window": {
+        "description": "Live: 1920x1080 NV12 at 30 frames per second, converted to RGBA and shown in a HoloViz window with the 640x640 letterboxed resize inset, until the window is closed.",
+        "run": {
+          "command": "\"<holohub_app_bin>/color_convert\" --camera nv12 --display window",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "offscreen": {
+        "description": "HoloViz renders offscreen into CUDA memory: 60 frames, each output checked against the CPU reference and each render against its frame.",
+        "run": {
+          "command": "\"<holohub_app_bin>/color_convert\" --camera nv12 --count 60 --period-ms 10 --display offscreen",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 60 YUYV and 1080p frames on the auto backend, every output checked against the CPU reference (byte for byte on CUDA, within tolerance on the VIC); on a CI runner, auto must take the VIC on the Jetson and CUDA on x86_64.",
+        "run": {
+          "command": "\"<holohub_app_bin>/color_convert\" --camera yuyv --backend auto --count 60 --period-ms 10 --display none",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
