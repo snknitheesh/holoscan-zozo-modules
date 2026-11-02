@@ -1,0 +1,78 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Image Quality",
+    "description": "Runs holoscan-image-quality's ImageQualityOp on a synthetic camera that cycles through degradations (sharp, blurred, dark, noisy, frozen, smudged, tinted), checks that each frame gets exactly the flags of its segment, and shows the image, the tile overlay and the metrics on a HoloViz display or renders them offscreen.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-image-quality demo, with a degrading synthetic camera checked frame by frame, a HoloViz display and an offscreen render check."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Image Quality",
+      "Camera Health",
+      "Visualization"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "image-quality"
+        }
+      ]
+    },
+    "default_mode": "display",
+    "modes": {
+      "display": {
+        "description": "Two cycles of the degrading camera on a HoloViz display (when there is one): the image, a tile overlay (red blurred, magenta obstructed, yellow low-texture tiles) and the metrics, every frame's flags checked.",
+        "run": {
+          "command": "\"<holohub_app_bin>/image_quality\" --count 630",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "offscreen": {
+        "description": "One cycle rendered offscreen by HoloViz into GPU memory, each rendered frame checked for the scene, the text and the overlay over the smudge, and the frame with the most overlay saved as image_quality.ppm.",
+        "run": {
+          "command": "\"<holohub_app_bin>/image_quality\" --count 315 --period-ms 10 --display offscreen --snapshot image_quality.ppm",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: two cycles of 40-frame segments (560 frames), each frame's flags checked against its segment: blurred only in the blurred segment, underexposed in the dark one, noisy in the noisy one, frozen on the repeats, obstructed once the smudge has lasted 30 frames, color cast in the tinted one, and nothing in the sharp segment or anywhere else.",
+        "run": {
+          "command": "\"<holohub_app_bin>/image_quality\" --count 560 --segment-frames 40 --period-ms 5 --display false",
+          "workdir": "holohub_app_bin",
+          "timeout": 600
+        }
+      }
+    }
+  }
+}
