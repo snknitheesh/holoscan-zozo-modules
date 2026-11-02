@@ -1,0 +1,84 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Foundation Stereo",
+    "description": "Learned stereo disparity and depth with holoscan-foundation-stereo's FoundationStereoOp and NVIDIA's Fast-FoundationStereo through TensorRT, from a synthetic scene checked against ground truth or from a recorded camera clip checked against the camera's own depth, shown beside the left image on a HoloViz display. Its ci mode runs the module's stub model, checked against the CPU reference of the operator's chain.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-foundation-stereo demo, with a synthetic source checked against ground truth, a recording player checked against the camera's depth, a stub-model ci mode, and a HoloViz display, on screen or offscreen."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Stereo",
+      "Depth",
+      "TensorRT"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10."
+        }
+      ],
+      "data": [
+        {
+          "name": "C-Fast-FoundationStereo (NVIDIA Open Model Agreement)",
+          "description": "For every mode but ci: the 480x736 ONNX model, which the module's prepare_model.py downloads into the data directory. Not part of this repository.",
+          "url": "https://huggingface.co/nvidia/c-fast-foundationstereo"
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "foundation-stereo"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "Run the model on 300 frames of a rendered scene, check its disparity against the ground truth, and show it beside the left image when a display is available.",
+        "run": {
+          "command": "\"<holohub_app_bin>/foundation_stereo\" --model \"<holohub_data_dir>/foundation_stereo/c_fast_foundationstereo_480x736.onnx\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "recording": {
+        "description": "Play a recorded RealSense clip from $HOLOSCAN_TEST_DATA/stereo-camera/ in real time, as from the camera, show its disparity beside the left image, and compare the depth with the camera's own. Choose another clip, or a recording folder with --recording, with --run-args.",
+        "run": {
+          "command": "\"<holohub_app_bin>/foundation_stereo\" --model \"<holohub_data_dir>/foundation_stereo/c_fast_foundationstereo_480x736.onnx\" --source recording --clip d585_720p_emitter_on --loop true --count 600 --realtime true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check that needs no download: 30 synthetic 640x480 frames through TensorRT with the module's stub model, each frame's disparity checked against the CPU reference of the operator's chain, and the display rendered offscreen and checked.",
+        "run": {
+          "command": "\"<holohub_app_bin>/foundation_stereo\" --model stub --count 30 --width 640 --height 480 --period-ms 50 --display offscreen",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
