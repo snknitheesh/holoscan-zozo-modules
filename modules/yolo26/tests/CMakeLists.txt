@@ -6,7 +6,8 @@
 
 add_executable(yolo26_letterbox_test letterbox_test.cu)
 add_executable(yolo26_decode_test decode_test.cu)
-foreach(_test yolo26_letterbox_test yolo26_decode_test)
+add_executable(yolo26_masks_test masks_test.cu)
+foreach(_test yolo26_letterbox_test yolo26_decode_test yolo26_masks_test)
   target_link_libraries(${_test} PRIVATE holoscan::yolo26)
   target_compile_features(${_test} PRIVATE cuda_std_20)
   # The tests' host evaluations of the kernels' expressions must not contract either.
@@ -28,6 +29,7 @@ endif()
 
 add_test(NAME yolo26_letterbox COMMAND yolo26_letterbox_test)
 add_test(NAME yolo26_decode COMMAND yolo26_decode_test)
+add_test(NAME yolo26_masks COMMAND yolo26_masks_test)
 # The stub models and their TensorRT engines go to a folder of their own.
 add_test(
   NAME yolo26_operators
@@ -36,6 +38,7 @@ add_test(
 set_tests_properties(
   yolo26_letterbox
   yolo26_decode
+  yolo26_masks
   yolo26_operators
   PROPERTIES LABELS "yolo26;gpu" TIMEOUT 600
 )

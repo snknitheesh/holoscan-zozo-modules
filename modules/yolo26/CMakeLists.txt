@@ -70,6 +70,7 @@ add_library(
   src/decode.cu
   src/letterbox.cpp
   src/letterbox.cu
+  src/masks.cu
   src/model_runtime.cpp
   src/stub_model.cpp
   src/synthetic_scene.cpp
@@ -78,7 +79,12 @@ add_library(
 add_library(holoscan::yolo26 ALIAS holoscan_yolo26)
 # Without fused multiply-adds the kernels compute bit for bit what the host computes
 # from the same expressions, so the tests compare them exactly.
-set_source_files_properties(src/decode.cu src/letterbox.cu PROPERTIES COMPILE_OPTIONS -fmad=false)
+set_source_files_properties(
+  src/decode.cu
+  src/letterbox.cu
+  src/masks.cu
+  PROPERTIES COMPILE_OPTIONS -fmad=false
+)
 target_compile_features(holoscan_yolo26 PUBLIC cxx_std_20 PRIVATE cuda_std_20)
 target_compile_options(
   holoscan_yolo26

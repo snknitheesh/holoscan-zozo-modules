@@ -49,10 +49,13 @@ __device__ bool decode_row(const float* row, const DecodeParams& p, Box& box, in
          isfinite(row[2]) && isfinite(row[3]);
 }
 
-// One block walks the rows in chunks, compacting the kept ones with a block
-// scan so they keep their order, then zeroes the unused slots. Once the
-// outputs are full it stops, unless it must count the rows kept beyond them.
-__global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs out) {
+// One block walks the rows, `row_fields` floats apart, in chunks, compacting
+// the kept ones with a block scan so they keep their order, then zeroes the
+// unused slots. Once the outputs are full it stops, unless it must count the
+// rows kept beyond them. With `coefficients`, it also copies each kept row's
+// `mask_channels` floats after the first six to its slot there.
+__global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs out, int row_fields,
+                              int mask_channels, float* coefficients) {
   using Scan = cub::BlockScan<int, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int written;
@@ -66,8 +69,9 @@ __global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs o
     const int r = base + static_cast<int>(threadIdx.x);
     Box box{};
     int class_id = 0;
-    const bool keep = r < p.rows && decode_row(rows + static_cast<std::int64_t>(r) * kRowFields, p,
-                                               box, class_id);
+    // Past the last row, the first one stands in, unread.
+    const float* row = rows + static_cast<std::int64_t>(r < p.rows ? r : 0) * row_fields;
+    const bool keep = r < p.rows && decode_row(row, p, box, class_id);
     int slot = 0;
     int kept = 0;
     Scan(scan_storage).ExclusiveSum(keep ? 1 : 0, slot, kept);
@@ -77,8 +81,13 @@ __global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs o
       out.boxes[4 * slot + 1] = box.y1;
       out.boxes[4 * slot + 2] = box.x2;
       out.boxes[4 * slot + 3] = box.y2;
-      out.scores[slot] = rows[static_cast<std::int64_t>(r) * kRowFields + 4];
+      out.scores[slot] = row[4];
       out.class_ids[slot] = class_id;
+      if (coefficients != nullptr) {
+        for (int m = 0; m < mask_channels; ++m) {
+          coefficients[static_cast<std::int64_t>(slot) * mask_channels + m] = row[kRowFields + m];
+        }
+      }
     }
     __syncthreads();  // Every thread has read `written`, and the scan storage is free.
     if (threadIdx.x == 0) {
@@ -97,6 +106,11 @@ __global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs o
     out.boxes[4 * slot + 3] = 0.0f;
     out.scores[slot] = 0.0f;
     out.class_ids[slot] = 0;
+    if (coefficients != nullptr) {
+      for (int m = 0; m < mask_channels; ++m) {
+        coefficients[static_cast<std::int64_t>(slot) * mask_channels + m] = 0.0f;
+      }
+    }
   }
   if (threadIdx.x == 0) {
     *out.count = written;
@@ -106,17 +120,33 @@ __global__ void decode_kernel(const float* rows, DecodeParams p, DecodeOutputs o
   }
 }
 
+bool valid(const float* rows, const DecodeParams& params, const DecodeOutputs& outputs) {
+  return !((rows == nullptr && params.rows != 0) || params.rows < 0 || params.rows > kMaxRows ||
+           params.capacity < 1 || params.capacity > kMaxRows || params.num_classes < 1 ||
+           !(params.letterbox.scale > 0.0f) || outputs.boxes == nullptr ||
+           outputs.scores == nullptr || outputs.class_ids == nullptr || outputs.count == nullptr);
+}
+
 }  // namespace
 
 cudaError_t launch_decode(const float* rows, const DecodeParams& params,
                           const DecodeOutputs& outputs, cudaStream_t stream) {
-  if ((rows == nullptr && params.rows != 0) || params.rows < 0 || params.rows > kMaxRows ||
-      params.capacity < 1 || params.capacity > kMaxRows || params.num_classes < 1 ||
-      !(params.letterbox.scale > 0.0f) || outputs.boxes == nullptr || outputs.scores == nullptr ||
-      outputs.class_ids == nullptr || outputs.count == nullptr) {
+  if (!valid(rows, params, outputs)) {
     return cudaErrorInvalidValue;
   }
-  decode_kernel<<<1, kThreads, 0, stream>>>(rows, params, outputs);
+  decode_kernel<<<1, kThreads, 0, stream>>>(rows, params, outputs, kRowFields, 0, nullptr);
+  return cudaGetLastError();
+}
+
+cudaError_t launch_segmentation_decode(const float* rows, const DecodeParams& params,
+                                       int mask_channels, const DecodeOutputs& outputs,
+                                       float* coefficients, cudaStream_t stream) {
+  if (!valid(rows, params, outputs) || mask_channels < 1 || mask_channels > kMaxMaskChannels ||
+      coefficients == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  decode_kernel<<<1, kThreads, 0, stream>>>(rows, params, outputs, kRowFields + mask_channels,
+                                            mask_channels, coefficients);
   return cudaGetLastError();
 }
 
