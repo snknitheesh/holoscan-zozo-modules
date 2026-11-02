@@ -1,0 +1,90 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Recorder",
+    "description": "Records synthetic streams (RGB8 and MONO16 from the GPU, MONO8 and NV12 from the host, and a tensor) with holoscan-recorder's RecorderOp, replays them with ReplayerOp into host and device memory and checks every byte, capture time and frame id; replays a recording or a stereo camera clip into a HoloViz window; and measures what the disk takes from a live camera.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-recorder demo, with a byte-exact record and replay check, a HoloViz replay of recordings and stereo camera clips, and a recording benchmark."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Recording",
+      "Replay",
+      "Testing",
+      "Visualization",
+      "Robotics"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Display",
+          "description": "For the HoloViz window of the replay mode.",
+          "required": false
+        }
+      ],
+      "data": [
+        {
+          "name": "Stereo camera recordings",
+          "description": "Optional: the RealSense D585 clips in $HOLOSCAN_TEST_DATA/stereo-camera/, for the replay mode and the real-data tests. Not part of this repository.",
+          "version": "2026-10-28"
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "recorder"
+        }
+      ]
+    },
+    "default_mode": "ci",
+    "modes": {
+      "ci": {
+        "description": "Finite headless check: 30 frames of five synthetic streams recorded, then replayed into host and into device memory, every sample checked byte for byte with its capture time and frame id.",
+        "run": {
+          "command": "\"<holohub_app_bin>/recorder\" --mode ci --recording \"<holohub_app_bin>/ci_recording\"",
+          "workdir": "holohub_app_bin",
+          "timeout": 600
+        }
+      },
+      "replay": {
+        "description": "Replays the RGB images of a stereo camera clip in real time, in a loop, in a HoloViz window; needs a display and $HOLOSCAN_TEST_DATA.",
+        "run": {
+          "command": "\"<holohub_app_bin>/recorder\" --mode replay --recording \"$HOLOSCAN_TEST_DATA/stereo-camera/d585_720p_emitter_on\" --stream rgb --loop true --display true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "bench": {
+        "description": "Records a synthetic 1280x720 RGB8 camera at 30 fps for 10 s through kDropOldest edges and reports the rate the disk took and the frames dropped.",
+        "run": {
+          "command": "\"<holohub_app_bin>/recorder\" --mode bench --width 1280 --height 720 --encoding rgb8 --fps 30 --frames 300",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
