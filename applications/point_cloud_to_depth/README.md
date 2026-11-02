@@ -16,7 +16,7 @@ flowchart LR
 
 ## Demo
 
-Videos of the demo on synthetic input and on real input go in [tests/video](tests/video).
+A video of the demo on real data is still to come, in [tests/video](tests/video).
 
 ## Requirements
 
