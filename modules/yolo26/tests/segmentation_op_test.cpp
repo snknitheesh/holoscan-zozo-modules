@@ -583,6 +583,11 @@ int main(int argc, char** argv) {
   if (argc == 4) {
     return yd::run_real(argv[3]);
   }
+  // Build the stub's engines before any run, as the operator asks: a Jetson
+  // can take longer than the harness lets a run start.
+  for (const int size : {640, 320}) {
+    yd::prepare_engine(yd::stub_config(size));
+  }
   using yd::PixelFormat;
   using yd::test::Memory;
   std::vector<yd::test::TestCase> cases{
