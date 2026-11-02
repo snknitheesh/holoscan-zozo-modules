@@ -192,7 +192,7 @@ dictionary. Heavy blur next to the markers in a board (2 px against 6 px margins
 chessboard corners to about 0.2 px.
 
 Detection time at 1280x720, from the gray image to the markers or chessboard corners on the host,
-the mean over 20 frames (`fiducials_backends` prints it):
+the mean over 20 frames on an otherwise idle machine (`fiducials_backends` prints it):
 
 | | Six markers | 9x6 ChArUco board (27 markers, 40 corners) |
 | --- | --- | --- |
