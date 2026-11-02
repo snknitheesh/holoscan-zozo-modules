@@ -1,0 +1,97 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Mono Depth",
+    "description": "Estimates depth from single images with holoscan-mono-depth's MonoDepthOp and Depth Anything V2 Small: a synthetic scene with known depth, JPEG and PPM files or a live V4L2 webcam; checks, times and writes the depth, and shows each image beside its colorized depth in a HoloViz window or rendered offscreen.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-mono-depth demo, with synthetic, JPEG/PPM and V4L2 webcam sources; a HoloViz display of the image beside its colorized depth, in a window or offscreen; checks against the host reference with the module's stub model, and against the synthetic scene's true depth with the real model; latency and GPU memory."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Depth Estimation",
+      "Monocular Depth",
+      "TensorRT",
+      "Robotics"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Webcam",
+          "description": "A V4L2 camera offering YUYV, for the camera mode, which also needs a display.",
+          "required": false
+        }
+      ],
+      "data": [
+        {
+          "name": "Depth Anything V2 Small (Apache-2.0)",
+          "description": "Not part of this repository. The module's tools/prepare_model.py downloads the pinned checkpoint and exports it to ONNX with a separately installed PyTorch and Transformers. Needed by the demo, files and camera modes only.",
+          "url": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/tree/5426e4f0f36572d16453bbda7a8389317b1bef99",
+          "version": "5426e4f0f36572d16453bbda7a8389317b1bef99"
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "mono-depth"
+        }
+      ]
+    },
+    "default_mode": "demo",
+    "modes": {
+      "demo": {
+        "description": "Depth of 300 frames of the synthetic scene with Depth Anything V2 Small, each checked against the scene's true depth, with latency and GPU memory; shown in a HoloViz window when there is a display.",
+        "run": {
+          "command": "\"<holohub_app_bin>/mono_depth\" --model \"<holohub_data_dir>/mono_depth/depth_anything_v2_small_518x518.onnx\" --count 300 --period-ms 10",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "files": {
+        "description": "Depth of each JPEG and PPM image in the data directory's images folder, written colorized to the build directory.",
+        "run": {
+          "command": "\"<holohub_app_bin>/mono_depth\" --model \"<holohub_data_dir>/mono_depth/depth_anything_v2_small_518x518.onnx\" --source files --images \"<holohub_data_dir>/mono_depth/images\" --image-dir .",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "camera": {
+        "description": "Live webcam beside its depth in a HoloViz window; needs /dev/video0, a display, and the prepared model. Local only.",
+        "run": {
+          "command": "\"<holohub_app_bin>/mono_depth\" --model \"<holohub_data_dir>/mono_depth/depth_anything_v2_small_518x518.onnx\" --source camera --display window",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check without downloads: 30 synthetic BGR8 frames through TensorRT with the module's stub model, which stands in for Depth Anything, every depth value checked against the host reference of the whole pipeline.",
+        "run": {
+          "command": "\"<holohub_app_bin>/mono_depth\" --model stub --count 30 --period-ms 5 --encoding bgr8",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
