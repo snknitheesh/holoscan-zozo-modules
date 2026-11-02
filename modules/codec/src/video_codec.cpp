@@ -92,8 +92,14 @@ std::vector<BackendStatus> probe_cached(bool encoder, Codec codec) {
   }
   const detail::Probe nvcodec =
       encoder ? detail::probe_nvcodec_encoder(codec) : detail::probe_nvcodec_decoder(codec);
-  const detail::Probe v4l2 =
-      encoder ? detail::probe_v4l2_encoder(codec) : detail::probe_v4l2_decoder(codec);
+  detail::Probe v4l2;
+  if (nvcodec.available) {
+    // Where the Video Codec SDK works (Jetson Thor), NVIDIA's V4L2 codec devices are a layer over
+    // it with other buffer semantics, which this backend does not drive: use nvcodec directly.
+    v4l2.detail = "the Video Codec SDK works here, so the nvcodec backend is used instead";
+  } else {
+    v4l2 = encoder ? detail::probe_v4l2_encoder(codec) : detail::probe_v4l2_decoder(codec);
+  }
   std::vector<BackendStatus> statuses{
       {.backend = Backend::kNvcodec, .available = nvcodec.available, .detail = nvcodec.detail},
       {.backend = Backend::kV4l2, .available = v4l2.available, .detail = v4l2.detail},

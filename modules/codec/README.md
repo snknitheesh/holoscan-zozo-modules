@@ -89,9 +89,13 @@ VideoDecoderOp: h264 on the v4l2 backend (NVDEC through /dev/v4l2-nvdec, VIC thr
 
 | Backend | Platforms | Encoding | Decoding |
 | --- | --- | --- | --- |
-| `kNvcodec` | x86_64 with an NVIDIA GPU; Jetson Thor | NVENC through the Video Codec SDK (`libnvidia-encode`), reading NV12 straight from device memory | NVDEC through the Video Codec SDK (`libnvcuvid`); each frame mapped in device memory and copied out |
+| `kNvcodec` | x86_64 with an NVIDIA GPU; Jetson Thor (JetPack 7.2) | NVENC through the Video Codec SDK (`libnvidia-encode`), reading NV12 straight from device memory | NVDEC through the Video Codec SDK (`libnvcuvid`); each frame mapped in device memory and copied out |
 | `kV4l2` | Jetson Orin (JetPack 7.2) | NVENC through `/dev/v4l2-nvenc` and NVIDIA's libv4l2; each frame copied from device memory into the device's input buffer (pinned, so a DMA copy) | NVDEC through `/dev/v4l2-nvdec`; the block-linear frames laid out pitch-linear in device memory by the VIC, through VPI 4 |
 | `kAuto` | Any | The first of the two that works here, probed once | The same |
+
+Jetson Thor also has `/dev/v4l2-nvenc` and `/dev/v4l2-nvdec`, but there NVIDIA's V4L2 plugins are a
+layer over the Video Codec SDK with other buffer semantics, which the `kV4l2` backend does not
+drive: where `kNvcodec` works, `kV4l2` reports itself unavailable and Thor uses `kNvcodec`.
 
 The module links none of these libraries: it loads them at run time, so it builds and runs
 anywhere, and a backend whose libraries or devices are missing is reported as unavailable with the
@@ -131,7 +135,7 @@ With a bitrate, the worst frame is taken after the first five, as the stream's f
 must fit one frame's worth of bits; easy content takes less than the target. The RGB to NV12
 conversion alone, at QP 0, gives about 51 dB.
 
-Throughput of `VideoEncoder` and `VideoDecoder` (`codec_benchmark`), in frames per second of the
+Throughput of `VideoEncoder` and `VideoDecoder` (the demo's `--benchmark` mode), in frames per second of the
 whole call (color conversion, the hardware, and the copies in and out), one stream at a time, low
 latency, 8 Mbit/s at 1080p and 20 Mbit/s at 2160p:
 
@@ -149,8 +153,8 @@ the device queues for each frame.
 
 On the RTX 5090, encoding takes 1 to 3 % of the GPU's SMs (the color conversion) while NVENC runs
 at 32 % (1080p H.264) to 63 % (2160p H.265) of one engine's capacity; decoding takes 1 to 4 % of
-the SMs, NVDEC about 48 %. Jetson Thor's figures are printed by the `codec_benchmark` test in its CI
-lane.
+the SMs, NVDEC about 48 %. The demo's `ci` mode prints these figures in every CI lane, Jetson Thor's
+included.
 
 ## Use it in your graph
 
@@ -226,7 +230,6 @@ encode and decode, saying why:
 | --- | --- | --- |
 | `codec_round_trip` | GPU with NVENC/NVDEC, or Jetson Orin | On every available backend, for H.264 and H.265: PSNR per rate-control setting (the table above); parameter sets on every keyframe and keyframes exactly every GOP; every frame back once, in order, with its pts, each one access unit after the next in low-latency mode; odd sizes cropped back; a size change in one decoder; access units before the first keyframe and empty ones; the smallest size; rejected settings |
 | `codec_operators` | The same | Both operators through the SDK's operator test harness: every input encoding in host and device memory, headers, frame ids and pts carried, keyframes, the raw file, RGB8, BGRA8 and NV12 output, an odd size, a size change (a new stream, or refused), empty and undecodable access units, bad configuration |
-| `codec_benchmark` | The same | Prints the throughput table; fails only when a backend fails |
 | `codec_host` | Nothing | The Annex-B reader on hand-made H.264 and H.265 streams, settings and their names, the test video and PSNR; also built on its own from `tests/host/` by the hosted CI job |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
