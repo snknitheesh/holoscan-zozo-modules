@@ -86,12 +86,19 @@ frame has the identity pose and no iterations.
   (the same grid, or one of that cell size) give a covariance, whose smallest eigenvector, found in
   closed form in double precision, is the normal, turned toward the sensor at the origin. A point
   with fewer than 3 neighbors, or on a line, has none and takes no part.
-- **The solver.** One kernel moves each source point by the current transform, finds its
-  correspondence, and adds its Jacobian terms to the 6x6 normal equations; `cub::BlockReduce` sums
-  each block, and one pass sums the blocks in double precision, in block order. The host solves the
-  6x6 system by Cholesky, with a damping of 1e-9 of the largest diagonal that keeps a degenerate
-  geometry (one plane) solvable, and updates the transform by the exponential map. Point-to-point
-  uses the same equations with three rows per correspondence, so the robust kernels apply to both.
+- **The solver, on the GPU.** One kernel moves each source point by the current transform, finds
+  its correspondence, and adds its Jacobian terms to the 6x6 normal equations; `cub::BlockReduce`
+  sums each block, and one pass sums the blocks in double precision, in block order. A one-thread
+  kernel then solves the 6x6 system by Cholesky, with a damping of 1e-9 of the largest diagonal that
+  keeps a degenerate geometry (one plane) solvable, updates the transform by the exponential map,
+  and decides: converged, finer distance, too few correspondences or out of iterations.
+  Point-to-point uses the same equations with three rows per correspondence, so the robust kernels
+  apply to both.
+- **Few round trips to the host.** Point counts stay on the GPU, and the host queues the iterations
+  in batches and waits for the GPU once per batch and once for the final evaluation: about four
+  waits a frame instead of one per iteration and per grid. A round trip costs 7 µs on the x86
+  machine, 30 to 80 µs on the Orin, and 1.8 ms on the Thor CI runner, where waiting once per
+  iteration took most of the frame time.
 - **Coarse to fine.** A wide correspondence distance catches a large motion; a narrow one keeps
   points the other cloud does not see from pulling on the result. Halving the distance each time the
   iterations converge gives both.
@@ -129,16 +136,17 @@ down to 3 cm (4.5 cm with 3 cm voxels), normals within three voxels; the mean ov
 
 | Resolution | x86, RTX 5090, 2 cm voxels | 3 cm | Jetson Orin, 2 cm | 3 cm | Jetson Thor, 2 cm | 3 cm |
 | --- | --- | --- | --- | --- | --- | --- |
-| 320x240 | 1.7 ms | 1.3 ms | 9.1 ms | 5.8 ms | in CI | in CI |
-| 640x480 | 3.6 ms | 1.9 ms | 30.3 ms | 10.6 ms | in CI | in CI |
-| 1280x720 | 6.6 ms | 2.4 ms | 63.5 ms | 15.1 ms | in CI | in CI |
+| 320x240 | 1.9 ms | 1.5 ms | 9.1 ms | 6.2 ms | 22.2 ms | 16.0 ms |
+| 640x480 | 4.8 ms | 2.3 ms | 32.2 ms | 11.5 ms | 66.1 ms | 26.0 ms |
+| 1280x720 | 9.1 ms | 3.0 ms | 69.9 ms | 16.2 ms | 137.5 ms | 34.7 ms |
 
 The time grows with the points left after subsampling (57 000, 117 000 and 143 000 with 2 cm
-voxels; 37 000, 57 000 and 58 000 with 3 cm) and with the iterations a frame needs (18 to 33). The
-Orin is 5 to 10 times slower than the RTX 5090; on it, 3 cm voxels make 640x480 and 1280x720 real
-time. They cost accuracy when the camera moves less than a voxel per frame, though: around the same
-path in 300 frames instead of 150, 3 cm voxels drift 2.6% at 640x480 and 7.7% at 1280x720, against
-0.45% and 1.7% for 2 cm.
+voxels; 37 000, 57 000 and 58 000 with 3 cm) and with the iterations a frame needs (15 to 33). The
+Jetson numbers are from the CI runners, which may share their board with other work; on the Thor
+runner one host round trip took 2.2 ms, so its frames carry about 10 ms of waiting besides the
+GPU's work. 3 cm voxels are 2 to 4 times faster on the Jetsons, but cost accuracy when the camera
+moves less than a voxel per frame: around the same path in 300 frames instead of 150, they drift
+2.6% at 640x480 and 7.7% at 1280x720, against 0.45% and 1.7% for 2 cm.
 
 ## Use it in your graph
 
