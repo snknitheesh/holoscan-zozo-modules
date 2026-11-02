@@ -388,6 +388,20 @@ of:
 Measured with Nsight Systems over 300 frames of the demo, tracing CUDA graph nodes; the demo's
 README has the command and the latency from capture to detections on the host.
 
+Segmentation costs little more. On the same RTX 5090, again shared with another process, YOLO26n
+against YOLO26n-seg at 640 on the same image (five instances found), median of 280 frames:
+
+| GPU work per frame | Detection, FP32 | Segmentation, FP32 | Detection, FP16 | Segmentation, FP16 |
+| --- | --- | --- | --- | --- |
+| TensorRT | 748 µs | 936 µs | 428 µs | 487 µs |
+| Decode kernel | 2.2 µs | 4.7 µs | 2.2 µs | 4.8 µs |
+| Mask kernels | | 9.2 µs | | 9.2 µs |
+| Letterbox start to last kernel end | 875 µs | 962 µs | 553 µs | 590 µs |
+| Capture to results on the host (demo, p50) | 1.39 ms | 1.37 ms | 0.95 ms | 1.00 ms |
+
+The mask kernels' time grows with the image's pixels times the detections, and the masks
+output's size with `max_detections`.
+
 The operator's code was validated, before it became this module, with SDK 5.0.0 on x86_64 (RTX
 5090, CUDA 13.2, TensorRT 10.16; RTX 5080 Laptop GPU, CUDA 13.0, TensorRT 10.13) and on Jetson AGX
 Thor (JetPack 7, CUDA 13.0, TensorRT 10.15), where the real model's FP32 and FP16 engines give the
