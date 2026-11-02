@@ -37,8 +37,9 @@ struct PlatformFacts {
 // it can. The VIC converts and rescales between NV12, YUYV, UYVY, RGBA8,
 // BGRA8 and MONO8 with nearest or bilinear sampling, sides of 16 to 16384
 // pixels and up to 16 times up or down; it reads and writes chroma-subsampled
-// images only at even offsets and sizes; and it has the BT.601 and BT.709
-// matrices but not BT.2020's alone.
+// images only at even offsets and sizes; between colour models it takes
+// only BT.709 and never makes MONO8 from colour, the conversions whose
+// results agree on Orin and Thor.
 [[nodiscard]] std::optional<std::string> vic_limitation(PixelFormat source, int source_width,
                                                         int source_height, PixelFormat destination,
                                                         int width, int height,

@@ -212,10 +212,13 @@ void check_auto() {
       packed_view(buffer.get(), PixelFormat::kRgba8, 1920, 1080, MemoryLocation::kDevice);
   const ImageView rgb =
       packed_view(buffer.get(), PixelFormat::kRgb8, 640, 360, MemoryLocation::kDevice);
-  VERIFY(converter.choose(nv12, rgba, ConversionParams{}).first == Backend::kVic);
+  VERIFY(converter.choose(nv12, rgba, ConversionParams{.matrix = ColorMatrix::kBt709}).first ==
+         Backend::kVic);
   VERIFY(converter.choose(nv12, rgb, ConversionParams{}).first == Backend::kCuda);
-  VERIFY(converter.choose(nv12, rgba, ConversionParams{.mode = ResizeMode::kArea}).first ==
-         Backend::kCuda);
+  VERIFY(converter
+             .choose(nv12, rgba,
+                     ConversionParams{.matrix = ColorMatrix::kBt709, .mode = ResizeMode::kArea})
+             .first == Backend::kCuda);
 }
 
 }  // namespace

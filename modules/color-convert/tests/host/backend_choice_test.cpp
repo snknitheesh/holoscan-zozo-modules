@@ -14,7 +14,7 @@ namespace holoscan::color_convert {
 namespace {
 
 bool vic_can(PixelFormat from, int sw, int sh, PixelFormat to, int w, int h,
-             const ConversionParams& params = {}) {
+             const ConversionParams& params = ConversionParams{.matrix = ColorMatrix::kBt709}) {
   return !vic_limitation(from, sw, sh, to, w, h, params).has_value();
 }
 
@@ -33,23 +33,27 @@ void check_vic_formats() {
   VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 1920, 1080));
   VERIFY(vic_can(PixelFormat::kYuyv, 1920, 1080, PixelFormat::kBgra8, 640, 360));
   VERIFY(vic_can(PixelFormat::kUyvy, 1280, 720, PixelFormat::kNv12, 1280, 720));
-  VERIFY(vic_can(PixelFormat::kRgba8, 1280, 720, PixelFormat::kMono8, 1280, 720));
+  VERIFY(!vic_can(PixelFormat::kRgba8, 1280, 720, PixelFormat::kMono8, 1280, 720));
+  VERIFY(!vic_can(PixelFormat::kNv12, 1280, 720, PixelFormat::kMono8, 1280, 720));
+  VERIFY(vic_can(PixelFormat::kMono8, 1280, 720, PixelFormat::kRgba8, 1280, 720));
+  VERIFY(vic_can(PixelFormat::kMono8, 1280, 720, PixelFormat::kMono8, 640, 360));
   // RGB8 and BGR8, I420, NV16 and the 16-bit formats are the CUDA kernel's.
   for (const PixelFormat format : {PixelFormat::kRgb8, PixelFormat::kBgr8, PixelFormat::kI420,
                                    PixelFormat::kNv16, PixelFormat::kMono16, PixelFormat::kRgb16}) {
     VERIFY(!vic_can(PixelFormat::kNv12, 640, 480, format, 640, 480));
     VERIFY(!vic_can(format, 640, 480, PixelFormat::kRgba8, 640, 480));
   }
-  const auto why = vic_limitation(PixelFormat::kNv12, 64, 64, PixelFormat::kRgb8, 64, 64, {});
+  const auto why =
+      vic_limitation(PixelFormat::kNv12, 64, 64, PixelFormat::kRgb8, 64, 64, ConversionParams{});
   VERIFY(why.has_value() && why->find("rgb8") != std::string::npos);
 }
 
 void check_vic_geometry() {
   // No area sampling.
   VERIFY(!vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 640, 360,
-                  ConversionParams{.mode = ResizeMode::kArea}));
+                  ConversionParams{.matrix = ColorMatrix::kBt709, .mode = ResizeMode::kArea}));
   VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 640, 360,
-                 ConversionParams{.mode = ResizeMode::kNearest}));
+                 ConversionParams{.matrix = ColorMatrix::kBt709, .mode = ResizeMode::kNearest}));
   // Sides of 16 to 16384.
   VERIFY(!vic_can(PixelFormat::kRgba8, 15, 64, PixelFormat::kRgba8, 64, 64));
   VERIFY(!vic_can(PixelFormat::kRgba8, 64, 64, PixelFormat::kRgba8, 64, 8));
@@ -59,19 +63,25 @@ void check_vic_geometry() {
   VERIFY(!vic_can(PixelFormat::kRgba8, 16, 16, PixelFormat::kRgba8, 257, 16));
   // Chroma-subsampled images only at even offsets and sizes.
   VERIFY(!vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 640, 360,
-                  ConversionParams{.crop = Rect{1, 0, 640, 360}}));
+                  ConversionParams{.matrix = ColorMatrix::kBt709, .crop = Rect{1, 0, 640, 360}}));
   VERIFY(!vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 640, 360,
-                  ConversionParams{.crop = Rect{0, 0, 641, 360}}));
+                  ConversionParams{.matrix = ColorMatrix::kBt709, .crop = Rect{0, 0, 641, 360}}));
   VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 640, 360,
-                 ConversionParams{.crop = Rect{2, 4, 640, 360}}));
+                 ConversionParams{.matrix = ColorMatrix::kBt709, .crop = Rect{2, 4, 640, 360}}));
   // RGBA has no chroma to align.
   VERIFY(vic_can(PixelFormat::kRgba8, 1920, 1080, PixelFormat::kRgba8, 641, 361,
-                 ConversionParams{.crop = Rect{1, 1, 641, 361}}));
+                 ConversionParams{.matrix = ColorMatrix::kBt709, .crop = Rect{1, 1, 641, 361}}));
   VERIFY(!vic_can(PixelFormat::kRgba8, 1920, 1080, PixelFormat::kNv12, 641, 360));
   // Letterboxed into a subsampled destination, the content is made even.
   VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kNv12, 640, 640,
-                 ConversionParams{.letterbox = true}));
-  // BT.2020 only where no matrix applies.
+                 ConversionParams{.matrix = ColorMatrix::kBt709, .letterbox = true}));
+  // Between colour models, BT.709 only; within one, any matrix.
+  VERIFY(!vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 1920, 1080,
+                  ConversionParams{.matrix = ColorMatrix::kBt601}));
+  VERIFY(vic_can(PixelFormat::kRgba8, 1920, 1080, PixelFormat::kNv12, 1920, 1080,
+                 ConversionParams{.matrix = ColorMatrix::kBt709}));
+  VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kUyvy, 1920, 1080,
+                 ConversionParams{.matrix = ColorMatrix::kBt601}));
   VERIFY(!vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kRgba8, 1920, 1080,
                   ConversionParams{.matrix = ColorMatrix::kBt2020}));
   VERIFY(vic_can(PixelFormat::kNv12, 1920, 1080, PixelFormat::kYuyv, 1920, 1080,
@@ -80,7 +90,7 @@ void check_vic_geometry() {
                  ConversionParams{.matrix = ColorMatrix::kBt2020}));
   // A crop outside the source is no VIC conversion either.
   VERIFY(!vic_can(PixelFormat::kRgba8, 64, 64, PixelFormat::kRgba8, 64, 64,
-                  ConversionParams{.crop = Rect{40, 0, 40, 40}}));
+                  ConversionParams{.matrix = ColorMatrix::kBt709, .crop = Rect{40, 0, 40, 40}}));
 }
 
 void check_names() {

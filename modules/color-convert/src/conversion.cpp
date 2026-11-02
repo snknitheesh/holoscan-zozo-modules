@@ -316,11 +316,21 @@ std::optional<std::string> vic_limitation(PixelFormat source, int source_width, 
   if (params.mode == ResizeMode::kArea) {
     return std::string("the VIC has no area sampling; use nearest or bilinear");
   }
-  if (params.matrix == ColorMatrix::kBt2020 &&
-      format_info(source).model != format_info(destination).model) {
-    return std::string(
-        "the VIC applies BT.2020 only together with a conversion from BT.2020 to BT.709 "
-        "primaries, which is more than the matrix");
+  // Where a matrix applies, only BT.709 gives the same colours on the VIC of
+  // every Jetson: Thor's applies BT.709 where BT.601 is asked, and VPI's
+  // BT.2020 also converts the primaries. Luma computed on the VIC (MONO8 from
+  // colour) differs on Thor by tens of codes, so it is left to CUDA as well.
+  const ColorModel from = format_info(source).model;
+  const ColorModel to = format_info(destination).model;
+  if (from != to) {
+    if (to == ColorModel::kGray) {
+      return std::string("the VIC's luma differs between Jetsons; MONO8 from colour runs on CUDA");
+    }
+    if (params.matrix != ColorMatrix::kBt709) {
+      return "the VIC converts between YUV and RGB the same way on every Jetson only with "
+             "BT.709, not " +
+             std::string(matrix_name(params.matrix));
+    }
   }
   Mapping mapping;
   try {

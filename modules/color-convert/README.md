@@ -119,7 +119,7 @@ sample mixes picture and fill.
 | Backend | Runs on | What it does |
 | --- | --- | --- |
 | `Backend::kCuda` | GPU | Everything: one CUDA kernel, one thread per pixel (per chroma sample for YUV output), queued on the operator's CUDA stream. The default. |
-| `Backend::kVic` | VIC (Jetson) | NV12, YUYV, UYVY, RGBA8, BGRA8 and MONO8, nearest or bilinear, sides of 16 to 16384 and 1/16x to 16x, even offsets and sizes in chroma-subsampled images, BT.601 and BT.709. Fails at construction where VPI reports no VIC, and on the first frame it cannot convert. |
+| `Backend::kVic` | VIC (Jetson) | NV12, YUYV, UYVY, RGBA8, BGRA8 and MONO8, nearest or bilinear, sides of 16 to 16384 and 1/16x to 16x, even offsets and sizes in chroma-subsampled images; between YUV and RGB only BT.709, and no MONO8 made from colour. Fails at construction where VPI reports no VIC, and on the first frame it cannot convert. |
 | `Backend::kAuto` | VIC or GPU | Chosen on the first frame (and again when the image changes): the VIC where VPI reports one and it can do the conversion, CUDA otherwise. Opt-in. |
 
 With `kAuto`, the operator logs its choice and why, for example
@@ -130,10 +130,14 @@ which can do this conversion`, and tells `on_backend`. `resolve_auto()` and `vic
 The VIC reads and writes the images in place: VPI wraps the CUDA device memory, a crop or a
 letterbox's content as a sub-image at an offset; the CUDA kernel fills a letterbox's border at the
 same time. It runs on its own VPI stream, so the operator waits for its CUDA stream before the VIC
-starts and for the VIC before it returns: a VIC conversion holds the operator's thread. VPI's
-BT.2020 also converts the gamut to BT.709 primaries, which is more than this module's matrix, so
-BT.2020 between YUV and RGB or MONO stays on CUDA; between YUV formats, or between RGB formats, no
-matrix applies and the VIC takes it.
+starts and for the VIC before it returns: a VIC conversion holds the operator's thread.
+
+Between colour models, the VIC gets only what gives the same result on every Jetson the CI tests:
+Thor's VIC applies BT.709 where BT.601 is asked for, VPI's BT.2020 also converts BT.2020 to BT.709
+primaries, and luma the VIC computes from colour (MONO8) differs on Thor by tens of codes. So a
+conversion between YUV and RGB takes the VIC only with BT.709, MONO8 made from colour stays on
+CUDA, and `auto` sends the rest to CUDA. Within a colour model no matrix applies, and the VIC takes
+any.
 
 Every backend reads device memory. A host image is copied to the GPU once per frame, and the
 operator says so once, at the first such frame:
@@ -153,8 +157,8 @@ ColorConvertOp (cuda backend): the images are in host memory and the backend rea
   (BT.601 and BT.709 limited range, JPEG's BT.601 full range), exactly but for two samples that lie
   exactly half way between codes (full-range yellow's Cb and cyan's Cr, 0.5), which round up;
   resizing within 1 code of a double-precision resize.
-- The VIC against the CUDA kernel, on Jetson Orin, over 918 conversions of a smooth picture (every
-  VIC format pair, matrix and range, same size and resized, nearest and bilinear, crop and
+- The VIC against the CUDA kernel, on Jetson Orin, over 432 conversions of a smooth picture (every
+  conversion the VIC takes, in both ranges, same size and resized, nearest and bilinear, crop and
   letterbox): mean difference at most 0.9 codes, 99th percentile at most 3, largest 6. The VIC
   interpolates chroma where the kernel replicates it, so at hard colour edges they differ more:
   on the demo's colour bars, mean 0.7, 99th percentile 2, largest 181.
@@ -172,7 +176,7 @@ a conversion the VIC cannot do.
 | --- | --- | --- | ---: | ---: | ---: |
 | NV12 1920x1080 | RGB8 1920x1080 | convert | 0.016 | 0.319 | n/a |
 | NV12 1920x1080 | RGBA8 1920x1080 | convert | 0.016 | 0.365 | 2.684 |
-| NV12 1920x1080 | MONO8 1920x1080 | convert | 0.015 | 0.267 | 2.389 |
+| NV12 1920x1080 | MONO8 1920x1080 | convert | 0.015 | 0.267 | n/a |
 | NV16 1920x1080 | RGB8 1920x1080 | convert | 0.016 | 0.463 | n/a |
 | I420 1920x1080 | RGB8 1920x1080 | convert | 0.016 | 0.286 | n/a |
 | YUYV 1920x1080 | RGB8 1920x1080 | convert | 0.016 | 0.287 | n/a |
@@ -190,7 +194,7 @@ a conversion the VIC cannot do.
 | NV12 1920x1080 | NV12 1280x720 | bilinear | 0.010 | 0.187 | 3.875 |
 | NV12 3840x2160 | RGB8 3840x2160 | convert | 0.059 | 1.104 | n/a |
 | NV12 3840x2160 | RGBA8 3840x2160 | convert | 0.062 | 1.150 | 21.853 |
-| NV12 3840x2160 | MONO8 3840x2160 | convert | 0.056 | 1.069 | 14.098 |
+| NV12 3840x2160 | MONO8 3840x2160 | convert | 0.056 | 1.069 | n/a |
 | NV16 3840x2160 | RGB8 3840x2160 | convert | 0.059 | 1.113 | n/a |
 | I420 3840x2160 | RGB8 3840x2160 | convert | 0.060 | 1.122 | n/a |
 | YUYV 3840x2160 | RGB8 3840x2160 | convert | 0.062 | 1.129 | n/a |
