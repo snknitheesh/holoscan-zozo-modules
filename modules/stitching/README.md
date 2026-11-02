@@ -237,19 +237,22 @@ There the corners are left out: one output pixel is a seventh of a camera pixel.
 One frame of four 1280x720 cameras, from submission until the output is in device memory, timed
 with CUDA events over 200 frames queued back to back, the best of three rounds; the tables once,
 on the host clock. x86_64: GeForce RTX 5090, driver 595. Orin: Jetson AGX Orin Developer Kit
-(64 GB), JetPack 7.2, MAXN. SDK 5.0.0, CUDA 13.2. Milliseconds.
+(64 GB), JetPack 7.2 (R39.2), MAXN. SDK 5.0.0, CUDA 13.2. Milliseconds.
 
 | Output | Blend | Tables, x86_64 | Frame, x86_64 | Tables, Orin | Frame, Orin | Table memory |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Bird's-eye 1024x1024 | feather | 1.6 | 0.024 | ORIN | ORIN | 39 MB |
-| Bird's-eye 1024x1024 | hard seam | 1.3 | 0.013 | ORIN | ORIN | 39 MB |
-| Bird's-eye 1024x1024 | feather + exposure | 1.3 | 0.074 | ORIN | ORIN | 39 MB |
-| Cylindrical 4096x1024 | feather | 5.7 | 0.087 | ORIN | ORIN | 129 MB |
-| Cylindrical 4096x1024 | hard seam | 5.8 | 0.050 | ORIN | ORIN | 129 MB |
-| Cylindrical 4096x1024 | feather + exposure | 5.8 | 0.133 | ORIN | ORIN | 129 MB |
-| Spherical 4096x1024 | feather | 6.8 | 0.081 | ORIN | ORIN | 117 MB |
+| Bird's-eye 1024x1024 | feather | 1.6 | 0.024 | 33 | 0.57 | 39 MB |
+| Bird's-eye 1024x1024 | hard seam | 1.3 | 0.013 | 29 | 0.37 | 39 MB |
+| Bird's-eye 1024x1024 | feather + exposure | 1.3 | 0.074 | 29 | 0.81 | 39 MB |
+| Cylindrical 4096x1024 | feather | 5.7 | 0.087 | 134 | 1.54 | 129 MB |
+| Cylindrical 4096x1024 | hard seam | 5.8 | 0.050 | 133 | 1.17 | 129 MB |
+| Cylindrical 4096x1024 | feather + exposure | 5.8 | 0.133 | 134 | 2.08 | 129 MB |
+| Spherical 4096x1024 | feather | 6.8 | 0.081 | 158 | 1.48 | 117 MB |
 
-The inputs are RGBA8; RGB8 inputs or output change little. The `stitching_benchmark` tool in the
+The inputs are RGBA8; RGB8 inputs or output change little. A frame costs about one memory pass
+over the output and the camera pixels it samples; exposure compensation adds a sampling pass at a
+sixteenth of the pixels and a one-thread solve. The tables are built in double precision, which
+the Orin's GPU runs slowly; they are built once, at `start()`. The `stitching_benchmark` tool in the
 tests prints this table on any machine (see [DEVELOPER.md](DEVELOPER.md)).
 
 ## Requirements

@@ -46,7 +46,8 @@ class Stitcher {
   // size, into `output`: the geometry's size in the settings' format,
   // `output_pitch` bytes per row, in CUDA device memory. Queued on `stream`;
   // the images must stay valid until it has run. With exposure compensation,
-  // the gains of this frame are computed on the GPU first.
+  // the gains of this frame are computed on the GPU first, into state the
+  // Stitcher keeps: queue one stitcher's frames on one stream at a time.
   // @throws std::invalid_argument if the images do not match the cameras.
   // @return the first CUDA error of queuing the work.
   cudaError_t stitch(std::span<const DeviceImage> images, void* output, std::size_t output_pitch,
