@@ -89,8 +89,10 @@ RUN set -eux; \
 # Jetson Linux's own libraries (libnvrm_*, libnvmedia, libnvbufsurface, libnvvic,
 # libnvos, the EGL driver), which the nvidia runtime mounts from the board: there,
 # building against VPI, not only running it, needs `--runtime nvidia`. It also needs
-# the EGL loader (libegl1). apt verifies every package against the key of its
-# repository.
+# the EGL loader (libegl1). The NVIDIA Vulkan driver that HoloViz renders with, which
+# the nvidia runtime mounts from the host, needs libX11 and libXext even when it renders
+# offscreen; without them Vulkan finds no driver. apt verifies every package against
+# the key of its repository.
 ARG HOLOSCAN_REPOSITORY=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404
 ARG HOLOSCAN_DEB_VERSION=5.0.0.8.0-1
 ARG TENSORRT_VERSION_AMD64=10.16.1.11-1+cuda13.2
@@ -144,7 +146,7 @@ RUN set -eux; \
       "libnvinfer-vc-plugin10=${tensorrt}" \
       "libnvinfer-dispatch10=${tensorrt}" \
       "libnvvpi4=${VPI_VERSION}" "vpi4-dev=${VPI_VERSION}" libegl1 \
-      git libvulkan-dev ninja-build python3 python3-pip; \
+      git libvulkan-dev libx11-6 libxext6 ninja-build python3 python3-pip; \
     rm -rf /tmp/holoscan-debs /var/lib/apt/lists/*
 WORKDIR /
 
