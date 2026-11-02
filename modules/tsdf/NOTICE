@@ -1,0 +1,18 @@
+holoscan-tsdf
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-tsdf uses the following open source software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+CUB, part of NVIDIA CCCL (https://github.com/NVIDIA/cccl)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0 with LLVM exceptions. Header-only, from the CUDA Toolkit; compiled
+into the library.
+
+Marching cubes triangle table (src/mc_tables.hpp), from Paul Bourke, "Polygonising a scalar
+field" (https://paulbourke.net/geometry/polygonise/), table by Cory Gene Bloyd. Released to the
+public domain.

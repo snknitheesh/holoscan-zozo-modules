@@ -1,0 +1,67 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-tsdf",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Dense 3D reconstruction on the GPU: depth images (uint16 millimeters or float32 meters), optionally with color, integrated into a fixed-size truncated signed distance volume from known camera poses; the volume ray cast into depth, normal and color images from any pose; and its surface extracted as an indexed triangle mesh with normals and colors by deterministic marching cubes into fixed-size outputs, on demand or every N frames. The volume can be reset and saved as a PLY mesh without a graph.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::tsdf"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "3D Reconstruction",
+      "Depth",
+      "Mesh",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/tsdf",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "TsdfIntegrateOp",
+      "TsdfMeshOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with memory for the volume: 8 bytes per voxel (12 with color), 128 MiB for 256^3."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-tsdf",
+      "install_commands": [
+        "sudo apt install ./holoscan-tsdf_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
