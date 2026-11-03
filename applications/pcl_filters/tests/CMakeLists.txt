@@ -24,6 +24,10 @@ pcl_app_test(pcl_app_statistical 0 "${_pass}"
 pcl_app_test(pcl_app_720p 0 "${_pass}"
   --count 5 --period-ms 20 --width 1280 --height 720 --voxel-size 0.05 --display false
 )
+# The voxels exactly as many as there are, waiting for their count.
+pcl_app_test(pcl_app_dense_voxels 0 "${_pass}"
+  --count 10 --period-ms 10 --display false --voxel-layout dense
+)
 # The display graph compiles, without a display server.
 pcl_app_test(pcl_app_display_graph 0 "plan=OK" --display true --compile-only true)
 
@@ -31,6 +35,7 @@ pcl_app_test(pcl_app_display_graph 0 "plan=OK" --display true --compile-only tru
 pcl_app_test(pcl_app_rejects_size 2 "^error: scene images" --width 10)
 pcl_app_test(pcl_app_rejects_voxel_size 2 "^error: voxel_size" --voxel-size 0)
 pcl_app_test(pcl_app_rejects_outliers 2 "^error: --outliers" --outliers median)
+pcl_app_test(pcl_app_rejects_voxel_layout 2 "^error: --voxel-layout" --voxel-layout keep)
 pcl_app_test(pcl_app_rejects_option 2 "^error: unknown option" --frames 3)
 
 get_property(_tests DIRECTORY PROPERTY TESTS)

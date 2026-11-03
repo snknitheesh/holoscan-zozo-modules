@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // SceneSourceOp: frames of holoscan-pcl-filters' synthetic scene as a depth
-// camera sends them: float32 depth in meters (0 where there is none) and an
-// aligned RGB image, in device memory, a fixed number on a clock, then idle.
+// camera's point clouds: organized PointCloud messages with colors, rendered
+// on the GPU into device memory, a fixed number on a clock, then idle.
 //
 // The filters cannot send a refused output again, so a full queue must never
 // meet them: with `finished`, the source keeps one frame in flight, sending
@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -23,9 +22,12 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
-#include <holoscan/sensor_io/sensor_schema_package.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 
 namespace pcl_filters_app {
+
+// The clouds' frame: the synthetic camera's optical frame.
+inline constexpr const char* kCameraFrame = "camera_optical";
 
 struct SceneSourceConfig {
   int width{640};
@@ -50,17 +52,14 @@ class SceneSourceOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  // MONO32F [H, W] meters, frame f of synthetic_scene(width, height, f).
-  holoscan::Output<holoscan::schema::ImageT> depth;
-  // RGB8 [H, W, 3].
-  holoscan::Output<holoscan::schema::ImageT> color;
+  // [H, W, 3] points of synthetic_scene(width, height, f) in metres in
+  // kCameraFrame, NaN without depth, and their colors; frame f has frame
+  // number f + 1.
+  holoscan::Output<holoscan::messages::schema::PointCloudT> point_cloud;
 
  private:
   SceneSourceConfig config_;
   std::uint32_t emitted_{};
-  // The frame being sent keeps its capture time until both images are out.
-  std::optional<holoscan::TimePoint> pending_capture_;
-  bool depth_sent_{};
 };
 
 }  // namespace pcl_filters_app

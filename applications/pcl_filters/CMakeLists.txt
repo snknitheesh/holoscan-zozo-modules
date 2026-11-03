@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# The PCL Filters demo, built against the INSTALLED holoscan-point-cloud and
-# holoscan-pcl-filters packages, as any other project would use them: put the modules'
-# install prefix on CMAKE_PREFIX_PATH.
+# The PCL Filters demo, built against the INSTALLED holoscan-messages and holoscan-pcl-filters
+# packages, as any other project would use them: put the modules' install prefix on
+# CMAKE_PREFIX_PATH.
 cmake_minimum_required(VERSION 4.0)
 project(pcl_filters LANGUAGES CXX)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -16,7 +16,7 @@ if(PCL_FILTERS_ENABLE_VISUALIZATION)
   list(APPEND _holoscan_components visualization)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
-find_package(holoscan-point-cloud 1.1 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(holoscan-pcl-filters 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
@@ -26,14 +26,14 @@ target_compile_features(pcl_filters_app_ops PUBLIC cxx_std_20)
 target_include_directories(pcl_filters_app_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   pcl_filters_app_ops
-  PUBLIC holoscan::pcl_filters holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::pcl_filters holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 # The reporter counts voxels as the GPU does and evaluates the scene as it renders: without
 # contracting, whatever the compiler's default.
 target_compile_options(pcl_filters_app_ops PUBLIC -ffp-contract=off)
 
 add_executable(pcl_filters src/main.cpp)
-target_link_libraries(pcl_filters PRIVATE pcl_filters_app_ops holoscan::point_cloud)
+target_link_libraries(pcl_filters PRIVATE pcl_filters_app_ops)
 target_compile_definitions(
   pcl_filters
   PRIVATE PCL_FILTERS_ENABLE_VISUALIZATION=$<BOOL:${PCL_FILTERS_ENABLE_VISUALIZATION}>

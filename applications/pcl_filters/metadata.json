@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "PCL Filters",
-    "description": "Filters point clouds on the GPU with holoscan-pcl-filters: a synthetic depth camera over a known scene is deprojected by holoscan-point-cloud's DepthToPointCloudOp, cropped, cleared of outliers and of the ground (RANSAC) and voxel-downsampled, every frame checked against the scene's truth, and the voxels shown in HoloViz.",
+    "description": "Filters point clouds on the GPU with holoscan-pcl-filters: the PointCloud messages of a synthetic depth camera over a known scene are cropped, cleared of outliers and of the ground (RANSAC) and voxel-downsampled, every frame checked against the scene's truth, and the voxels shown in HoloViz.",
     "authors": [
       {
         "name": "zozo",
@@ -45,7 +45,7 @@
     "dependencies": {
       "modules": [
         {
-          "name": "point-cloud"
+          "name": "messages"
         },
         {
           "name": "pcl-filters"
@@ -62,7 +62,7 @@
         }
       },
       "ci": {
-        "description": "Finite headless check: 30 synthetic 640x480 frames through the crop box, radius outlier removal, RANSAC ground removal and a 2 cm voxel grid; the plane, the ground, objects and outliers left, and the voxel count checked against the truth.",
+        "description": "Finite headless check: 30 synthetic 640x480 frames through the crop box, radius outlier removal, RANSAC ground removal and a 2 cm voxel grid; the plane, the ground, objects and outliers left, and the voxel count and layout checked against the truth.",
         "run": {
           "command": "\"<holohub_app_bin>/pcl_filters\" --count 30 --period-ms 10 --display false",
           "workdir": "holohub_app_bin"

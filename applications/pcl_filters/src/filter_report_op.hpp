@@ -4,14 +4,16 @@
 // FilterReportOp: the demo's sink. For each frame it takes the organized cloud
 // after ground removal, the ground plane and the voxels, and checks them
 // against the synthetic scene's truth: the plane against the true ground, how
-// much ground, objects and flying pixels are left, and the voxel count
-// against a CPU count of the voxels of the same cloud, and that they have
-// colors. It completes the run
-// after the expected frames.
+// much ground, objects and flying pixels are left, the voxel count against a
+// CPU count of the voxels of the same cloud, the voxels' layout and colors,
+// and that every cloud keeps the camera's frame id. It completes the run after
+// the expected frames. With a view output it draws the voxels, seen from the
+// camera, for the display.
 
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -23,6 +25,9 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/point_cloud.hpp>
+#include <holoscan/pcl_filters/cloud_filter_op.hpp>
+#include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace pcl_filters_app {
 
@@ -45,6 +50,8 @@ struct FilterReport {
   std::uint64_t outliers{};
   std::uint64_t outliers_left{};
   std::uint64_t voxels{};
+  // Frames whose voxel count differs from the CPU's, or whose voxels are not
+  // laid out as configured.
   std::uint32_t wrong_voxel_counts{};
   // Voxels without a color: every scene surface has one, so none is black.
   std::uint64_t black_voxels{};
@@ -68,9 +75,13 @@ struct FilterReportConfig {
   int width{};
   int height{};
   float voxel_size{};
+  // VoxelDownsampleOp's layout: kDense or kPadded.
+  holoscan::pcl_filters::OutputLayout voxel_layout{holoscan::pcl_filters::OutputLayout::kDense};
   std::uint32_t expected_frames{};
   // Counts the frames done, for the source that waits for them.
   std::shared_ptr<std::atomic<std::uint32_t>> finished;
+  // Declare the `view` output.
+  bool view_output{};
 };
 
 class FilterReportOp final : public holoscan::Operator<> {
@@ -84,17 +95,27 @@ class FilterReportOp final : public holoscan::Operator<> {
       holoscan::ExecutionContext& context) override;
 
   // The organized cloud after ground removal, [H, W, 3].
-  holoscan::Input<holoscan::Tensor> points;
+  holoscan::Input<holoscan::messages::schema::PointCloudT> ground_cloud;
   // The ground plane, [4].
   holoscan::Input<holoscan::Tensor> plane;
-  // The voxels of `points`, [M, 3], and their colors.
-  holoscan::Input<holoscan::Tensor> voxels;
-  holoscan::Input<holoscan::Tensor> voxel_colors;
+  // The voxels of `ground_cloud`, with their colors.
+  holoscan::Input<holoscan::messages::schema::PointCloudT> voxels;
+  // With `view_output`: RGB8 [H, W, 3] in host memory, each voxel a 5-pixel
+  // square where the camera sees it, the nearest in front.
+  holoscan::Output<holoscan::schema::ImageT> view;
 
  private:
+  // Checks the voxels and counts them; draws them when there is a view.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> check_voxels(
+      const holoscan::messages::schema::PointCloudT& cloud, holoscan::ExecutionContext& context);
+  // Sends the view of the voxels in voxel_xyz_ and voxel_rgb_.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> send_view(
+      std::size_t voxel_count, const holoscan::EmitOptions& emit);
+
   FilterReportConfig config_;
   std::vector<float> xyz_;
-  std::vector<std::uint8_t> rgb_;
+  std::vector<float> voxel_xyz_;
+  std::vector<std::uint8_t> voxel_rgb_;
   std::uint64_t last_frame_id_{};
   bool finished_{};
 };

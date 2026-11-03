@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// PCL Filters: a synthetic depth camera over a known scene, deprojected by
-// holoscan-point-cloud's DepthToPointCloudOp, then filtered on the GPU by
+// PCL Filters: the point clouds of a synthetic depth camera over a known
+// scene, sent as PointCloud messages and filtered on the GPU by
 // holoscan-pcl-filters: a crop box, outlier removal, ground removal and a
 // voxel grid. A reporter checks every frame against the scene's truth, and
-// with a display the voxels are projected back into the camera by
-// PointCloudToDepthOp and shown in HoloViz.
+// with a display draws the voxels as the camera sees them in HoloViz.
 
 #include <algorithm>
 #include <atomic>
@@ -39,8 +38,6 @@
 #include <holoscan/pcl_filters/outlier_removal_op.hpp>
 #include <holoscan/pcl_filters/synthetic_scene.hpp>
 #include <holoscan/pcl_filters/voxel_downsample_op.hpp>
-#include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
-#include <holoscan/point_cloud/point_cloud_to_depth_op.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #if PCL_FILTERS_ENABLE_VISUALIZATION
 #include <holoscan/visualization/holoviz_op.hpp>
@@ -53,7 +50,6 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 namespace app = pcl_filters_app;
-namespace pc = holoscan::point_cloud;
 namespace pf = holoscan::pcl_filters;
 
 constexpr std::string_view kAppName = "pcl_filters";
@@ -66,6 +62,7 @@ struct Options {
   int width{640};
   int height{480};
   float voxel_size{0.02F};
+  pf::OutputLayout voxel_layout{pf::OutputLayout::kPadded};
   pf::OutlierMode outliers{pf::OutlierMode::kRadius};
   DisplayMode display{DisplayMode::kAuto};
   std::uint32_t timeout_seconds{120};
@@ -106,6 +103,14 @@ Options parse_args(int argc, char** argv) {
       opts.height = parse_number<int>(value, option);
     } else if (option == "--voxel-size") {
       opts.voxel_size = parse_number<float>(value, option);
+    } else if (option == "--voxel-layout") {
+      if (value == "padded") {
+        opts.voxel_layout = pf::OutputLayout::kPadded;
+      } else if (value == "dense") {
+        opts.voxel_layout = pf::OutputLayout::kDense;
+      } else {
+        throw std::invalid_argument("--voxel-layout must be padded or dense");
+      }
     } else if (option == "--outliers") {
       if (value == "radius") {
         opts.outliers = pf::OutlierMode::kRadius;
@@ -144,7 +149,11 @@ void usage(const char* argv0) {
                "  --count N                Frames (default: 300)\n"
                "  --period-ms N            Camera period, 1..1000 ms (default: 33)\n"
                "  --width N --height N     Image size, 64x48 to 4096x4096 (default: 640x480)\n"
-               "  --voxel-size M           Voxel side in meters (default: 0.02)\n"
+               "  --voxel-size M           Voxel side in metres (default: 0.02)\n"
+               "  --voxel-layout padded|dense\n"
+               "                           The voxels as many points as the input, the rest\n"
+               "                           NaN, with no wait; or exactly as many as there are,\n"
+               "                           waiting for the count (default: padded)\n"
                "  --outliers radius|statistical\n"
                "                           Outlier removal (default: radius)\n"
                "  --display auto|true|false  Show the voxels in HoloViz (default: auto, on\n"
@@ -157,27 +166,6 @@ bool env_set(const char* name) {
   const char* value = std::getenv(name);
   return value != nullptr && *value != '\0';
 }
-
-// Drops what it receives: the projected depth image, which only the display
-// branch makes and nothing uses.
-class DiscardOp final : public holoscan::Operator<> {
- public:
-  void setup(holoscan::OperatorSpec& spec) override { spec.input(image, "image"); }
-  [[nodiscard]] holoscan::Contract contract() const override {
-    holoscan::Contract result;
-    result.trigger(holoscan::OnEach{image});
-    return result;
-  }
-  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
-      holoscan::ExecutionContext&) override {
-    auto sample = image.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
-    }
-    return {};
-  }
-  holoscan::Input<holoscan::schema::ImageT> image;
-};
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
@@ -196,9 +184,6 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 
   const pf::SyntheticScene scene = pf::synthetic_scene(opts.width, opts.height, 0);
-  const pc::CameraIntrinsics intrinsics{scene.fx, scene.fy, scene.cx, scene.cy};
-  const auto points =
-      static_cast<std::uint32_t>(opts.width) * static_cast<std::uint32_t>(opts.height);
   float truth[4];
   pf::synthetic_ground_plane(scene, truth);
 
@@ -210,19 +195,16 @@ int execute(const Options& opts, SignalDomain& signals) {
                                        .count = opts.count,
                                        .period = std::chrono::milliseconds(opts.period_ms),
                                        .finished = finished});
-  auto deproject = graph.op<pc::DepthToPointCloudOp>(
-      "deproject", pc::DepthToPointCloudConfig{.intrinsics = intrinsics,
-                                               .depth_scale = 1.0F,
-                                               .depth_min = 0.1F,
-                                               .depth_max = 10.0F,
-                                               .color = true,
-                                               .max_width = opts.width,
-                                               .max_height = opts.height});
+  // The clouds carry colors and no other optional field; organized up to the
+  // voxel grid, so that the reporter can tell what is left pixel by pixel.
+  const pf::CloudSettings cloud{.max_points = static_cast<std::uint32_t>(opts.width) *
+                                              static_cast<std::uint32_t>(opts.height),
+                                .fields = {.colors = true}};
   // Everything within 6 m of the camera.
-  pf::CropBoxConfig crop{.color = true, .max_points = points};
+  pf::CropBoxConfig crop{.cloud = cloud};
   crop.box.max_distance = 6.0F;
   auto cropper = graph.op<pf::CropBoxOp>("crop", crop);
-  pf::OutlierRemovalConfig outliers{.color = true, .max_points = points};
+  pf::OutlierRemovalConfig outliers{.cloud = cloud};
   outliers.outliers.mode = opts.outliers;
   outliers.outliers.radius = 0.03F;
   outliers.outliers.min_neighbors = 3;
@@ -231,39 +213,35 @@ int execute(const Options& opts, SignalDomain& signals) {
   outliers.outliers.std_multiplier = 2.0F;
   auto outlier_filter = graph.op<pf::OutlierRemovalOp>("outliers", outliers);
   // The camera is mounted pitched down; up is the true ground normal.
-  pf::GroundRemovalConfig ground{.color = true, .max_points = points};
+  pf::GroundRemovalConfig ground{.cloud = cloud};
   std::copy(truth, truth + 3, ground.ground.up);
   ground.ground.distance_threshold = 0.03F;
   auto ground_filter = graph.op<pf::GroundRemovalOp>("ground", ground);
+  pf::CloudSettings voxel_cloud = cloud;
+  voxel_cloud.layout = opts.voxel_layout;
   auto voxels = graph.op<pf::VoxelDownsampleOp>(
-      "voxels", pf::VoxelDownsampleConfig{
-                    .voxel_size = opts.voxel_size, .color = true, .max_points = points});
+      "voxels", pf::VoxelDownsampleConfig{.voxel_size = opts.voxel_size, .cloud = voxel_cloud});
   auto report = std::make_shared<app::FilterReport>();
-  auto reporter =
-      graph.op<app::FilterReportOp>("report", app::FilterReportConfig{.report = report,
-                                                                      .width = opts.width,
-                                                                      .height = opts.height,
-                                                                      .voxel_size = opts.voxel_size,
-                                                                      .expected_frames = opts.count,
-                                                                      .finished = finished});
+  auto reporter = graph.op<app::FilterReportOp>(
+      "report", app::FilterReportConfig{.report = report,
+                                        .width = opts.width,
+                                        .height = opts.height,
+                                        .voxel_size = opts.voxel_size,
+                                        .voxel_layout = opts.voxel_layout,
+                                        .expected_frames = opts.count,
+                                        .finished = finished,
+                                        .view_output = display});
 
   // Lossless edges: every frame is filtered and checked, in order. The source
   // keeps one frame in flight, so no queue fills and no filter is refused.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(source->depth, deproject->depth, lossless);
-  graph.add_flow(source->color, deproject->color, lossless);
-  graph.add_flow(deproject->point_cloud, cropper->points, lossless);
-  graph.add_flow(deproject->colors, cropper->colors, lossless);
-  graph.add_flow(cropper->filtered_points, outlier_filter->points, lossless);
-  graph.add_flow(cropper->filtered_colors, outlier_filter->colors, lossless);
-  graph.add_flow(outlier_filter->filtered_points, ground_filter->points, lossless);
-  graph.add_flow(outlier_filter->filtered_colors, ground_filter->colors, lossless);
-  graph.add_flow(ground_filter->filtered_points, voxels->points, lossless);
-  graph.add_flow(ground_filter->filtered_colors, voxels->colors, lossless);
-  graph.add_flow(ground_filter->filtered_points, reporter->points, lossless);
+  graph.add_flow(source->point_cloud, cropper->point_cloud, lossless);
+  graph.add_flow(cropper->filtered_point_cloud, outlier_filter->point_cloud, lossless);
+  graph.add_flow(outlier_filter->filtered_point_cloud, ground_filter->point_cloud, lossless);
+  graph.add_flow(ground_filter->filtered_point_cloud, voxels->point_cloud, lossless);
+  graph.add_flow(ground_filter->filtered_point_cloud, reporter->ground_cloud, lossless);
   graph.add_flow(ground_filter->plane, reporter->plane, lossless);
-  graph.add_flow(voxels->filtered_points, reporter->voxels, lossless);
-  graph.add_flow(voxels->filtered_colors, reporter->voxel_colors, lossless);
+  graph.add_flow(voxels->filtered_point_cloud, reporter->voxels, lossless);
 
   holoscan::CompileOptions compile_options;
   const auto on_gpu = [&compile_options](std::string op, std::string port) {
@@ -272,30 +250,15 @@ int execute(const Options& opts, SignalDomain& signals) {
                                               .output_port = std::move(port),
                                               .device = holoscan::DeviceId{0}});
   };
-  on_gpu("source", "depth");
-  on_gpu("source", "color");
-  on_gpu("deproject", "point_cloud");
-  on_gpu("deproject", "colors");
+  on_gpu("source", "point_cloud");
   for (const char* op : {"crop", "outliers", "ground", "voxels"}) {
-    on_gpu(op, "filtered_points");
-    on_gpu(op, "filtered_colors");
+    on_gpu(op, "filtered_point_cloud");
   }
   on_gpu("ground", "plane");
 
 #if PCL_FILTERS_ENABLE_VISUALIZATION
   if (display) {
     namespace viz = holoscan::visualization;
-    // The voxels, back in the camera that saw them, each a 5-pixel square.
-    auto project = graph.op<pc::PointCloudToDepthOp>(
-        "project", pc::PointCloudToDepthConfig{.width = opts.width,
-                                               .height = opts.height,
-                                               .intrinsics = intrinsics,
-                                               .depth_min = 0.1F,
-                                               .depth_max = 10.0F,
-                                               .point_size = 5,
-                                               .color = true,
-                                               .max_points = points});
-    auto discard = graph.op<DiscardOp>("discard");
     viz::LayerStack layers;
     layers.add_image_layer(
         "voxels", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8Unorm,
@@ -306,15 +269,10 @@ int execute(const Options& opts, SignalDomain& signals) {
         viz::WindowSinkDesc{.title = "PCL Filters: voxels above the ground",
                             .width = static_cast<std::uint32_t>(opts.width),
                             .height = static_cast<std::uint32_t>(opts.height)});
-    // Best effort: the display keeps the newest frame and never holds back the filters.
-    const holoscan::ConnectionOptions latest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                             .queue_depth = 1U};
-    graph.add_flow(voxels->filtered_points, project->points, latest);
-    graph.add_flow(voxels->filtered_colors, project->colors, latest);
-    graph.add_flow(project->color, visualizer->image_layer_input(0), latest);
-    graph.add_flow(project->depth, discard->image, latest);
-    on_gpu("project", "depth");
-    on_gpu("project", "color");
+    // Best effort: the display keeps the newest view and never holds back the reporter.
+    graph.add_flow(reporter->view, visualizer->image_layer_input(0),
+                   holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                               .queue_depth = 1U});
   }
 #endif
 
