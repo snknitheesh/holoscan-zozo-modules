@@ -78,7 +78,7 @@ and distance. HoloViz draws when the overlay's axes arrive, over the image they 
 
 Median time from receiving an image to having detections and poses, for 300 synthetic 1280x720
 frames with four `tag36h11` tags, one backend at a time (SDK 5.0.0, CUDA 13.2, VPI 4.0.5) on an
-RTX 5090 and a Ryzen 9 9950X3D. Every backend found all 1200 tags and nothing else.
+RTX 5090. Every backend found all 1200 tags and nothing else.
 
 ```bash
 build/apriltag_detection/apriltag_detection --backend cuda --count 300 --period-ms 1 --display false
