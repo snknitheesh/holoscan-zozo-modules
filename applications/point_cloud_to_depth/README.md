@@ -2,15 +2,17 @@
 
 The demo of `PointCloudToDepthOp` from the [holoscan-point-cloud](../../modules/point-cloud/)
 module. A source, either a synthetic cloud with known ground truth or a folder of PLY files, feeds
-the operator, and a reporter checks every depth and color pixel of the images against the truth,
-measures them and can write them as PGM and PPM files. It uses the installed module the way any
-other project would: `find_package(holoscan-point-cloud)`.
+the operator `PointCloud` messages, the camera comes from a ROS `camera_info` file through
+`CameraInfoSourceOp` from [holoscan-messages](../../modules/messages/), and a reporter checks every
+depth and color pixel of the images against the truth, measures them and can write them as PGM and
+PPM files. It uses the installed modules the way any other project would:
+`find_package(holoscan-point-cloud)`.
 
 ```mermaid
 flowchart LR
-    S[Synthetic cloud or PLY files] -->|points| P[PointCloudToDepthOp]
-    S -->|colors, optional| P
-    S -->|intrinsics, optional| P
+    Y[camera_info file] --> C[CameraInfoSourceOp]
+    S[Synthetic cloud or PLY files] -->|point_cloud| P[PointCloudToDepthOp]
+    C -->|camera_info| P
     P -->|depth, color| R[Report: ground truth, statistics, PGM and PPM files]
 ```
 
@@ -20,16 +22,17 @@ Videos of the demo on synthetic input and on real input go in [tests/video](test
 
 ## Requirements
 
-- holoscan-point-cloud 1.1 or later, installed (see [its README](../../modules/point-cloud/README.md)),
-  and what it needs: Holoscan SDK 5.0 with Core and Sensor I/O (Testing for the tests), CUDA 13,
-  CMake 4.0 or later and a C++20 compiler.
+- holoscan-point-cloud 2.0 and holoscan-messages 1.0, installed (see
+  [its README](../../modules/point-cloud/README.md)), and what they need: Holoscan SDK 5.0 with Core
+  and Sensor I/O (Testing for the tests), CUDA 13, CMake 4.0 or later and a C++20 compiler.
 
-The demo downloads nothing and needs no models. The `files` mode reads your own point clouds; every
-other mode makes its clouds.
+The demo downloads nothing and needs no models. The `files` mode reads your own point clouds and a
+`camera_info` file; every other mode makes its clouds and writes the synthetic camera's
+`camera_info` file to the temporary folder, removing it when the run ends.
 
 ## Build and run
 
-From the repository root, after installing the module into `install/`:
+From the repository root, after installing the modules into `install/`:
 
 ```bash
 cmake -S applications/point_cloud_to_depth -B build/point_cloud_to_depth -G Ninja \
@@ -37,7 +40,7 @@ cmake -S applications/point_cloud_to_depth -B build/point_cloud_to_depth -G Ninj
 cmake --build build/point_cloud_to_depth
 build/point_cloud_to_depth/point_cloud_to_depth --count 300   # synthetic mode
 build/point_cloud_to_depth/point_cloud_to_depth --count 30 --period-ms 5 \
-  --depth-format uint16 --intrinsics-input true                # ci mode
+  --depth-format uint16                                        # ci mode
 ```
 
 The modes in [metadata.json](metadata.json) are these commands and the `files` mode below:
@@ -45,8 +48,8 @@ The modes in [metadata.json](metadata.json) are these commands and the `files` m
 | Mode | Behavior |
 | --- | --- |
 | `synthetic` (default) | 300 synthetic clouds with colors, every depth and color pixel checked against ground truth. |
-| `files` | Projects the PLY files in the data directory, `<holohub_data_dir>/point_cloud_to_depth`. |
-| `ci` | 30 synthetic clouds with colors and per-frame intrinsics into uint16 depth, checked against ground truth; a finite headless check that CI runs. |
+| `files` | Projects the PLY files in the data directory, `<holohub_data_dir>/point_cloud_to_depth`, into the camera of the `camera_info.yaml` next to them. |
+| `ci` | 30 synthetic clouds with colors and the camera from a `camera_info` file into uint16 depth, checked against ground truth; a finite headless check that CI runs. |
 
 The synthetic clouds come from the module's synthetic depth camera: a tilted plane with a dome,
 small holes with no depth, and a patch 50 m away, beyond the default range of 0.1 to 10 m, all
@@ -59,9 +62,11 @@ pixel without depth. The ground truth is the camera's depth image itself: each p
 nearest valid depth among the pixels its square covers (within 1 µm plus 1 µm per meter, exactly for
 uint16 millimeters), the color of a point at that depth, or nothing where no valid depth is.
 
-`--depth-format uint16` makes uint16 millimeters instead of float32 meters, `--point-size 3` or `5`
-draws each point as a square, `--host-input true` sends the clouds from host instead of GPU memory,
-and `--intrinsics-input true` sends per-frame intrinsics. `--image-dir DIR` writes each depth image
+The synthetic camera goes to `CameraInfoSourceOp` as a `camera_info` file written at the start of
+the run. `--depth-format uint16` makes uint16 millimeters instead of float32 meters,
+`--point-size 3` or `5` draws each point as a square, `--host-input true` sends the clouds from host
+instead of GPU memory, and `--camera-info-per-frame true` sends the camera info with every cloud
+instead, its focal length changing from cloud to cloud. `--image-dir DIR` writes each depth image
 as `DIR/depth_NNNNNN.pgm`, 16-bit millimeters, and each color image as `DIR/color_NNNNNN.ppm`. The
 PGM rounds each depth to the nearest millimeter: below 0.5 mm it shows as 0, and beyond 65.535 m as
 65535. `--help` lists every option.
@@ -78,26 +83,28 @@ properties `float x`, `float y`, `float z`, optionally followed by `uchar red`, 
 properties and other elements are rejected with an error naming the file and what it does not
 support.
 
-Give the image size and the camera's intrinsics, and the extrinsics if the points are not in the
-camera optical frame, as twelve comma-separated numbers, `R` and `t` row by row. `R` must be a
-rotation, without scale or mirroring:
+Give the camera's ROS `camera_info` file, whose size the images have, and the extrinsics if the
+points are not in the camera optical frame, as twelve comma-separated numbers, `R` and `t` row by
+row. `R` must be a rotation, without scale or mirroring. The camera must be undistorted or
+rectified: the operator refuses one whose distortion coefficients are not all zero.
 
 ```bash
 build/point_cloud_to_depth/point_cloud_to_depth --source files --clouds path/to/ply/folder \
-  --width 640 --height 480 --fx 615 --fy 615 --cx 319.5 --cy 239.5 --image-dir .
+  --camera-info path/to/camera.yaml --image-dir .
 ```
 
 ## Output
 
-Each run prints the frame and pixel counts, the filled pixels and their depth range and, for
-synthetic input, how many depths and colors differ from the truth and the largest error. A gap in
-the frame ids fails the run and is printed too. So does a run whose images, unchecked against a
-truth, are all empty, which most likely means wrong intrinsics or extrinsics. Then comes a
+Each run prints the images and clouds, the clouds that came before the first camera info (which
+give no image), the pixel counts, the filled pixels and their depth range and, for synthetic input,
+how many depths and colors differ from the truth and the largest error. Every cloud after the first
+camera info must give an image; a gap in the frame ids fails the run and is printed too. So does a run whose images, unchecked against a
+truth, are all empty, which most likely means a wrong camera or extrinsics. Then comes a
 `verdict`: `PASS`, `FAIL`, or `STOPPED` when an interrupt ends the run early. It exits 0 on `PASS`,
 2 for invalid options, else 1:
 
 ```text
-point_cloud_to_depth: frames=30/30 pixels=9216000 filled=8878080 depth_m=[1.040, 2.196] truth: wrong_depths=0 wrong_colors=0 max_error_m=0.00e+00
+point_cloud_to_depth: frames=30/30 before_camera_info=0 pixels=9216000 filled=8878080 depth_m=[1.040, 2.196] truth: wrong_depths=0 wrong_colors=0 max_error_m=0.00e+00
 point_cloud_to_depth: verdict=PASS
 ```
 
@@ -125,12 +132,13 @@ is not part of the operator.
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest` checks the demo's operators, the file source with a consumer far
-slower than its clock and the reporter's frame-id check, completion and truth settings, and the
-demo's runs: synthetic clouds in every variant (float32 and uint16, host and GPU memory, configured
-and per-frame intrinsics, every splat size, narrower and wider ranges) against ground truth; folders
-of PLY files with and without colors, once and looped; image output; and the exit status and verdict
-of failed, empty, slow, timed-out, stopped and invalid runs, and of a run without managed signal
-handling. The PLY, PGM and PPM file test in [tests/host/](tests/host/) needs neither the SDK nor a
+slower than its clock and the reporter's frame-id check, completion at the last frame and truth
+settings, and the demo's runs: synthetic clouds in every variant (float32 and uint16, host and GPU
+memory, the camera from a `camera_info` file and with every cloud, every splat size, narrower and
+wider ranges) against ground truth; folders of PLY files with and without colors and their
+`camera_info` file, once and looped; image output; cameras that are missing or raw; and the exit
+status and verdict of failed, empty, slow, timed-out, stopped and invalid runs, and of a run without
+managed signal handling. The PLY, PGM and PPM file test in [tests/host/](tests/host/) needs neither the SDK nor a
 GPU, and also runs on the hosted CI job. None of it needs data.
 
 ## Licenses

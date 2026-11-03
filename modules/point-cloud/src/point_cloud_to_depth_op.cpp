@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -22,14 +21,16 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/camera_info.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
 #include "host_input.hpp"
+#include "pinhole_camera.hpp"
 
 namespace holoscan::point_cloud {
 namespace {
 
-using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
 
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 constexpr DLDataType kUInt16{kDLUInt, 16U, 1U};
@@ -137,11 +138,6 @@ bool aligned(const holoscan::Tensor& tensor, std::size_t alignment) {
   return !on_gpu(tensor) || reinterpret_cast<std::uintptr_t>(tensor.data()) % alignment == 0U;
 }
 
-bool usable(const CameraIntrinsics& k) {
-  return std::isfinite(k.fx) && k.fx > 0 && std::isfinite(k.fy) && k.fy > 0 &&
-         std::isfinite(k.cx) && std::isfinite(k.cy);
-}
-
 // The number of points in a float32 [N, 3] or [H, W, 3] cloud, or an error.
 holoscan::expected<std::uint64_t, holoscan::Error> point_count(const holoscan::Tensor& tensor) {
   const std::span<const std::int64_t> shape = tensor.shape_span();
@@ -167,21 +163,10 @@ holoscan::expected<std::uint64_t, holoscan::Error> point_count(const holoscan::T
 }  // namespace
 
 void validate_config(const PointCloudToDepthConfig& config) {
-  if (config.width < 1 || config.height < 1 || config.width > kMaxImageSide ||
-      config.height > kMaxImageSide) {
-    throw std::invalid_argument("width and height must be 1.." + std::to_string(kMaxImageSide));
-  }
-  if (config.intrinsics) {
-    if (!usable(*config.intrinsics)) {
-      throw std::invalid_argument("intrinsics need finite, positive fx and fy and finite cx, cy");
-    }
-    if (config.intrinsics_input) {
-      // Per-frame intrinsics are paired with each cloud; nothing would fall
-      // back to configured ones, so refuse a setting that would be ignored.
-      throw std::invalid_argument("give intrinsics or enable the intrinsics input, not both");
-    }
-  } else if (!config.intrinsics_input) {
-    throw std::invalid_argument("give intrinsics or enable the intrinsics input");
+  if (config.max_width < 1 || config.max_height < 1 || config.max_width > kMaxImageSide ||
+      config.max_height > kMaxImageSide) {
+    throw std::invalid_argument("max_width and max_height must be 1.." +
+                                std::to_string(kMaxImageSide));
   }
   if (config.extrinsics &&
       !std::all_of(std::begin(config.extrinsics->matrix), std::end(config.extrinsics->matrix),
@@ -203,16 +188,14 @@ void validate_config(const PointCloudToDepthConfig& config) {
   if (config.max_points < 1 || config.max_points > kMaxPointsLimit) {
     throw std::invalid_argument("max_points must be 1.." + std::to_string(kMaxPointsLimit));
   }
+  if (config.camera_info.max_age <= std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("camera_info.max_age must be > 0");
+  }
 }
 
 PointCloudToDepthOp::PointCloudToDepthOp(PointCloudToDepthConfig config)
     : config_(std::move(config)) {
   validate_config(config_);
-  params_.width = config_.width;
-  params_.height = config_.height;
-  if (config_.intrinsics) {
-    params_.intrinsics = *config_.intrinsics;
-  }
   if (config_.extrinsics) {
     params_.extrinsics = *config_.extrinsics;
   }
@@ -226,23 +209,18 @@ PointCloudToDepthOp::PointCloudToDepthOp(PointCloudToDepthConfig config)
 PointCloudToDepthOp::~PointCloudToDepthOp() { release(); }
 
 void PointCloudToDepthOp::setup(holoscan::OperatorSpec& spec) {
-  const auto pixels =
-      static_cast<std::uint64_t>(config_.width) * static_cast<std::uint64_t>(config_.height);
+  const auto pixels = static_cast<std::uint64_t>(config_.max_width) *
+                      static_cast<std::uint64_t>(config_.max_height);
   const bool uint16 = config_.depth_format == DepthFormat::kUint16;
   // Two slots per input: one cloud in compute() while the next one arrives.
-  spec.input(points, "points").queue_depth(2U);
-  // Optional ports exist only when configured: an unconnected input would
-  // never be satisfied, and an emit into an unconnected output fails.
-  if (config_.color) {
-    spec.input(colors, "colors").queue_depth(2U);
-  }
-  if (config_.intrinsics_input) {
-    spec.input(intrinsics, "intrinsics").queue_depth(2U);
-  }
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
+  spec.input(camera_info, "camera_info").queue_depth(2U);
   spec.output(depth, "depth")
       .produces_tensor(device_image(uint16 ? kUInt16 : kFloat32, 2U,
                                     pixels * (uint16 ? sizeof(std::uint16_t) : sizeof(float))))
       .payload_options(image_payload());
+  // The color output exists only when configured: an emit into an unconnected
+  // output fails.
   if (config_.color) {
     spec.output(color, "color")
         .produces_tensor(device_image(kUInt8, 3U, pixels * 3U))
@@ -251,20 +229,13 @@ void PointCloudToDepthOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract PointCloudToDepthOp::contract() const {
-  holoscan::Contract result;
-  if (!config_.color && !config_.intrinsics_input) {
-    result.trigger(holoscan::OnEach{points});
-    return result;
-  }
-  // Every input of one frame carries the same capture time.
-  std::vector<holoscan::PortRef> ports{points};
-  if (config_.color) ports.emplace_back(colors);
-  if (config_.intrinsics_input) ports.emplace_back(intrinsics);
-  result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
-  result.input(points, holoscan::Exact{});
-  if (config_.color) result.input(colors, holoscan::Exact{});
-  if (config_.intrinsics_input) result.input(intrinsics, holoscan::Exact{});
-  return result;
+  return hm::camera_info_contract(config_.camera_info, camera_info, point_cloud);
+}
+
+// Each run starts without a camera; the SDK may start an operator again.
+void PointCloudToDepthOp::start() {
+  info_.reset();
+  intrinsics_.reset();
 }
 
 void PointCloudToDepthOp::stop() { release(); }
@@ -347,9 +318,39 @@ holoscan::expected<const void*, holoscan::Error> PointCloudToDepthOp::on_device(
 
 holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
     holoscan::ExecutionContext& context) {
-  auto cloud = points.receive();
+  auto cloud = point_cloud.receive();
   if (!cloud) {
     return holoscan::make_unexpected(std::move(cloud).error());
+  }
+  auto info = info_.update(camera_info);
+  if (!info) {
+    return holoscan::make_unexpected(std::move(info).error());
+  }
+  if (*info == nullptr) {
+    return {};  // No camera info yet: this cloud gives no image.
+  }
+  const hm::CameraInfo& camera = **info;
+  if (info_.changed()) {
+    intrinsics_.reset();
+    auto intrinsics = detail::pinhole_intrinsics(camera, "PointCloudToDepthOp");
+    if (!intrinsics) {
+      return holoscan::make_unexpected(std::move(intrinsics).error());
+    }
+    intrinsics_ = *intrinsics;
+  }
+  if (std::cmp_greater(camera.width, config_.max_width) ||
+      std::cmp_greater(camera.height, config_.max_height)) {
+    return holoscan::make_unexpected(invalid(
+        "camera info '" + camera.header.frame_id + "' is for " + std::to_string(camera.width) +
+        "x" + std::to_string(camera.height) + " images, larger than the configured " +
+        std::to_string(config_.max_width) + "x" + std::to_string(config_.max_height)));
+  }
+  if (auto checked = hm::check_point_cloud(cloud->data); !checked) {
+    return holoscan::make_unexpected(invalid(checked.error().message));
+  }
+  const bool has_colors = hm::is_present(cloud->data.colors);
+  if (config_.color && !has_colors) {
+    return holoscan::make_unexpected(invalid("the cloud has no colors to make the color image of"));
   }
   auto stream_or = stream_for(context);
   if (!stream_or) {
@@ -361,9 +362,13 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
   if (const cudaError_t status = cudaStreamGetDevice(stream, &device); status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("cudaStreamGetDevice", status));
   }
+  ProjectParams params = params_;
+  params.width = static_cast<int>(camera.width);
+  params.height = static_cast<int>(camera.height);
+  params.intrinsics = *intrinsics_;
 
   // The points.
-  const holoscan::Tensor& point_tensor = cloud->data;
+  const holoscan::Tensor& point_tensor = *cloud->data.points;
   auto count_or = point_count(point_tensor);
   if (!count_or) {
     return holoscan::make_unexpected(std::move(count_or).error());
@@ -387,60 +392,10 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
     return holoscan::make_unexpected(std::move(ready).error());
   }
 
-  // The frame's own intrinsics, or the configured ones. The sample stays
-  // alive until compute() returns, as the kernel may read it in place.
-  ProjectParams params = params_;
-  std::optional<holoscan::Sample<holoscan::Tensor>> intrinsics_sample;
-  if (config_.intrinsics_input) {
-    auto sample = intrinsics.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
-    }
-    intrinsics_sample.emplace(std::move(*sample));
-    const holoscan::Tensor& tensor = intrinsics_sample->data;
-    if (!is_dtype(tensor.dtype(), kFloat32) || tensor.size() != 4 || !packed(tensor)) {
-      return holoscan::make_unexpected(invalid("intrinsics must be float32 [fx, fy, cx, cy]"));
-    }
-    if (!aligned(tensor, sizeof(float))) {
-      return holoscan::make_unexpected(invalid("intrinsics data must be aligned to 4 bytes"));
-    }
-    if (!on_device_of(tensor, device)) {
-      return holoscan::make_unexpected(invalid("intrinsics are on another GPU than the operator"));
-    }
-    if (on_gpu(tensor)) {
-      // The kernel reads them where they are, so the host never waits for them.
-      params.device_intrinsics = static_cast<const float*>(tensor.data());
-    } else {
-      // The host reads them, so it waits for their producer, pinned or not.
-      if (auto ready = tensor.synchronize_for_host(); !ready) {
-        return holoscan::make_unexpected(std::move(ready).error());
-      }
-      std::array<float, 4> k{};
-      std::memcpy(k.data(), tensor.data(), sizeof(k));
-      params.intrinsics = {k[0], k[1], k[2], k[3]};
-      if (!usable(params.intrinsics)) {
-        return holoscan::make_unexpected(
-            invalid("intrinsics need finite, positive fx and fy and finite cx, cy"));
-      }
-    }
-  }
-
-  // The colors.
+  // The colors, which check_point_cloud() found uint8 of the points' shape.
   const std::uint8_t* color_data = nullptr;
-  std::optional<holoscan::Sample<holoscan::Tensor>> colors_sample;
   if (config_.color) {
-    auto sample = colors.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
-    }
-    colors_sample.emplace(std::move(*sample));
-    const holoscan::Tensor& tensor = colors_sample->data;
-    const std::span<const std::int64_t> shape = tensor.shape_span();
-    const std::span<const std::int64_t> point_shape = point_tensor.shape_span();
-    if (!is_dtype(tensor.dtype(), kUInt8) ||
-        !std::equal(shape.begin(), shape.end(), point_shape.begin(), point_shape.end())) {
-      return holoscan::make_unexpected(invalid("colors must be uint8 RGB of the points' shape"));
-    }
+    const holoscan::Tensor& tensor = *cloud->data.colors;
     if (!packed(tensor)) {
       return holoscan::make_unexpected(invalid("colors must be packed"));
     }
@@ -467,16 +422,16 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
     point_data = static_cast<const float*>(*data);
   }
   auto zbuffer = reserve(
-      zbuffer_, zbuffer_entries(config_.width, config_.height) * sizeof(std::uint64_t), stream);
+      zbuffer_, zbuffer_entries(params.width, params.height) * sizeof(std::uint64_t), stream);
   if (!zbuffer) {
     return holoscan::make_unexpected(std::move(zbuffer).error());
   }
 
   // The outputs.
   const bool uint16 = config_.depth_format == DepthFormat::kUint16;
-  auto depth_loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
-      .shape = std::array<std::int64_t, 2>{config_.height, config_.width},
-      .dtype = uint16 ? kUInt16 : kFloat32});
+  auto depth_loan = depth.allocate_tensor(
+      holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 2>{params.height, params.width},
+                                  .dtype = uint16 ? kUInt16 : kFloat32});
   if (!depth_loan) {
     return holoscan::make_unexpected(std::move(depth_loan).error());
   }
@@ -488,7 +443,7 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
   std::optional<holoscan::TensorOutputWriteGuard> color_writer;
   if (config_.color) {
     auto loan = color.allocate_tensor(holoscan::TensorLoanRequest{
-        .shape = std::array<std::int64_t, 3>{config_.height, config_.width, 3}, .dtype = kUInt8});
+        .shape = std::array<std::int64_t, 3>{params.height, params.width, 3}, .dtype = kUInt8});
     if (!loan) {
       return holoscan::make_unexpected(std::move(loan).error());
     }
@@ -516,10 +471,10 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
   // is already delivered without it, and compute() fails (see the header).
   if (auto sent =
           depth.emit_tensor(std::move(*depth_loan),
-                            image_descriptor(config_.width, config_.height,
+                            image_descriptor(params.width, params.height,
                                              uint16 ? holoscan::schema::ImageEncoding_MONO16
                                                     : holoscan::schema::ImageEncoding_MONO32F,
-                                             cloud->metadata, config_.frame_id),
+                                             cloud->metadata, camera.header.frame_id),
                             emit);
       !sent) {
     return sent;
@@ -530,8 +485,8 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
     }
     return color.emit_tensor(
         std::move(*color_loan),
-        image_descriptor(config_.width, config_.height, holoscan::schema::ImageEncoding_RGB8,
-                         cloud->metadata, config_.frame_id),
+        image_descriptor(params.width, params.height, holoscan::schema::ImageEncoding_RGB8,
+                         cloud->metadata, camera.header.frame_id),
         emit);
   }
   return {};

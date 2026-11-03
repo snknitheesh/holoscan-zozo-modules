@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // DepthImageReportOp: the application's sink. Counts filled pixels and their
-// depth range, checks that frame ids run 1, 2, 3, ... without a gap, checks
-// every pixel (and color) against the synthetic camera's ground truth when the
-// input is synthetic, optionally writes the images as PGM and PPM files, and
-// asks the run to complete after its expected frames.
+// depth range, checks that frame ids run without a gap from the first image
+// to the last frame (clouds before the first camera info give no image),
+// checks every pixel (and color) against the synthetic camera's ground truth
+// when the input is synthetic, optionally writes the images as PGM and PPM
+// files, and asks the run to complete at the last frame's image.
 
 #pragma once
 
@@ -37,6 +38,9 @@ using holoscan::point_cloud::SceneTruth;
 // that it makes progress.
 struct DepthReport {
   std::atomic<std::uint32_t> frames{};
+  // The frame id of the first image: the clouds before it came before the
+  // first camera info.
+  std::uint64_t first_frame_id{};
   std::uint64_t pixels{};
   std::uint64_t filled_pixels{};
   float min_depth_m{};
@@ -51,7 +55,8 @@ struct DepthReport {
   double max_error_m{};
 
   [[nodiscard]] bool passed() const noexcept {
-    return frame_gaps == 0 && (!verified || (wrong_depths == 0 && wrong_colors == 0));
+    return frames.load() != 0 && frame_gaps == 0 &&
+           (!verified || (wrong_depths == 0 && wrong_colors == 0));
   }
 };
 
@@ -66,8 +71,8 @@ struct DepthImageTruth {
 struct DepthImageReportConfig {
   // Where the reporter adds what it sees; one report per run.
   std::shared_ptr<DepthReport> report;
-  // Frames after which the run completes, counted by each reporter on its
-  // own; 0 never completes.
+  // The frame id of the last frame, whose image completes the run; 0 never
+  // completes.
   std::uint32_t expected_frames{};
   // The depth images' format and, for uint16, meters per count.
   DepthFormat depth_format{DepthFormat::kFloat32};
@@ -114,7 +119,7 @@ class DepthImageReportOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> rgb_;
   std::vector<std::uint16_t> millimeters_;
   std::uint64_t last_frame_id_{};
-  // Images this reporter has seen; it requests completion at expected_frames.
+  // Images this reporter has seen, which number its files.
   std::uint32_t seen_{};
 };
 

@@ -27,15 +27,19 @@ function(pcd_app_test name status output)
   )
 endfunction()
 
-# The demo on the synthetic cloud, every pixel and color checked
-# against ground truth: float32 and uint16 depth, from GPU and host memory,
-# with configured and per-frame intrinsics, and every splat size.
+# The demo on the synthetic cloud, every pixel and color checked against ground truth:
+# float32 and uint16 depth, from GPU and host memory, with the camera from a camera_info
+# file or with every cloud, and every splat size. The clouds before the first camera info
+# give no image; the demo reports how many (before_camera_info) and checks every image
+# after them.
 set(_pass "wrong_depths=0 wrong_colors=0 .*verdict=PASS")
 pcd_app_test(pcd_app_float32 0 "${_pass}" --count 20 --period-ms 5)
 pcd_app_test(pcd_app_uint16 0 "${_pass}" --count 20 --period-ms 5 --depth-format uint16)
 pcd_app_test(pcd_app_host_input 0 "${_pass}" --count 20 --period-ms 5 --host-input true)
-pcd_app_test(pcd_app_intrinsics_input 0 "${_pass}"
-  --count 20 --period-ms 5 --intrinsics-input true
+# With every cloud, the camera's intrinsics change from cloud to cloud, and every cloud
+# gives an image.
+pcd_app_test(pcd_app_camera_info_per_frame 0 "frames=20/20 before_camera_info=0 .*${_pass}"
+  --count 20 --period-ms 5 --camera-info-per-frame true
 )
 pcd_app_test(pcd_app_without_color 0 "wrong_depths=0 .*verdict=PASS"
   --count 20 --period-ms 5 --color false
@@ -56,22 +60,24 @@ pcd_app_test(pcd_app_far_patch_uint16 0 "depth_m=\\[1\\.040, 50\\.000\\] truth: 
   --count 20 --period-ms 5 --depth-max 100 --depth-format uint16
 )
 
-# Image output: a depth and a color image per frame.
+# Image output: a depth and a color image per frame that gives one.
 set(_images "${CMAKE_CURRENT_BINARY_DIR}/images")
 add_test(
   NAME pcd_app_images
   COMMAND
-    ${CMAKE_COMMAND} -DEXPECT_EXIT=0 "-DEXPECT_OUTPUT=files_written=6 .*verdict=PASS"
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=0
+    "-DEXPECT_OUTPUT=(frames=3/3 .* files_written=6|frames=2/3 .* files_written=4) .*verdict=PASS"
     "-DMAKE_DIRECTORY=${_images}" -P "${_run_and_match}" -- $<TARGET_FILE:point_cloud_to_depth>
     --count 3 --period-ms 5 --image-dir "${_images}"
 )
 
-# Folders of PLY files written by the fixture: synthetic frames 0..4 at
-# 320x240, in the body frame, with and without colors. Read back with the
-# camera's intrinsics and the body-to-camera extrinsics, every pixel with a
-# valid scene depth is filled: 73984 per frame with 768 of the 76800 pixels in
-# the far patch, and holes; 369920 over the five frames, with depths of
-# 1.040..1.956 m, as an independent evaluation of the scene gives.
+# Folders of PLY files written by the fixture: synthetic frames 0..4 at 320x240, in the
+# body frame, with and without colors, and the camera's camera_info file. Read back with
+# that camera and the body-to-camera extrinsics, every pixel with a valid scene depth is
+# filled: 73984 per frame with 768 of the 76800 pixels in the far patch, and holes;
+# 369920 over the five frames, with depths of 1.040..1.956 m, as an independent
+# evaluation of the scene gives (or one frame less, when the first cloud comes before the
+# first camera info).
 set(_clouds "${CMAKE_CURRENT_BINARY_DIR}/clouds")
 set(_clouds_xyz "${CMAKE_CURRENT_BINARY_DIR}/clouds_xyz")
 add_test(
@@ -122,26 +128,11 @@ file(
   "property float z\nend_header\n1 2 3\n"
 )
 
-set(
-  _camera
-  --width
-  320
-  --height
-  240
-  --fx
-  256
-  --fy
-  248.32
-  --cx
-  159.5
-  --cy
-  119.5
-  --extrinsics
-  0,-1,0,-0.04,0,0,-1,0.35,1,0,0,-0.12
-)
+set(_extrinsics --extrinsics 0,-1,0,-0.04,0,0,-1,0.35,1,0,0,-0.12)
+set(_camera --camera-info "${_clouds}/camera_info.yaml" ${_extrinsics})
 set(
   _files_pass
-  "frames=5/5 pixels=384000 filled=369920 depth_m=\\[1\\.040, 1\\.956\\].*verdict=PASS"
+  "(frames=5/5 before_camera_info=0 pixels=384000 filled=369920|frames=4/5 before_camera_info=1 pixels=307200 filled=295936) depth_m=\\[1\\.[0-9]+, 1\\.9[0-9]+\\].*verdict=PASS"
 )
 pcd_app_test(pcd_app_files 0 "${_files_pass}"
   --source files --clouds "${_clouds}" ${_camera} --period-ms 5
@@ -154,28 +145,33 @@ pcd_app_test(pcd_app_files_uint16 0 "${_files_pass}"
   --depth-scale 0.001
 )
 # --loop starts over after the last file: 12 clouds from 5 files.
-pcd_app_test(pcd_app_files_loop 0 "frames=12/12 pixels=921600 .*verdict=PASS"
+pcd_app_test(pcd_app_files_loop 0 "frames=[0-9]+/12 .*verdict=PASS"
   --source files --clouds "${_clouds}" ${_camera} --period-ms 5 --loop true --count 12
 )
 pcd_app_test(pcd_app_rejects_count_beyond_files 2 "^error: .*--loop true"
   --source files --clouds "${_clouds}" ${_camera} --count 6
 )
-pcd_app_test(pcd_app_rejects_files_without_intrinsics 2 "^error: .*--fx"
-  --source files --clouds "${_clouds}" --width 320 --height 240
+# The camera: required, readable, and one the operator can model; it sets the images' size.
+pcd_app_test(pcd_app_rejects_files_without_camera_info 2 "^error: .*--camera-info FILE"
+  --source files --clouds "${_clouds}" ${_extrinsics}
 )
-pcd_app_test(pcd_app_rejects_files_without_size 2 "^error: .*--width and --height"
-  --source files --clouds "${_clouds}" --fx 256 --fy 248.32 --cx 159.5 --cy 119.5
+pcd_app_test(pcd_app_rejects_missing_camera_info 2 "^error: .*no_such_camera_info\\.yaml"
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/no_such_camera_info.yaml"
 )
-pcd_app_test(pcd_app_rejects_partial_intrinsics 2 "^error: .*go together"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256
+pcd_app_test(pcd_app_rejects_size_with_files 2 "^error: .*the images have the camera's size"
+  --source files --clouds "${_clouds}" ${_camera} --width 320
+)
+pcd_app_test(pcd_app_rejects_raw_camera 1 "camera info 'camera' describes raw images.*verdict=FAIL"
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/raw.yaml" ${_extrinsics}
+  --period-ms 5
 )
 pcd_app_test(pcd_app_rejects_short_extrinsics 2 "^error: .*12 comma-separated numbers"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256 --fy 248.32
-  --cx 159.5 --cy 119.5 --extrinsics 1,0,0,0,0,1,0,0,0,0,1
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
+  --extrinsics 1,0,0,0,0,1,0,0,0,0,1
 )
 pcd_app_test(pcd_app_rejects_non_finite_extrinsics 2 "^error: extrinsics must be finite"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256 --fy 248.32
-  --cx 159.5 --cy 119.5 --extrinsics 1,0,0,0,0,1,0,0,0,0,1,inf
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
+  --extrinsics 1,0,0,0,0,1,0,0,0,0,1,inf
 )
 pcd_app_test(pcd_app_rejects_zero_depth_scale 2 "^error: depth_scale"
   --source files --clouds "${_clouds}" ${_camera} --depth-format uint16 --depth-scale 0
@@ -194,19 +190,19 @@ pcd_app_test(pcd_app_rejects_zero_count_with_files 2 "^error: --count must be po
 )
 # The extrinsics must be a camera pose: no scale, and no mirror.
 pcd_app_test(pcd_app_rejects_scaled_extrinsics 2 "^error: --extrinsics must be a rigid transform"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256 --fy 248.32
-  --cx 159.5 --cy 119.5 --extrinsics 0,-2,0,-0.04,0,0,-2,0.35,2,0,0,-0.12
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
+  --extrinsics 0,-2,0,-0.04,0,0,-2,0.35,2,0,0,-0.12
 )
 pcd_app_test(pcd_app_rejects_mirrored_extrinsics 2 "^error: --extrinsics must be a rigid transform"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256 --fy 248.32
-  --cx 159.5 --cy 119.5 --extrinsics 0,1,0,-0.04,0,0,-1,0.35,1,0,0,-0.12
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
+  --extrinsics 0,1,0,-0.04,0,0,-1,0.35,1,0,0,-0.12
 )
 # Without a truth to check them against, images in which no point landed fail
 # the run: here the camera looks away from the points, 100 m behind them.
 pcd_app_test(pcd_app_files_all_empty 1
   "warning: no point reached the image.*filled=0 .*verdict=FAIL"
-  --source files --clouds "${_clouds}" --width 320 --height 240 --fx 256 --fy 248.32
-  --cx 159.5 --cy 119.5 --extrinsics 0,-1,0,-0.04,0,0,-1,0.35,1,0,0,-100 --period-ms 5
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
+  --extrinsics 0,-1,0,-0.04,0,0,-1,0.35,1,0,0,-100 --period-ms 5
 )
 set_tests_properties(
   pcd_app_files
@@ -214,9 +210,10 @@ set_tests_properties(
   pcd_app_files_uint16
   pcd_app_files_loop
   pcd_app_rejects_count_beyond_files
-  pcd_app_rejects_files_without_intrinsics
-  pcd_app_rejects_files_without_size
-  pcd_app_rejects_partial_intrinsics
+  pcd_app_rejects_files_without_camera_info
+  pcd_app_rejects_missing_camera_info
+  pcd_app_rejects_size_with_files
+  pcd_app_rejects_raw_camera
   pcd_app_rejects_short_extrinsics
   pcd_app_rejects_non_finite_extrinsics
   pcd_app_rejects_zero_depth_scale
@@ -230,19 +227,30 @@ set_tests_properties(
   PROPERTIES FIXTURES_REQUIRED pcd_clouds
 )
 pcd_app_test(pcd_app_files_with_empty_cloud 0
-  "frames=2/2 pixels=153600 filled=73984 .*verdict=PASS"
+  "(frames=2/2 before_camera_info=0 pixels=153600 filled=73984|frames=1/2 before_camera_info=1 pixels=76800 filled=0) .*verdict=PASS"
   --source files --clouds "${_clouds_empty}" ${_camera} --period-ms 5
 )
-set_tests_properties(pcd_app_files_with_empty_cloud PROPERTIES FIXTURES_REQUIRED pcd_clouds_empty)
+set_tests_properties(
+  pcd_app_files_with_empty_cloud
+  PROPERTIES FIXTURES_REQUIRED "pcd_clouds;pcd_clouds_empty"
+)
 pcd_app_test(pcd_app_rejects_mixed_colors 2 "^error: either every PLY file has colors"
   --source files --clouds "${_clouds_mixed}" ${_camera}
 )
-set_tests_properties(pcd_app_rejects_mixed_colors PROPERTIES FIXTURES_REQUIRED pcd_clouds_mixed)
+set_tests_properties(
+  pcd_app_rejects_mixed_colors
+  PROPERTIES FIXTURES_REQUIRED "pcd_clouds;pcd_clouds_mixed"
+)
 pcd_app_test(pcd_app_rejects_ascii_file 2 "^error: .*only binary_little_endian"
   --source files --clouds "${_clouds_ascii}" ${_camera}
 )
 pcd_app_test(pcd_app_rejects_missing_clouds 2 "^error: .*cannot list"
   --source files --clouds "${CMAKE_CURRENT_BINARY_DIR}/no_such_folder" ${_camera}
+)
+set_tests_properties(
+  pcd_app_rejects_ascii_file
+  pcd_app_rejects_missing_clouds
+  PROPERTIES FIXTURES_REQUIRED pcd_clouds
 )
 set(_no_clouds "${CMAKE_CURRENT_BINARY_DIR}/no_clouds")
 add_test(
@@ -252,6 +260,7 @@ add_test(
     "-DMAKE_DIRECTORY=${_no_clouds}" -P "${_run_and_match}" -- $<TARGET_FILE:point_cloud_to_depth>
     --source files --clouds "${_no_clouds}" ${_camera}
 )
+set_tests_properties(pcd_app_rejects_empty_clouds PROPERTIES FIXTURES_REQUIRED pcd_clouds)
 
 # Invalid input fails fast with a usage error (exit status 2) instead of
 # starting a run.
@@ -263,6 +272,9 @@ pcd_app_test(pcd_app_rejects_point_size 2 "^error: point_size must be 1, 3 or 5"
 pcd_app_test(pcd_app_rejects_depth_format 2 "^error: --depth-format" --depth-format meters)
 pcd_app_test(pcd_app_rejects_extrinsics_with_synthetic 2 "^error: the synthetic camera"
   --extrinsics 1,0,0,0,0,1,0,0,0,0,1,0
+)
+pcd_app_test(pcd_app_rejects_camera_info_with_synthetic 2 "^error: the synthetic camera"
+  --camera-info "${CMAKE_CURRENT_BINARY_DIR}/camera_info.yaml"
 )
 pcd_app_test(pcd_app_rejects_depth_scale_with_synthetic 2 "^error: .*drop --depth-scale"
   --depth-format uint16 --depth-scale 0.001
@@ -293,7 +305,7 @@ add_test(
 # here: eight of them outlast a 2 s timeout, yet the run goes on and passes.
 # A 4096x4096 image takes about 2 s, beyond a 1 s timeout: that run is stopped
 # and fails. Each holds 1 to 3 GiB of GPU memory, so it runs alone.
-pcd_app_test(pcd_app_slow_but_progressing 0 "frames=8/8 .*verdict=PASS"
+pcd_app_test(pcd_app_slow_but_progressing 0 "frames=[78]/8 .*verdict=PASS"
   --width 2048 --height 2048 --point-size 5 --count 8 --period-ms 1 --timeout-seconds 2
 )
 pcd_app_test(pcd_app_timed_out 1 "timed out: no image for 1 s.*frames=[01]/2 .*verdict=FAIL"

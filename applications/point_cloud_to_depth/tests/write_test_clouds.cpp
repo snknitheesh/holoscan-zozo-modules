@@ -3,7 +3,9 @@
 //
 // Writes synthetic clouds (frames 0, 1, ...) as PLY files, in the body frame
 // and with colors unless `xyz` is given, for the tests that feed the
-// application a folder of PLY files.
+// application a folder of PLY files; and the synthetic camera's camera_info
+// file, camera_info.yaml, and the camera with lens distortion, raw.yaml,
+// which the operator must refuse.
 //
 // Usage: write_test_clouds DIR COUNT WIDTH HEIGHT [xyz]
 
@@ -16,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/synthetic_scene.hpp>
 
 #include "cloud_io.hpp"
@@ -42,6 +45,16 @@ int main(int argc, char** argv) try {
   const int width = number(argv[3]);
   const int height = number(argv[4]);
   std::filesystem::create_directories(directory);
+  namespace hm = holoscan::messages;
+  namespace pc = holoscan::point_cloud;
+  const hm::CameraInfo camera =
+      pc::synthetic_camera_info(pc::synthetic_frame(width, height, 0, false), "camera");
+  hm::write_camera_info_yaml(camera, directory / "camera_info.yaml");
+  hm::CameraInfo raw = camera;
+  raw.state = hm::CameraState::kRaw;
+  raw.distortion_model = hm::DistortionModel::kEquidistant;
+  raw.coefficients = {0.05, -0.01, 0.0, 0.0};
+  hm::write_camera_info_yaml(raw, directory / "raw.yaml");
   for (int frame = 0; frame < count; ++frame) {
     std::vector<float> xyz;
     std::vector<std::uint8_t> rgb;

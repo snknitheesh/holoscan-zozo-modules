@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The demo's operators on their own: the file source with a consumer far
-// slower than its clock, and the reporter's frame-id check, its completion and
-// its truth settings, through the SDK's operator test harness.
+// slower than its clock, and the reporter's frame-id check, its completion at
+// the last frame and its truth settings, through the SDK's operator test
+// harness.
 //
 // Usage: pcd_app_ops_test DIR (a scratch folder for the files)
 
@@ -31,6 +32,7 @@
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 
@@ -42,6 +44,7 @@
 namespace point_cloud_to_depth_app {
 namespace {
 
+namespace hm = holoscan::messages;
 constexpr DLDataType kFloat32{kDLFloat, 32, 1};
 
 std::filesystem::path g_directory;
@@ -83,33 +86,28 @@ class SlowCloudSinkOp final : public holoscan::Operator<> {
  public:
   explicit SlowCloudSinkOp(std::shared_ptr<SlowSinkLog> log) : log_(std::move(log)) {}
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.input(points, "points").queue_depth(1U);
-    spec.input(colors, "colors").queue_depth(1U);
+    spec.input(point_cloud, "point_cloud").queue_depth(1U);
   }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
-    result.trigger(holoscan::OnAligned{
-        .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, colors}},
-        .window = std::chrono::nanoseconds{0}});
-    result.input(points, holoscan::Exact{});
-    result.input(colors, holoscan::Exact{});
+    result.trigger(holoscan::OnEach{point_cloud});
     return result;
   }
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    auto cloud = points.receive();
-    auto rgb = colors.receive();
-    if (!cloud || !rgb) {
-      return holoscan::make_unexpected(
-          holoscan::Error{holoscan::ErrorCode::kFailure, "SlowCloudSinkOp: missing input"});
+    auto cloud = point_cloud.receive();
+    if (!cloud) {
+      return holoscan::make_unexpected(std::move(cloud).error());
     }
-    // File i holds points of value i and colors of value i.
+    if (auto checked = hm::check_point_cloud(cloud->data); !checked) {
+      return checked;
+    }
+    // File i holds points of value i and colors of value i, in host memory.
     float x = 0.0F;
     std::uint8_t c = 0U;
-    std::memcpy(&x, cloud->data.data(), sizeof(x));
-    std::memcpy(&c, rgb->data.data(), sizeof(c));
-    log_->mismatched +=
-        static_cast<int>(x) != c || cloud->metadata.frame_id != rgb->metadata.frame_id;
+    std::memcpy(&x, cloud->data.points->data(), sizeof(x));
+    std::memcpy(&c, cloud->data.colors->data(), sizeof(c));
+    log_->mismatched += static_cast<int>(x) != c;
     log_->frame_ids.push_back(cloud->metadata.frame_id);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     if (log_->frame_ids.size() == kFrames) {
@@ -119,8 +117,7 @@ class SlowCloudSinkOp final : public holoscan::Operator<> {
   }
 
   static constexpr std::size_t kFrames = 12;
-  holoscan::Input<holoscan::Tensor> points;
-  holoscan::Input<holoscan::Tensor> colors;
+  holoscan::Input<hm::schema::PointCloudT> point_cloud;
 
  private:
   std::shared_ptr<SlowSinkLog> log_;
@@ -151,8 +148,7 @@ void check_file_source_waits_for_consumer() {
   auto log = std::make_shared<SlowSinkLog>();
   auto sink = graph.op<SlowCloudSinkOp>("sink", log);
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(source->points, sink->points, lossless);
-  graph.add_flow(source->colors, sink->colors, lossless);
+  graph.add_flow(source->point_cloud, sink->point_cloud, lossless);
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph);
   VERIFY_MSG(plan.ok(), holoscan::format_diagnostics(plan.diagnostics(), plan.graph()));
@@ -175,7 +171,8 @@ void check_file_source_waits_for_consumer() {
   VERIFY_MSG(log->mismatched == 0, std::to_string(log->mismatched) + " clouds mismatched");
 }
 
-// The reporter counts an image whose frame id does not follow the previous one.
+// The reporter counts an image whose frame id does not follow the previous
+// one; the first image may come after the first frame.
 void check_report_frame_gaps(const std::vector<std::uint64_t>& frame_ids,
                              std::uint32_t expected_gaps) {
   auto report = std::make_shared<DepthReport>();
@@ -199,6 +196,7 @@ void check_report_frame_gaps(const std::vector<std::uint64_t>& frame_ids,
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   VERIFY(report->frames == frame_ids.size());
+  VERIFY(report->first_frame_id == frame_ids.front());
   VERIFY(report->filled_pixels == 8U * frame_ids.size());
   VERIFY_MSG(report->frame_gaps == expected_gaps, std::to_string(report->frame_gaps) +
                                                       " frame gaps, expected " +
@@ -221,21 +219,20 @@ holoscan::testing::TestSample<holoscan::schema::ImageT> depth_sample(std::uint64
   return sample;
 }
 
-// The reporter completes after its own expected frames, whatever the shared
-// report counted before it: a report already holding frames does not end the
-// run at its first image.
-void check_report_completes_on_its_own_count() {
+// The reporter completes at the image of the last frame, whatever the shared
+// report counted before it, and however many frames came before its first.
+void check_report_completes_at_last_frame() {
   auto report = std::make_shared<DepthReport>();
   report->frames = 5U;
   auto h = holoscan::testing::create_operator_test<DepthImageReportOp>(
-      DepthImageReportConfig{.report = report, .expected_frames = 3});
+      DepthImageReportConfig{.report = report, .expected_frames = 4});
   std::vector<holoscan::testing::TestSample<holoscan::schema::ImageT>> samples;
-  for (std::uint64_t id = 1; id <= 4; ++id) samples.push_back(depth_sample(id));
+  for (std::uint64_t id = 2; id <= 5; ++id) samples.push_back(depth_sample(id));
   h.push_samples("depth", std::move(samples));
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   VERIFY_MSG(report->frames == 8U, std::to_string(report->frames.load()) +
-                                       " frames counted, expected 5 + 3: completion at the third");
+                                       " frames counted, expected 5 + 3: completion at frame 4");
 }
 
 // A truth that does not fit the images' format is refused up front.
@@ -300,7 +297,9 @@ int main(int argc, char** argv) {
        [] { app::check_report_frame_gaps({1, 2, 3}, 0); }},
       {"the reporter counts a gap in frame ids",
        [] { app::check_report_frame_gaps({1, 2, 4, 5}, 1); }},
-      {"the reporter completes on its own count", app::check_report_completes_on_its_own_count},
+      {"the first image may come after the first frame",
+       [] { app::check_report_frame_gaps({3, 4, 5}, 0); }},
+      {"the reporter completes at the last frame", app::check_report_completes_at_last_frame},
       {"the reporter refuses a truth that does not fit", app::check_report_rejects_unfit_truth},
   });
 }

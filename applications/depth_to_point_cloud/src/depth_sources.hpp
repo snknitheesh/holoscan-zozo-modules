@@ -21,6 +21,7 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 #include "image_io.hpp"
@@ -36,8 +37,9 @@ struct SyntheticSourceConfig {
   bool millimeters{false};
   // Also emit an aligned RGB8 image on `color`.
   bool color{false};
-  // Also emit each frame's intrinsics on `intrinsics`, varying by frame.
-  bool intrinsics{false};
+  // Also emit each frame's camera info on `camera_info`, with the frame's
+  // capture time and intrinsics that vary by frame.
+  bool camera_info{false};
   // Emit images in CUDA device memory instead of host memory.
   bool device_output{true};
 };
@@ -61,10 +63,10 @@ class SyntheticDepthSourceOp final : public holoscan::Operator<> {
 
   holoscan::Output<holoscan::schema::ImageT> depth;
   holoscan::Output<holoscan::schema::ImageT> color;
-  holoscan::Output<holoscan::Tensor> intrinsics;
+  holoscan::Output<holoscan::messages::schema::CameraInfoT> camera_info;
 
  private:
-  static constexpr std::uint32_t kSentIntrinsics = 1U;
+  static constexpr std::uint32_t kSentCameraInfo = 1U;
   static constexpr std::uint32_t kSentColor = 2U;
   static constexpr std::uint32_t kSentDepth = 4U;
 

@@ -164,8 +164,11 @@ holoscan::expected<void, holoscan::Error> DepthImageReportOp::process(
 
   DepthReport& report = *config_.report;
   // Sources number their frames from 1; the images keep their cloud's id.
+  // The clouds before the first image came before the first camera info.
   const std::uint64_t frame_id = image->metadata.frame_id;
-  if (frame_id != last_frame_id_ + 1U) {
+  if (seen_ == 0) {
+    report.first_frame_id = frame_id;
+  } else if (frame_id != last_frame_id_ + 1U) {
     ++report.frame_gaps;
   }
   last_frame_id_ = frame_id;
@@ -192,7 +195,7 @@ holoscan::expected<void, holoscan::Error> DepthImageReportOp::process(
   }
   ++seen_;
   report.frames.fetch_add(1U);
-  if (config_.expected_frames != 0 && seen_ == config_.expected_frames) {
+  if (config_.expected_frames != 0 && frame_id == config_.expected_frames) {
     context.request_completion();
   }
   return {};

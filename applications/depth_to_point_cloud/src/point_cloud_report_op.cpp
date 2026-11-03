@@ -4,7 +4,6 @@
 #include "point_cloud_report_op.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -28,7 +27,7 @@ using holoscan::point_cloud::synthetic_depth_mm;
 using holoscan::point_cloud::synthetic_frame;
 using holoscan::point_cloud::SyntheticFrame;
 
-using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
 
 holoscan::Error invalid(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "PointCloudReportOp: " + message};
@@ -60,25 +59,24 @@ PointCloudReportOp::PointCloudReportOp(PointCloudReportConfig config) : config_(
 }
 
 void PointCloudReportOp::setup(holoscan::OperatorSpec& spec) {
-  // Two slots per input: one cloud in compute() while the next one arrives.
+  // Two slots: one cloud in compute() while the next one arrives.
   spec.input(point_cloud, "point_cloud").queue_depth(2U);
-  if (config_.colors) {
-    spec.input(colors, "colors").queue_depth(2U);
-  }
 }
 
 holoscan::Contract PointCloudReportOp::contract() const {
   holoscan::Contract result;
-  if (!config_.colors) {
-    result.trigger(holoscan::OnEach{point_cloud});
-    return result;
-  }
-  result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{point_cloud, colors}},
-      .window = 0ns});
-  result.input(point_cloud, holoscan::Exact{});
-  result.input(colors, holoscan::Exact{});
+  result.trigger(holoscan::OnEach{point_cloud});
   return result;
+}
+
+// Each run counts its own clouds and frame ids from the start.
+void PointCloudReportOp::start() { last_frame_id_ = 0; }
+
+bool PointCloudReportOp::well_formed(const hm::schema::PointCloudT& cloud) const {
+  return hm::check_point_cloud(cloud).has_value() && cloud.organized && cloud.valid_count == -1 &&
+         cloud.header != nullptr && cloud.header->frame_id == config_.frame_id &&
+         hm::is_present(cloud.colors) == config_.colors && !hm::is_present(cloud.normals) &&
+         !hm::is_present(cloud.intensity);
 }
 
 holoscan::expected<void, holoscan::Error> PointCloudReportOp::compute(
@@ -87,33 +85,35 @@ holoscan::expected<void, holoscan::Error> PointCloudReportOp::compute(
   if (!cloud) {
     return holoscan::make_unexpected(std::move(cloud).error());
   }
+  CloudReport& report = *config_.report;
+  if (!well_formed(cloud->data)) {
+    return holoscan::make_unexpected(
+        invalid("the cloud is not the operator's organized cloud of the camera's frame"));
+  }
   int width = 0;
   int height = 0;
-  if (auto fetched = fetch(cloud->data, context.cuda_stream(), xyz_, width, height); !fetched) {
+  if (auto fetched = fetch(*cloud->data.points, context.cuda_stream(), xyz_, width, height);
+      !fetched) {
     return fetched;
   }
   const std::vector<std::uint8_t>* rgb = nullptr;
   if (config_.colors) {
-    auto sample = colors.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
-    }
     int color_width = 0;
     int color_height = 0;
-    if (auto fetched = fetch(sample->data, context.cuda_stream(), rgb_, color_width, color_height);
+    if (auto fetched =
+            fetch(*cloud->data.colors, context.cuda_stream(), rgb_, color_width, color_height);
         !fetched) {
       return fetched;
-    }
-    if (color_width != width || color_height != height) {
-      return holoscan::make_unexpected(invalid("colors and points differ in size"));
     }
     rgb = &rgb_;
   }
 
-  CloudReport& report = *config_.report;
   // Sources number their frames from 1; the cloud keeps its depth image's id.
+  // The frames before the first cloud came before the first camera info.
   const std::uint64_t frame_id = cloud->metadata.frame_id;
-  if (frame_id != last_frame_id_ + 1U) {
+  if (report.frames == 0) {
+    report.first_frame_id = frame_id;
+  } else if (frame_id != last_frame_id_ + 1U) {
     ++report.frame_gaps;
   }
   last_frame_id_ = frame_id;
@@ -150,8 +150,7 @@ holoscan::expected<void, holoscan::Error> PointCloudReportOp::compute(
     ++report.ply_files;
   }
   ++report.frames;
-  if (!finished_ && config_.expected_frames != 0 && report.frames >= config_.expected_frames) {
-    finished_ = true;
+  if (config_.expected_frames != 0 && frame_id == config_.expected_frames) {
     context.request_completion();
   }
   return {};
