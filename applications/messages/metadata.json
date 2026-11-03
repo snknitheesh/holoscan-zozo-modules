@@ -1,0 +1,70 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "Messages",
+    "description": "The holoscan-messages demo: a stereo calibration with known values written as the two ROS camera_info YAML files of a stereo calibration, sent by CameraInfoSourceOp to an operator that takes stereo frames and the camera info with the recommended contract and checks every field and the recovered extrinsics, and synthetic point clouds with points, colors and normals in device or host memory, every value checked.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-messages demo of CameraInfoSourceOp, the camera info consumer contract and the PointCloud message, checked against ground truth."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Camera",
+      "Calibration",
+      "Point Cloud"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "messages"
+        }
+      ]
+    },
+    "default_mode": "synthetic",
+    "modes": {
+      "synthetic": {
+        "description": "300 stereo frames with camera info every 100 ms and 300 point clouds in device memory, every camera info field and cloud value checked against the calibration and clouds made.",
+        "run": {
+          "command": "\"<holohub_app_bin>/messages_demo\" --count 300",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check: 60 stereo frames with camera info every 20 ms and 60 point clouds in device memory, every camera info field and cloud value checked.",
+        "run": {
+          "command": "\"<holohub_app_bin>/messages_demo\" --count 60 --period-ms 5 --info-period-ms 20",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
