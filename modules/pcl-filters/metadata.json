@@ -4,7 +4,7 @@
     "name": "holoscan-pcl-filters",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Point-cloud filters on the GPU for organized or unorganized XYZ clouds with optional colors, in holoscan-point-cloud's layout: a deterministic voxel grid (centroid or first point, mean colors), a crop box and pass-through or range filter with an optional transform, RANSAC ground removal with the plane's coefficients (or a height threshold), and statistical or radius outlier removal over a GPU grid. Clouds stay organized, removed points NaN, or come out packed.",
+    "description": "Point-cloud filters on the GPU for holoscan-messages PointCloud messages, organized or not, carrying their colors, normals and intensities: a deterministic voxel grid (centroid or first point, mean fields), a crop box and pass-through or range filter with an optional transform, RANSAC ground removal with the plane's coefficients (or a height threshold), and statistical or radius outlier removal over a GPU grid. Clouds keep their shape, removed points NaN, or come out packed, with a host wait or padded without one.",
     "authors": [
       {
         "name": "zozo",
@@ -52,7 +52,11 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-pcl-filters",
       "install_commands": [

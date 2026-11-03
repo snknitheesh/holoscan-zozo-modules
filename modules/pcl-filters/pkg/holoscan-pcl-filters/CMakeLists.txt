@@ -6,12 +6,13 @@
 # packages everything the module installs.
 include("${PROJECT_SOURCE_DIR}/cmake/holohub_configure_deb.cmake")
 
-# "holoscan" is the Debian package of the SDK 5.0 on its platforms.
+# "holoscan" is the Debian package of the SDK 5.0 on its platforms; holoscan-messages that of
+# the PointCloud message.
 holohub_configure_deb(
   NAME "holoscan-pcl-filters"
   DESCRIPTION "${PROJECT_DESCRIPTION}"
   VERSION "${PROJECT_VERSION}"
   VENDOR "zozo"
   CONTACT "zozo <snknitheesh@gmail.com>"
-  DEPENDS "holoscan (>= 5.0.0)"
+  DEPENDS "holoscan (>= 5.0.0), holoscan-messages (>= 1.0.0)"
 )

@@ -25,12 +25,8 @@ struct GroundRemovalConfig {
   GroundParams ground;
   // Declare the `plane` output. An output must be connected when it exists.
   bool emit_plane{true};
-  // Declare the `colors` input and `filtered_colors` output.
-  bool color{false};
-  // Keep the input's shape (removed points NaN), or pack the kept points.
-  OutputLayout layout{OutputLayout::kKeep};
-  // Largest cloud accepted; see CloudSettings.
-  std::uint32_t max_points{1920U * 1080U};
+  // The output's layout, size and fields.
+  CloudSettings cloud;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -48,14 +44,15 @@ class GroundRemovalOp final : public CloudFilterOp {
       holoscan::ExecutionContext& context) override;
 
   // With `emit_plane`: float32 [4] (a, b, c, d), a x + b y + c z + d = 0 with
-  // (a, b, c) a unit normal toward `up`, in the cloud's frame, in device
-  // memory; NaN when no plane was found. Emitted after the cloud, with its
-  // capture time.
+  // (a, b, c) a unit normal toward `up`, in metres in the cloud's frame
+  // (its header's frame_id), in device memory; NaN when no plane was found.
+  // Sent after the cloud, with its sample's capture time and frame number.
   holoscan::Output<holoscan::Tensor> plane;
 
  private:
   GroundRemovalConfig config_;
   std::unique_ptr<GroundSegmenter> segmenter_;
+  // The plane without `emit_plane`, which the filter needs all the same.
   float* plane_scratch_{};
 };
 

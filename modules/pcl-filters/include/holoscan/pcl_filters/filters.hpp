@@ -2,17 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The point-cloud filters on the GPU, without a Holoscan graph: a cloud is
-// `count` packed float32 x, y, z triples in device memory, optionally with
-// packed uint8 RGB triples, the layout of holoscan-point-cloud's clouds. A
-// point is invalid when any coordinate is not finite (DepthToPointCloudOp
-// writes NaN); no filter keeps an invalid point.
+// `count` packed float32 x, y, z triples in device memory, optionally with a
+// value per point of each of the fields a holoscan-messages PointCloud may
+// carry: uint8 RGB triples, float32 unit normal triples and float32
+// intensities (see CloudFields). A point is invalid when any coordinate is
+// not finite (a depth camera's cloud has NaN where there is no depth); no
+// filter keeps an invalid point.
 //
 // The filters that only remove points (crop box, ground removal, outlier
 // removal) write a keep mask, one byte per point; apply_mask() turns it into
-// an organized cloud of the same size, removed points NaN, and Compactor into
-// a dense cloud of the kept points in their input order. The voxel grid makes
-// a dense cloud of one point per voxel. Every result is deterministic: the
-// same input gives the same bits on every run.
+// a cloud of the same size, removed points NaN, and Compactor into a dense
+// cloud of the kept points in their input order. The voxel grid makes a dense
+// cloud of one point per voxel. pad_cloud() fills the rest of a buffer of
+// fixed size after a dense cloud whose size only the device knows. Every
+// result is deterministic: the same input gives the same bits on every run.
 //
 // Each class keeps its device scratch between calls, grown as needed, and is
 // for one stream at a time. All work is ordered on the given stream; nothing
@@ -39,14 +42,42 @@ struct Transform {
                    0.0F, 0.0F, 1.0F, 0.0F};
 };
 
+// ---- Clouds -------------------------------------------------------------------------------------
+
+// A cloud's fields in device memory, one value per point, packed: x, y, z
+// (required); and red, green, blue; a unit normal (NaN where unknown); an
+// intensity. A null optional field is absent.
+struct CloudFields {
+  const float* xyz{};
+  const std::uint8_t* rgb{};
+  const float* normals{};
+  const float* intensity{};
+};
+
+// Where a filter writes a cloud, field for field. A field given here must be
+// given in the input as well; a null one is not written. A removed point, and
+// a padding point, is NaN, with black, a NaN normal and a NaN intensity.
+struct CloudOutput {
+  float* xyz{};
+  std::uint8_t* rgb{};
+  float* normals{};
+  float* intensity{};
+};
+
+// Writes removed points into the points [*device_count, capacity) of `out`,
+// after a dense cloud whose size `device_count` holds in device memory, so
+// that a buffer sized before the filter ran needs no wait for its count.
+cudaError_t pad_cloud(const CloudOutput& out, const std::uint32_t* device_count,
+                      std::uint32_t capacity, cudaStream_t stream);
+
 // ---- Keep masks ---------------------------------------------------------------------------------
 
-// Writes the kept points of a mask into an organized cloud of the same size:
-// kept points and their colors as they are, removed and invalid points NaN
-// with black. `rgb` and `out_rgb` may both be null.
-cudaError_t apply_mask(const float* xyz, const std::uint8_t* rgb, const std::uint8_t* keep,
-                       std::uint32_t count, float* out_xyz, std::uint8_t* out_rgb,
-                       cudaStream_t stream);
+// Writes the kept points of a mask into a cloud of the same size: kept points
+// and their fields as they are, removed and invalid points removed (NaN; see
+// CloudOutput).
+// @return cudaErrorInvalidValue when `out` has a field that `in` has not.
+cudaError_t apply_mask(const CloudFields& in, const std::uint8_t* keep, std::uint32_t count,
+                       const CloudOutput& out, cudaStream_t stream);
 
 // Packs the kept points of a mask, in their input order.
 class Compactor {
@@ -60,10 +91,10 @@ class Compactor {
   cudaError_t count(const std::uint8_t* keep, std::uint32_t count, cudaStream_t stream);
   // The number of kept points, in device memory, once count() has run.
   [[nodiscard]] const std::uint32_t* device_count() const noexcept;
-  // Writes the kept points (and colors, when both are given) of the cloud
-  // count() saw, into buffers of at least that many points.
-  cudaError_t write(const float* xyz, const std::uint8_t* rgb, float* out_xyz,
-                    std::uint8_t* out_rgb, cudaStream_t stream);
+  // Writes the kept points of the cloud count() saw, with every field `out`
+  // has, into buffers of at least that many points.
+  // @return cudaErrorInvalidValue when `out` has a field that `in` has not.
+  cudaError_t write(const CloudFields& in, const CloudOutput& out, cudaStream_t stream);
 
  private:
   struct Impl;
@@ -109,8 +140,10 @@ inline constexpr std::int32_t kVoxelIndexRange = std::int32_t{1} << 20;
 
 // One point per occupied voxel of size `voxel_size`, the voxel of p being
 // floor(p / voxel_size) on each axis. Voxels come out in ascending order of
-// their (x, y, z) index, x slowest; colors are the voxel's mean color,
-// rounded, in both modes.
+// their (x, y, z) index, x slowest. In both modes the other fields are the
+// voxel's means: colors rounded to the nearest; normals over its points'
+// finite normals, normalized (NaN when they have none, or cancel out);
+// intensity over its points' finite intensities (NaN when none).
 class VoxelGrid {
  public:
   VoxelGrid();
@@ -122,10 +155,11 @@ class VoxelGrid {
   cudaError_t group(const float* xyz, std::uint32_t count, float voxel_size, cudaStream_t stream);
   // The number of voxels, in device memory, once group() has run.
   [[nodiscard]] const std::uint32_t* device_count() const noexcept;
-  // Writes one point (and color, when both are given) per voxel of the cloud
-  // group() saw, into buffers of at least that many points.
-  cudaError_t write(const float* xyz, const std::uint8_t* rgb, VoxelMode mode, float* out_xyz,
-                    std::uint8_t* out_rgb, cudaStream_t stream);
+  // Writes one point per voxel of the cloud group() saw, with every field
+  // `out` has, into buffers of at least that many points.
+  // @return cudaErrorInvalidValue when `out` has a field that `in` has not.
+  cudaError_t write(const CloudFields& in, VoxelMode mode, const CloudOutput& out,
+                    cudaStream_t stream);
 
  private:
   struct Impl;

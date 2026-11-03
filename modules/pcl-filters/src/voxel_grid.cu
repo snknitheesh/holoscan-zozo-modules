@@ -3,8 +3,9 @@
 //
 // The voxel grid: each point's voxel key, a stable radix sort of (key, index),
 // a scan of the voxel heads, and one thread per voxel that sums its points in
-// input order. Sums are in double and nothing contracts (--fmad=false), so a
-// host reference that sums in the same order gets the same bits.
+// input order, with its other fields. Sums are in double and nothing contracts
+// (--fmad=false), so a host reference that sums in the same order gets the
+// same bits.
 
 #include <cstddef>
 #include <cstdint>
@@ -60,14 +61,21 @@ __global__ void starts_kernel(const std::uint32_t* __restrict__ heads,
 
 __global__ void zero_kernel(std::uint32_t* value) { *value = 0U; }
 
-__global__ void voxel_write_kernel(const float* __restrict__ xyz,
-                                   const std::uint8_t* __restrict__ rgb,
-                                   const std::uint64_t* __restrict__ keys,
+// The mean of a voxel's finite normals, normalized; NaN when there is none or
+// they cancel out.
+__device__ void write_mean_normal(const double sum[3], std::uint32_t count, float* out) {
+  const double length = sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+  const bool usable = count != 0U && length > 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    out[axis] = usable ? static_cast<float>(sum[axis] / length) : detail::quiet_nan();
+  }
+}
+
+__global__ void voxel_write_kernel(CloudFields in, const std::uint64_t* __restrict__ keys,
                                    const std::uint32_t* __restrict__ indices,
                                    const std::uint32_t* __restrict__ starts,
                                    const std::uint32_t* __restrict__ total, std::uint32_t count,
-                                   VoxelMode mode, float* __restrict__ out_xyz,
-                                   std::uint8_t* __restrict__ out_rgb) {
+                                   VoxelMode mode, CloudOutput out) {
   const std::uint32_t voxel = blockIdx.x * blockDim.x + threadIdx.x;
   if (voxel >= *total) {
     return;
@@ -76,16 +84,33 @@ __global__ void voxel_write_kernel(const float* __restrict__ xyz,
   const std::uint64_t key = keys[start];
   double sum[3] = {0.0, 0.0, 0.0};
   std::uint32_t color[3] = {0U, 0U, 0U};
+  double normal[3] = {0.0, 0.0, 0.0};
+  std::uint32_t normals = 0;
+  double intensity = 0.0;
+  std::uint32_t intensities = 0;
   std::uint32_t points = 0;
   for (std::uint32_t j = start; j < count && keys[j] == key; ++j) {
     const std::uint32_t index = indices[j];
     for (int axis = 0; axis < 3; ++axis) {
-      sum[axis] += static_cast<double>(xyz[3 * index + axis]);
+      sum[axis] += static_cast<double>(in.xyz[3 * index + axis]);
     }
-    if (out_rgb != nullptr) {
+    if (out.rgb != nullptr) {
       for (int channel = 0; channel < 3; ++channel) {
-        color[channel] += rgb[3 * index + channel];
+        color[channel] += in.rgb[3 * index + channel];
       }
+    }
+    if (out.normals != nullptr) {
+      const float* n = in.normals + 3 * index;
+      if (detail::valid_point(n[0], n[1], n[2])) {
+        for (int axis = 0; axis < 3; ++axis) {
+          normal[axis] += static_cast<double>(n[axis]);
+        }
+        ++normals;
+      }
+    }
+    if (out.intensity != nullptr && isfinite(in.intensity[index])) {
+      intensity += static_cast<double>(in.intensity[index]);
+      ++intensities;
     }
     ++points;
   }
@@ -93,15 +118,23 @@ __global__ void voxel_write_kernel(const float* __restrict__ xyz,
   // its point with the lowest index.
   const std::uint32_t first = indices[start];
   for (int axis = 0; axis < 3; ++axis) {
-    out_xyz[3 * voxel + axis] = mode == VoxelMode::kCentroid
+    out.xyz[3 * voxel + axis] = mode == VoxelMode::kCentroid
                                     ? static_cast<float>(sum[axis] / static_cast<double>(points))
-                                    : xyz[3 * first + axis];
+                                    : in.xyz[3 * first + axis];
   }
-  if (out_rgb != nullptr) {
+  if (out.rgb != nullptr) {
     for (int channel = 0; channel < 3; ++channel) {
-      out_rgb[3 * voxel + channel] =
+      out.rgb[3 * voxel + channel] =
           static_cast<std::uint8_t>((color[channel] + points / 2U) / points);
     }
+  }
+  if (out.normals != nullptr) {
+    write_mean_normal(normal, normals, out.normals + 3 * voxel);
+  }
+  if (out.intensity != nullptr) {
+    out.intensity[voxel] = intensities == 0U
+                               ? detail::quiet_nan()
+                               : static_cast<float>(intensity / static_cast<double>(intensities));
   }
 }
 
@@ -176,10 +209,10 @@ const std::uint32_t* VoxelGrid::device_count() const noexcept {
   return impl_->total.as<std::uint32_t>();
 }
 
-cudaError_t VoxelGrid::write(const float* xyz, const std::uint8_t* rgb, VoxelMode mode,
-                             float* out_xyz, std::uint8_t* out_rgb, cudaStream_t stream) {
+cudaError_t VoxelGrid::write(const CloudFields& in, VoxelMode mode, const CloudOutput& out,
+                             cudaStream_t stream) {
   const Impl& s = *impl_;
-  if (out_rgb != nullptr && rgb == nullptr) {
+  if (!detail::fields_match(in, out)) {
     return cudaErrorInvalidValue;
   }
   if (s.count == 0U) {
@@ -188,8 +221,8 @@ cudaError_t VoxelGrid::write(const float* xyz, const std::uint8_t* rgb, VoxelMod
   // As many threads as points, the most voxels there can be; each reads the
   // actual count on the device.
   voxel_write_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(
-      xyz, rgb, s.sorted_keys.as<std::uint64_t>(), s.sorted_indices.as<std::uint32_t>(),
-      s.starts.as<std::uint32_t>(), s.total.as<std::uint32_t>(), s.count, mode, out_xyz, out_rgb);
+      in, s.sorted_keys.as<std::uint64_t>(), s.sorted_indices.as<std::uint32_t>(),
+      s.starts.as<std::uint32_t>(), s.total.as<std::uint32_t>(), s.count, mode, out);
   return cudaGetLastError();
 }
 

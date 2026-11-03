@@ -10,16 +10,8 @@
 #include <utility>
 
 namespace holoscan::pcl_filters {
-namespace {
-
-CloudSettings settings_of(const CropBoxConfig& config) {
-  return CloudSettings{
-      .color = config.color, .layout = config.layout, .max_points = config.max_points};
-}
-
-}  // namespace
-
 void validate_config(const CropBoxConfig& config) {
+  validate_settings(config.cloud);
   const CropBoxParams& box = config.box;
   for (int axis = 0; axis < 3; ++axis) {
     if (std::isnan(box.min[axis]) || std::isnan(box.max[axis]) || box.min[axis] > box.max[axis]) {
@@ -37,7 +29,7 @@ void validate_config(const CropBoxConfig& config) {
 }
 
 CropBoxOp::CropBoxOp(CropBoxConfig config)
-    : CloudFilterOp("CropBoxOp", settings_of(config)), config_(config) {
+    : CloudFilterOp("CropBoxOp", config.cloud), config_(config) {
   validate_config(config_);
 }
 
@@ -51,7 +43,7 @@ holoscan::expected<void, holoscan::Error> CropBoxOp::compute(holoscan::Execution
     return holoscan::make_unexpected(std::move(keep).error());
   }
   if (const cudaError_t status =
-          launch_crop_box(cloud->xyz, cloud->count, config_.box, *keep, cloud->stream);
+          launch_crop_box(cloud->fields.xyz, cloud->count, config_.box, *keep, cloud->stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("crop box kernel", status));
   }

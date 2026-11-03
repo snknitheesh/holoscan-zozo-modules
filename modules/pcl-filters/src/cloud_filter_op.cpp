@@ -5,20 +5,18 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
-#include <holoscan/core/tensor_contract.hpp>
+#include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
 #include "device_buffer.hpp"
@@ -27,28 +25,35 @@
 namespace holoscan::pcl_filters {
 namespace {
 
-using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
+using FieldSelector = holoscan::TensorFieldSelector<hm::schema::PointCloudT>;
 
-constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
-constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
+// The message's four tensors, in the order of CloudFields.
+constexpr std::size_t kPoints = 0;
+constexpr std::size_t kColors = 1;
+constexpr std::size_t kNormals = 2;
+constexpr std::size_t kIntensity = 3;
+constexpr std::size_t kFields = 4;
+struct FieldInfo {
+  FieldSelector selector;
+  const char* name;
+  std::size_t bytes_per_point;
+  std::size_t alignment;
+};
 
-// Device memory of any shape up to rank 3: organized and dense clouds alike.
-holoscan::TensorOutputSpec device_cloud(DLDataType dtype, std::uint64_t bytes) {
-  return holoscan::TensorOutputSpec{
-      .representation =
-          holoscan::TensorRepresentation{
-              .memory_kind = holoscan::MemoryKind::kCudaDevice,
-              .dtype = dtype,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-          },
-      .bounds = holoscan::TensorBounds{.max_rank = 3U, .max_byte_span = bytes},
-      .storage = holoscan::TensorOutputStorage::kRuntimePool,
-  };
+const FieldInfo& field_info(std::size_t field) {
+  static constexpr std::array<FieldInfo, kFields> kInfo{{
+      {hm::PointCloudFields::points, "points", 3U * sizeof(float), sizeof(float)},
+      {hm::PointCloudFields::colors, "colors", 3U, 1U},
+      {hm::PointCloudFields::normals, "normals", 3U * sizeof(float), sizeof(float)},
+      {hm::PointCloudFields::intensity, "intensity", sizeof(float), sizeof(float)},
+  }};
+  return kInfo[field];
 }
 
-bool is_dtype(const DLDataType& dtype, const DLDataType& expected) {
-  return dtype.code == expected.code && dtype.bits == expected.bits &&
-         dtype.lanes == expected.lanes;
+std::array<const std::shared_ptr<holoscan::Tensor>*, kFields> tensors_of(
+    const hm::schema::PointCloudT& message) {
+  return {&message.points, &message.colors, &message.normals, &message.intensity};
 }
 
 bool on_gpu(const holoscan::Tensor& tensor) {
@@ -95,29 +100,79 @@ holoscan::expected<void, holoscan::Error> wait_for_host(const holoscan::Tensor& 
   return tensor.synchronize_for_host();
 }
 
+// N, or H * W, saturating rather than wrapping, so that a huge shape cannot
+// pass for a small one. The shape is a checked cloud's points: [N, 3] or
+// [H, W, 3].
+std::uint64_t point_count(std::span<const std::int64_t> shape) {
+  std::uint64_t count = 1;
+  for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) {
+    const auto extent = static_cast<std::uint64_t>(shape[axis]);
+    count = extent != 0 && count > std::numeric_limits<std::uint64_t>::max() / extent
+                ? std::numeric_limits<std::uint64_t>::max()
+                : count * extent;
+  }
+  return count;
+}
+
+// Whether a cloud with `contents` has `field`; every cloud has points.
+bool has_field(const hm::PointCloudContents& contents, std::size_t field) {
+  switch (field) {
+    case kColors:
+      return contents.colors;
+    case kNormals:
+      return contents.normals;
+    case kIntensity:
+      return contents.intensity;
+    default:
+      return true;
+  }
+}
+
+// Opens the device writes of `fields` one inside the other, keeping each
+// one's address in `data`, and runs `fill` with all of them open: one kernel
+// writes every field before any is committed.
+template <typename Fill>
+holoscan::expected<void, holoscan::Error> write_fields(hm::PointCloudLoan& loan,
+                                                       std::span<const std::size_t> fields,
+                                                       cudaStream_t stream,
+                                                       std::array<void*, kFields>& data,
+                                                       const Fill& fill) {
+  if (fields.empty()) {
+    return fill();
+  }
+  const std::size_t field = fields.front();
+  return loan.write_and_commit(field_info(field).selector, ::cuda::stream_ref{stream},
+                               [&](const holoscan::TensorOutputWriteGuard& guard)
+                                   -> holoscan::expected<void, holoscan::Error> {
+                                 data[field] = guard.data();
+                                 return write_fields(loan, fields.subspan(1), stream, data, fill);
+                               });
+}
+
 }  // namespace
 
 void validate_settings(const CloudSettings& settings) {
   if (settings.max_points < 1U || settings.max_points > kMaxPointsLimit) {
     throw std::invalid_argument("max_points must be 1.." + std::to_string(kMaxPointsLimit));
   }
-  if (settings.layout != OutputLayout::kKeep && settings.layout != OutputLayout::kDense) {
-    throw std::invalid_argument("layout must be kKeep or kDense");
+  if (settings.layout != OutputLayout::kKeep && settings.layout != OutputLayout::kDense &&
+      settings.layout != OutputLayout::kPadded) {
+    throw std::invalid_argument("layout must be kKeep, kDense or kPadded");
   }
 }
 
 struct CloudFilterOp::Impl {
-  detail::DeviceBuffer points_staging;
-  detail::DeviceBuffer colors_staging;
+  std::array<detail::DeviceBuffer, kFields> staging;
   detail::DeviceBuffer keep;
   Compactor compactor;
   std::uint32_t* host_count{};  // Pinned.
 
-  ~Impl() { release(); }
-  void release() noexcept {
+  Impl() = default;
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+  ~Impl() {
     if (host_count != nullptr) {
       cudaFreeHost(host_count);
-      host_count = nullptr;
     }
   }
 };
@@ -150,33 +205,20 @@ holoscan::Error CloudFilterOp::cuda_failure(const char* what, cudaError_t status
 }
 
 void CloudFilterOp::setup(holoscan::OperatorSpec& spec) {
-  const std::uint64_t points_max = settings_.max_points;
-  // Two slots per input: one cloud in compute() while the next one arrives.
-  spec.input(points, "points").queue_depth(2U);
-  // Optional ports exist only when configured: an unconnected input would
-  // never be satisfied, and an emit into an unconnected output fails.
-  if (settings_.color) {
-    spec.input(colors, "colors").queue_depth(2U);
-  }
-  spec.output(filtered_points, "filtered_points")
-      .produces_tensor(device_cloud(kFloat32, points_max * 3U * sizeof(float)));
-  if (settings_.color) {
-    spec.output(filtered_colors, "filtered_colors")
-        .produces_tensor(device_cloud(kUInt8, points_max * 3U));
-  }
+  // Two slots: one cloud in compute() while the next one arrives.
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
+  hm::declare_point_cloud_output(spec, filtered_point_cloud, "filtered_point_cloud",
+                                 hm::PointCloudOutputSpec{
+                                     .max_points = settings_.max_points,
+                                     .colors = settings_.fields.colors,
+                                     .normals = settings_.fields.normals,
+                                     .intensity = settings_.fields.intensity,
+                                 });
 }
 
 holoscan::Contract CloudFilterOp::contract() const {
   holoscan::Contract result;
-  if (!settings_.color) {
-    result.trigger(holoscan::OnEach{points});
-    return result;
-  }
-  // A cloud and its colors carry the same capture time.
-  result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, colors}}, .window = 0ns});
-  result.input(points, holoscan::Exact{});
-  result.input(colors, holoscan::Exact{});
+  result.trigger(holoscan::OnEach{point_cloud});
   return result;
 }
 
@@ -188,11 +230,11 @@ void CloudFilterOp::stop() {
 
 holoscan::expected<CloudFilterOp::Cloud, holoscan::Error> CloudFilterOp::receive(
     holoscan::ExecutionContext& context) {
-  auto points_sample = points.receive();
-  if (!points_sample) {
-    return holoscan::make_unexpected(std::move(points_sample).error());
+  auto sample = point_cloud.receive();
+  if (!sample) {
+    return holoscan::make_unexpected(std::move(sample).error());
   }
-  Cloud cloud{std::move(*points_sample)};
+  Cloud cloud{std::move(*sample)};
   // The runtime assigns a stream to an operator with device outputs, and
   // writes their loans on that stream only.
   cloud.stream = context.cuda_stream().get();
@@ -207,104 +249,94 @@ holoscan::expected<CloudFilterOp::Cloud, holoscan::Error> CloudFilterOp::receive
     return holoscan::make_unexpected(cuda_failure("cudaStreamGetDevice", status));
   }
 
-  const holoscan::Tensor& tensor = cloud.points.data;
-  const std::span<const std::int64_t> shape = tensor.shape_span();
-  if (!is_dtype(tensor.dtype(), kFloat32) || (shape.size() != 2 && shape.size() != 3) ||
-      shape.back() != 3) {
-    return holoscan::make_unexpected(invalid("points must be float32 [N, 3] or [H, W, 3]"));
+  const hm::schema::PointCloudT& message = cloud.sample.data;
+  if (auto checked = hm::check_point_cloud(message); !checked) {
+    return holoscan::make_unexpected(invalid(checked.error().message));
   }
-  std::uint64_t count = 1;
-  for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) {
-    if (shape[axis] < 0) {
-      return holoscan::make_unexpected(invalid("points have a negative extent"));
-    }
-    // Saturates instead of wrapping, so that a huge shape cannot pass for a small one.
-    const auto extent = static_cast<std::uint64_t>(shape[axis]);
-    count = extent != 0 && count > std::numeric_limits<std::uint64_t>::max() / extent
-                ? std::numeric_limits<std::uint64_t>::max()
-                : count * extent;
-  }
+  const std::span<const std::int64_t> shape = message.points->shape_span();
+  const std::uint64_t count = point_count(shape);
   if (count > settings_.max_points) {
     return holoscan::make_unexpected(invalid(std::to_string(count) +
                                              " points exceed the configured maximum of " +
                                              std::to_string(settings_.max_points)));
   }
   cloud.count = static_cast<std::uint32_t>(count);
-  if (!packed(tensor)) {
-    return holoscan::make_unexpected(invalid("points must be packed"));
-  }
-  if (!aligned(tensor, sizeof(float))) {
-    return holoscan::make_unexpected(invalid("point data must be aligned to 4 bytes"));
-  }
-  if (!on_device_of(tensor, device)) {
-    return holoscan::make_unexpected(invalid("points are on another GPU than the operator"));
-  }
-  if (auto ready = wait_for_host(tensor); !ready) {
-    return holoscan::make_unexpected(std::move(ready).error());
-  }
+  cloud.shape =
+      message.organized ? hm::organized_cloud(shape[0], shape[1]) : hm::unorganized_cloud(shape[0]);
 
-  if (settings_.color) {
-    auto colors_sample = colors.receive();
-    if (!colors_sample) {
-      return holoscan::make_unexpected(std::move(colors_sample).error());
+  // Checks every field the cloud carries, then copies the host ones to the
+  // GPU through staging buffers. The runtime orders the release of device,
+  // managed and stream-ready pinned inputs after this operator's stream, but
+  // may reuse pinned memory of its own pools once compute() returns, which
+  // is held here until the copies are done. Pageable memory needs nothing:
+  // cudaMemcpyAsync has staged it by the time it returns.
+  const auto tensors = tensors_of(message);
+  std::array<const void*, kFields> data{};
+  std::array<const holoscan::Tensor*, kFields> pinned{};
+  std::size_t pinned_count = 0;
+  cloud.contents = hm::PointCloudContents{
+      .colors = hm::is_present(message.colors),
+      .normals = hm::is_present(message.normals),
+      .intensity = hm::is_present(message.intensity),
+  };
+  for (std::size_t field = 0; field < kFields; ++field) {
+    if (!has_field(cloud.contents, field)) {
+      continue;
     }
-    cloud.colors.emplace(std::move(*colors_sample));
-    const holoscan::Tensor& rgb = cloud.colors->data;
-    const std::span<const std::int64_t> rgb_shape = rgb.shape_span();
-    if (!is_dtype(rgb.dtype(), kUInt8) ||
-        !std::equal(rgb_shape.begin(), rgb_shape.end(), shape.begin(), shape.end())) {
-      return holoscan::make_unexpected(invalid("colors must be uint8 RGB of the points' shape"));
+    const holoscan::Tensor& tensor = **tensors[field];
+    const FieldInfo& info = field_info(field);
+    const std::string name = info.name;
+    if (!has_field(settings_.fields, field)) {
+      return holoscan::make_unexpected(invalid("the cloud has " + name +
+                                               ", which the output has no room for (fields." +
+                                               name + " is off)"));
     }
-    if (!packed(rgb)) {
-      return holoscan::make_unexpected(invalid("colors must be packed"));
+    if (!packed(tensor)) {
+      return holoscan::make_unexpected(invalid(name + " must be packed"));
     }
-    if (!on_device_of(rgb, device)) {
-      return holoscan::make_unexpected(invalid("colors are on another GPU than the operator"));
+    if (!aligned(tensor, info.alignment)) {
+      return holoscan::make_unexpected(
+          invalid(name + " must be aligned to " + std::to_string(info.alignment) + " bytes"));
     }
-    if (auto ready = wait_for_host(rgb); !ready) {
+    if (!on_device_of(tensor, device)) {
+      return holoscan::make_unexpected(
+          invalid("the " + name + " tensor is on another GPU than the operator"));
+    }
+    if (auto ready = wait_for_host(tensor); !ready) {
       return holoscan::make_unexpected(std::move(ready).error());
     }
-  }
-
-  // Host input goes to the GPU through staging buffers. The runtime orders
-  // the release of device, managed and stream-ready pinned inputs after this
-  // operator's stream, but not of host-written pinned memory, which is held
-  // here until the copy is done. Pageable memory needs nothing:
-  // cudaMemcpyAsync has staged it by the time it returns.
-  const auto on_device =
-      [&](const holoscan::Tensor& input, std::size_t bytes,
-          detail::DeviceBuffer& staging) -> holoscan::expected<const void*, holoscan::Error> {
-    if (on_gpu(input) || bytes == 0U) {
-      return input.data();
+    const std::size_t bytes = std::size_t{cloud.count} * info.bytes_per_point;
+    if (on_gpu(tensor) || bytes == 0U) {
+      data[field] = tensor.data();
+      continue;
     }
+    detail::DeviceBuffer& staging = impl_->staging[field];
     if (const cudaError_t status = staging.reserve(bytes, cloud.stream); status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
     }
-    if (const cudaError_t status = cudaMemcpyAsync(staging.as<void>(), input.data(), bytes,
+    if (const cudaError_t status = cudaMemcpyAsync(staging.as<void>(), tensor.data(), bytes,
                                                    cudaMemcpyHostToDevice, cloud.stream);
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
     }
-    if (input.device().device_type == kDLCUDAHost) {
-      if (auto held = detail::hold_until_done(input, cloud.stream, name_); !held) {
-        return holoscan::make_unexpected(std::move(held).error());
-      }
+    if (tensor.device().device_type == kDLCUDAHost) {
+      pinned[pinned_count++] = &tensor;
     }
-    return static_cast<const void*>(staging.as<void>());
+    data[field] = staging.as<void>();
+  }
+  if (pinned_count != 0U) {
+    if (auto held =
+            detail::hold_until_done(std::span(pinned.data(), pinned_count), cloud.stream, name_);
+        !held) {
+      return holoscan::make_unexpected(std::move(held).error());
+    }
+  }
+  cloud.fields = CloudFields{
+      .xyz = static_cast<const float*>(data[kPoints]),
+      .rgb = static_cast<const std::uint8_t*>(data[kColors]),
+      .normals = static_cast<const float*>(data[kNormals]),
+      .intensity = static_cast<const float*>(data[kIntensity]),
   };
-  auto xyz =
-      on_device(tensor, std::size_t{cloud.count} * 3U * sizeof(float), impl_->points_staging);
-  if (!xyz) {
-    return holoscan::make_unexpected(std::move(xyz).error());
-  }
-  cloud.xyz = static_cast<const float*>(*xyz);
-  if (cloud.colors) {
-    auto rgb = on_device(cloud.colors->data, std::size_t{cloud.count} * 3U, impl_->colors_staging);
-    if (!rgb) {
-      return holoscan::make_unexpected(std::move(rgb).error());
-    }
-    cloud.rgb = static_cast<const std::uint8_t*>(*rgb);
-  }
   return cloud;
 }
 
@@ -319,68 +351,32 @@ holoscan::expected<std::uint8_t*, holoscan::Error> CloudFilterOp::mask(const Clo
 
 holoscan::expected<void, holoscan::Error> CloudFilterOp::emit_kept(const Cloud& cloud,
                                                                    const std::uint8_t* keep) {
-  if (settings_.layout == OutputLayout::kDense) {
-    if (const cudaError_t status = impl_->compactor.count(keep, cloud.count, cloud.stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("compaction", status));
-    }
-    return emit_dense(cloud, impl_->compactor.device_count(),
-                      [this, &cloud](float* xyz, std::uint8_t* rgb) {
-                        return impl_->compactor.write(cloud.xyz, cloud.rgb, xyz, rgb, cloud.stream);
-                      });
+  if (settings_.layout == OutputLayout::kKeep) {
+    return emit_cloud(cloud, cloud.shape, -1, [&](const CloudOutput& out) {
+      return apply_mask(cloud.fields, keep, cloud.count, out, cloud.stream);
+    });
   }
-  const std::span<const std::int64_t> shape = cloud.points.data.shape_span();
-  const std::vector<std::int64_t> out_shape(shape.begin(), shape.end());
-  auto points_loan = filtered_points.allocate_tensor(
-      holoscan::TensorLoanRequest{.shape = out_shape, .dtype = kFloat32});
-  if (!points_loan) {
-    return holoscan::make_unexpected(std::move(points_loan).error());
-  }
-  auto points_writer = points_loan->write(cloud.stream);
-  if (!points_writer) {
-    return holoscan::make_unexpected(std::move(points_writer).error());
-  }
-  std::optional<holoscan::TensorOutputLoan> colors_loan;
-  std::optional<holoscan::TensorOutputWriteGuard> colors_writer;
-  if (settings_.color) {
-    auto loan = filtered_colors.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = out_shape, .dtype = kUInt8});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    colors_loan.emplace(std::move(*loan));
-    auto writer = colors_loan->write(cloud.stream);
-    if (!writer) {
-      return holoscan::make_unexpected(std::move(writer).error());
-    }
-    colors_writer.emplace(std::move(*writer));
-  }
-  if (const cudaError_t status = apply_mask(
-          cloud.xyz, cloud.rgb, keep, cloud.count, points_writer->data_as<float>(),
-          colors_writer ? colors_writer->data_as<std::uint8_t>() : nullptr, cloud.stream);
+  if (const cudaError_t status = impl_->compactor.count(keep, cloud.count, cloud.stream);
       status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("apply_mask", status));
+    return holoscan::make_unexpected(cuda_failure("compaction", status));
   }
-  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(cloud.points);
-  if (auto committed = std::move(*points_writer).commit(); !committed) {
-    return holoscan::make_unexpected(std::move(committed).error());
-  }
-  if (auto sent = filtered_points.emit(std::move(*points_loan), emit); !sent) {
-    return emit_failure("filtered_points", std::move(sent).error());
-  }
-  if (settings_.color) {
-    if (auto committed = std::move(*colors_writer).commit(); !committed) {
-      return holoscan::make_unexpected(std::move(committed).error());
-    }
-    if (auto sent = filtered_colors.emit(std::move(*colors_loan), emit); !sent) {
-      return emit_failure("filtered_colors", std::move(sent).error());
-    }
-  }
-  return {};
+  return emit_packed(cloud, impl_->compactor.device_count(), [&](const CloudOutput& out) {
+    return impl_->compactor.write(cloud.fields, out, cloud.stream);
+  });
 }
 
-holoscan::expected<void, holoscan::Error> CloudFilterOp::emit_dense(
-    const Cloud& cloud, const std::uint32_t* device_count, const DenseWriter& write) {
+holoscan::expected<void, holoscan::Error> CloudFilterOp::emit_packed(
+    const Cloud& cloud, const std::uint32_t* device_count, const PackedWriter& write) {
+  if (settings_.layout == OutputLayout::kPadded) {
+    return emit_cloud(cloud, hm::unorganized_cloud(cloud.count), -1, [&](const CloudOutput& out) {
+      if (cloud.count == 0U) {
+        return cudaSuccess;
+      }
+      const cudaError_t status = write(out);
+      return status != cudaSuccess ? status
+                                   : pad_cloud(out, device_count, cloud.count, cloud.stream);
+    });
+  }
   if (impl_->host_count == nullptr) {
     if (const cudaError_t status =
             cudaMallocHost(reinterpret_cast<void**>(&impl_->host_count), sizeof(std::uint32_t));
@@ -404,53 +400,50 @@ holoscan::expected<void, holoscan::Error> CloudFilterOp::emit_dense(
     return holoscan::make_unexpected(holoscan::Error{
         holoscan::ErrorCode::kFailure, name_ + ": the filter counted more points than it got"});
   }
-  const std::array<std::int64_t, 2> out_shape{kept, 3};
-  auto points_loan = filtered_points.allocate_tensor(
-      holoscan::TensorLoanRequest{.shape = out_shape, .dtype = kFloat32});
-  if (!points_loan) {
-    return holoscan::make_unexpected(std::move(points_loan).error());
+  // Every point a filter keeps, and every voxel, is valid.
+  return emit_cloud(cloud, hm::unorganized_cloud(kept), kept,
+                    [&](const CloudOutput& out) { return kept == 0U ? cudaSuccess : write(out); });
+}
+
+holoscan::expected<void, holoscan::Error> CloudFilterOp::emit_cloud(
+    const Cloud& cloud, const hm::PointCloudShape& shape, std::int64_t valid_count,
+    const PackedWriter& write) {
+  auto loan = hm::allocate_point_cloud(filtered_point_cloud, shape, cloud.contents,
+                                       ::cuda::stream_ref{cloud.stream});
+  if (!loan) {
+    return holoscan::make_unexpected(std::move(loan).error());
   }
-  auto points_writer = points_loan->write(cloud.stream);
-  if (!points_writer) {
-    return holoscan::make_unexpected(std::move(points_writer).error());
-  }
-  std::optional<holoscan::TensorOutputLoan> colors_loan;
-  std::optional<holoscan::TensorOutputWriteGuard> colors_writer;
-  if (settings_.color) {
-    auto loan = filtered_colors.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = out_shape, .dtype = kUInt8});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    colors_loan.emplace(std::move(*loan));
-    auto writer = colors_loan->write(cloud.stream);
-    if (!writer) {
-      return holoscan::make_unexpected(std::move(writer).error());
-    }
-    colors_writer.emplace(std::move(*writer));
-  }
-  if (kept != 0U) {
-    if (const cudaError_t status =
-            write(points_writer->data_as<float>(),
-                  colors_writer ? colors_writer->data_as<std::uint8_t>() : nullptr);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("filter kernels", status));
+  std::array<std::size_t, kFields> fields{};
+  std::size_t field_count = 0;
+  for (std::size_t field = 0; field < kFields; ++field) {
+    if (has_field(cloud.contents, field)) {
+      fields[field_count++] = field;
     }
   }
-  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(cloud.points);
-  if (auto committed = std::move(*points_writer).commit(); !committed) {
-    return holoscan::make_unexpected(std::move(committed).error());
+  std::array<void*, kFields> data{};
+  auto written =
+      write_fields(*loan, std::span(fields.data(), field_count), cloud.stream, data,
+                   [&]() -> holoscan::expected<void, holoscan::Error> {
+                     const CloudOutput out{
+                         .xyz = static_cast<float*>(data[kPoints]),
+                         .rgb = static_cast<std::uint8_t*>(data[kColors]),
+                         .normals = static_cast<float*>(data[kNormals]),
+                         .intensity = static_cast<float*>(data[kIntensity]),
+                     };
+                     if (const cudaError_t status = write(out); status != cudaSuccess) {
+                       return holoscan::make_unexpected(cuda_failure("filter kernels", status));
+                     }
+                     return {};
+                   });
+  if (!written) {
+    return holoscan::make_unexpected(std::move(written).error());
   }
-  if (auto sent = filtered_points.emit(std::move(*points_loan), emit); !sent) {
-    return emit_failure("filtered_points", std::move(sent).error());
-  }
-  if (settings_.color) {
-    if (auto committed = std::move(*colors_writer).commit(); !committed) {
-      return holoscan::make_unexpected(std::move(committed).error());
-    }
-    if (auto sent = filtered_colors.emit(std::move(*colors_loan), emit); !sent) {
-      return emit_failure("filtered_colors", std::move(sent).error());
-    }
+  const hm::schema::PointCloudT& message = cloud.sample.data;
+  const hm::Header header = message.header ? hm::from_message(*message.header) : hm::Header{};
+  if (auto sent = hm::emit_point_cloud(filtered_point_cloud, std::move(*loan), header, shape,
+                                       valid_count, holoscan::sensor_io::derive_from(cloud.sample));
+      !sent) {
+    return emit_failure("filtered_point_cloud", std::move(sent).error());
   }
   return {};
 }

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Keep masks to clouds: organized, removed points NaN, or packed.
+// Keep masks to clouds: the input's size, removed points NaN, or packed; and
+// the padding after a packed cloud.
 
 #include <cstddef>
 #include <cstdint>
@@ -19,23 +20,16 @@ namespace {
 using detail::blocks_for;
 using detail::kBlock;
 
-__global__ void apply_mask_kernel(const float* __restrict__ xyz,
-                                  const std::uint8_t* __restrict__ rgb,
-                                  const std::uint8_t* __restrict__ keep, std::uint32_t count,
-                                  float* __restrict__ out_xyz, std::uint8_t* __restrict__ out_rgb) {
+__global__ void apply_mask_kernel(CloudFields in, const std::uint8_t* __restrict__ keep,
+                                  std::uint32_t count, CloudOutput out) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) {
     return;
   }
-  const bool kept = keep[i] != 0U;
-  const float nan = __int_as_float(0x7FC00000);
-  for (int axis = 0; axis < 3; ++axis) {
-    out_xyz[3 * i + axis] = kept ? xyz[3 * i + axis] : nan;
-  }
-  if (out_rgb != nullptr) {
-    for (int channel = 0; channel < 3; ++channel) {
-      out_rgb[3 * i + channel] = kept ? rgb[3 * i + channel] : std::uint8_t{0};
-    }
+  if (keep[i] != 0U) {
+    detail::copy_point(in, i, out, i);
+  } else {
+    detail::remove_point(out, i);
   }
 }
 
@@ -54,38 +48,46 @@ __global__ void total_kernel(const std::uint32_t* __restrict__ flags,
   *total = count == 0U ? 0U : offsets[count - 1U] + flags[count - 1U];
 }
 
-__global__ void scatter_kernel(const float* __restrict__ xyz, const std::uint8_t* __restrict__ rgb,
-                               const std::uint32_t* __restrict__ flags,
+__global__ void scatter_kernel(CloudFields in, const std::uint32_t* __restrict__ flags,
                                const std::uint32_t* __restrict__ offsets, std::uint32_t count,
-                               float* __restrict__ out_xyz, std::uint8_t* __restrict__ out_rgb) {
+                               CloudOutput out) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count || flags[i] == 0U) {
-    return;
+  if (i < count && flags[i] != 0U) {
+    detail::copy_point(in, i, out, offsets[i]);
   }
-  const std::uint32_t o = offsets[i];
-  for (int axis = 0; axis < 3; ++axis) {
-    out_xyz[3 * o + axis] = xyz[3 * i + axis];
-  }
-  if (out_rgb != nullptr) {
-    for (int channel = 0; channel < 3; ++channel) {
-      out_rgb[3 * o + channel] = rgb[3 * i + channel];
-    }
+}
+
+__global__ void pad_kernel(CloudOutput out, const std::uint32_t* __restrict__ device_count,
+                           std::uint32_t capacity) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < capacity && i >= *device_count) {
+    detail::remove_point(out, i);
   }
 }
 
 }  // namespace
 
-cudaError_t apply_mask(const float* xyz, const std::uint8_t* rgb, const std::uint8_t* keep,
-                       std::uint32_t count, float* out_xyz, std::uint8_t* out_rgb,
-                       cudaStream_t stream) {
+cudaError_t pad_cloud(const CloudOutput& out, const std::uint32_t* device_count,
+                      std::uint32_t capacity, cudaStream_t stream) {
+  if (capacity == 0U) {
+    return cudaSuccess;
+  }
+  if (out.xyz == nullptr || device_count == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  pad_kernel<<<blocks_for(capacity), kBlock, 0, stream>>>(out, device_count, capacity);
+  return cudaGetLastError();
+}
+
+cudaError_t apply_mask(const CloudFields& in, const std::uint8_t* keep, std::uint32_t count,
+                       const CloudOutput& out, cudaStream_t stream) {
   if (count == 0U) {
     return cudaSuccess;
   }
-  if (out_rgb != nullptr && rgb == nullptr) {
+  if (!detail::fields_match(in, out)) {
     return cudaErrorInvalidValue;
   }
-  apply_mask_kernel<<<blocks_for(count), kBlock, 0, stream>>>(xyz, rgb, keep, count, out_xyz,
-                                                              out_rgb);
+  apply_mask_kernel<<<blocks_for(count), kBlock, 0, stream>>>(in, keep, count, out);
   return cudaGetLastError();
 }
 
@@ -131,18 +133,16 @@ const std::uint32_t* Compactor::device_count() const noexcept {
   return impl_->total.as<std::uint32_t>();
 }
 
-cudaError_t Compactor::write(const float* xyz, const std::uint8_t* rgb, float* out_xyz,
-                             std::uint8_t* out_rgb, cudaStream_t stream) {
+cudaError_t Compactor::write(const CloudFields& in, const CloudOutput& out, cudaStream_t stream) {
   const Impl& s = *impl_;
   if (s.count == 0U) {
     return cudaSuccess;
   }
-  if (out_rgb != nullptr && rgb == nullptr) {
+  if (!detail::fields_match(in, out)) {
     return cudaErrorInvalidValue;
   }
-  scatter_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(xyz, rgb, s.flags.as<std::uint32_t>(),
-                                                             s.offsets.as<std::uint32_t>(), s.count,
-                                                             out_xyz, out_rgb);
+  scatter_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(
+      in, s.flags.as<std::uint32_t>(), s.offsets.as<std::uint32_t>(), s.count, out);
   return cudaGetLastError();
 }
 

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Times each filter on organized clouds of the synthetic scene, as its
-// operator runs it: the filter, then the organized output (apply_mask) or the
-// dense one (count, wait for it, pack). Prints a Markdown table of the mean
+// operator runs it: the filter, then the output in each layout: kKeep
+// (apply_mask), kDense (count, wait for it, pack) or kPadded (count, pack,
+// pad, no wait). Prints a Markdown table of the mean
 // and the 95th percentile over the iterations, in milliseconds of GPU time
 // on one stream, waits included.
 //
@@ -93,17 +94,25 @@ void run(int width, int height, int iterations) {
   check(cudaMalloc(&plane, 16), "cudaMalloc");
   check(cudaMallocHost(&count, 4), "cudaMallocHost");
   check(pf::render_synthetic_scene(scene, nullptr, rgb, xyz, stream), "render");
+  const pf::CloudFields in{.xyz = xyz, .rgb = rgb};
+  const pf::CloudOutput out{.xyz = out_xyz, .rgb = out_rgb};
 
   pf::Compactor compactor;
-  const auto organized = [&] {
-    check(pf::apply_mask(xyz, rgb, keep, n, out_xyz, out_rgb, stream), "apply_mask");
+  const auto organized = [&] { check(pf::apply_mask(in, keep, n, out, stream), "apply_mask"); };
+  const auto wait_for = [&](const std::uint32_t* device_count) {
+    check(cudaMemcpyAsync(count, device_count, 4, cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpyAsync");
+    check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   };
   const auto dense = [&] {
     check(compactor.count(keep, n, stream), "count");
-    check(cudaMemcpyAsync(count, compactor.device_count(), 4, cudaMemcpyDeviceToHost, stream),
-          "cudaMemcpyAsync");
-    check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    check(compactor.write(xyz, rgb, out_xyz, out_rgb, stream), "write");
+    wait_for(compactor.device_count());
+    check(compactor.write(in, out, stream), "write");
+  };
+  const auto padded = [&] {
+    check(compactor.count(keep, n, stream), "count");
+    check(compactor.write(in, out, stream), "write");
+    check(pf::pad_cloud(out, compactor.device_count(), n, stream), "pad");
   };
 
   pf::CropBoxParams box;
@@ -138,21 +147,28 @@ void run(int width, int height, int iterations) {
          check(pf::launch_crop_box(xyz, n, box, keep, stream), "crop");
          dense();
        }},
-      {"VoxelDownsampleOp (2 cm)",
+      {"CropBoxOp (padded)",
+       [&] {
+         check(pf::launch_crop_box(xyz, n, box, keep, stream), "crop");
+         padded();
+       }},
+      {"VoxelDownsampleOp (2 cm, dense)",
        [&] {
          check(grid.group(xyz, n, 0.02F, stream), "group");
-         check(cudaMemcpyAsync(count, grid.device_count(), 4, cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync");
-         check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-         check(grid.write(xyz, rgb, pf::VoxelMode::kCentroid, out_xyz, out_rgb, stream), "write");
+         wait_for(grid.device_count());
+         check(grid.write(in, pf::VoxelMode::kCentroid, out, stream), "write");
        }},
-      {"VoxelDownsampleOp (5 cm)",
+      {"VoxelDownsampleOp (2 cm, padded)",
+       [&] {
+         check(grid.group(xyz, n, 0.02F, stream), "group");
+         check(grid.write(in, pf::VoxelMode::kCentroid, out, stream), "write");
+         check(pf::pad_cloud(out, grid.device_count(), n, stream), "pad");
+       }},
+      {"VoxelDownsampleOp (5 cm, dense)",
        [&] {
          check(grid.group(xyz, n, 0.05F, stream), "group");
-         check(cudaMemcpyAsync(count, grid.device_count(), 4, cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync");
-         check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-         check(grid.write(xyz, rgb, pf::VoxelMode::kCentroid, out_xyz, out_rgb, stream), "write");
+         wait_for(grid.device_count());
+         check(grid.write(in, pf::VoxelMode::kCentroid, out, stream), "write");
        }},
       {"GroundRemovalOp (RANSAC, 256 iterations)",
        [&] {

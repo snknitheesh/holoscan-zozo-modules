@@ -10,16 +10,8 @@
 #include <utility>
 
 namespace holoscan::pcl_filters {
-namespace {
-
-CloudSettings settings_of(const OutlierRemovalConfig& config) {
-  return CloudSettings{
-      .color = config.color, .layout = config.layout, .max_points = config.max_points};
-}
-
-}  // namespace
-
 void validate_config(const OutlierRemovalConfig& config) {
+  validate_settings(config.cloud);
   const OutlierParams& p = config.outliers;
   if (p.mode == OutlierMode::kStatistical) {
     if (p.k < 1U || p.k > kMaxNeighbors) {
@@ -41,7 +33,7 @@ void validate_config(const OutlierRemovalConfig& config) {
 }
 
 OutlierRemovalOp::OutlierRemovalOp(OutlierRemovalConfig config)
-    : CloudFilterOp("OutlierRemovalOp", settings_of(config)),
+    : CloudFilterOp("OutlierRemovalOp", config.cloud),
       config_(config),
       filter_(std::make_unique<OutlierFilter>()) {
   validate_config(config_);
@@ -65,7 +57,7 @@ holoscan::expected<void, holoscan::Error> OutlierRemovalOp::compute(
     return holoscan::make_unexpected(std::move(keep).error());
   }
   if (const cudaError_t status =
-          filter_->filter(cloud->xyz, cloud->count, config_.outliers, *keep, cloud->stream);
+          filter_->filter(cloud->fields.xyz, cloud->count, config_.outliers, *keep, cloud->stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("outlier kernels", status));
   }

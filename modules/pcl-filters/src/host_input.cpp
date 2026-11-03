@@ -7,14 +7,17 @@
 
 namespace holoscan::pcl_filters::detail {
 
-holoscan::expected<void, holoscan::Error> hold_until_done(const holoscan::Tensor& tensor,
-                                                          cudaStream_t stream,
-                                                          std::string_view op) {
-  holoscan::Tensor handle = tensor;
-  if (handle.set_deallocation_stream(stream)) {
+holoscan::expected<void, holoscan::Error> hold_until_done(
+    std::span<const holoscan::Tensor* const> tensors, cudaStream_t stream, std::string_view op) {
+  bool held = true;
+  for (const holoscan::Tensor* tensor : tensors) {
+    holoscan::Tensor handle = *tensor;
+    held = handle.set_deallocation_stream(stream) && held;
+  }
+  if (held) {
     return {};
   }
-  // The memory cannot wait for the stream, so wait here.
+  // Some memory cannot wait for the stream, so wait here.
   if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
     return holoscan::make_unexpected(holoscan::Error{
         holoscan::ErrorCode::kFailure,

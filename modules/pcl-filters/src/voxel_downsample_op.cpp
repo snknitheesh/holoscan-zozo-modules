@@ -9,16 +9,11 @@
 #include <utility>
 
 namespace holoscan::pcl_filters {
-namespace {
-
-CloudSettings settings_of(const VoxelDownsampleConfig& config) {
-  return CloudSettings{
-      .color = config.color, .layout = OutputLayout::kDense, .max_points = config.max_points};
-}
-
-}  // namespace
-
 void validate_config(const VoxelDownsampleConfig& config) {
+  validate_settings(config.cloud);
+  if (config.cloud.layout == OutputLayout::kKeep) {
+    throw std::invalid_argument("layout must be kDense or kPadded: a voxel has no input position");
+  }
   if (!(config.voxel_size > 0.0F) || !std::isfinite(config.voxel_size)) {
     throw std::invalid_argument("voxel_size must be finite and positive");
   }
@@ -28,7 +23,7 @@ void validate_config(const VoxelDownsampleConfig& config) {
 }
 
 VoxelDownsampleOp::VoxelDownsampleOp(VoxelDownsampleConfig config)
-    : CloudFilterOp("VoxelDownsampleOp", settings_of(config)),
+    : CloudFilterOp("VoxelDownsampleOp", config.cloud),
       config_(config),
       grid_(std::make_unique<VoxelGrid>()) {
   validate_config(config_);
@@ -48,12 +43,12 @@ holoscan::expected<void, holoscan::Error> VoxelDownsampleOp::compute(
     return holoscan::make_unexpected(std::move(cloud).error());
   }
   if (const cudaError_t status =
-          grid_->group(cloud->xyz, cloud->count, config_.voxel_size, cloud->stream);
+          grid_->group(cloud->fields.xyz, cloud->count, config_.voxel_size, cloud->stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("voxel grid", status));
   }
-  return emit_dense(*cloud, grid_->device_count(), [&](float* xyz, std::uint8_t* rgb) {
-    return grid_->write(cloud->xyz, cloud->rgb, config_.mode, xyz, rgb, cloud->stream);
+  return emit_packed(*cloud, grid_->device_count(), [&](const CloudOutput& out) {
+    return grid_->write(cloud->fields, config_.mode, out, cloud->stream);
   });
 }
 

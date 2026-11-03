@@ -31,7 +31,8 @@ hold a hyphen, so the headers, namespace and target say `pcl_filters`.
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-pcl-filters/holoscan-pcl-filters-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-pcl-filters)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-pcl-filters`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
+| Debian package | `holoscan-pcl-filters`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0)` |
+| Module dependencies | holoscan-messages (`module.dependencies`): `holoscan::messages` from the same build when the repository root added it, otherwise its installed package; the package config finds it for consumers |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
 | Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
 | Test labels | `pcl_filters` and `gpu` on all |
@@ -40,7 +41,10 @@ hold a hyphen, so the headers, namespace and target say `pcl_filters`.
 
 - Code lives in `holoscan::pcl_filters`. The filters (`filters.hpp`) and the synthetic scene are
   public and need no Holoscan graph; the operators are thin: `CloudFilterOp` receives, checks and
-  stages the cloud and emits it in either layout, and each operator runs one filter in between.
+  stages the `PointCloud` message and sends the result in its layout with every field the input
+  has, and each operator runs one filter in between. A kernel that writes a cloud writes every field
+  `CloudOutput` has, in one launch: `CloudFilterOp` opens the writes of all the output's fields
+  before it and commits them after.
   Helpers shared by the filters stay private in `src/`.
 - Public headers carry only SDK, CUDA runtime and standard types; CUB stays in `src/`.
 - Every result is deterministic: integer counts may use atomics, but floating-point sums are reduced
@@ -54,5 +58,8 @@ hold a hyphen, so the headers, namespace and target say `pcl_filters`.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
   gone; it fails the frame, with an error that names the port.
+- No host wait per frame unless the output's size needs it (`kDense`) or the runtime may reuse
+  pinned input: count the waits a change adds (`cudaStreamSynchronize`, a synchronous copy) and
+  say why in the README's cost table.
 - A new filter option needs a case in `pcl_filters_filters` against a reference or the truth; a new
   port or behavior of an operator, a case in `pcl_filters_operators`.

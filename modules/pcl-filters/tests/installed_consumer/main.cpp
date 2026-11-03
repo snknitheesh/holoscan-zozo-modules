@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A project built against the installed holoscan-pcl-filters package: a source
-// sends organized clouds of the synthetic scene, with colors, in host memory;
-// CropBoxOp keeps what is within 6 m, OutlierRemovalOp drops the flying
-// pixels, GroundRemovalOp finds and removes the ground and VoxelDownsampleOp
-// thins what is left. A sink checks the plane against the scene's truth and
-// that the voxels and their colors came through.
+// sends organized PointCloud messages of the synthetic scene, with colors, in
+// host memory; CropBoxOp keeps what is within 6 m, OutlierRemovalOp drops the
+// flying pixels, GroundRemovalOp finds and removes the ground and
+// VoxelDownsampleOp thins what is left. A sink checks the plane against the
+// scene's truth, and that the voxels came through with their colors, header
+// and count.
 
 #include <algorithm>
 #include <array>
@@ -26,8 +27,9 @@
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/run.hpp>
-#include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/conversion.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/pcl_filters/crop_box_op.hpp>
 #include <holoscan/pcl_filters/ground_removal_op.hpp>
 #include <holoscan/pcl_filters/outlier_removal_op.hpp>
@@ -37,34 +39,33 @@
 
 namespace {
 
+namespace hm = holoscan::messages;
 namespace pf = holoscan::pcl_filters;
 
 constexpr int kWidth = 160;
 constexpr int kHeight = 120;
 constexpr std::uint32_t kFrames = 5;
-constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
-constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
+constexpr const char* kFrameId = "camera_optical";
 
-holoscan::TensorOutputSpec host_tensor(DLDataType dtype, std::uint64_t bytes) {
-  return holoscan::TensorOutputSpec{
-      .representation =
-          holoscan::TensorRepresentation{
-              .memory_kind = holoscan::MemoryKind::kHost,
-              .dtype = dtype,
-              .rank = 3U,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-          },
-      .bounds = holoscan::tensor_bounds(bytes),
-      .storage = holoscan::TensorOutputStorage::kRuntimePool,
-  };
-}
+struct Tally {
+  // Written by the sink; read by the source too.
+  std::atomic<std::uint32_t> frames{};
+  std::uint64_t voxels{};
+  std::uint32_t wrong_planes{};
+  std::uint32_t frame_gaps{};
+};
 
-// kFrames organized clouds of the scene with their colors, then idle.
+// kFrames organized clouds of the scene with their colors, then idle. A
+// filter cannot send a refused cloud again, so the source keeps one frame in
+// flight: it sends the next once the sink has counted the previous one.
 class CloudSourceOp final : public holoscan::Operator<> {
  public:
+  explicit CloudSourceOp(std::shared_ptr<const Tally> tally) : tally_(std::move(tally)) {}
+
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.output(points, "points").produces_tensor(host_tensor(kFloat32, kPixels * 12U));
-    spec.output(colors, "colors").produces_tensor(host_tensor(kUInt8, kPixels * 3U));
+    hm::declare_point_cloud_output(
+        spec, point_cloud, "point_cloud",
+        {.max_points = kPixels, .colors = true, .memory_kind = holoscan::MemoryKind::kHost});
   }
 
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -75,59 +76,54 @@ class CloudSourceOp final : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    if (emitted_ >= kFrames) {
+    if (emitted_ >= kFrames || tally_->frames.load() < emitted_) {
       return {};
     }
     std::vector<float> xyz;
     std::vector<std::uint8_t> rgb;
     std::vector<pf::SceneLabel> labels;
     pf::synthetic_scene_cloud(pf::synthetic_scene(kWidth, kHeight, emitted_), xyz, rgb, labels);
-    const std::array<std::int64_t, 3> shape{kHeight, kWidth, 3};
-    auto points_loan =
-        points.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kFloat32});
-    auto colors_loan =
-        colors.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
-    if (!points_loan || !colors_loan) {
-      return holoscan::make_unexpected(!points_loan ? points_loan.error() : colors_loan.error());
+    const hm::PointCloudShape shape = hm::organized_cloud(kHeight, kWidth);
+    auto loan =
+        hm::allocate_point_cloud(point_cloud, shape, {.colors = true}, context.cuda_stream());
+    if (!loan) {
+      return holoscan::make_unexpected(std::move(loan).error());
     }
-    const auto fill = [](holoscan::TensorOutputLoan& loan, const void* data, std::size_t bytes) {
-      return loan.write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                            -> holoscan::expected<void, holoscan::Error> {
-        std::memcpy(writer.data_as<std::uint8_t>(), data, bytes);
-        return {};
-      });
+    const auto fill = [&](hm::PointCloudLoan& cloud,
+                          holoscan::TensorFieldSelector<hm::schema::PointCloudT> field,
+                          const void* data, std::size_t bytes) {
+      return cloud.write_host_and_commit(field,
+                                         [&](const holoscan::TensorOutputWriteGuard& writer)
+                                             -> holoscan::expected<void, holoscan::Error> {
+                                           std::memcpy(writer.data(), data, bytes);
+                                           return {};
+                                         });
     };
-    if (auto filled = fill(*points_loan, xyz.data(), xyz.size() * sizeof(float)); !filled) {
+    if (auto filled =
+            fill(*loan, hm::PointCloudFields::points, xyz.data(), xyz.size() * sizeof(float));
+        !filled) {
       return filled;
     }
-    if (auto filled = fill(*colors_loan, rgb.data(), rgb.size()); !filled) {
+    if (auto filled = fill(*loan, hm::PointCloudFields::colors, rgb.data(), rgb.size()); !filled) {
       return filled;
     }
-    const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
-                                     .frame_id = emitted_ + 1U};
-    if (auto sent = points.emit(std::move(*points_loan), emit); !sent) {
-      return sent;
-    }
-    if (auto sent = colors.emit(std::move(*colors_loan), emit); !sent) {
+    const holoscan::TimePoint now = context.activation_time();
+    const hm::Header header{.frame_id = kFrameId, .capture_timestamp_ns = now.timestamp_ns};
+    if (auto sent = hm::emit_point_cloud(point_cloud, std::move(*loan), header, shape, -1,
+                                         {.capture_time = now, .frame_id = emitted_ + 1U});
+        !sent) {
       return sent;
     }
     ++emitted_;
     return {};
   }
 
-  holoscan::Output<holoscan::Tensor> points;
-  holoscan::Output<holoscan::Tensor> colors;
+  holoscan::Output<hm::schema::PointCloudT> point_cloud;
 
  private:
   static constexpr std::uint64_t kPixels = std::uint64_t{kWidth} * kHeight;
+  std::shared_ptr<const Tally> tally_;
   std::uint32_t emitted_{};
-};
-
-struct Tally {
-  std::uint32_t frames{};
-  std::uint64_t voxels{};
-  std::uint32_t wrong_planes{};
-  std::uint32_t frame_gaps{};
 };
 
 // Checks each frame's plane and voxels.
@@ -137,7 +133,6 @@ class CheckOp final : public holoscan::Operator<> {
 
   void setup(holoscan::OperatorSpec& spec) override {
     spec.input(voxels, "voxels").queue_depth(2U);
-    spec.input(colors, "colors").queue_depth(2U);
     spec.input(plane, "plane").queue_depth(2U);
   }
 
@@ -145,10 +140,8 @@ class CheckOp final : public holoscan::Operator<> {
     using std::chrono_literals::operator""ns;
     holoscan::Contract result;
     result.trigger(holoscan::OnAligned{
-        .ports = holoscan::PortList{std::vector<holoscan::PortRef>{voxels, colors, plane}},
-        .window = 0ns});
+        .ports = holoscan::PortList{std::vector<holoscan::PortRef>{voxels, plane}}, .window = 0ns});
     result.input(voxels, holoscan::Exact{});
-    result.input(colors, holoscan::Exact{});
     result.input(plane, holoscan::Exact{});
     return result;
   }
@@ -156,16 +149,22 @@ class CheckOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
     auto cloud = voxels.receive();
-    auto rgb = colors.receive();
     auto coefficients = plane.receive();
-    if (!cloud || !rgb || !coefficients) {
+    if (!cloud || !coefficients) {
       return holoscan::make_unexpected(
           holoscan::Error{holoscan::ErrorCode::kFailure, "a frame's outputs did not all arrive"});
     }
-    const std::span<const std::int64_t> shape = cloud->data.shape_span();
-    if (shape.size() != 2 || shape[1] != 3 || rgb->data.shape_span()[0] != shape[0]) {
-      return holoscan::make_unexpected(
-          holoscan::Error{holoscan::ErrorCode::kFailure, "voxels must be a dense [M, 3] cloud"});
+    if (auto checked = hm::check_point_cloud(cloud->data); !checked) {
+      return checked;
+    }
+    const hm::schema::PointCloudT& message = cloud->data;
+    const std::span<const std::int64_t> shape = message.points->shape_span();
+    if (message.organized || message.valid_count != shape[0] || !hm::is_present(message.colors) ||
+        hm::is_present(message.normals) || !message.header ||
+        message.header->frame_id != kFrameId) {
+      return holoscan::make_unexpected(holoscan::Error{
+          holoscan::ErrorCode::kFailure,
+          "voxels must be a dense cloud with its count, colors and the source's frame id"});
     }
     std::array<float, 4> got{};
     if (auto copied =
@@ -174,7 +173,7 @@ class CheckOp final : public holoscan::Operator<> {
       return copied;
     }
     const std::uint64_t frame_id = cloud->metadata.frame_id;
-    tally_->frame_gaps += frame_id != tally_->frames + 1U ? 1U : 0U;
+    tally_->frame_gaps += frame_id != tally_->frames.load() + 1U ? 1U : 0U;
     float truth[4];
     pf::synthetic_ground_plane(
         pf::synthetic_scene(kWidth, kHeight, static_cast<std::uint32_t>(frame_id - 1U)), truth);
@@ -189,8 +188,7 @@ class CheckOp final : public holoscan::Operator<> {
     return {};
   }
 
-  holoscan::Input<holoscan::Tensor> voxels;
-  holoscan::Input<holoscan::Tensor> colors;
+  holoscan::Input<hm::schema::PointCloudT> voxels;
   holoscan::Input<holoscan::Tensor> plane;
 
  private:
@@ -201,48 +199,45 @@ class CheckOp final : public holoscan::Operator<> {
 
 int main() {
   holoscan::Graph graph{"pcl_filters_consumer"};
-  auto source = graph.op<CloudSourceOp>("source");
+  auto tally = std::make_shared<Tally>();
+  auto source = graph.op<CloudSourceOp>("source", tally);
   constexpr std::uint32_t kPoints = std::uint32_t{kWidth} * kHeight;
-  pf::CropBoxConfig crop{.color = true, .max_points = kPoints};
+  // Room for the colors the source sends, and no other field.
+  const pf::CloudSettings cloud{.max_points = kPoints, .fields = {.colors = true}};
+  pf::CropBoxConfig crop{.cloud = cloud};
   crop.box.max_distance = 6.0F;
   auto cropper = graph.op<pf::CropBoxOp>("crop", crop);
   auto outliers = graph.op<pf::OutlierRemovalOp>(
       "outliers",
-      pf::OutlierRemovalConfig{
-          .outliers = {.k = 6, .search_radius = 0.3F}, .color = true, .max_points = kPoints});
-  pf::GroundRemovalConfig ground{.color = true, .max_points = kPoints};
+      pf::OutlierRemovalConfig{.outliers = {.k = 6, .search_radius = 0.3F}, .cloud = cloud});
+  pf::GroundRemovalConfig ground{.cloud = cloud};
   float truth[4];
   pf::synthetic_ground_plane(pf::synthetic_scene(kWidth, kHeight, 0), truth);
   std::copy(truth, truth + 3, ground.ground.up);
   ground.ground.distance_threshold = 0.03F;
   auto grounder = graph.op<pf::GroundRemovalOp>("ground", ground);
+  pf::CloudSettings dense = cloud;
+  dense.layout = pf::OutputLayout::kDense;
   auto voxels = graph.op<pf::VoxelDownsampleOp>(
-      "voxels",
-      pf::VoxelDownsampleConfig{.voxel_size = 0.05F, .color = true, .max_points = kPoints});
-  auto tally = std::make_shared<Tally>();
+      "voxels", pf::VoxelDownsampleConfig{.voxel_size = 0.05F, .cloud = dense});
   auto check = graph.op<CheckOp>("check", tally);
 
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(source->points, cropper->points, lossless);
-  graph.add_flow(source->colors, cropper->colors, lossless);
-  graph.add_flow(cropper->filtered_points, outliers->points, lossless);
-  graph.add_flow(cropper->filtered_colors, outliers->colors, lossless);
-  graph.add_flow(outliers->filtered_points, grounder->points, lossless);
-  graph.add_flow(outliers->filtered_colors, grounder->colors, lossless);
-  graph.add_flow(grounder->filtered_points, voxels->points, lossless);
-  graph.add_flow(grounder->filtered_colors, voxels->colors, lossless);
-  graph.add_flow(voxels->filtered_points, check->voxels, lossless);
-  graph.add_flow(voxels->filtered_colors, check->colors, lossless);
+  graph.add_flow(source->point_cloud, cropper->point_cloud, lossless);
+  graph.add_flow(cropper->filtered_point_cloud, outliers->point_cloud, lossless);
+  graph.add_flow(outliers->filtered_point_cloud, grounder->point_cloud, lossless);
+  graph.add_flow(grounder->filtered_point_cloud, voxels->point_cloud, lossless);
+  graph.add_flow(voxels->filtered_point_cloud, check->voxels, lossless);
   graph.add_flow(grounder->plane, check->plane, lossless);
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // Every filter's outputs are in device memory, on GPU 0.
   holoscan::CompileOptions options;
   for (const char* op : {"crop", "outliers", "ground", "voxels"}) {
-    for (const char* port : {"filtered_points", "filtered_colors"}) {
-      options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
-          .operator_path = op, .output_port = port, .device = holoscan::DeviceId{0}});
-    }
+    options.deployment.bind_tensor_output_device(
+        holoscan::TensorOutputDevicePlacement{.operator_path = op,
+                                              .output_port = "filtered_point_cloud",
+                                              .device = holoscan::DeviceId{0}});
   }
   options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
       .operator_path = "ground", .output_port = "plane", .device = holoscan::DeviceId{0}});
@@ -255,11 +250,11 @@ int main() {
     std::cerr << "pcl_filters_consumer: run failed with " << status << '\n';
     return 1;
   }
-  const bool passed = tally->frames == kFrames && tally->wrong_planes == 0 &&
+  const bool passed = tally->frames.load() == kFrames && tally->wrong_planes == 0 &&
                       tally->frame_gaps == 0 && tally->voxels > 100U * kFrames;
-  std::cout << "pcl_filters_consumer: frames=" << tally->frames << " voxels=" << tally->voxels
-            << " wrong_planes=" << tally->wrong_planes << " frame_gaps=" << tally->frame_gaps
-            << '\n'
+  std::cout << "pcl_filters_consumer: frames=" << tally->frames.load()
+            << " voxels=" << tally->voxels << " wrong_planes=" << tally->wrong_planes
+            << " frame_gaps=" << tally->frame_gaps << '\n'
             << "pcl_filters_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 1;
 }

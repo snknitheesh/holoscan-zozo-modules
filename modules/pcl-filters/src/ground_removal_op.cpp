@@ -18,16 +18,12 @@
 namespace holoscan::pcl_filters {
 namespace {
 
-CloudSettings settings_of(const GroundRemovalConfig& config) {
-  return CloudSettings{
-      .color = config.color, .layout = config.layout, .max_points = config.max_points};
-}
-
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 
 }  // namespace
 
 void validate_config(const GroundRemovalConfig& config) {
+  validate_settings(config.cloud);
   const GroundParams& g = config.ground;
   const float up = g.up[0] * g.up[0] + g.up[1] * g.up[1] + g.up[2] * g.up[2];
   if (!(up > 0.0F) || !std::isfinite(up)) {
@@ -54,7 +50,7 @@ void validate_config(const GroundRemovalConfig& config) {
 }
 
 GroundRemovalOp::GroundRemovalOp(GroundRemovalConfig config)
-    : CloudFilterOp("GroundRemovalOp", settings_of(config)),
+    : CloudFilterOp("GroundRemovalOp", config.cloud),
       config_(config),
       segmenter_(std::make_unique<GroundSegmenter>()) {
   validate_config(config_);
@@ -104,40 +100,46 @@ holoscan::expected<void, holoscan::Error> GroundRemovalOp::compute(
   if (!keep) {
     return holoscan::make_unexpected(std::move(keep).error());
   }
-  if (plane_scratch_ == nullptr) {
-    if (const cudaError_t status = cudaMalloc(&plane_scratch_, 4U * sizeof(float));
+  const auto segment = [&](float* plane_out) -> holoscan::expected<void, holoscan::Error> {
+    if (const cudaError_t status =
+            segmenter_->segment(cloud->fields.xyz, cloud->count, config_.ground, plane_out, *keep,
+                                nullptr, cloud->stream);
         status != cudaSuccess) {
-      plane_scratch_ = nullptr;
-      return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
+      return holoscan::make_unexpected(cuda_failure("ground kernels", status));
     }
+    return {};
+  };
+  if (!config_.emit_plane) {
+    if (plane_scratch_ == nullptr) {
+      if (const cudaError_t status = cudaMalloc(&plane_scratch_, 4U * sizeof(float));
+          status != cudaSuccess) {
+        plane_scratch_ = nullptr;
+        return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
+      }
+    }
+    if (auto segmented = segment(plane_scratch_); !segmented) {
+      return segmented;
+    }
+    return emit_kept(*cloud, *keep);
   }
-  if (const cudaError_t status = segmenter_->segment(cloud->xyz, cloud->count, config_.ground,
-                                                     plane_scratch_, *keep, nullptr, cloud->stream);
-      status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("ground kernels", status));
-  }
-  if (auto sent = emit_kept(*cloud, *keep); !sent || !config_.emit_plane) {
-    return sent;
-  }
+  // The filter writes the plane straight into the output, which goes out
+  // after the cloud.
   auto loan = plane.allocate_tensor(
       holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 1>{4}, .dtype = kFloat32});
   if (!loan) {
     return holoscan::make_unexpected(std::move(loan).error());
   }
-  auto writer = loan->write(cloud->stream);
-  if (!writer) {
-    return holoscan::make_unexpected(std::move(writer).error());
+  if (auto written = loan->write_and_commit(::cuda::stream_ref{cloud->stream},
+                                            [&](const holoscan::TensorOutputWriteGuard& guard) {
+                                              return segment(guard.data_as<float>());
+                                            });
+      !written) {
+    return written;
   }
-  if (const cudaError_t status =
-          cudaMemcpyAsync(writer->data_as<float>(), plane_scratch_, 4U * sizeof(float),
-                          cudaMemcpyDeviceToDevice, cloud->stream);
-      status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
+  if (auto sent = emit_kept(*cloud, *keep); !sent) {
+    return sent;
   }
-  if (auto committed = std::move(*writer).commit(); !committed) {
-    return holoscan::make_unexpected(std::move(committed).error());
-  }
-  if (auto sent = plane.emit(std::move(*loan), holoscan::sensor_io::derive_from(cloud->points));
+  if (auto sent = plane.emit(std::move(*loan), holoscan::sensor_io::derive_from(cloud->sample));
       !sent) {
     return emit_failure("plane", std::move(sent).error());
   }

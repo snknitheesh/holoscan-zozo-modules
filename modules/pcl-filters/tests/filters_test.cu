@@ -21,6 +21,7 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <holoscan/pcl_filters/filters.hpp>
@@ -120,6 +121,37 @@ std::vector<std::uint8_t> random_colors(std::size_t count, std::uint64_t seed) {
     value = static_cast<std::uint8_t>(random.next() & 0xFFU);
   }
   return rgb;
+}
+
+// `count` random unit normals, every 13th NaN and every 29th zero, which the
+// voxel grid leaves out or which cancel out.
+std::vector<float> random_normals(std::size_t count, std::uint64_t seed) {
+  Random random(seed);
+  std::vector<float> normals(3 * count);
+  for (std::size_t i = 0; i < count; ++i) {
+    float v[3];
+    for (float& value : v) {
+      value = random.uniform(-1.0F, 1.0F);
+    }
+    const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    for (int axis = 0; axis < 3; ++axis) {
+      normals[3 * i + axis] = i % 13 == 5   ? std::numeric_limits<float>::quiet_NaN()
+                              : i % 29 == 7 ? 0.0F
+                                            : v[axis] / length;
+    }
+  }
+  return normals;
+}
+
+// `count` random intensities, every 11th NaN.
+std::vector<float> random_intensity(std::size_t count, std::uint64_t seed) {
+  Random random(seed);
+  std::vector<float> intensity(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    intensity[i] =
+        i % 11 == 2 ? std::numeric_limits<float>::quiet_NaN() : random.uniform(0.0F, 255.0F);
+  }
+  return intensity;
 }
 
 // The scene's synthetic GPU render matches its host version bit for bit.
@@ -224,11 +256,34 @@ void check_crop() {
   }
 }
 
-// apply_mask and Compactor against a host mask.
+// Whether `got` is `want`, bit for bit, or a removed point (NaN) where `want`
+// is null; `stride` values per point.
+template <typename T>
+std::size_t wrong_values(const std::vector<T>& got, const T* want, std::size_t at,
+                         std::size_t stride) {
+  std::size_t wrong = 0;
+  for (std::size_t k = 0; k < stride; ++k) {
+    const T value = got[stride * at + k];
+    if (want == nullptr) {
+      if constexpr (std::is_floating_point_v<T>) {
+        wrong += !std::isnan(value);
+      } else {
+        wrong += value != T{0};
+      }
+    } else {
+      wrong += std::memcmp(&value, want + k, sizeof(T)) != 0;
+    }
+  }
+  return wrong;
+}
+
+// apply_mask, Compactor and pad_cloud against a host mask, with every field.
 void check_masks() {
   const std::uint32_t n = 10007;
   const std::vector<float> xyz = random_cloud(n, 3);
   const std::vector<std::uint8_t> rgb = random_colors(n, 4);
+  const std::vector<float> normals = random_normals(n, 6);
+  const std::vector<float> intensity = random_intensity(n, 7);
   std::vector<std::uint8_t> mask(n);
   Random random(5);
   for (auto& value : mask) {
@@ -236,70 +291,149 @@ void check_masks() {
   }
   Device<float> device_xyz(xyz);
   Device<std::uint8_t> device_rgb(rgb);
+  Device<float> device_normals(normals);
+  Device<float> device_intensity(intensity);
   Device<std::uint8_t> device_mask(mask);
+  const CloudFields in{.xyz = device_xyz.get(),
+                       .rgb = device_rgb.get(),
+                       .normals = device_normals.get(),
+                       .intensity = device_intensity.get()};
   Device<float> out_xyz(3 * n);
   Device<std::uint8_t> out_rgb(3 * n);
+  Device<float> out_normals(3 * n);
+  Device<float> out_intensity(n);
+  const CloudOutput out{.xyz = out_xyz.get(),
+                        .rgb = out_rgb.get(),
+                        .normals = out_normals.get(),
+                        .intensity = out_intensity.get()};
+  // The values of output point `at` that are not input point `*i`, or not a
+  // removed point when `i` is null.
+  const auto check_point =
+      [&](const std::vector<float>& got_xyz, const std::vector<std::uint8_t>& got_rgb,
+          const std::vector<float>& got_normals, const std::vector<float>& got_intensity,
+          std::size_t at, const std::uint32_t* i) {
+        return wrong_values(got_xyz, i ? xyz.data() + 3 * *i : nullptr, at, 3) +
+               wrong_values(got_rgb, i ? rgb.data() + 3 * *i : nullptr, at, 3) +
+               wrong_values(got_normals, i ? normals.data() + 3 * *i : nullptr, at, 3) +
+               wrong_values(got_intensity, i ? intensity.data() + *i : nullptr, at, 1);
+      };
 
-  VERIFY(apply_mask(device_xyz.get(), device_rgb.get(), device_mask.get(), n, out_xyz.get(),
-                    out_rgb.get(), nullptr) == cudaSuccess);
+  VERIFY(apply_mask(in, device_mask.get(), n, out, nullptr) == cudaSuccess);
   VERIFY(cudaDeviceSynchronize() == cudaSuccess);
-  const std::vector<float> organized = out_xyz.host();
-  const std::vector<std::uint8_t> organized_rgb = out_rgb.host();
-  std::size_t wrong = 0;
-  for (std::uint32_t i = 0; i < n; ++i) {
-    for (int k = 0; k < 3; ++k) {
-      if (mask[i] != 0U) {
-        wrong += std::memcmp(&organized[3 * i + k], &xyz[3 * i + k], 4) != 0 ||
-                 organized_rgb[3 * i + k] != rgb[3 * i + k];
-      } else {
-        wrong += !std::isnan(organized[3 * i + k]) || organized_rgb[3 * i + k] != 0U;
-      }
+  {
+    const std::vector<float> got_xyz = out_xyz.host();
+    const std::vector<std::uint8_t> got_rgb = out_rgb.host();
+    const std::vector<float> got_normals = out_normals.host();
+    const std::vector<float> got_intensity = out_intensity.host();
+    std::size_t wrong = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+      wrong += check_point(got_xyz, got_rgb, got_normals, got_intensity, i,
+                           mask[i] != 0U ? &i : nullptr);
     }
+    VERIFY_MSG(wrong == 0, std::to_string(wrong) + " values of the masked cloud differ");
   }
-  VERIFY_MSG(wrong == 0, std::to_string(wrong) + " organized values differ");
 
   Compactor compactor;
   VERIFY(compactor.count(device_mask.get(), n, nullptr) == cudaSuccess);
   const std::uint32_t kept = read_count(compactor.device_count());
   VERIFY(kept == static_cast<std::uint32_t>(std::count(mask.begin(), mask.end(), 1U)));
-  VERIFY(compactor.write(device_xyz.get(), device_rgb.get(), out_xyz.get(), out_rgb.get(),
-                         nullptr) == cudaSuccess);
+  VERIFY(compactor.write(in, out, nullptr) == cudaSuccess);
+  // The rest of the buffers, as kPadded leaves them.
+  VERIFY(pad_cloud(out, compactor.device_count(), n, nullptr) == cudaSuccess);
   VERIFY(cudaDeviceSynchronize() == cudaSuccess);
-  std::vector<float> want_xyz;
-  std::vector<std::uint8_t> want_rgb;
-  for (std::uint32_t i = 0; i < n; ++i) {
-    if (mask[i] != 0U) {
-      want_xyz.insert(want_xyz.end(), xyz.begin() + 3 * i, xyz.begin() + 3 * i + 3);
-      want_rgb.insert(want_rgb.end(), rgb.begin() + 3 * i, rgb.begin() + 3 * i + 3);
+  {
+    const std::vector<float> got_xyz = out_xyz.host();
+    const std::vector<std::uint8_t> got_rgb = out_rgb.host();
+    const std::vector<float> got_normals = out_normals.host();
+    const std::vector<float> got_intensity = out_intensity.host();
+    std::size_t wrong = 0;
+    std::uint32_t at = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+      if (mask[i] != 0U) {
+        wrong += check_point(got_xyz, got_rgb, got_normals, got_intensity, at++, &i);
+      }
     }
+    VERIFY_MSG(wrong == 0, std::to_string(wrong) + " packed values differ, or are out of order");
+    std::size_t wrong_padding = 0;
+    for (std::uint32_t i = kept; i < n; ++i) {
+      wrong_padding += check_point(got_xyz, got_rgb, got_normals, got_intensity, i, nullptr);
+    }
+    VERIFY_MSG(wrong_padding == 0,
+               std::to_string(wrong_padding) + " padding values are not removed points");
   }
-  const std::vector<float> got = out_xyz.host(3 * kept);
-  const bool same = got.size() == want_xyz.size() &&
-                    std::memcmp(got.data(), want_xyz.data(), got.size() * 4) == 0;
-  VERIFY_MSG(same, "packed points differ, or are out of order");
-  VERIFY(out_rgb.host(3 * kept) == want_rgb);
+
+  // Only the fields the output has are written; the points alone, too.
+  VERIFY(apply_mask(CloudFields{.xyz = device_xyz.get()}, device_mask.get(), n,
+                    CloudOutput{.xyz = out_xyz.get()}, nullptr) == cudaSuccess);
+  // An output field the input has not is refused.
+  VERIFY(apply_mask(CloudFields{.xyz = device_xyz.get()}, device_mask.get(), n,
+                    CloudOutput{.xyz = out_xyz.get(), .normals = out_normals.get()},
+                    nullptr) == cudaErrorInvalidValue);
+  VERIFY(compactor.write(CloudFields{.xyz = device_xyz.get()},
+                         CloudOutput{.xyz = out_xyz.get(), .intensity = out_intensity.get()},
+                         nullptr) == cudaErrorInvalidValue);
+  VERIFY(pad_cloud(CloudOutput{}, compactor.device_count(), n, nullptr) == cudaErrorInvalidValue);
+  VERIFY(pad_cloud(CloudOutput{}, nullptr, 0, nullptr) == cudaSuccess);
 }
 
-// Runs the voxel grid; returns points and colors.
-test::VoxelResult run_voxels(VoxelGrid& grid, const Device<float>& xyz,
-                             const Device<std::uint8_t>* rgb, std::uint32_t n, float size,
-                             VoxelMode mode) {
+// A cloud's optional fields in device memory, for the voxel grid.
+struct DeviceFields {
+  const Device<std::uint8_t>* rgb{};
+  const Device<float>* normals{};
+  const Device<float>* intensity{};
+};
+
+// Runs the voxel grid; returns the voxels with the fields `fields` has.
+test::VoxelResult run_voxels(VoxelGrid& grid, const Device<float>& xyz, DeviceFields fields,
+                             std::uint32_t n, float size, VoxelMode mode) {
   test::VoxelResult result;
   if (grid.group(xyz.get(), n, size, nullptr) != cudaSuccess) {
     VERIFY_MSG(false, "VoxelGrid::group failed");
     return result;
   }
-  const std::uint32_t voxels = read_count(grid.device_count());
-  Device<float> out_xyz(3 * static_cast<std::size_t>(voxels));
-  Device<std::uint8_t> out_rgb(3 * static_cast<std::size_t>(voxels));
-  VERIFY(grid.write(xyz.get(), rgb != nullptr ? rgb->get() : nullptr, mode, out_xyz.get(),
-                    rgb != nullptr ? out_rgb.get() : nullptr, nullptr) == cudaSuccess);
+  const std::size_t voxels = read_count(grid.device_count());
+  Device<float> out_xyz(3 * voxels);
+  Device<std::uint8_t> out_rgb(3 * voxels);
+  Device<float> out_normals(3 * voxels);
+  Device<float> out_intensity(voxels);
+  const CloudFields in{
+      .xyz = xyz.get(),
+      .rgb = fields.rgb != nullptr ? fields.rgb->get() : nullptr,
+      .normals = fields.normals != nullptr ? fields.normals->get() : nullptr,
+      .intensity = fields.intensity != nullptr ? fields.intensity->get() : nullptr,
+  };
+  const CloudOutput out{
+      .xyz = out_xyz.get(),
+      .rgb = fields.rgb != nullptr ? out_rgb.get() : nullptr,
+      .normals = fields.normals != nullptr ? out_normals.get() : nullptr,
+      .intensity = fields.intensity != nullptr ? out_intensity.get() : nullptr,
+  };
+  VERIFY(grid.write(in, mode, out, nullptr) == cudaSuccess);
   VERIFY(cudaDeviceSynchronize() == cudaSuccess);
-  result.xyz = out_xyz.host(3 * static_cast<std::size_t>(voxels));
-  if (rgb != nullptr) {
-    result.rgb = out_rgb.host(3 * static_cast<std::size_t>(voxels));
+  result.xyz = out_xyz.host(3 * voxels);
+  if (fields.rgb != nullptr) {
+    result.rgb = out_rgb.host(3 * voxels);
+  }
+  if (fields.normals != nullptr) {
+    result.normals = out_normals.host(3 * voxels);
+  }
+  if (fields.intensity != nullptr) {
+    result.intensity = out_intensity.host(voxels);
   }
   return result;
+}
+
+// Bitwise equality, any NaN equal to any NaN.
+bool same_values(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (!(std::isnan(a[i]) && std::isnan(b[i])) && std::memcmp(&a[i], &b[i], 4) != 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void check_voxels() {
@@ -317,31 +451,59 @@ void check_voxels() {
     rgb.insert(rgb.end(), {1U, 2U, 3U});
   }
   const auto n = static_cast<std::uint32_t>(xyz.size() / 3);
+  const std::vector<float> normals = random_normals(n, 13);
+  const std::vector<float> intensity = random_intensity(n, 14);
   Device<float> device_xyz(xyz);
   Device<std::uint8_t> device_rgb(rgb);
+  Device<float> device_normals(normals);
+  Device<float> device_intensity(intensity);
+  const DeviceFields all{
+      .rgb = &device_rgb, .normals = &device_normals, .intensity = &device_intensity};
   VoxelGrid grid;
   for (const float size : {0.01F, 0.05F, 0.2F, 100.0F}) {
     for (const VoxelMode mode : {VoxelMode::kCentroid, VoxelMode::kFirstPoint}) {
       const std::string name =
           "voxel " + std::to_string(size) + (mode == VoxelMode::kCentroid ? " centroid" : " first");
-      const test::VoxelResult want = test::voxel_reference(xyz, rgb, size, mode);
-      const test::VoxelResult got = run_voxels(grid, device_xyz, &device_rgb, n, size, mode);
+      const test::VoxelResult want =
+          test::voxel_reference(xyz, rgb, size, mode, normals, intensity);
+      const test::VoxelResult got = run_voxels(grid, device_xyz, all, n, size, mode);
       VERIFY_MSG(got.xyz.size() == want.xyz.size(),
                  name + ": " + std::to_string(got.xyz.size() / 3) + " voxels, expected " +
                      std::to_string(want.xyz.size() / 3));
       VERIFY_MSG(same_bits(got.xyz, want.xyz), name + ": points differ from the reference");
       VERIFY_MSG(got.rgb == want.rgb, name + ": colors differ from the reference");
+      VERIFY_MSG(same_values(got.normals, want.normals),
+                 name + ": normals differ from the reference");
+      VERIFY_MSG(same_values(got.intensity, want.intensity),
+                 name + ": intensities differ from the reference");
       if (size == 100.0F) {
         // The eight voxels around the origin hold every point but the far ones.
         VERIFY_MSG(want.xyz.size() / 3 <= 8 + 3, name + ": a few voxels");
       }
     }
   }
-  // Without colors.
+  // Without the optional fields.
   const test::VoxelResult want = test::voxel_reference(xyz, {}, 0.05F, VoxelMode::kCentroid);
-  const test::VoxelResult got =
-      run_voxels(grid, device_xyz, nullptr, n, 0.05F, VoxelMode::kCentroid);
+  const test::VoxelResult got = run_voxels(grid, device_xyz, {}, n, 0.05F, VoxelMode::kCentroid);
   VERIFY(same_bits(got.xyz, want.xyz));
+  // Normals that cancel out, or that the voxel's points have none of, are NaN;
+  // so are the intensities of a voxel without any.
+  const std::vector<float> pair_xyz{0.01F, 0.01F, 0.01F, 0.02F, 0.02F, 0.02F, 0.5F, 0.5F, 0.5F};
+  const std::vector<float> pair_normals{0.0F, 0.0F, 1.0F, 0.0F, 0.0F, -1.0F, NAN, NAN, NAN};
+  const std::vector<float> pair_intensity{NAN, NAN, 4.0F};
+  Device<float> pair(pair_xyz);
+  Device<float> pair_n(pair_normals);
+  Device<float> pair_i(pair_intensity);
+  const test::VoxelResult two =
+      run_voxels(grid, pair, DeviceFields{.normals = &pair_n, .intensity = &pair_i}, 3, 0.1F,
+                 VoxelMode::kCentroid);
+  VERIFY(two.normals.size() == 6 && std::isnan(two.normals[0]) && std::isnan(two.normals[3]));
+  VERIFY(two.intensity.size() == 2 && std::isnan(two.intensity[0]) && two.intensity[1] == 4.0F);
+  // An output field the input has not is refused.
+  Device<float> out(3 * n);
+  VERIFY(grid.write(CloudFields{.xyz = device_xyz.get()}, VoxelMode::kCentroid,
+                    CloudOutput{.xyz = out.get(), .rgb = device_rgb.get()},
+                    nullptr) == cudaErrorInvalidValue);
   VERIFY(grid.group(device_xyz.get(), n, 0.0F, nullptr) == cudaErrorInvalidValue);
   VERIFY(grid.group(device_xyz.get(), n, std::nanf(""), nullptr) == cudaErrorInvalidValue);
 }
@@ -631,7 +793,8 @@ void check_determinism() {
            cudaSuccess);
     const std::vector<std::uint8_t> outliers = keep.host();
     VoxelGrid grid;
-    const test::VoxelResult voxels = run_voxels(grid, xyz, &rgb, n, 0.03F, VoxelMode::kCentroid);
+    const test::VoxelResult voxels =
+        run_voxels(grid, xyz, DeviceFields{.rgb = &rgb}, n, 0.03F, VoxelMode::kCentroid);
     if (run == 0) {
       first_plane = plane;
       first_ground = ground.keep;
@@ -675,8 +838,9 @@ void check_degenerate() {
     VoxelGrid grid;
     VERIFY(grid.group(device.get(), n, 0.1F, nullptr) == cudaSuccess);
     VERIFY_MSG(read_count(grid.device_count()) == 0U, name + ": no voxels");
-    VERIFY(grid.write(device.get(), nullptr, VoxelMode::kCentroid, nullptr, nullptr, nullptr) ==
-           cudaSuccess);
+    Device<float> voxels(3);
+    VERIFY(grid.write(CloudFields{.xyz = device.get()}, VoxelMode::kCentroid,
+                      CloudOutput{.xyz = voxels.get()}, nullptr) == cudaSuccess);
 
     GroundSegmenter segmenter;
     const GroundResult ground = run_ground(segmenter, device, n, GroundParams{});
@@ -701,7 +865,7 @@ void check_degenerate() {
   std::vector<float> one{0.5F, 0.5F, 0.5F};
   Device<float> device(one);
   VoxelGrid grid;
-  const test::VoxelResult voxels = run_voxels(grid, device, nullptr, 1, 0.1F, VoxelMode::kCentroid);
+  const test::VoxelResult voxels = run_voxels(grid, device, {}, 1, 0.1F, VoxelMode::kCentroid);
   VERIFY(voxels.xyz == one);
   GroundSegmenter segmenter;
   VERIFY(std::isnan(run_ground(segmenter, device, 1, GroundParams{}).plane[0]));
@@ -722,7 +886,8 @@ void check_huge() {
   VERIFY_MSG(keep.host() == test::crop_reference(scene.xyz, box), "huge: crop");
 
   VoxelGrid grid;
-  const test::VoxelResult got = run_voxels(grid, xyz, &rgb, n, 0.02F, VoxelMode::kCentroid);
+  const test::VoxelResult got =
+      run_voxels(grid, xyz, DeviceFields{.rgb = &rgb}, n, 0.02F, VoxelMode::kCentroid);
   const test::VoxelResult want =
       test::voxel_reference(scene.xyz, scene.rgb, 0.02F, VoxelMode::kCentroid);
   VERIFY_MSG(same_bits(got.xyz, want.xyz) && got.rgb == want.rgb,

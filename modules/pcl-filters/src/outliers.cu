@@ -155,7 +155,7 @@ __global__ void fill_kernel(std::uint32_t count, float* __restrict__ mean,
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < count) {
     if (mean != nullptr) {
-      mean[i] = __int_as_float(0x7FC00000);
+      mean[i] = detail::quiet_nan();
     }
     keep[i] = 0U;
   }

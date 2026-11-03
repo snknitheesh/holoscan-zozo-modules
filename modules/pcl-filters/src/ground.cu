@@ -37,8 +37,6 @@ constexpr unsigned int kSumBlocks = 64;
 // Sums per block: n, x, y, z, xx, xy, xz, yy, yz, zz.
 constexpr int kSums = 10;
 
-__device__ inline float nan_float() { return __int_as_float(0x7FC00000); }
-
 __global__ void valid_flags_kernel(const float* __restrict__ xyz, std::uint32_t count,
                                    std::uint32_t* __restrict__ flags) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -78,7 +76,7 @@ __global__ void hypotheses_kernel(const float* __restrict__ xyz,
   if (h >= iterations) {
     return;
   }
-  const float nan = nan_float();
+  const float nan = detail::quiet_nan();
   planes[h] = make_float4(nan, nan, nan, nan);
   const std::uint32_t n = *valid;
   if (n < 3U) {
@@ -122,7 +120,7 @@ __global__ void score_kernel(const float* __restrict__ xyz, std::uint32_t count,
                              float threshold, std::uint32_t* __restrict__ scores) {
   __shared__ float tile[3 * kBlock];
   const std::uint32_t h = blockIdx.y * blockDim.x + threadIdx.x;
-  const float nan = nan_float();
+  const float nan = detail::quiet_nan();
   const float4 plane = h < iterations ? planes[h] : make_float4(nan, nan, nan, nan);
   std::uint32_t hits = 0;
   const std::size_t floats = 3U * static_cast<std::size_t>(count);
@@ -174,7 +172,7 @@ __global__ void select_kernel(const float4* __restrict__ planes,
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    const float nan = nan_float();
+    const float nan = detail::quiet_nan();
     *plane = best_score[0] == 0U ? make_float4(nan, nan, nan, nan) : planes[best_index[0]];
   }
 }

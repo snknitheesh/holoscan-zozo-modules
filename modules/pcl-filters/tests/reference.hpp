@@ -72,11 +72,15 @@ inline bool voxel_of(const float* p, float size, std::int64_t index[3]) {
 struct VoxelResult {
   std::vector<float> xyz;
   std::vector<std::uint8_t> rgb;
+  std::vector<float> normals;
+  std::vector<float> intensity;
 };
 
+// The voxel grid; an empty optional field is absent.
 inline VoxelResult voxel_reference(const std::vector<float>& xyz,
-                                   const std::vector<std::uint8_t>& rgb, float size,
-                                   VoxelMode mode) {
+                                   const std::vector<std::uint8_t>& rgb, float size, VoxelMode mode,
+                                   const std::vector<float>& normals = {},
+                                   const std::vector<float>& intensity = {}) {
   struct Entry {
     std::int64_t voxel[3];
     std::uint32_t index;
@@ -97,6 +101,10 @@ inline VoxelResult voxel_reference(const std::vector<float>& xyz,
     std::size_t end = start;
     double sum[3] = {};
     std::uint32_t color[3] = {};
+    double normal[3] = {};
+    std::uint32_t normal_count = 0;
+    double intensity_sum = 0.0;
+    std::uint32_t intensity_count = 0;
     while (end < entries.size() &&
            std::equal(entries[end].voxel, entries[end].voxel + 3, entries[start].voxel)) {
       const std::uint32_t i = entries[end].index;
@@ -107,6 +115,16 @@ inline VoxelResult voxel_reference(const std::vector<float>& xyz,
         for (int channel = 0; channel < 3; ++channel) {
           color[channel] += rgb[3 * i + channel];
         }
+      }
+      if (!normals.empty() && valid(normals.data() + 3 * i)) {
+        for (int axis = 0; axis < 3; ++axis) {
+          normal[axis] += static_cast<double>(normals[3 * i + axis]);
+        }
+        ++normal_count;
+      }
+      if (!intensity.empty() && std::isfinite(intensity[i])) {
+        intensity_sum += static_cast<double>(intensity[i]);
+        ++intensity_count;
       }
       ++end;
     }
@@ -121,6 +139,21 @@ inline VoxelResult voxel_reference(const std::vector<float>& xyz,
       for (int channel = 0; channel < 3; ++channel) {
         result.rgb.push_back(static_cast<std::uint8_t>((color[channel] + points / 2U) / points));
       }
+    }
+    if (!normals.empty()) {
+      const double length =
+          std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+      for (int axis = 0; axis < 3; ++axis) {
+        result.normals.push_back(normal_count != 0U && length > 0.0
+                                     ? static_cast<float>(normal[axis] / length)
+                                     : std::numeric_limits<float>::quiet_NaN());
+      }
+    }
+    if (!intensity.empty()) {
+      result.intensity.push_back(
+          intensity_count == 0U
+              ? std::numeric_limits<float>::quiet_NaN()
+              : static_cast<float>(intensity_sum / static_cast<double>(intensity_count)));
     }
     start = end;
   }

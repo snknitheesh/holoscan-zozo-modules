@@ -20,12 +20,8 @@ namespace holoscan::pcl_filters {
 
 struct OutlierRemovalConfig {
   OutlierParams outliers;
-  // Declare the `colors` input and `filtered_colors` output.
-  bool color{false};
-  // Keep the input's shape (removed points NaN), or pack the kept points.
-  OutputLayout layout{OutputLayout::kKeep};
-  // Largest cloud accepted; see CloudSettings.
-  std::uint32_t max_points{1920U * 1080U};
+  // The output's layout, size and fields.
+  CloudSettings cloud;
 };
 
 // @throws std::invalid_argument naming the first unusable field.

@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Device helpers shared by the filters: point validity, grid cell keys, launch
-// sizes, and the CUB scans and sorts with their scratch.
+// Device helpers shared by the filters: point validity, copying and removing a
+// point with its fields, grid cell keys, launch sizes, and the CUB scans and
+// sorts with their scratch.
 
 #pragma once
 
@@ -25,6 +26,58 @@ inline unsigned int blocks_for(std::uint32_t count) { return (count + kBlock - 1
 
 __device__ inline bool valid_point(float x, float y, float z) {
   return isfinite(x) && isfinite(y) && isfinite(z);
+}
+
+// Whether `in` has points and every field that `out` has, which `out` needs
+// points for.
+inline bool fields_match(const CloudFields& in, const CloudOutput& out) {
+  return in.xyz != nullptr && out.xyz != nullptr && (out.rgb == nullptr || in.rgb != nullptr) &&
+         (out.normals == nullptr || in.normals != nullptr) &&
+         (out.intensity == nullptr || in.intensity != nullptr);
+}
+
+__device__ inline float quiet_nan() { return __int_as_float(0x7FC00000); }
+
+// Point `from` of `in`, with every field `out` has, as point `to` of `out`.
+__device__ inline void copy_point(const CloudFields& in, std::uint32_t from, const CloudOutput& out,
+                                  std::uint32_t to) {
+  for (int axis = 0; axis < 3; ++axis) {
+    out.xyz[3 * to + axis] = in.xyz[3 * from + axis];
+  }
+  if (out.rgb != nullptr) {
+    for (int channel = 0; channel < 3; ++channel) {
+      out.rgb[3 * to + channel] = in.rgb[3 * from + channel];
+    }
+  }
+  if (out.normals != nullptr) {
+    for (int axis = 0; axis < 3; ++axis) {
+      out.normals[3 * to + axis] = in.normals[3 * from + axis];
+    }
+  }
+  if (out.intensity != nullptr) {
+    out.intensity[to] = in.intensity[from];
+  }
+}
+
+// Point `at` of `out` removed: NaN, black, a NaN normal and a NaN intensity.
+__device__ inline void remove_point(const CloudOutput& out, std::uint32_t at) {
+  const float nan = quiet_nan();
+  for (int axis = 0; axis < 3; ++axis) {
+    out.xyz[3 * at + axis] = nan;
+  }
+  if (out.rgb != nullptr) {
+    for (int channel = 0; channel < 3; ++channel) {
+      out.rgb[3 * at + channel] = 0U;
+    }
+  }
+  if (out.normals != nullptr) {
+    for (int axis = 0; axis < 3; ++axis) {
+      out.normals[3 * at + axis] = nan;
+    }
+  }
+  if (out.intensity != nullptr) {
+    out.intensity[at] = nan;
+  }
 }
 
 // A grid cell key: the cell's (x, y, z) index, each biased by
