@@ -25,21 +25,21 @@ class DeviceBuffer {
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
   // Makes the buffer at least `bytes` long. Grows by at least half, so that a
-  // slowly growing cloud does not reallocate every frame; the old buffer is
-  // freed after `stream` is done with it.
+  // slowly growing cloud does not reallocate every frame; an old buffer is
+  // freed after `stream` is done with it, the only time this waits.
   cudaError_t reserve(std::size_t bytes, cudaStream_t stream) {
     if (bytes <= bytes_) {
       return cudaSuccess;
     }
-    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-      return status;
-    }
+    const std::size_t grown = std::max(bytes, bytes_ + bytes_ / 2U);
     if (data_ != nullptr) {
+      if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+        return status;
+      }
       cudaFree(data_);
       data_ = nullptr;
       bytes_ = 0;
     }
-    const std::size_t grown = std::max(bytes, bytes_ + bytes_ / 2U);
     if (const cudaError_t status = cudaMalloc(&data_, grown); status != cudaSuccess) {
       data_ = nullptr;
       return status;
