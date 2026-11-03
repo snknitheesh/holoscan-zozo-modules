@@ -1,0 +1,35 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// A point cloud, with optional per-point colors, normals and intensities, as
+// tensors in host or device memory. Every message carries all four tensors:
+// an optional one that a cloud does not have is the empty rank-1 tensor [0].
+// Compatible edits keep the root name, the file identifier and the explicit
+// field ids, and only append fields.
+include "tensor.fbs";
+include "header.fbs";
+
+namespace holoscan.messages.schema;
+
+table PointCloud {
+  // capture_timestamp_ns: when the points were measured; frame_id: the frame
+  // they are in.
+  header: holoscan.schema.Header (id: 0);
+  // float32 [N, 3], or [H, W, 3] when organized: x, y, z in metres in
+  // header.frame_id. An invalid point is NaN in all three.
+  points: holoscan.schema.Tensor (id: 1);
+  // uint8 [N, 3] or [H, W, 3]: red, green, blue; or [0].
+  colors: holoscan.schema.Tensor (id: 2);
+  // float32 [N, 3] or [H, W, 3]: unit vectors, NaN where unknown; or [0].
+  normals: holoscan.schema.Tensor (id: 3);
+  // float32 [N] or [H, W]; or [0].
+  intensity: holoscan.schema.Tensor (id: 4);
+  // Whether points is [H, W, 3], laid out as the image it came from.
+  organized: bool (id: 5);
+  // How many points are valid, or -1 when the producer did not count them
+  // (counting device data would cost a synchronization).
+  valid_count: int64 = -1 (id: 6);
+}
+
+root_type PointCloud;
+file_identifier "HMPC";

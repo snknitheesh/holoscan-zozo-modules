@@ -1,0 +1,77 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// One camera's calibration, as the images it goes with need it: size,
+// intrinsics, distortion, and whether the images are raw, undistorted or
+// rectified. Compatible edits keep the root name, the file identifier and the
+// explicit field ids, and only append fields.
+include "header.fbs";
+include "geometry.fbs";
+
+namespace holoscan.messages.schema;
+
+// What has been done to the images this camera info describes.
+enum CameraState : byte {
+  // As the sensor saw them: the distortion below still applies.
+  Raw = 0,
+  // No distortion left (every coefficient zero). A `rectification` may still
+  // rotate them into a stereo pair's rectified frame.
+  Undistorted = 1,
+  // Undistorted and rotated into the rectified frame of a stereo pair: rows
+  // of the two cameras see the same epipolar line.
+  Rectified = 2,
+}
+
+// The lens models, with the coefficients of ROS's names, in this order:
+//   None                0 coefficients
+//   PlumbBob            5: k1 k2 p1 p2 k3 (ROS "plumb_bob", OpenCV's default)
+//   RationalPolynomial  8: k1 k2 p1 p2 k3 k4 k5 k6 (ROS "rational_polynomial")
+//   Equidistant         4: k1 k2 k3 k4 (ROS "equidistant", OpenCV's fisheye)
+enum DistortionModel : byte {
+  None = 0,
+  PlumbBob = 1,
+  RationalPolynomial = 2,
+  Equidistant = 3,
+}
+
+// The part of the sensor the images hold, in full-resolution pixels before
+// binning: columns x .. x + width - 1, rows y .. y + height - 1.
+struct RegionOfInterest {
+  x: uint32;
+  y: uint32;
+  width: uint32;
+  height: uint32;
+}
+
+table CameraInfo {
+  // capture_timestamp_ns: the time this calibration is for; frame_id: the
+  // camera's optical frame (x right, y down, z forward).
+  header: holoscan.schema.Header (id: 0);
+  // The images' size in pixels, both > 0.
+  width: uint32 (id: 1);
+  height: uint32 (id: 2);
+  state: CameraState (id: 3);
+  // The intrinsics in pixels, with pixel centers at integer coordinates (as
+  // in ROS and OpenCV): a point (x, y, z) in the optical frame projects to
+  // u = fx * x / z + skew * y / z + cx, v = fy * y / z + cy, before distortion.
+  fx: double (id: 4);
+  fy: double (id: 5);
+  cx: double (id: 6);
+  cy: double (id: 7);
+  skew: double (id: 8);
+  distortion_model: DistortionModel (id: 9);
+  // Exactly as many as the model has.
+  coefficients: [double] (id: 10);
+  // Row-major rotation from this camera's frame to its stereo pair's
+  // rectified frame. Absent when there is none to apply: always for a
+  // Rectified camera, and for a camera outside a stereo pair.
+  rectification: holoscan.schema.Matrix3d (id: 11);
+  // Absent: the images hold the whole sensor.
+  roi: RegionOfInterest (id: 12);
+  // Sensor pixels per image pixel, at least 1.
+  binning_x: uint32 = 1 (id: 13);
+  binning_y: uint32 = 1 (id: 14);
+}
+
+root_type CameraInfo;
+file_identifier "HMCI";
