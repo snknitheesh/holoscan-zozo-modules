@@ -230,27 +230,33 @@ compute what the CPU computes from the same expressions; host code that checks t
 
 ## Performance
 
-Each filter as its operator runs it (the filter, then an organized output, or for dense outputs
-the wait for the count), on organized clouds of the synthetic scene, mean milliseconds of GPU time
-over 100 runs; `pcl_filters_benchmark` measures it.
+Each filter as its operator runs it (the filter, then the output in a layout: `kKeep` writes it,
+`kDense` waits for the count and packs, `kPadded` packs and pads), on organized clouds of the
+synthetic scene, in milliseconds of GPU time, waits included: the median of five runs of the mean
+over 100; `pcl_filters_benchmark` measures it.
 
-| Filter | RTX 5090, 640x480 | RTX 5090, 1280x720 | Orin, 640x480 | Orin, 1280x720 |
+| Filter | RTX 5090, 640x480 | RTX 5090, 1280x720 | Jetson Orin, 640x480 | Jetson Orin, 1280x720 |
 | --- | --- | --- | --- | --- |
-| CropBoxOp (organized) | 0.007 | 0.012 | 0.097 | 0.238 |
-| CropBoxOp (dense) | 0.020 | 0.025 | 0.187 | 0.386 |
-| VoxelDownsampleOp (2 cm) | 0.118 | 0.210 | 1.286 | 2.266 |
-| VoxelDownsampleOp (5 cm) | 0.221 | 0.632 | 1.215 | 3.590 |
-| GroundRemovalOp (RANSAC, 256 iterations) | 0.287 | 0.338 | 0.844 | 1.915 |
-| OutlierRemovalOp (statistical, k 8, 10 cm) | 1.566 | 5.299 | 12.569 | 48.468 |
-| OutlierRemovalOp (statistical, k 8, 4 cm) | 1.303 | 3.266 | 15.063 | 42.031 |
-| OutlierRemovalOp (radius, 5 cm, 3) | 0.296 | 0.828 | 1.338 | 4.807 |
+| CropBoxOp (`kKeep`) | 0.009 | 0.018 | 0.100 | 0.282 |
+| CropBoxOp (`kDense`) | 0.023 | 0.039 | 0.160 | 0.426 |
+| CropBoxOp (`kPadded`) | 0.019 | 0.032 | 0.145 | 0.425 |
+| VoxelDownsampleOp (2 cm, `kDense`) | 0.146 | 0.266 | 0.831 | 2.362 |
+| VoxelDownsampleOp (2 cm, `kPadded`) | 0.115 | 0.214 | 0.769 | 2.559 |
+| VoxelDownsampleOp (5 cm, `kDense`) | 0.243 | 0.699 | 1.158 | 4.008 |
+| GroundRemovalOp (RANSAC, 256 iterations) | 0.288 | 0.341 | 0.857 | 1.940 |
+| OutlierRemovalOp (statistical, k 8, 10 cm) | 1.567 | 5.726 | 14.357 | 55.910 |
+| OutlierRemovalOp (statistical, k 8, 4 cm) | 1.307 | 3.465 | 17.404 | 45.472 |
+| OutlierRemovalOp (radius, 5 cm, 3) | 0.302 | 0.831 | 1.380 | 5.179 |
 
-The x86_64 machine has an RTX 5090; the Orin is a Jetson AGX Orin developer kit (64 GB) with JetPack 7.2,
-in the power mode it was set to. A dense output costs the wait for the count: a few tens of microseconds on the
-discrete GPU, about 0.1 to 0.2 ms on the Orin. The statistical mode is the costly one: every flying
-pixel searches every ring of cells for its neighbors, one binary search per cell, and a warp waits
-for its slowest point. For a real-time pipeline prefer the radius mode, which stops counting at
-`min_neighbors`; it removes the same flying pixels here.
+The Jetson Orin ran JetPack 7.2 in the power mode it was set to. On an idle GPU, `kDense`'s wait
+for the count costs a few tens of microseconds on the RTX 5090 and up to about 0.1 ms on the Jetson
+Orin. On a GPU that another process keeps busy it costs a time slice: with another process holding
+the RTX 5090 fully, `kDense` took 2.5 to 3.5 ms where `kPadded` took what it takes on an idle GPU.
+`kPadded` also never holds the operator's thread, so the runtime can queue the next operators' work
+meanwhile; its cost is a full-size output, which the next operator reads in full. The statistical
+mode is the costly one: every flying pixel searches every ring of cells for its neighbors, one
+binary search per cell, and a warp waits for its slowest point. For a real-time pipeline prefer the
+radius mode, which stops counting at `min_neighbors`; it removes the same flying pixels here.
 
 ## Requirements
 
