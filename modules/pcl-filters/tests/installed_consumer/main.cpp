@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -48,20 +47,15 @@ constexpr std::uint32_t kFrames = 5;
 constexpr const char* kFrameId = "camera_optical";
 
 struct Tally {
-  // Written by the sink; read by the source too.
-  std::atomic<std::uint32_t> frames{};
+  std::uint32_t frames{};
   std::uint64_t voxels{};
   std::uint32_t wrong_planes{};
   std::uint32_t frame_gaps{};
 };
 
-// kFrames organized clouds of the scene with their colors, then idle. A
-// filter cannot send a refused cloud again, so the source keeps one frame in
-// flight: it sends the next once the sink has counted the previous one.
+// kFrames organized clouds of the scene with their colors, then idle.
 class CloudSourceOp final : public holoscan::Operator<> {
  public:
-  explicit CloudSourceOp(std::shared_ptr<const Tally> tally) : tally_(std::move(tally)) {}
-
   void setup(holoscan::OperatorSpec& spec) override {
     hm::declare_point_cloud_output(
         spec, point_cloud, "point_cloud",
@@ -76,7 +70,7 @@ class CloudSourceOp final : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    if (emitted_ >= kFrames || tally_->frames.load() < emitted_) {
+    if (emitted_ >= kFrames) {
       return {};
     }
     std::vector<float> xyz;
@@ -122,7 +116,6 @@ class CloudSourceOp final : public holoscan::Operator<> {
 
  private:
   static constexpr std::uint64_t kPixels = std::uint64_t{kWidth} * kHeight;
-  std::shared_ptr<const Tally> tally_;
   std::uint32_t emitted_{};
 };
 
@@ -173,7 +166,7 @@ class CheckOp final : public holoscan::Operator<> {
       return copied;
     }
     const std::uint64_t frame_id = cloud->metadata.frame_id;
-    tally_->frame_gaps += frame_id != tally_->frames.load() + 1U ? 1U : 0U;
+    tally_->frame_gaps += frame_id != tally_->frames + 1U ? 1U : 0U;
     float truth[4];
     pf::synthetic_ground_plane(
         pf::synthetic_scene(kWidth, kHeight, static_cast<std::uint32_t>(frame_id - 1U)), truth);
@@ -200,7 +193,7 @@ class CheckOp final : public holoscan::Operator<> {
 int main() {
   holoscan::Graph graph{"pcl_filters_consumer"};
   auto tally = std::make_shared<Tally>();
-  auto source = graph.op<CloudSourceOp>("source", tally);
+  auto source = graph.op<CloudSourceOp>("source");
   constexpr std::uint32_t kPoints = std::uint32_t{kWidth} * kHeight;
   // Room for the colors the source sends, and no other field.
   const pf::CloudSettings cloud{.max_points = kPoints, .fields = {.colors = true}};
@@ -229,6 +222,10 @@ int main() {
   graph.add_flow(grounder->filtered_point_cloud, voxels->point_cloud, lossless);
   graph.add_flow(voxels->filtered_point_cloud, check->voxels, lossless);
   graph.add_flow(grounder->plane, check->plane, lossless);
+  // One worker for the whole graph, as the module's README advises: the ground
+  // filter feeds the voxel filter and the checker, which the automatic
+  // partitioning would split.
+  graph.partition("pcl_filters_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // Every filter's outputs are in device memory, on GPU 0.
@@ -250,11 +247,11 @@ int main() {
     std::cerr << "pcl_filters_consumer: run failed with " << status << '\n';
     return 1;
   }
-  const bool passed = tally->frames.load() == kFrames && tally->wrong_planes == 0 &&
+  const bool passed = tally->frames == kFrames && tally->wrong_planes == 0 &&
                       tally->frame_gaps == 0 && tally->voxels > 100U * kFrames;
-  std::cout << "pcl_filters_consumer: frames=" << tally->frames.load()
-            << " voxels=" << tally->voxels << " wrong_planes=" << tally->wrong_planes
-            << " frame_gaps=" << tally->frame_gaps << '\n'
+  std::cout << "pcl_filters_consumer: frames=" << tally->frames << " voxels=" << tally->voxels
+            << " wrong_planes=" << tally->wrong_planes << " frame_gaps=" << tally->frame_gaps
+            << '\n'
             << "pcl_filters_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 1;
 }

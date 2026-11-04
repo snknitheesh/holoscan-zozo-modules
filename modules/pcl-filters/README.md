@@ -200,8 +200,15 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
 ```
 
 An operator cannot send a refused output again: a lossless (`kBlocking`) edge whose queue is full
-fails the frame. Keep the producer at most one frame ahead of the slowest consumer, as the demo's
-source does, or connect consumers that only need the newest cloud with `QueuePolicy::kDropOldest`.
+fails the frame. Keep a lossless chain on one worker, as the demo does:
+`graph.partition("name").include_all()` runs the whole graph on one, where no emit is refused. A
+graph with a second source, or one that forks or joins (above, the ground filter feeds the voxel
+filter and the planner), is split by the SDK's automatic partitioning onto several workers. Across
+workers, the SDK 5.0 runs a producer even while its consumer's lossless queue is full, and refuses
+what it sends: an emit fails with `kBackpressured`, and an allocation with `kResourceExhausted`
+while every slot of the output's pool is still held. A graph that must be split keeps its source at
+most one frame ahead of the slowest consumer, as the demo's source does, or connects consumers that
+only need the newest cloud with `QueuePolicy::kDropOldest`.
 
 The filters need no Holoscan graph: `launch_crop_box()`, `apply_mask()`, `Compactor`, `pad_cloud()`,
 `VoxelGrid`, `GroundSegmenter` and `OutlierFilter` in `<holoscan/pcl_filters/filters.hpp>` work on

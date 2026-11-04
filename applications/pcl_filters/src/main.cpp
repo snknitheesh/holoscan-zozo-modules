@@ -276,6 +276,12 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 #endif
 
+  // One worker for the whole graph. The ground filter's cloud goes to the
+  // voxel filter and to the reporter, which also takes the voxels, so the
+  // automatic partitioning would give the voxel filter and the reporter a
+  // worker each; across workers a filter can run while its consumer's
+  // lossless queue is full, and fail on the refused emit.
+  graph.partition(kAppName).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   if (!plan.diagnostics().empty()) {
@@ -285,7 +291,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
     return 0;
   }
   if (!signals) {

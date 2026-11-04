@@ -28,8 +28,15 @@ pcl_app_test(pcl_app_720p 0 "${_pass}"
 pcl_app_test(pcl_app_dense_voxels 0 "${_pass}"
   --count 10 --period-ms 10 --display false --voxel-layout dense
 )
-# The display graph compiles, without a display server.
-pcl_app_test(pcl_app_display_graph 0 "plan=OK" --display true --compile-only true)
+# The display graph compiles, without a display server. Only the plan's verdict: an
+# accepted plan has no warnings, and the graph runs on one worker, as the demo lays it out;
+# the automatic partitioning would split it onto three.
+pcl_app_test(pcl_app_display_graph 0 "^pcl_filters: plan=OK workers=1\n*$"
+  --display true --compile-only true
+)
+pcl_app_test(pcl_app_one_worker 0 "^pcl_filters: plan=OK workers=1\n*$"
+  --display false --compile-only true
+)
 
 # Unusable arguments are usage errors.
 pcl_app_test(pcl_app_rejects_size 2 "^error: scene images" --width 10)
