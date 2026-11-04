@@ -42,8 +42,10 @@ using Result = holoscan::expected<void, holoscan::Error>;
 
 // Records the outcome of sending one output of a frame. Consumers still busy
 // with earlier frames make an emit fail with kBackpressured before anything
-// is delivered, or an allocation with kResourceExhausted while they hold
-// every slot of the output's pool; the source then sends that output again
+// is delivered, or an allocation with kResourceExhausted while every slot of
+// the output's pool is still held, by frames they have not finished with or
+// by a frame they refused (the SDK takes back a refused loan only once this
+// source's GPU work on it is done); the source then sends that output again
 // on its next tick, with the frame's capture time, rather than failing the
 // run or skipping the frame. Returns nothing to go on with the frame's other
 // outputs, or what compute() returns now: success when the consumers are

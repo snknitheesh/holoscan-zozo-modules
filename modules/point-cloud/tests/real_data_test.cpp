@@ -296,6 +296,10 @@ void check_clip(const fs::path& clip) {
   graph.add_flow(deproject->point_cloud, project->point_cloud, lossless);
   graph.add_flow(deproject->point_cloud, check->point_cloud, lossless);
   graph.add_flow(project->depth, check->depth, lossless);
+  // One worker for the whole graph. Split across workers, as the automatic
+  // partitioning does with two sources, an operator could run while the
+  // checker's queue is full, and fail on the refused emit.
+  graph.partition("point_cloud_real_data").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   holoscan::CompileOptions options;
   for (const auto& [op, port] : {std::pair{"deproject", "point_cloud"}, {"project", "depth"}}) {

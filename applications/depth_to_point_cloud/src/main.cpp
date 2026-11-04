@@ -415,6 +415,12 @@ int execute(Options opts, SignalDomain& signals) {
     graph.add_flow(camera->camera_info, cloud->camera_info, hm::latest_camera_info_connection());
   }
   graph.add_flow(cloud->point_cloud, reporter->point_cloud, lossless);
+  // One worker for the whole graph, as with a single source. With
+  // CameraInfoSourceOp the graph has two sources, and the automatic
+  // partitioning would give the frame source a worker of its own; it would
+  // then run ahead of the deprojection and the reporter, which waits for each
+  // cloud, and could find every slot of its output pool held.
+  graph.partition(kAppName).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // GPU outputs are on device 0.
@@ -441,7 +447,8 @@ int execute(Options opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
     return 0;
   }
   if (!signals) {

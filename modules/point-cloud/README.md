@@ -38,6 +38,17 @@ it, and frames before the first one give no output; with camera info sent with e
 [Take camera info in an operator](../messages/README.md#take-camera-info-in-an-operator). Connect a
 `CameraInfoSourceOp` with `latest_camera_info_connection()`.
 
+With a `CameraInfoSourceOp`, the graph has two sources, and the SDK's automatic partitioning gives
+the frame source, and each operator that takes camera info and frames, a worker of its own (a graph
+with one source runs on one worker). Across workers, the SDK 5.0 runs a producer even while its
+consumer's lossless queue is full, and refuses what it sends: an emit fails with `kBackpressured`,
+and an allocation with `kResourceExhausted` while every slot of the output's pool is still held,
+by frames the consumers have not finished with or by a refused frame, whose slot comes back only
+when the producer's own GPU work on it is done. A source can treat both as backpressure (a camera
+drops the frame, a lossless source sends it again on its next tick), but these operators have
+already taken their input and return the error, which fails the run. So keep a lossless chain on
+one worker, as the demos do: `graph.partition("name").include_all()` runs the whole graph on one.
+
 The kernels model a pinhole camera: `CameraState::kUndistorted` or `kRectified`, without skew. A
 `kRaw` camera, whose images still have their lens distortion (a distortion coefficient that is not
 zero), fails the frame with an error that names the camera and says to undistort or rectify the

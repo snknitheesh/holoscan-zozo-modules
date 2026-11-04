@@ -90,7 +90,10 @@ class DepthSourceOp final : public holoscan::Operator<> {
     auto loan =
         depth.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt16});
     if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
+      // Every slot of the pool is still held downstream. Send it next tick.
+      return loan.error().code == holoscan::ErrorCode::kResourceExhausted
+                 ? holoscan::expected<void, holoscan::Error>{}
+                 : holoscan::make_unexpected(std::move(loan).error());
     }
     auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
                                                    -> holoscan::expected<void, holoscan::Error> {
@@ -323,6 +326,9 @@ int main() {
   graph.add_flow(deproject->point_cloud, check->point_cloud, lossless);
   graph.add_flow(deproject->point_cloud, project->point_cloud, lossless);
   graph.add_flow(project->depth, depth_check->depth, lossless);
+  // One worker for the whole graph, as the module's README advises with a
+  // CameraInfoSourceOp.
+  graph.partition("point_cloud_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // The cloud and the depth image are in device memory, on GPU 0.

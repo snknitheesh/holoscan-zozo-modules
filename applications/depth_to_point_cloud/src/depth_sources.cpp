@@ -68,9 +68,12 @@ holoscan::schema::ImageT image_descriptor(int width, int height,
 
 // Whether `error` says the consumers are still busy with earlier frames: an
 // emit fails with kBackpressured before anything is delivered, and an
-// allocation with kResourceExhausted while they still hold every slot of the
-// output's pool. The source then sends the same frame on its next tick
-// instead of failing the run or skipping the frame.
+// allocation with kResourceExhausted while every slot of the output's pool is
+// still held, by frames the consumers have not finished with or by a frame
+// they refused (the SDK takes back a refused loan only once this source's GPU
+// work on it is done). A source that runs on a worker of its own can meet
+// both. It then sends the same frame on its next tick instead of failing the
+// run or skipping the frame.
 bool consumers_busy(const holoscan::Error& error) {
   return error.code == holoscan::ErrorCode::kBackpressured ||
          error.code == holoscan::ErrorCode::kResourceExhausted;

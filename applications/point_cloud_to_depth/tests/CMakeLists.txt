@@ -287,8 +287,11 @@ file(CREATE_LINK loop "${_looped}/loop" SYMBOLIC)
 pcd_app_test(pcd_app_rejects_unreadable_image_dir 2 "^error: --image-dir is not a directory"
   --count 1 --image-dir "${_looped}/loop/images"
 )
-# Only the plan's verdict: an accepted plan has no warnings.
-pcd_app_test(pcd_app_compile_only 0 "^point_cloud_to_depth: plan=OK\n*$" --compile-only true)
+# Only the plan's verdict: an accepted plan has no warnings. With CameraInfoSourceOp
+# the graph has two sources and still runs on one worker, as the demo lays it out.
+pcd_app_test(pcd_app_compile_only 0 "^point_cloud_to_depth: plan=OK workers=1\n*$"
+  --compile-only true
+)
 
 # A failed run reports its cause and exits 1.
 set(_blocked "${CMAKE_CURRENT_BINARY_DIR}/blocked_images")

@@ -52,6 +52,11 @@ depth_app_test(depth_app_depth_range 0
   "depth_m=\\[1\\.200, 1\\.800\\] truth: wrong_points=0 wrong_colors=0 .*verdict=PASS"
   --count 20 --period-ms 5 --depth-min 1.2 --depth-max 1.8
 )
+# Only the plan's verdict: an accepted plan has no warnings. With CameraInfoSourceOp
+# the graph has two sources and still runs on one worker, as the demo lays it out.
+depth_app_test(depth_app_compile_only 0 "^depth_to_point_cloud: plan=OK workers=1\n*$"
+  --compile-only true
+)
 
 # PLY output: one file per cloud, which the verdict checks.
 set(_ply "${CMAKE_CURRENT_BINARY_DIR}/ply")
