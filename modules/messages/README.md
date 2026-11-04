@@ -230,6 +230,32 @@ auto info = graph.op<hm::CameraInfoSourceOp>(
 graph.add_flow(info->stereo_camera_info, my_op->camera_info, hm::latest_camera_info_connection());
 ```
 
+## Run a graph on one worker
+
+The SDK 5.0 runs each partition of a graph on a worker of its own, and its automatic partitioning
+splits a graph wherever it has another source, forks or joins. A `CameraInfoSourceOp` next to a
+camera is a second source: the camera, the camera info, and the operator that takes both each get a
+worker (the demo's graph, with three sources, would run on four). The compiled plan says how many:
+`plan.execution_lanes().size()`.
+
+Across workers, the SDK runs a producer even while its consumer's lossless (`kBlocking`) queue is
+full, and refuses what it sends: an emit fails with `kBackpressured`, and an allocation with
+`kResourceExhausted` while every slot of the output's pool is still held, by tensors the consumers
+have not finished with or by a refused one, whose slot comes back only when the producer's own GPU
+work on it is done. Under GPU load that happens often. On one worker it does not: a source cannot
+tick again until its consumers have taken what it sent.
+
+So keep a lossless chain on one worker, as the demo does:
+
+```cpp
+graph.partition("my_app").include_all();  // Every operator of the graph, on one worker.
+```
+
+A source that does run on a worker of its own can treat both errors as backpressure and send the
+same frame again on its next tick (`CameraInfoSourceOp` sends again on a `kBackpressured`). An
+operator in the middle of a chain has taken its input by the time it emits and cannot send it
+again: it returns the error, which fails the run.
+
 ## Send and receive point clouds
 
 [point_cloud.hpp](include/holoscan/messages/point_cloud.hpp): a producer declares the output, then
@@ -298,7 +324,7 @@ The tests:
 The SDK-free tests are also a standalone project, [tests/host/](tests/host/), which the hosted CI job
 builds without the SDK. [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project
 that uses the installed package: it writes a camera_info file and runs `CameraInfoSourceOp` into an
-operator that takes frames and the camera info with the contract.
+operator that takes frames and the camera info with the contract, on one worker.
 
 ## Debian package
 

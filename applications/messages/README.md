@@ -17,7 +17,9 @@ flowchart LR
 ```
 
 The frames are bare SDK headers with capture times: the calibration check aligns them and takes
-the camera info the way an image operator would, without needing pixels.
+the camera info the way an image operator would, without needing pixels. The whole graph runs on one
+worker, as the module's README advises for a graph with
+[more than one source](../../modules/messages/README.md#run-a-graph-on-one-worker).
 
 ## Requirements
 
@@ -50,6 +52,7 @@ build/messages_demo/messages_demo --count 60 --period-ms 5 --info-period-ms 20  
 | `--period-ms N` | 10 | Their period, 1..1000 ms |
 | `--info-period-ms N` | 100 | `CameraInfoSourceOp`'s period, 1..10000 ms |
 | `--cloud-memory WHERE` | `device` | `device` or `host` |
+| `--compile-only BOOL` | `false` | Build and check the graph, print how many workers it runs on, and exit |
 
 What it checks:
 
@@ -73,4 +76,4 @@ messages: verdict=PASS
 
 With `-DBUILD_TESTING=ON`, `ctest` runs the demo with clouds in device and in host memory, with
 camera info much slower than the frames, and with invalid options, checking its exit status and
-output.
+output, and checks that the graph compiles to one worker.

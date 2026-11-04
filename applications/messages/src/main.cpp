@@ -57,6 +57,7 @@ struct Options {
   std::uint32_t period_ms{10};
   std::uint32_t info_period_ms{100};
   holoscan::MemoryKind cloud_memory{holoscan::MemoryKind::kCudaDevice};
+  bool compile_only{};
   bool help{};
 };
 
@@ -69,6 +70,12 @@ std::uint32_t parse_number(std::string_view value, std::string_view option, std:
                                 ".." + std::to_string(high) + ", not '" + std::string(value) + "'");
   }
   return result;
+}
+
+bool parse_bool(std::string_view value, std::string_view option) {
+  if (value == "true") return true;
+  if (value == "false") return false;
+  throw std::invalid_argument(std::string(option) + " takes true or false");
 }
 
 Options parse_args(int argc, char** argv) {
@@ -93,6 +100,8 @@ Options parse_args(int argc, char** argv) {
       }
       opts.cloud_memory =
           value == "host" ? holoscan::MemoryKind::kHost : holoscan::MemoryKind::kCudaDevice;
+    } else if (option == "--compile-only") {
+      opts.compile_only = parse_bool(value, option);
     } else {
       throw std::invalid_argument("unknown option: " + std::string(option));
     }
@@ -106,7 +115,9 @@ void usage(const char* argv0) {
                "  --count N               Stereo frames and point clouds (default: 300)\n"
                "  --period-ms N           Their period, 1..1000 ms (default: 10)\n"
                "  --info-period-ms N      CameraInfoSourceOp's period, 1..10000 ms (default: 100)\n"
-               "  --cloud-memory WHERE    device or host (default: device)\n";
+               "  --cloud-memory WHERE    device or host (default: device)\n"
+               "  --compile-only BOOL     Build and check the graph, print its workers and exit\n"
+               "                          without running it (default: false)\n";
 }
 
 // A folder for the calibration files, removed with everything in it.
@@ -166,6 +177,12 @@ int execute(const Options& opts, SignalDomain& signals) {
   auto clouds = graph.op<demo::CloudSourceOp>("clouds", cloud_config);
   auto cloud_check = graph.op<demo::CloudCheckOp>("cloud_check", cloud_config);
   graph.add_flow(clouds->cloud, cloud_check->cloud, lossless);
+  // One worker for the whole graph. With three sources (the frames, the camera
+  // info and the clouds), the automatic partitioning would give the frame
+  // source, the camera info source, the calibration check, and the clouds with
+  // their check a worker each; the frame source would then run while the
+  // calibration check's lossless queue is full, and have its pairs refused.
+  graph.partition(kAppName).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   holoscan::CompileOptions compile_options;
@@ -178,6 +195,11 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
   }
   if (!plan.ok()) return 1;
+  if (opts.compile_only) {
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
+    return 0;
+  }
   if (!signals) {
     std::cerr << kAppName << ": warning: running without managed SIGINT/SIGTERM handling: "
               << holoscan::runtime_error_message(signals.error())

@@ -108,6 +108,9 @@ int main() try {
   auto consumer = graph.op<ConsumerOp>("consumer", result);
   graph.add_flow(frames->frame, consumer->frame);
   graph.add_flow(source->camera_info, consumer->camera_info, hm::latest_camera_info_connection());
+  // One worker for the whole graph, as the module's README advises with a
+  // CameraInfoSourceOp.
+  graph.partition("messages_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph);
   if (!plan.ok()) {
