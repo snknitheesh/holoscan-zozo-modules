@@ -1,0 +1,98 @@
+{
+  "$schema": "urn:holoscan:application:v1",
+  "application": {
+    "name": "SAM 3 Segmentation",
+    "description": "Segments every instance of a concept with holoscan-sam3's Sam3SegmentationOp and Meta's SAM 3: text prompts such as \"circle\" or \"cup\" and exemplar boxes, on a synthetic scene with known shapes, JPEG and PPM files or a live V4L2 webcam; checks, times, prints and writes the instances, and shows each image under its instances in a HoloViz window or rendered offscreen. New prompts can be typed while it runs.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0.0": "Initial release: the holoscan-sam3 demo, with synthetic, JPEG/PPM and V4L2 webcam sources; text and box prompts, and prompts typed at run time; a HoloViz display of each image under its instances, in a window or offscreen; checks against the host reference with the module's stub model, and against the synthetic scene's true shapes with SAM 3; latency and GPU memory."
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Computer Vision and Perception",
+      "Segmentation",
+      "Instance Segmentation",
+      "Open Vocabulary",
+      "TensorRT",
+      "Robotics"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Webcam",
+          "description": "A V4L2 camera offering YUYV, for the camera mode, which also needs a display.",
+          "required": false
+        }
+      ],
+      "data": [
+        {
+          "name": "SAM 3 (SAM License, gated)",
+          "description": "Not part of this repository. The module's tools/prepare_model.py downloads the pinned checkpoint with your own Hugging Face access token, after you have requested access and accepted the SAM License, and exports it to ONNX with a separately installed PyTorch and Transformers. Needed by the demo, files and camera modes only.",
+          "url": "https://huggingface.co/facebook/sam3/tree/3c879f39826c281e95690f02c7821c4de09afae7",
+          "version": "3c879f39826c281e95690f02c7821c4de09afae7"
+        }
+      ]
+    },
+    "dependencies": {
+      "modules": [
+        {
+          "name": "sam3"
+        }
+      ]
+    },
+    "default_mode": "demo",
+    "modes": {
+      "demo": {
+        "description": "SAM 3 on 100 frames of the synthetic scene with the prompts circle, blue rectangle and triangle, each prompt's best instance checked against its true shape, with latency and GPU memory; shown in a HoloViz window when there is a display.",
+        "run": {
+          "command": "\"<holohub_app_bin>/sam3_segmentation\" --model \"<holohub_data_dir>/sam3\" --count 100 --period-ms 10",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "files": {
+        "description": "SAM 3's instances in each JPEG and PPM image in the data directory's images folder, printed, and written over the images to the build directory.",
+        "run": {
+          "command": "\"<holohub_app_bin>/sam3_segmentation\" --model \"<holohub_data_dir>/sam3\" --source files --images \"<holohub_data_dir>/sam3/images\" --prompts \"person,cup,bottle\" --image-dir .",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "camera": {
+        "description": "Live webcam under its instances in a HoloViz window; type new comma-separated prompts and Enter while it runs. Needs /dev/video0, a display, and the prepared model. Local only.",
+        "run": {
+          "command": "\"<holohub_app_bin>/sam3_segmentation\" --model \"<holohub_data_dir>/sam3\" --source camera --display window --prompts \"person,cup\" --interactive true",
+          "workdir": "holohub_app_bin"
+        }
+      },
+      "ci": {
+        "description": "Finite headless check without downloads: 30 synthetic BGR8 frames through TensorRT with the module's stub model, which stands in for SAM 3, with two text prompts and an exemplar box, every instance checked against the host reference of the whole pipeline.",
+        "run": {
+          "command": "\"<holohub_app_bin>/sam3_segmentation\" --model stub --count 30 --period-ms 5 --encoding bgr8 --box-on triangle",
+          "workdir": "holohub_app_bin"
+        }
+      }
+    }
+  }
+}
