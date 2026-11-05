@@ -1,0 +1,21 @@
+holoscan-rectify
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-rectify uses the following NVIDIA software, and follows the conventions of
+OpenCV's calibration module.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+NVIDIA VPI 4 (optional, for the vpi-* backends)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's license, installed with VPI as /opt/nvidia/vpi4/doc/VPI_EULA.txt. Linked
+from the installed VPI; not redistributed.
+
+OpenCV (https://opencv.org)
+The output cameras follow the published methods that OpenCV's getOptimalNewCameraMatrix()
+and stereoRectify() implement (Bouguet's rectification), with the same conventions, so
+that the results can be compared. No OpenCV code is included or linked; OpenCV is
+licensed under Apache-2.0.
