@@ -1,0 +1,418 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+//
+// PCL Filters: the point clouds of a synthetic depth camera over a known
+// scene, sent as PointCloud messages and filtered on the GPU by
+// holoscan-pcl-filters: a crop box, outlier removal, ground removal and a
+// voxel grid. A reporter checks every frame against the scene's truth, and
+// with a display draws the voxels as the camera sees them in HoloViz.
+
+#include <algorithm>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+#include <holoscan/core/compile.hpp>
+#include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
+#include <holoscan/core/errors.hpp>
+#include <holoscan/core/graph.hpp>
+#include <holoscan/core/managed_shutdown_signals.hpp>
+#include <holoscan/core/run.hpp>
+#include <holoscan/core/run_session.hpp>
+#include <holoscan/logger/logger.hpp>
+#include <holoscan/pcl_filters/crop_box_op.hpp>
+#include <holoscan/pcl_filters/ground_removal_op.hpp>
+#include <holoscan/pcl_filters/outlier_removal_op.hpp>
+#include <holoscan/pcl_filters/synthetic_scene.hpp>
+#include <holoscan/pcl_filters/voxel_downsample_op.hpp>
+#include <holoscan/time/realtime_clock.hpp>
+#if PCL_FILTERS_ENABLE_VISUALIZATION
+#include <holoscan/visualization/holoviz_op.hpp>
+#endif
+
+#include "filter_report_op.hpp"
+#include "scene_source_op.hpp"
+
+namespace {
+
+using std::chrono_literals::operator""ms;
+namespace app = pcl_filters_app;
+namespace pf = holoscan::pcl_filters;
+
+constexpr std::string_view kAppName = "pcl_filters";
+
+enum class DisplayMode { kAuto, kOn, kOff };
+
+struct Options {
+  std::uint32_t count{300};
+  std::uint32_t period_ms{33};
+  int width{640};
+  int height{480};
+  float voxel_size{0.02F};
+  pf::OutputLayout voxel_layout{pf::OutputLayout::kPadded};
+  pf::OutlierMode outliers{pf::OutlierMode::kRadius};
+  DisplayMode display{DisplayMode::kAuto};
+  std::uint32_t timeout_seconds{120};
+  bool compile_only{false};
+  bool help{false};
+};
+
+template <typename T>
+T parse_number(std::string_view value, std::string_view option) {
+  T result{};
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), result);
+  if (error != std::errc() || end != value.data() + value.size()) {
+    throw std::invalid_argument(std::string(option) + " requires a number, got '" +
+                                std::string(value) + "'");
+  }
+  return result;
+}
+
+Options parse_args(int argc, char** argv) {
+  Options opts;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view option{argv[i]};
+    if (option == "--help" || option == "-h") {
+      opts.help = true;
+      return opts;
+    }
+    if (i + 1 >= argc) {
+      throw std::invalid_argument("missing value for " + std::string(option));
+    }
+    const std::string_view value{argv[++i]};
+    if (option == "--count") {
+      opts.count = parse_number<std::uint32_t>(value, option);
+    } else if (option == "--period-ms") {
+      opts.period_ms = parse_number<std::uint32_t>(value, option);
+    } else if (option == "--width") {
+      opts.width = parse_number<int>(value, option);
+    } else if (option == "--height") {
+      opts.height = parse_number<int>(value, option);
+    } else if (option == "--voxel-size") {
+      opts.voxel_size = parse_number<float>(value, option);
+    } else if (option == "--voxel-layout") {
+      if (value == "padded") {
+        opts.voxel_layout = pf::OutputLayout::kPadded;
+      } else if (value == "dense") {
+        opts.voxel_layout = pf::OutputLayout::kDense;
+      } else {
+        throw std::invalid_argument("--voxel-layout must be padded or dense");
+      }
+    } else if (option == "--outliers") {
+      if (value == "radius") {
+        opts.outliers = pf::OutlierMode::kRadius;
+      } else if (value == "statistical") {
+        opts.outliers = pf::OutlierMode::kStatistical;
+      } else {
+        throw std::invalid_argument("--outliers must be radius or statistical");
+      }
+    } else if (option == "--display") {
+      if (value == "auto") {
+        opts.display = DisplayMode::kAuto;
+      } else if (value == "true") {
+        opts.display = DisplayMode::kOn;
+      } else if (value == "false") {
+        opts.display = DisplayMode::kOff;
+      } else {
+        throw std::invalid_argument("--display must be auto, true or false");
+      }
+    } else if (option == "--timeout-seconds") {
+      opts.timeout_seconds = parse_number<std::uint32_t>(value, option);
+    } else if (option == "--compile-only") {
+      if (value != "true" && value != "false") {
+        throw std::invalid_argument("--compile-only requires true or false");
+      }
+      opts.compile_only = value == "true";
+    } else {
+      throw std::invalid_argument("unknown option: " + std::string(option));
+    }
+  }
+  return opts;
+}
+
+void usage(const char* argv0) {
+  std::cout << "Usage: " << argv0
+            << " [options]\n"
+               "  --count N                Frames (default: 300)\n"
+               "  --period-ms N            Camera period, 1..1000 ms (default: 33)\n"
+               "  --width N --height N     Image size, 64x48 to 4096x4096 (default: 640x480)\n"
+               "  --voxel-size M           Voxel side in metres (default: 0.02)\n"
+               "  --voxel-layout padded|dense\n"
+               "                           The voxels as many points as the input, the rest\n"
+               "                           NaN, with no wait; or exactly as many as there are,\n"
+               "                           waiting for the count (default: padded)\n"
+               "  --outliers radius|statistical\n"
+               "                           Outlier removal (default: radius)\n"
+               "  --display auto|true|false  Show the voxels in HoloViz (default: auto, on\n"
+               "                           when a display is available)\n"
+               "  --timeout-seconds N      Allowance beyond the expected run time (default: 120)\n"
+               "  --compile-only true|false  Build and check the graph without running it\n";
+}
+
+bool env_set(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && *value != '\0';
+}
+
+using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
+
+// Closes the signal domain, once no session runs, so that a failure to
+// restore the signal state is reported rather than left to its destructor.
+void close_signals(SignalDomain& signals) {
+  if (!signals) {
+    return;
+  }
+  if (auto closed = signals->close(); !closed) {
+    std::cerr << kAppName << ": warning: closing the signal domain failed: "
+              << holoscan::runtime_error_message(closed.error()) << '\n';
+  }
+}
+
+// The time allowed for each frame's filters and checks, by its points: well
+// above what the slowest platform takes.
+constexpr std::chrono::duration<double, std::micro> kAllowancePerPoint{1.0};
+// The longest run the deadline allows, so that no size or count overflows it.
+constexpr std::chrono::hours kLongestRun{24 * 365};
+// How long a stopped run may take to wind down before the process exits anyway.
+constexpr std::chrono::seconds kStopGrace{10};
+
+int execute(const Options& opts, SignalDomain& signals) {
+  const bool display_available =
+      env_set("DISPLAY") || (env_set("WAYLAND_DISPLAY") && env_set("XDG_RUNTIME_DIR"));
+  const bool display =
+      opts.display == DisplayMode::kOn ||
+      (opts.display == DisplayMode::kAuto && display_available && PCL_FILTERS_ENABLE_VISUALIZATION);
+  if (display && !PCL_FILTERS_ENABLE_VISUALIZATION) {
+    throw std::invalid_argument("--display needs a build with visualization enabled");
+  }
+  if (display && !display_available && !opts.compile_only) {
+    throw std::invalid_argument(
+        "the display needs a display server; set DISPLAY or add --display false");
+  }
+
+  const pf::SyntheticScene scene = pf::synthetic_scene(opts.width, opts.height, 0);
+  float truth[4];
+  pf::synthetic_ground_plane(scene, truth);
+
+  holoscan::Graph graph{std::string(kAppName)};
+  auto finished = std::make_shared<std::atomic<std::uint32_t>>(0U);
+  auto source = graph.op<app::SceneSourceOp>(
+      "source", app::SceneSourceConfig{.width = opts.width,
+                                       .height = opts.height,
+                                       .count = opts.count,
+                                       .period = std::chrono::milliseconds(opts.period_ms),
+                                       .finished = finished});
+  // The clouds carry colors and no other optional field; organized up to the
+  // voxel grid, so that the reporter can tell what is left pixel by pixel.
+  const pf::CloudSettings cloud{.max_points = static_cast<std::uint32_t>(opts.width) *
+                                              static_cast<std::uint32_t>(opts.height),
+                                .fields = {.colors = true}};
+  // Everything within 6 m of the camera.
+  pf::CropBoxConfig crop{.cloud = cloud};
+  crop.box.max_distance = 6.0F;
+  auto cropper = graph.op<pf::CropBoxOp>("crop", crop);
+  pf::OutlierRemovalConfig outliers{.cloud = cloud};
+  outliers.outliers.mode = opts.outliers;
+  outliers.outliers.radius = 0.03F;
+  outliers.outliers.min_neighbors = 3;
+  outliers.outliers.k = 8;
+  outliers.outliers.search_radius = 0.1F;
+  outliers.outliers.std_multiplier = 2.0F;
+  auto outlier_filter = graph.op<pf::OutlierRemovalOp>("outliers", outliers);
+  // The camera is mounted pitched down; up is the true ground normal.
+  pf::GroundRemovalConfig ground{.cloud = cloud};
+  std::copy(truth, truth + 3, ground.ground.up);
+  ground.ground.distance_threshold = 0.03F;
+  auto ground_filter = graph.op<pf::GroundRemovalOp>("ground", ground);
+  pf::CloudSettings voxel_cloud = cloud;
+  voxel_cloud.layout = opts.voxel_layout;
+  auto voxels = graph.op<pf::VoxelDownsampleOp>(
+      "voxels", pf::VoxelDownsampleConfig{.voxel_size = opts.voxel_size, .cloud = voxel_cloud});
+  auto report = std::make_shared<app::FilterReport>();
+  auto reporter = graph.op<app::FilterReportOp>(
+      "report", app::FilterReportConfig{.report = report,
+                                        .width = opts.width,
+                                        .height = opts.height,
+                                        .voxel_size = opts.voxel_size,
+                                        .voxel_layout = opts.voxel_layout,
+                                        .expected_frames = opts.count,
+                                        .finished = finished,
+                                        .view_output = display});
+
+  // Lossless edges: every frame is filtered and checked, in order. The source
+  // keeps one frame in flight, so no queue fills and no filter is refused.
+  const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
+  graph.add_flow(source->point_cloud, cropper->point_cloud, lossless);
+  graph.add_flow(cropper->filtered_point_cloud, outlier_filter->point_cloud, lossless);
+  graph.add_flow(outlier_filter->filtered_point_cloud, ground_filter->point_cloud, lossless);
+  graph.add_flow(ground_filter->filtered_point_cloud, voxels->point_cloud, lossless);
+  graph.add_flow(ground_filter->filtered_point_cloud, reporter->ground_cloud, lossless);
+  graph.add_flow(ground_filter->plane, reporter->plane, lossless);
+  graph.add_flow(voxels->filtered_point_cloud, reporter->voxels, lossless);
+
+  holoscan::CompileOptions compile_options;
+  const auto on_gpu = [&compile_options](std::string op, std::string port) {
+    compile_options.deployment.bind_tensor_output_device(
+        holoscan::TensorOutputDevicePlacement{.operator_path = std::move(op),
+                                              .output_port = std::move(port),
+                                              .device = holoscan::DeviceId{0}});
+  };
+  on_gpu("source", "point_cloud");
+  for (const char* op : {"crop", "outliers", "ground", "voxels"}) {
+    on_gpu(op, "filtered_point_cloud");
+  }
+  on_gpu("ground", "plane");
+
+#if PCL_FILTERS_ENABLE_VISUALIZATION
+  if (display) {
+    namespace viz = holoscan::visualization;
+    viz::LayerStack layers;
+    layers.add_image_layer(
+        "voxels", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8Unorm,
+                                      .max_width = static_cast<std::uint32_t>(opts.width),
+                                      .max_height = static_cast<std::uint32_t>(opts.height)});
+    auto visualizer = graph.op<viz::HolovizOp>(
+        "holoviz", std::move(layers),
+        viz::WindowSinkDesc{.title = "PCL Filters: voxels above the ground",
+                            .width = static_cast<std::uint32_t>(opts.width),
+                            .height = static_cast<std::uint32_t>(opts.height)});
+    // Best effort: the display keeps the newest view and never holds back the reporter.
+    graph.add_flow(reporter->view, visualizer->image_layer_input(0),
+                   holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                               .queue_depth = 1U});
+  }
+#endif
+
+  // One worker for the whole graph. The ground filter's cloud goes to the
+  // voxel filter and to the reporter, which also takes the voxels, so the
+  // automatic partitioning would give the voxel filter and the reporter a
+  // worker each; across workers a filter can run while its consumer's
+  // lossless queue is full, and fail on the refused emit.
+  graph.partition(kAppName).include_all();
+  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+  const auto plan = holoscan::compile(graph, std::move(compile_options));
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
+  }
+  if (!plan.ok()) {
+    close_signals(signals);
+    return 1;
+  }
+  if (opts.compile_only) {
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
+    close_signals(signals);
+    return 0;
+  }
+  if (!signals) {
+    std::cerr << kAppName << ": warning: running without managed SIGINT/SIGTERM handling: "
+              << holoscan::runtime_error_message(signals.error())
+              << "; an interrupt ends the process without a report\n";
+  }
+  auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
+  const double point_frames = static_cast<double>(opts.width) * opts.height * opts.count;
+  const std::chrono::duration<double> allowance =
+      std::chrono::seconds(opts.timeout_seconds) +
+      std::chrono::milliseconds(2LL * opts.count * opts.period_ms) +
+      kAllowancePerPoint * point_frames;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::min(allowance, std::chrono::duration<double>(kLongestRun)));
+  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  const bool timed_out = session.is_running();
+  if (timed_out) {
+    std::cerr << kAppName << ": timed out\n";
+    session.request_stop();
+    if (!session.wait_for(kStopGrace)) {
+      // A callback does not return: waiting for it would hang the process.
+      std::cerr << kAppName << ": did not stop within " << kStopGrace.count() << " s\n"
+                << kAppName << ": verdict=FAIL" << std::endl;
+      std::_Exit(1);
+    }
+  }
+  session.wait();
+  const holoscan::RunTermination termination = session.termination();
+  const bool sdk_reported = termination == holoscan::RunTermination::kFailed &&
+                            holoscan::automatic_diagnostic_logging_enabled() &&
+                            holoscan::log_level() <= holoscan::LogLevel::ERROR;
+  if (!session.diagnostics().empty() && !sdk_reported) {
+    std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
+  }
+  close_signals(signals);
+
+  const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
+  const bool passed = !timed_out && session.diagnostics().empty() &&
+                      termination == holoscan::RunTermination::kRequestedCompleted &&
+                      report->frames == opts.count && report->passed();
+  const app::FilterReport& r = *report;
+  std::cout << std::fixed << std::setprecision(2) << kAppName << ": frames=" << r.frames << '/'
+            << opts.count << " ground_left=" << 100.0 * r.fraction(r.ground_left, r.ground)
+            << "% objects_kept=" << 100.0 * r.fraction(r.objects_kept, r.objects)
+            << "% outliers_left=" << 100.0 * r.fraction(r.outliers_left, r.outliers)
+            << "% voxels_per_frame=" << (r.frames == 0 ? 0U : r.voxels / r.frames)
+            << " wrong_voxel_counts=" << r.wrong_voxel_counts << std::setprecision(4)
+            << " plane: max_angle_deg=" << r.max_plane_angle_deg
+            << " max_offset_m=" << r.max_plane_offset_m << " wrong_planes=" << r.wrong_planes;
+  if (r.frame_gaps != 0) {
+    std::cout << " frame_gaps=" << r.frame_gaps;
+  }
+  std::cout << '\n'
+            << kAppName << ": verdict="
+            << (passed    ? "PASS"
+                : stopped ? "STOPPED"
+                          : "FAIL")
+            << '\n';
+  return passed ? 0 : 1;
+}
+
+void validate(const Options& opts) {
+  if (opts.period_ms == 0 || opts.period_ms > 1000 || opts.timeout_seconds == 0) {
+    throw std::invalid_argument("--period-ms must be 1..1000 and --timeout-seconds positive");
+  }
+  app::validate_config(app::SceneSourceConfig{.width = opts.width,
+                                              .height = opts.height,
+                                              .count = opts.count,
+                                              .period = std::chrono::milliseconds(opts.period_ms)});
+  pf::validate_config(pf::VoxelDownsampleConfig{.voxel_size = opts.voxel_size});
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  // Take over SIGINT and SIGTERM while this is the only thread; the SDK
+  // refuses a process that already runs others.
+  SignalDomain signals = holoscan::ManagedShutdownSignals::create();
+  try {
+    const Options opts = parse_args(argc, argv);
+    if (opts.help) {
+      usage(argv[0]);
+      close_signals(signals);
+      return 0;
+    }
+    validate(opts);
+    return execute(opts, signals);
+  } catch (const std::invalid_argument& error) {
+    std::cerr << "error: " << error.what() << '\n';
+    close_signals(signals);
+    return 2;
+  } catch (const std::exception& error) {
+    std::cerr << "error: " << error.what() << '\n';
+    close_signals(signals);
+    return 1;
+  }
+}
