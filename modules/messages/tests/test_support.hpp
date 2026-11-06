@@ -6,12 +6,17 @@
 
 #pragma once
 
+#include <stdlib.h>
+
+#include <cerrno>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -50,6 +55,32 @@ inline int run(const std::vector<TestCase>& cases) {
             << '\n';
   return failures() == 0 ? 0 : 1;
 }
+
+// A folder of its own under the temporary directory, which mkdtemp() names
+// unpredictably and makes private, so that nothing can be planted in it;
+// removed with everything in it.
+class TemporaryFolder {
+ public:
+  explicit TemporaryFolder(std::string_view prefix) {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / (std::string(prefix) + "_XXXXXX")).string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    path_ = pattern;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
 
 template <typename Exception, typename Body>
 bool throws(Body&& body) {

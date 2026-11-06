@@ -14,8 +14,7 @@ add_executable(messages_consumer main.cpp)
 target_link_libraries(messages_consumer PRIVATE holoscan::messages)
 set_target_properties(messages_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# Passes on exit status 0, which the consumer returns only when it prints PASS (a
+# PASS_REGULAR_EXPRESSION would ignore the exit status).
 add_test(NAME messages_installed_consumer COMMAND messages_consumer)
-set_tests_properties(
-  messages_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "messages_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(messages_installed_consumer PROPERTIES TIMEOUT 300)

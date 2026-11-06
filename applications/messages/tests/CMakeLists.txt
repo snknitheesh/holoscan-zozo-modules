@@ -3,7 +3,8 @@
 
 # Runs the demo through run_and_match.cmake, which checks its exit status as well as its
 # output: messages_app_test(<name> <exit status> <output regex> <arguments>...). The runs
-# need a GPU and its driver.
+# and the graph's compilation need a GPU and its driver; the option errors exit before
+# either.
 set(_run_and_match "${CMAKE_CURRENT_SOURCE_DIR}/run_and_match.cmake")
 function(messages_app_test name status output)
   add_test(
@@ -40,8 +41,11 @@ set_tests_properties(
   messages_app_host_clouds
   messages_app_slow_camera_info
   messages_app_one_worker
+  PROPERTIES LABELS "messages;gpu" TIMEOUT 300
+)
+set_tests_properties(
   messages_app_bad_option
   messages_app_bad_period
   messages_app_bad_compile_only
-  PROPERTIES LABELS "messages;gpu" TIMEOUT 300
+  PROPERTIES LABELS "messages" TIMEOUT 300
 )

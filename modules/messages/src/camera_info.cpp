@@ -78,16 +78,16 @@ void check_distortion(const CameraInfo& info, std::string_view name) {
   }
 }
 
+// The ROI says where on the sensor the images were read from; the module
+// knows nothing of the sensor's size, so only its own extent is checked.
 void check_roi(const CameraInfo& info, std::string_view name) {
   if (!info.roi) return;
   const RegionOfInterest& roi = *info.roi;
   if (roi.width == 0 || roi.height == 0) fail(field(name, "roi") + " is empty");
-  const std::uint64_t sensor_width = std::uint64_t{info.width} * info.binning_x;
-  const std::uint64_t sensor_height = std::uint64_t{info.height} * info.binning_y;
-  if (std::uint64_t{roi.x} + roi.width > sensor_width ||
-      std::uint64_t{roi.y} + roi.height > sensor_height) {
-    fail(field(name, "roi") + " reaches past the " + std::to_string(sensor_width) + "x" +
-         std::to_string(sensor_height) + " sensor (the image size times the binning)");
+  constexpr std::uint64_t kCoordinates = std::uint64_t{1} << 32;
+  if (std::uint64_t{roi.x} + roi.width > kCoordinates ||
+      std::uint64_t{roi.y} + roi.height > kCoordinates) {
+    fail(field(name, "roi") + " reaches past the largest sensor coordinate, 2^32 - 1");
   }
 }
 

@@ -22,16 +22,25 @@
 // - K and D describe the camera; a camera whose D has a coefficient that is
 //   not zero is kRaw, else kUndistorted (a distortion_model of "none" or ""
 //   with no coefficients is kNone).
-// - R, when present and not the identity, is the camera's rectification.
+// - R, when present and not the identity, is the camera's rectification. ROS's
+//   stereo calibration writes it with 8 decimals, which leaves it up to ~1e-8
+//   from a rotation: an R within 1e-6 of one is taken as the rotation nearest
+//   to it; one further off is refused.
 // - P is read only to recover a stereo pair's extrinsics (below); a camera's
 //   own images are described by K.
 // Writing is the inverse: R is the rectification or the identity, and P is
-// [K | 0] for a single camera.
+// [K | 0] for a single camera. The format has no region of interest or
+// binning, so a camera with either is refused rather than written as if it
+// were the whole sensor.
 //
 // Values are written with the fewest digits that read back as the same
 // double, so write then read gives back the same CameraInfo (a kRectified
 // camera reads back as kUndistorted on its own: one file cannot say it
-// belongs to a rectified pair; read it as a pair).
+// belongs to a rectified pair; read it as a pair). A pair's extrinsics,
+// baseline and doffs are not in the files but recomputed from R, P and K
+// when they are read, so they read back to within the rounding of that
+// arithmetic, not bit for bit: same_calibration() of a pair and of the pair
+// read back from its files may differ.
 
 #pragma once
 
@@ -55,7 +64,8 @@ inline constexpr std::uintmax_t kMaxCameraInfoFileBytes = 1U << 20;
 [[nodiscard]] CameraInfo parse_camera_info_yaml(std::string_view text);
 
 // Writes `info` (validated first) as a camera_info file, replacing `path`.
-// @throws std::invalid_argument for an invalid `info` or a file that cannot be written.
+// @throws std::invalid_argument for an invalid `info`, one with a region of
+// interest or binning, or a file that cannot be written.
 void write_camera_info_yaml(const CameraInfo& info, const std::filesystem::path& path);
 [[nodiscard]] std::string format_camera_info_yaml(const CameraInfo& info);
 
@@ -69,7 +79,10 @@ void write_camera_info_yaml(const CameraInfo& info, const std::filesystem::path&
 // which for a usual file (left Tx = 0) is -R_right^T * (baseline, 0, 0).
 // A pair whose files describe rectified images (no distortion, R the
 // identity, P's left 3x3 equal to K, one fx, fy and cy, Ty = 0) is a
-// kRectified pair, with baseline = -Tx_r / fx_r and doffs = cx_r - cx_l.
+// kRectified pair, with baseline = -Tx_r / fx_r and doffs = cx_r - cx_l. So,
+// as for a single file, the files cannot tell an undistorted pair that is not
+// rectified, but whose geometry happens to be, from a rectified one: it reads
+// back as kRectified, with its baseline.
 // @throws std::invalid_argument naming the file and what is wrong, including
 // a right projection without a baseline.
 [[nodiscard]] StereoCameraInfo read_stereo_camera_info_yaml(
@@ -82,8 +95,12 @@ void write_camera_info_yaml(const CameraInfo& info, const std::filesystem::path&
 // extrinsics only as R and P, so a pair that is not rectified needs both
 // cameras' rectifications (an absent one is the identity) to agree with
 // right_from_left (see validate()), and its P are written with the left
-// camera's fy as fx' and fy' and its principal point.
-// @throws std::invalid_argument for a pair that is not valid or cannot be written.
+// camera's fy as fx' and fy' and its principal point. Both files' text is
+// made (and the pair checked) before either is written, but the files are
+// written one after the other: when writing the right one fails, the left
+// one has already been replaced.
+// @throws std::invalid_argument for a pair that is not valid or cannot be
+// written, or a camera with a region of interest or binning.
 void write_stereo_camera_info_yaml(const StereoCameraInfo& info,
                                    const std::filesystem::path& left_path,
                                    const std::filesystem::path& right_path);

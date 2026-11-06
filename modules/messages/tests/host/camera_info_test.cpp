@@ -112,15 +112,22 @@ void test_camera_refusals() {
   VERIFY(camera_refused([](CameraInfo& c) { c.binning_y = 0; }, "camera_info.binning_x"));
   VERIFY(camera_refused([](CameraInfo& c) { c.roi = RegionOfInterest{0, 0, 0, 10}; },
                         "camera_info.roi is empty"));
-  VERIFY(camera_refused([](CameraInfo& c) { c.roi = RegionOfInterest{1200, 0, 100, 10}; },
-                        "camera_info.roi reaches past the 1280x720 sensor"));
+  VERIFY(camera_refused([](CameraInfo& c) { c.roi = RegionOfInterest{0xFFFFFFFFU, 0, 2, 10}; },
+                        "camera_info.roi reaches past the largest sensor coordinate"));
   VERIFY(camera_refused([](CameraInfo& c) { c.header.frame_id.assign(kMaxFrameIdBytes + 1, 'f'); },
                         "camera_info.header.frame_id has 257 bytes"));
-  // Binning makes the sensor larger than the images; a ROI may cover it.
+  // Binned images: the ROI is in sensor pixels, past the images' own size.
   CameraInfo binned = raw_camera();
   binned.binning_x = 2;
   binned.roi = RegionOfInterest{1280, 0, 1280, 720};
   validate(binned);
+  // A window of the sensor at an offset, which the images are: 640x480 images
+  // of the sensor's columns 100 .. 739 and rows 50 .. 529.
+  CameraInfo cropped = raw_camera();
+  cropped.width = 640;
+  cropped.height = 480;
+  cropped.roi = RegionOfInterest{100, 50, 640, 480};
+  validate(cropped);
   binned.header.frame_id.assign(kMaxFrameIdBytes, 'f');
   validate(binned);
   // A rectified camera has no rotation left.

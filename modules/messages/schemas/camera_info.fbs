@@ -34,8 +34,8 @@ enum DistortionModel : byte {
   Equidistant = 3,
 }
 
-// The part of the sensor the images hold, in full-resolution pixels before
-// binning: columns x .. x + width - 1, rows y .. y + height - 1.
+// The part of the sensor the images were read from, in full-resolution
+// pixels before binning: columns x .. x + width - 1, rows y .. y + height - 1.
 struct RegionOfInterest {
   x: uint32;
   y: uint32;
@@ -66,7 +66,8 @@ table CameraInfo {
   // rectified frame. Absent when there is none to apply: always for a
   // Rectified camera, and for a camera outside a stereo pair.
   rectification: holoscan.schema.Matrix3d (id: 11);
-  // Absent: the images hold the whole sensor.
+  // Absent: the whole sensor (or not known). Not tied to width and height,
+  // which describe the images as they are.
   roi: RegionOfInterest (id: 12);
   // Sensor pixels per image pixel, at least 1.
   binning_x: uint32 = 1 (id: 13);

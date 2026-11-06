@@ -5,15 +5,18 @@
 // and runs CameraInfoSourceOp into an operator that takes frames and the
 // camera info with camera_info_contract() and LatestCameraInfo.
 
-#include <unistd.h>
+#include <stdlib.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -36,6 +39,8 @@ using Frame = holoscan::schema::HeaderT;
 using std::chrono_literals::operator""ms;
 constexpr std::uint32_t kFrames = 20;
 
+// kFrames frames, stamped with their activation time; one a consumer has no
+// room for goes again on the next tick, with its capture time.
 class FrameSourceOp final : public holoscan::Operator<> {
  public:
   void setup(holoscan::OperatorSpec& spec) override { spec.output(frame, "frame"); }
@@ -44,16 +49,55 @@ class FrameSourceOp final : public holoscan::Operator<> {
     result.trigger(holoscan::OnClock{.period = 5ms});
     return result;
   }
+  void start() override {
+    sent_ = 0;
+    capture_.reset();
+  }
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
     if (sent_ >= kFrames) return {};
+    if (!capture_) capture_ = context.activation_time();
+    Frame header;
+    header.capture_timestamp_ns = capture_->timestamp_ns;
+    header.device_sequence = sent_ + 1U;
+    auto sent = frame.emit(header, holoscan::EmitOptions{.capture_time = *capture_});
+    if (!sent) {
+      if (sent.error().code == holoscan::ErrorCode::kBackpressured) return {};
+      return sent;
+    }
+    capture_.reset();
     ++sent_;
-    return frame.emit(Frame{}, holoscan::EmitOptions{.capture_time = context.activation_time()});
+    return {};
   }
   holoscan::Output<Frame> frame;
 
  private:
   std::uint32_t sent_{};
+  std::optional<holoscan::TimePoint> capture_;
+};
+
+// A folder for the camera_info file, which mkdtemp() names unpredictably and
+// makes private; removed with everything in it.
+class TemporaryFolder {
+ public:
+  TemporaryFolder() {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "messages_consumer_XXXXXX").string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    path_ = pattern;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  std::filesystem::path path_;
 };
 
 struct Result {
@@ -94,8 +138,10 @@ class ConsumerOp final : public holoscan::Operator<> {
 }  // namespace
 
 int main() try {
-  const std::filesystem::path file = std::filesystem::temp_directory_path() /
-                                     ("messages_consumer_" + std::to_string(::getpid()) + ".yaml");
+  // The run constructs the operators again, reading the file then: it stays
+  // until main() returns.
+  const TemporaryFolder folder;
+  const std::filesystem::path file = folder.path() / "camera_info.yaml";
   const hm::CameraInfo truth =
       hm::synthetic_stereo_camera_info(hm::DistortionModel::kPlumbBob).left;
   hm::write_camera_info_yaml(truth, file);
@@ -113,11 +159,10 @@ int main() try {
   graph.partition("messages_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph);
-  if (!plan.ok()) {
-    std::filesystem::remove(file);
+  if (!plan.diagnostics().empty()) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
-    return 1;
   }
+  if (!plan.ok()) return 1;
   auto session = holoscan::run_async(plan);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
   while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
@@ -125,8 +170,6 @@ int main() try {
   }
   if (session.is_running()) session.request_stop();
   session.wait();
-  // The run constructs the operators again, reading the file then: remove it only now.
-  std::filesystem::remove(file);
   const bool passed = session.termination() == holoscan::RunTermination::kRequestedCompleted &&
                       result->frames == kFrames && result->with_info + 1 >= kFrames &&
                       result->fx == truth.fx;

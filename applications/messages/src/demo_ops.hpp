@@ -42,7 +42,8 @@ struct Report {
   std::atomic<std::uint32_t> wrong_camera_info{};
   std::atomic<std::uint32_t> clouds{};
   std::atomic<std::uint32_t> wrong_clouds{};
-  // The largest difference from the true extrinsics, rotation and translation (m).
+  // The largest difference from the true extrinsics, rotation and translation
+  // (m), and from the true rectifications.
   std::atomic<double> max_extrinsics_error{};
   // Checkers still running; the last one to finish ends the run.
   std::atomic<int> running{2};
@@ -74,7 +75,7 @@ class FrameSourceOp final : public holoscan::Operator<> {
 };
 
 struct CalibrationCheckConfig {
-  // The calibration the files were written from.
+  // The calibration the files were written from, with the decimals they hold.
   hm::StereoCameraInfo truth;
   std::uint32_t frames{};
   std::shared_ptr<Report> report;
@@ -82,7 +83,9 @@ struct CalibrationCheckConfig {
 
 // Takes the stereo frames and the camera info with the recommended contract,
 // and checks each new calibration against the truth: both cameras field by
-// field, the extrinsics recovered from R and P to 1e-9.
+// field (K and D as the files hold them), the rectifications and the
+// extrinsics recovered from R and P to 1e-7 (the files hold R with 8
+// decimals).
 class CalibrationCheckOp final : public holoscan::Operator<> {
  public:
   explicit CalibrationCheckOp(CalibrationCheckConfig config) : config_(std::move(config)) {}
@@ -130,6 +133,9 @@ class CloudSourceOp final : public holoscan::Operator<> {
  private:
   CloudConfig config_;
   std::uint32_t sent_{};
+  // The cloud being sent: its capture time and number stay the same until it
+  // is out, however often a busy checker refuses it.
+  std::optional<holoscan::EmitOptions> pending_;
 };
 
 // Checks each cloud, every value, against the one its frame number gives.

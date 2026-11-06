@@ -9,9 +9,10 @@
 // and normals through the graph, checking every value. Exit status 0 only
 // when everything matched.
 
-#include <unistd.h>
+#include <stdlib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -120,13 +122,18 @@ void usage(const char* argv0) {
                "                          without running it (default: false)\n";
 }
 
-// A folder for the calibration files, removed with everything in it.
+// A folder for the calibration files, which mkdtemp() names unpredictably
+// and makes private, so that nothing can be planted where the files go;
+// removed with everything in it on every path out of the run.
 class TemporaryFolder {
  public:
-  TemporaryFolder()
-      : path_(fs::temp_directory_path() /
-              ("holoscan_messages_demo_" + std::to_string(::getpid()))) {
-    fs::create_directories(path_);
+  TemporaryFolder() {
+    std::string pattern = (fs::temp_directory_path() / "holoscan_messages_demo_XXXXXX").string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the calibration files");
+    }
+    path_ = pattern;
   }
   ~TemporaryFolder() {
     std::error_code ignored;
@@ -142,9 +149,28 @@ class TemporaryFolder {
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
+// Closes the signal domain, if there is one, on every way out of main().
+class CloseSignals {
+ public:
+  explicit CloseSignals(SignalDomain& signals) noexcept : signals_(signals) {}
+  ~CloseSignals() {
+    if (!signals_) return;
+    if (auto closed = signals_->close(); !closed) {
+      std::cerr << kAppName << ": warning: closing the signal domain failed: "
+                << holoscan::runtime_error_message(closed.error()) << '\n';
+    }
+  }
+  CloseSignals(const CloseSignals&) = delete;
+  CloseSignals& operator=(const CloseSignals&) = delete;
+
+ private:
+  SignalDomain& signals_;
+};
+
 int execute(const Options& opts, SignalDomain& signals) {
   // The calibration, written as ROS files: the rectified cameras' focal
-  // length and principal point are the left camera's.
+  // length and principal point are the left camera's. The files hold K and D
+  // with the calibrator's decimals, which the checker expects.
   const hm::StereoCameraInfo truth =
       hm::synthetic_stereo_camera_info(hm::DistortionModel::kPlumbBob);
   const TemporaryFolder folder;
@@ -152,6 +178,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   const fs::path right_file = folder.path() / "right.yaml";
   demo::write_ros_stereo_files(truth, truth.left.fy, truth.left.cx, truth.left.cy, left_file,
                                right_file);
+  hm::StereoCameraInfo as_written = truth;
+  as_written.left = demo::as_written(truth.left);
+  as_written.right = demo::as_written(truth.right);
 
   auto report = std::make_shared<demo::Report>();
   const auto period = std::chrono::milliseconds(opts.period_ms);
@@ -166,7 +195,7 @@ int execute(const Options& opts, SignalDomain& signals) {
                                  .period = std::chrono::milliseconds(opts.info_period_ms)});
   auto check = graph.op<demo::CalibrationCheckOp>(
       "calibration_check",
-      demo::CalibrationCheckConfig{.truth = truth, .frames = opts.count, .report = report});
+      demo::CalibrationCheckConfig{.truth = as_written, .frames = opts.count, .report = report});
   graph.add_flow(frames->left, check->left, lossless);
   graph.add_flow(frames->right, check->right, lossless);
   graph.add_flow(camera_info->stereo_camera_info, check->camera_info,
@@ -177,11 +206,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   auto clouds = graph.op<demo::CloudSourceOp>("clouds", cloud_config);
   auto cloud_check = graph.op<demo::CloudCheckOp>("cloud_check", cloud_config);
   graph.add_flow(clouds->cloud, cloud_check->cloud, lossless);
-  // One worker for the whole graph. With three sources (the frames, the camera
-  // info and the clouds), the automatic partitioning would give the frame
-  // source, the camera info source, the calibration check, and the clouds with
-  // their check a worker each; the frame source would then run while the
-  // calibration check's lossless queue is full, and have its pairs refused.
+  // One worker for the whole graph, as the module's README advises for
+  // lossless chains (every frame and cloud here is checked). With three
+  // sources (the frames, the camera info and the clouds), the automatic
+  // partitioning would give the frame source, the camera info source, the
+  // calibration check, and the clouds with their check a worker each, and the
+  // sources would then run while their checkers' queues or the clouds' pool
+  // slots are full, and have what they send refused (and send it again).
   graph.partition(kAppName).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
@@ -196,8 +227,8 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (!plan.ok()) return 1;
   if (opts.compile_only) {
-    // The workers the graph runs on, one per partition.
-    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
+    // The workers the graph runs on: one per partition that runs operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -232,12 +263,6 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!session.diagnostics().empty() && !sdk_reported) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
   }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
-  }
 
   // CameraInfoSourceOp sends first when the run starts; at most the first
   // frame can come before it.
@@ -268,6 +293,7 @@ int main(int argc, char** argv) try {
   // Take over SIGINT and SIGTERM while this is the only thread; the SDK
   // refuses a process that already runs others.
   SignalDomain signals = holoscan::ManagedShutdownSignals::create();
+  const CloseSignals close_signals(signals);
   const Options opts = parse_args(argc, argv);
   if (opts.help) {
     usage(argv[0]);

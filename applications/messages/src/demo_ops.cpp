@@ -72,20 +72,38 @@ double max_difference(const hm::Vector3& a, const hm::Vector3& b) {
   return worst;
 }
 
-// Every field that the files hold, exactly, and the extrinsics to 1e-9.
+// What the files' 8 decimals of R leave of the rotations, with room.
+constexpr double kExtrinsicsTolerance = 1e-7;
+
+// How far `got`'s rectification is from `truth`'s; infinite when only one has one.
+double rectification_error(const hm::CameraInfo& got, const hm::CameraInfo& truth) {
+  if (!got.rectification || !truth.rectification) {
+    return got.rectification == truth.rectification ? 0.0 : INFINITY;
+  }
+  return max_difference(*got.rectification, *truth.rectification);
+}
+
+// Every field that the files hold: K and D exactly as written, frame ids
+// included; R and the extrinsics recovered from R and P to 1e-7.
 bool check_calibration(const hm::StereoCameraInfo& got, const hm::StereoCameraInfo& truth,
                        Report& report) {
-  const double error =
-      std::max(max_difference(got.right_from_left.rotation, truth.right_from_left.rotation),
-               max_difference(got.right_from_left.translation, truth.right_from_left.translation));
+  const double error = std::max(
+      {max_difference(got.right_from_left.rotation, truth.right_from_left.rotation),
+       max_difference(got.right_from_left.translation, truth.right_from_left.translation),
+       rectification_error(got.left, truth.left), rectification_error(got.right, truth.right)});
   double worst = report.max_extrinsics_error.load();
   while (error > worst && !report.max_extrinsics_error.compare_exchange_weak(worst, error)) {
   }
-  hm::CameraInfo left = got.left;
-  hm::CameraInfo right = got.right;
-  left.header = truth.left.header;
-  right.header = truth.right.header;
-  const bool ok = left == truth.left && right == truth.right && error < 1e-9 &&
+  // The camera info's capture time and sequence are the source's, not the
+  // file's; the rest must be the file's.
+  const auto as_sent = [](hm::CameraInfo camera, const hm::CameraInfo& truth_camera) {
+    camera.header.capture_timestamp_ns = truth_camera.header.capture_timestamp_ns;
+    camera.header.device_sequence = truth_camera.header.device_sequence;
+    camera.rectification = truth_camera.rectification;
+    return camera;
+  };
+  const bool ok = as_sent(got.left, truth.left) == truth.left &&
+                  as_sent(got.right, truth.right) == truth.right && error < kExtrinsicsTolerance &&
                   got.header.frame_id == truth.header.frame_id && got.baseline == 0.0 &&
                   got.doffs == 0.0;
   if (!ok) {
@@ -162,6 +180,8 @@ holoscan::expected<void, holoscan::Error> FrameSourceOp::compute(
 // --- CalibrationCheckOp -------------------------------------------------------
 
 void CalibrationCheckOp::setup(holoscan::OperatorSpec& spec) {
+  // Two: room for the next pair while the checker takes this one, so that a
+  // full queue (which only makes the source send again) is rare.
   spec.input(left, "left").queue_depth(2U);
   spec.input(right, "right").queue_depth(2U);
   spec.input(camera_info, "camera_info");
@@ -207,11 +227,18 @@ holoscan::Contract CloudSourceOp::contract() const {
   return result;
 }
 
-void CloudSourceOp::start() { sent_ = 0; }
+void CloudSourceOp::start() {
+  sent_ = 0;
+  pending_.reset();
+}
 
 holoscan::expected<void, holoscan::Error> CloudSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (sent_ >= config_.count) return {};
+  if (!pending_) {
+    pending_ =
+        holoscan::EmitOptions{.capture_time = context.activation_time(), .frame_id = sent_ + 1U};
+  }
   const CloudValues values = cloud_values(sent_);
   const hm::PointCloudShape shape = hm::organized_cloud(kCloudHeight, kCloudWidth);
   auto loan = hm::allocate_point_cloud(cloud, shape, {.colors = true, .normals = true},
@@ -226,7 +253,8 @@ holoscan::expected<void, holoscan::Error> CloudSourceOp::compute(
         std::memcpy(writer.data(), data, bytes);
         return {};
       }
-      // From pageable memory, the copy has read `data` when it returns.
+      // From pageable memory, the copy may still read `data` after it returns:
+      // the stream is synchronized below, before `values` goes.
       if (const cudaError_t copied = cudaMemcpyAsync(
               writer.data(), data, bytes, cudaMemcpyHostToDevice, context.cuda_stream().get());
           copied != cudaSuccess) {
@@ -248,14 +276,21 @@ holoscan::expected<void, holoscan::Error> CloudSourceOp::compute(
       !r) {
     return r;
   }
-  const holoscan::TimePoint now = context.activation_time();
-  if (auto sent = hm::emit_point_cloud(cloud, std::move(*loan),
-                                       hm::Header{"left", now.timestamp_ns, sent_ + 1U}, shape,
-                                       values.valid, holoscan::EmitOptions{.capture_time = now});
+  if (!host) {
+    if (const cudaError_t done = cudaStreamSynchronize(context.cuda_stream().get());
+        done != cudaSuccess) {
+      return holoscan::make_unexpected(failure(cudaGetErrorString(done)));
+    }
+  }
+  const std::int64_t capture_ns = pending_->capture_time->timestamp_ns;
+  if (auto sent =
+          hm::emit_point_cloud(cloud, std::move(*loan), hm::Header{"left", capture_ns, sent_ + 1U},
+                               shape, values.valid, *pending_);
       !sent) {
     // A checker without room: this cloud again on the next tick.
     return busy(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
   }
+  pending_.reset();
   ++sent_;
   return {};
 }
@@ -263,6 +298,8 @@ holoscan::expected<void, holoscan::Error> CloudSourceOp::compute(
 // --- CloudCheckOp ---------------------------------------------------------------
 
 void CloudCheckOp::setup(holoscan::OperatorSpec& spec) {
+  // Two: room for the next cloud while the checker takes this one, so that a
+  // full queue (which only makes the source send again) is rare.
   spec.input(cloud, "cloud").queue_depth(2U);
 }
 
@@ -278,9 +315,12 @@ holoscan::expected<void, holoscan::Error> CloudCheckOp::compute(
   if (!sample) return holoscan::make_unexpected(std::move(sample).error());
   const hm::schema::PointCloudT& c = sample->data;
   Report& report = *config_.report;
+  // In the memory the source was asked for: host (pageable) or device.
+  const auto memory = config_.memory == holoscan::MemoryKind::kHost ? kDLCPU : kDLCUDA;
   bool ok = static_cast<bool>(hm::check_point_cloud(c)) && c.header &&
             c.header->device_sequence >= 1 && c.organized && hm::is_present(c.colors) &&
-            hm::is_present(c.normals) && !hm::is_present(c.intensity);
+            hm::is_present(c.normals) && !hm::is_present(c.intensity) &&
+            c.points->device().device_type == memory;
   if (ok) {
     const CloudValues expected =
         cloud_values(static_cast<std::uint32_t>(c.header->device_sequence - 1));
