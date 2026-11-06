@@ -173,14 +173,18 @@ collection's other modules. A 1.x graph changes as follows:
 | | 1.x | 2.0 |
 | --- | --- | --- |
 | Intrinsics | `intrinsics` in the configs, or an `intrinsics` tensor input with `intrinsics_input` | The mandatory `camera_info` input, from `CameraInfoSourceOp` and a ROS `camera_info` file, or sent with every frame (`camera_info.timing = kEveryFrame`) |
-| `DepthToPointCloudOp` outputs | `point_cloud` (`Tensor` `[H, W, 3]`) and `colors` (`Tensor`) | One `point_cloud` (`PointCloudT`) with `points` and, with `color`, `colors` |
+| Workers | One source, one worker | `CameraInfoSourceOp` is a second source: add `graph.partition("name").include_all()` to keep a lossless chain on one worker (see [The camera](#the-camera)) |
+| Frames before the camera info | Every input gave an output | Frames or clouds that arrive before the first camera info give none |
+| `DepthToPointCloudOp` outputs | `point_cloud` (`Tensor` `[H, W, 3]`) and, with `color`, `colors` (`Tensor`) | One `point_cloud` (`PointCloudT`) with `points` and, with `color`, `colors`; no `colors` port |
 | `DepthToPointCloudConfig::invalid_value` | Any value for invalid points | Gone: invalid points are NaN, as the message defines |
 | `PointCloudToDepthOp` inputs | `points` and `colors` (`Tensor`), `intrinsics` | One `point_cloud` (`PointCloudT`) and `camera_info` |
-| `PointCloudToDepthConfig` `width`, `height`, `frame_id` | The image size and the images' frame | From the camera info; `max_width` and `max_height` size the outputs |
-| Raw (distorted) cameras | Not modeled, not detected | Refused with an error: undistort or rectify first |
-| Package | `find_package(holoscan-point-cloud 1.1)` | `find_package(holoscan-point-cloud 2.0)`, which finds holoscan-messages; the Debian package depends on `holoscan-messages` |
+| `PointCloudToDepthConfig` `width`, `height`, `frame_id` | The image size, default 640x480, and the images' frame | The camera info's size and frame; `max_width` and `max_height`, default 1920x1080, size the output pools (8.3 MB a float32 depth slot, from 1.2 MB): set them to your largest camera |
+| Headers | Images: the configured `frame_id` | Cloud and images: the camera info's frame id and the input's capture time; the cloud's `valid_count` is -1 (not counted) |
+| New refusals | | A depth image of another size than its camera info, and a skewed or raw (distorted) camera, fail the frame: undistort or rectify first |
+| Includes | `depth_to_point_cloud_op.hpp` brought `<holoscan/core/domain/tensor.hpp>` and `<limits>`, `point_cloud_to_depth_op.hpp` `<string>` | Include them yourself where you use them |
+| Package | `find_package(holoscan-point-cloud 1.1)`, `libholoscan_point_cloud.so.1` | `find_package(holoscan-point-cloud 2.0)`, which finds holoscan-messages; `libholoscan_point_cloud.so.2`, so rebuild; the Debian package depends on `holoscan-messages` 1.x |
 
-Before:
+A depth camera, before:
 
 ```cpp
 auto cloud = graph.op<pc::DepthToPointCloudOp>(
@@ -202,11 +206,33 @@ auto cloud = graph.op<pc::DepthToPointCloudOp>(
 graph.add_flow(camera->depth, cloud->depth);
 graph.add_flow(info->camera_info, cloud->camera_info, hm::latest_camera_info_connection());
 graph.add_flow(cloud->point_cloud, consumer->cloud);  // Input<hm::schema::PointCloudT>
+graph.partition("my_app").include_all();  // Two sources now: keep one worker.
 ```
 
 where `depth.yaml` is the camera's `camera_info` file, with `camera_matrix` holding `fx`, `fy`,
 `cx` and `cy`. A consumer reads the points from `sample->data.points` and the colors from
 `sample->data.colors`, and checks the message with `hm::check_point_cloud()`.
+
+A cloud producer for `PointCloudToDepthOp`, before, sent its own tensor:
+
+```cpp
+spec.output(points, "points");                     // Output<holoscan::Tensor>
+// compute():
+points.emit(xyz_tensor, options);                  // float32 [N, 3]
+```
+
+After, it declares a `PointCloud` output and fills a cloud from the output's pool, which is the only
+memory a `PointCloud` message can carry, so points the producer keeps in memory of its own cost one
+copy:
+
+```cpp
+hm::declare_point_cloud_output(spec, cloud, "cloud", {.max_points = 1 << 20});
+// compute():
+const auto shape = hm::unorganized_cloud(n);
+auto loan = hm::allocate_point_cloud(cloud, shape, {}, stream);
+loan->write_and_commit(hm::PointCloudFields::points, stream, fill_points);
+hm::emit_point_cloud(cloud, std::move(*loan), {.frame_id = "lidar"}, shape, -1, options);
+```
 
 ## Use it in your graph
 
@@ -232,7 +258,10 @@ auto cloud = graph.op<pc::DepthToPointCloudOp>(
                                              .depth_max = 10.0F,
                                              .max_width = 640,
                                              .max_height = 480});
-graph.add_flow(camera->depth, cloud->depth);  // Output<holoscan::schema::ImageT>
+// Live sensors: the newest frame replaces one the operator has not taken yet.
+const holoscan::ConnectionOptions live{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                       .queue_depth = 1U};
+graph.add_flow(camera->depth, cloud->depth, live);  // Output<holoscan::schema::ImageT>
 graph.add_flow(info->camera_info, cloud->camera_info, hm::latest_camera_info_connection());
 
 // Lidar points into the same camera: x forward, y left, z up into the camera
@@ -248,9 +277,12 @@ auto project = graph.op<pc::PointCloudToDepthOp>(
                    .depth_max = 50.0F,
                    .depth_format = pc::DepthFormat::kUint16,  // millimeters
                    .point_size = 3});
-graph.add_flow(lidar->cloud, project->point_cloud);  // Output<hm::schema::PointCloudT>
+graph.add_flow(lidar->cloud, project->point_cloud, live);  // Output<hm::schema::PointCloudT>
 graph.add_flow(info->camera_info, project->camera_info, hm::latest_camera_info_connection());
 graph.add_flow(project->depth, consumer->depth);  // Input<holoscan::schema::ImageT>
+
+// CameraInfoSourceOp is a second source: keep the graph on one worker (see The camera).
+graph.partition("my_app").include_all();
 ```
 
 The outputs of both operators are in device memory, so bind their GPU when compiling:
@@ -327,7 +359,7 @@ holoscan --project-root modules/point-cloud package holoscan-point-cloud --langu
 `--language cpp` selects the module rather than its package entry, which has the same name. This
 builds for every major GPU architecture and writes `holoscan-point-cloud_2.0.0_<arch>.deb` to the
 current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)` and
-`holoscan-messages (>= 1.0.0)`, so install it with the messages module's package,
+`holoscan-messages` 1.x (`>= 1.0.0`, `<< 2`), so install it with the messages module's package,
 `apt install ./holoscan-messages_1.0.0_<arch>.deb ./holoscan-point-cloud_2.0.0_<arch>.deb`, which
 needs NVIDIA's CUDA repository.
 

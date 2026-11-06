@@ -28,8 +28,9 @@ Videos of the demo on synthetic input and on real input go in [tests/video](test
   and Sensor I/O (Testing for the tests), CUDA 13, CMake 4.0 or later and a C++20 compiler.
 
 The demo downloads nothing and needs no models. The `images` mode reads your own depth images and
-their `camera_info` file; every other mode renders its frames and writes the synthetic camera's
-`camera_info` file to the temporary folder, removing it when the run ends.
+their `camera_info` file; every other mode renders its frames and, unless
+`--camera-info-per-frame true`, writes the synthetic camera's `camera_info` file to a folder of its
+own in the temporary folder, removing it when the run ends.
 
 ## Build and run
 
@@ -58,26 +59,28 @@ away to be valid, all moving from frame to frame. Its camera goes to `CameraInfo
 as uint16 millimeters instead of float32 meters, `--host-input true` from host instead of GPU
 memory, and `--camera-info-per-frame true` sends the camera info with every frame instead, its
 focal length changing from frame to frame. `--ply-dir DIR` writes each cloud as
-`DIR/frame_NNNNNN.ply`, which any point-cloud viewer opens. `--help` lists every option.
+`DIR/frame_NNNNNN.ply`, `NNNNNN` the frame from 0, which any point-cloud viewer opens. `--help`
+lists every option.
 
 ### Your own depth images
 
 The image source reads binary PGM files, 8- or 16-bit, as depth cameras and image tools save them;
 16-bit samples are big-endian, as the format specifies. Give the camera's ROS `camera_info` file,
-for images of the depth images' size, and the depth scale if the images are not in millimeters:
+for images of the depth images' size, and the depth scale in meters per sample value if the images
+are not in millimeters; 8-bit images always need it:
 
 ```bash
 build/depth_to_point_cloud/depth_to_point_cloud --source images --images path/to/pgm/folder \
   --camera-info path/to/depth.yaml --ply-dir .
 ```
 
-The camera must be undistorted or rectified: the operator refuses one whose distortion
-coefficients are not all zero.
+The camera must be undistorted or rectified, without skew: the demo refuses one whose distortion
+coefficients are not all zero, or that has a skew.
 
 ## Output
 
 Each run prints the clouds and frames, the frames that came before the first camera info (which
-give no cloud), the point counts, the valid points and their depth range and, for synthetic input,
+give no cloud; at most one may), the point counts, the valid points and their depth range and, for synthetic input,
 how many points and colors differ from the truth and the largest error. Every frame after the
 first camera info must give a cloud; a gap in the frame ids fails the run and is printed too. Then
 comes a `verdict`: `PASS`, `FAIL`, or `STOPPED` when an interrupt ends the run early. It exits 0 on
@@ -109,8 +112,8 @@ SDK's operator test harness, and the demo's runs: the synthetic camera in float3
 GPU and host memory, with the camera from a `camera_info` file and with every frame and a narrower
 depth range, every point and color against ground truth; a folder of 16-bit PGM depth images with
 its `camera_info` file, once and looped; PLY output; cameras that are missing, unreadable, of
-another size or raw; and the exit status and verdict of failed, timed-out, stopped and invalid
-runs, and of a run without managed signal handling. The PGM file test in
+another size, raw or skewed; and the exit status and verdict of failed, timed-out, stopped and
+invalid runs, and of a run without managed signal handling. The PGM file test in
 [tests/host/](tests/host/) needs neither the SDK nor a GPU, and also runs on the hosted CI job.
 
 `depth_app_real_recordings` runs the demo on the local recordings, each clip's depth images with

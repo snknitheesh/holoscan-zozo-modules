@@ -8,8 +8,7 @@
 // the synthetic camera, with every frame), and a reporter checks, measures and
 // optionally writes the clouds as PLY files.
 
-#include <unistd.h>
-
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -83,7 +82,8 @@ struct Options {
   float depth_min{0.1F};
   float depth_max{10.0F};
   std::filesystem::path ply_dir;
-  bool verify{true};
+  // Synthetic frames only; checked unless false.
+  std::optional<bool> verify;
   std::uint32_t timeout_seconds{120};
   bool compile_only{false};
   bool help{false};
@@ -222,7 +222,8 @@ app::SyntheticSourceConfig synthetic_source_config(const Options& opts) {
                                     .millimeters = opts.millimeters,
                                     .color = opts.color,
                                     .camera_info = opts.camera_info_per_frame,
-                                    .device_output = !opts.host_input};
+                                    .device_output = !opts.host_input,
+                                    .delay_first_frame = !opts.camera_info_per_frame};
 }
 
 app::DepthFileSourceConfig file_source_config(const Options& opts) {
@@ -231,7 +232,8 @@ app::DepthFileSourceConfig file_source_config(const Options& opts) {
                                     .height = opts.height,
                                     .count = opts.count.value_or(0),
                                     .loop = opts.loop,
-                                    .period = std::chrono::milliseconds(opts.period_ms)};
+                                    .period = std::chrono::milliseconds(opts.period_ms),
+                                    .delay_first_frame = true};
 }
 
 float depth_scale(const Options& opts) {
@@ -253,32 +255,44 @@ pc::DepthToPointCloudConfig deproject_config(const Options& opts) {
       .max_height = opts.height};
 }
 
-// The synthetic camera's frame id; the camera_info file it is written to
-// names it too.
-constexpr std::string_view kSyntheticFrameId = "synthetic_camera";
-
 // A camera_info file of the synthetic camera, written for CameraInfoSourceOp
-// to read, and removed with this object.
+// to read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every path out of the run.
 class SyntheticCameraInfoFile {
  public:
-  explicit SyntheticCameraInfoFile(const Options& opts)
-      : path_(std::filesystem::temp_directory_path() /
-              (std::string(kAppName) + "_" + std::to_string(::getpid()) + "_camera_info.yaml")) {
-    hm::write_camera_info_yaml(
-        pc::synthetic_camera_info(pc::synthetic_frame(opts.width, opts.height, 0, false),
-                                  std::string(kSyntheticFrameId)),
-        path_);
+  explicit SyntheticCameraInfoFile(const Options& opts) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(
+          pc::synthetic_camera_info(pc::synthetic_frame(opts.width, opts.height, 0, false),
+                                    std::string(app::kSyntheticFrameId)),
+          path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
   }
-  ~SyntheticCameraInfoFile() {
-    std::error_code ignored;
-    std::filesystem::remove(path_, ignored);
-  }
+  ~SyntheticCameraInfoFile() { remove(); }
   SyntheticCameraInfoFile(const SyntheticCameraInfoFile&) = delete;
   SyntheticCameraInfoFile& operator=(const SyntheticCameraInfoFile&) = delete;
 
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
 
  private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
   std::filesystem::path path_;
 };
 
@@ -293,10 +307,11 @@ void validate(Options& opts) {
     if (opts.camera_info_file.empty()) {
       throw std::invalid_argument("--source images needs --camera-info FILE");
     }
-    if (opts.camera_info_per_frame || opts.host_input || opts.millimeters || opts.size_given) {
+    if (opts.camera_info_per_frame || opts.host_input || opts.millimeters || opts.size_given ||
+        opts.verify.value_or(false)) {
       throw std::invalid_argument(
-          "--camera-info-per-frame, --host-input, --depth-format, --width and --height apply to "
-          "synthetic frames only");
+          "--camera-info-per-frame, --host-input, --depth-format, --width, --height and --verify "
+          "apply to synthetic frames only");
     }
     opts.color = false;
     // Read the first image now, so a missing folder or an unreadable image is a
@@ -306,6 +321,13 @@ void validate(Options& opts) {
       const app::DepthImage first = app::read_pgm_depth(opts.image_files.front());
       opts.width = first.width;
       opts.height = first.height;
+      // 8-bit samples are rarely millimeters: the default scale would put
+      // every depth below 0.256 m.
+      if (first.one_byte_samples && !opts.depth_scale) {
+        throw std::invalid_argument(opts.image_files.front().string() +
+                                    ": 8-bit depth images need --depth-scale, the meters per "
+                                    "sample value");
+      }
     } catch (const std::runtime_error& error) {
       throw std::invalid_argument(error.what());
     }
@@ -320,6 +342,18 @@ void validate(Options& opts) {
                                   " images, the depth images are " + std::to_string(opts.width) +
                                   "x" + std::to_string(opts.height));
     }
+    // And one the operator can model: undistorted or rectified, without skew.
+    if (opts.camera->state == hm::CameraState::kRaw) {
+      throw std::invalid_argument(opts.camera_info_file.string() +
+                                  ": the camera describes raw images, with lens distortion; the "
+                                  "operator models undistorted or rectified images only: "
+                                  "undistort or rectify the images first");
+    }
+    if (opts.camera->skew != 0.0) {
+      throw std::invalid_argument(opts.camera_info_file.string() +
+                                  ": the camera has a skew; the operator models cameras without "
+                                  "skew only");
+    }
     const auto total = static_cast<std::uint32_t>(opts.image_files.size());
     if (opts.count.value_or(0) == 0) {
       opts.count = total;
@@ -328,6 +362,9 @@ void validate(Options& opts) {
   } else {
     if (!opts.images.empty()) {
       throw std::invalid_argument("--images needs --source images");
+    }
+    if (opts.loop) {
+      throw std::invalid_argument("--loop applies to --source images");
     }
     if (!opts.camera_info_file.empty()) {
       throw std::invalid_argument(
@@ -373,7 +410,7 @@ int execute(Options opts, SignalDomain& signals) {
   auto cloud = graph.op<pc::DepthToPointCloudOp>("deproject", deproject_config(opts));
   auto report = std::make_shared<app::CloudReport>();
   std::optional<app::CloudTruth> truth;
-  if (opts.source == Source::kSynthetic && opts.verify) {
+  if (opts.source == Source::kSynthetic && opts.verify.value_or(true)) {
     truth = app::CloudTruth{.width = opts.width,
                             .height = opts.height,
                             .millimeters = opts.millimeters,
@@ -384,13 +421,13 @@ int execute(Options opts, SignalDomain& signals) {
   }
   auto reporter = graph.op<app::PointCloudReportOp>(
       "report",
-      app::PointCloudReportConfig{
-          .report = report,
-          .expected_frames = frames,
-          .colors = opts.color,
-          .frame_id = opts.camera ? opts.camera->header.frame_id : std::string(kSyntheticFrameId),
-          .truth = truth,
-          .ply_dir = opts.ply_dir});
+      app::PointCloudReportConfig{.report = report,
+                                  .expected_frames = frames,
+                                  .colors = opts.color,
+                                  .frame_id = opts.camera ? opts.camera->header.frame_id
+                                                          : std::string(app::kSyntheticFrameId),
+                                  .truth = truth,
+                                  .ply_dir = opts.ply_dir});
 
   // Lossless edges: every cloud is checked, in order, against its frame. The
   // queue depth is the one each input declares in its operator's setup().
@@ -495,11 +532,15 @@ int execute(Options opts, SignalDomain& signals) {
   // failure, but not a pass either.
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
   // The frames before the first camera info give no cloud; every one after
-  // it, up to the last, must.
-  const std::uint64_t before_camera_info = report->frames == 0 ? 0U : report->first_frame_id - 1U;
+  // it, up to the last, must. Camera info sent with every frame comes before
+  // it; CameraInfoSourceOp sends when the run starts, a period before the
+  // source's first frame, so at most one frame, should the worker run it
+  // a period late, comes first. A run of one frame relies on that period: should
+  // its only frame come first, it times out.
+  const std::uint64_t before_camera_info = report->before_camera_info();
   const bool passed = !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
-                      report->passed() && before_camera_info + report->frames == frames &&
+                      report->complete(frames, opts.camera_info_per_frame ? 0U : 1U) &&
                       (opts.ply_dir.empty() || report->ply_files == report->frames);
   std::cout << std::fixed << std::setprecision(3) << kAppName << ": frames=" << report->frames
             << '/' << frames << " before_camera_info=" << before_camera_info

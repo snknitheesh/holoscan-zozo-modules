@@ -30,33 +30,40 @@ endfunction()
 # The demo on the synthetic cloud, every pixel and color checked against ground truth:
 # float32 and uint16 depth, from GPU and host memory, with the camera from a camera_info
 # file or with every cloud, and every splat size. The clouds before the first camera info
-# give no image; the demo reports how many (before_camera_info) and checks every image
-# after them.
+# give no image; the demo reports how many (before_camera_info), at most one, and checks
+# every image after them.
 set(_pass "wrong_depths=0 wrong_colors=0 .*verdict=PASS")
-pcd_app_test(pcd_app_float32 0 "${_pass}" --count 20 --period-ms 5)
-pcd_app_test(pcd_app_uint16 0 "${_pass}" --count 20 --period-ms 5 --depth-format uint16)
-pcd_app_test(pcd_app_host_input 0 "${_pass}" --count 20 --period-ms 5 --host-input true)
+set(_bounded "before_camera_info=[01] .*")
+pcd_app_test(pcd_app_float32 0 "${_bounded}${_pass}" --count 20 --period-ms 5)
+pcd_app_test(pcd_app_uint16 0 "${_bounded}${_pass}" --count 20 --period-ms 5 --depth-format uint16)
+pcd_app_test(pcd_app_host_input 0 "${_bounded}${_pass}" --count 20 --period-ms 5 --host-input true)
 # With every cloud, the camera's intrinsics change from cloud to cloud, and every cloud
 # gives an image.
 pcd_app_test(pcd_app_camera_info_per_frame 0 "frames=20/20 before_camera_info=0 .*${_pass}"
   --count 20 --period-ms 5 --camera-info-per-frame true
 )
-pcd_app_test(pcd_app_without_color 0 "wrong_depths=0 .*verdict=PASS"
+# A run of one cloud: the source sends it a period after the camera info, which
+# CameraInfoSourceOp sends when the run starts, so it gives an image and ends the run.
+pcd_app_test(pcd_app_one_cloud 0 "frames=1/1 before_camera_info=0 .*${_pass}"
+  --count 1 --period-ms 5 --timeout-seconds 30
+)
+pcd_app_test(pcd_app_without_color 0 "${_bounded}wrong_depths=0 .*verdict=PASS"
   --count 20 --period-ms 5 --color false
 )
-pcd_app_test(pcd_app_point_size_3 0 "${_pass}" --count 20 --period-ms 5 --point-size 3)
-pcd_app_test(pcd_app_point_size_5_uint16 0 "${_pass}"
+pcd_app_test(pcd_app_point_size_3 0 "${_bounded}${_pass}" --count 20 --period-ms 5 --point-size 3)
+pcd_app_test(pcd_app_point_size_5_uint16 0 "${_bounded}${_pass}"
   --count 20 --period-ms 5 --point-size 5 --depth-format uint16
 )
 # A narrower valid range reaches the operator: the truth applies the same one,
 # and the reported depths stay inside it. Duplicates of nearer points, twice as
 # far, now fall inside the range where their own points do not.
 pcd_app_test(pcd_app_depth_range 0
-  "depth_m=\\[1\\.200, 1\\.800\\] truth: ${_pass}"
+  "${_bounded}depth_m=\\[1\\.200, 1\\.800\\] truth: ${_pass}"
   --count 20 --period-ms 5 --depth-min 1.2 --depth-max 1.8
 )
 # A wider one lets the far patch at 50 m in, which uint16 millimeters hold.
-pcd_app_test(pcd_app_far_patch_uint16 0 "depth_m=\\[1\\.040, 50\\.000\\] truth: ${_pass}"
+pcd_app_test(pcd_app_far_patch_uint16 0
+  "${_bounded}depth_m=\\[1\\.040, 50\\.000\\] truth: ${_pass}"
   --count 20 --period-ms 5 --depth-max 100 --depth-format uint16
 )
 
@@ -145,7 +152,8 @@ pcd_app_test(pcd_app_files_uint16 0 "${_files_pass}"
   --depth-scale 0.001
 )
 # --loop starts over after the last file: 12 clouds from 5 files.
-pcd_app_test(pcd_app_files_loop 0 "frames=[0-9]+/12 .*verdict=PASS"
+pcd_app_test(pcd_app_files_loop 0
+  "(frames=12/12 before_camera_info=0 pixels=921600 filled=887808|frames=11/12 before_camera_info=1 pixels=844800 filled=813824) depth_m=\\[1\\.040, 1\\.956\\].*verdict=PASS"
   --source files --clouds "${_clouds}" ${_camera} --period-ms 5 --loop true --count 12
 )
 pcd_app_test(pcd_app_rejects_count_beyond_files 2 "^error: .*--loop true"
@@ -161,9 +169,15 @@ pcd_app_test(pcd_app_rejects_missing_camera_info 2 "^error: .*no_such_camera_inf
 pcd_app_test(pcd_app_rejects_size_with_files 2 "^error: .*the images have the camera's size"
   --source files --clouds "${_clouds}" ${_camera} --width 320
 )
-pcd_app_test(pcd_app_rejects_raw_camera 1 "camera info 'camera' describes raw images.*verdict=FAIL"
+pcd_app_test(pcd_app_rejects_raw_camera 2 "^error: .*raw\\.yaml: the camera describes raw images"
   --source files --clouds "${_clouds}" --camera-info "${_clouds}/raw.yaml" ${_extrinsics}
-  --period-ms 5
+)
+pcd_app_test(pcd_app_rejects_skewed_camera 2 "^error: .*skewed\\.yaml: the camera has a skew"
+  --source files --clouds "${_clouds}" --camera-info "${_clouds}/skewed.yaml" ${_extrinsics}
+)
+# Options that do not apply to the input are refused, not ignored.
+pcd_app_test(pcd_app_rejects_verify_with_files 2 "^error: .*--verify apply to synthetic"
+  --source files --clouds "${_clouds}" ${_camera} --verify true
 )
 pcd_app_test(pcd_app_rejects_short_extrinsics 2 "^error: .*12 comma-separated numbers"
   --source files --clouds "${_clouds}" --camera-info "${_clouds}/camera_info.yaml"
@@ -214,6 +228,8 @@ set_tests_properties(
   pcd_app_rejects_missing_camera_info
   pcd_app_rejects_size_with_files
   pcd_app_rejects_raw_camera
+  pcd_app_rejects_skewed_camera
+  pcd_app_rejects_verify_with_files
   pcd_app_rejects_short_extrinsics
   pcd_app_rejects_non_finite_extrinsics
   pcd_app_rejects_zero_depth_scale
@@ -266,6 +282,9 @@ set_tests_properties(pcd_app_rejects_empty_clouds PROPERTIES FIXTURES_REQUIRED p
 # starting a run.
 pcd_app_test(pcd_app_rejects_unknown_option 2 "^error: unknown option" --colour true)
 pcd_app_test(pcd_app_rejects_zero_count 2 "^error: " --count 0)
+pcd_app_test(pcd_app_rejects_loop_with_synthetic 2 "^error: --loop applies to --source files"
+  --loop true
+)
 pcd_app_test(pcd_app_rejects_zero_width 2 "^error: synthetic images" --width 0)
 pcd_app_test(pcd_app_rejects_inverted_range 2 "^error: depth range" --depth-min 5 --depth-max 1)
 pcd_app_test(pcd_app_rejects_point_size 2 "^error: point_size must be 1, 3 or 5" --point-size 2)
@@ -293,13 +312,14 @@ pcd_app_test(pcd_app_compile_only 0 "^point_cloud_to_depth: plan=OK workers=1\n*
   --compile-only true
 )
 
-# A failed run reports its cause and exits 1.
+# A failed run reports its cause and exits 1. The second frame's file is blocked: it is
+# written whether or not the first cloud came before the first camera info.
 set(_blocked "${CMAKE_CURRENT_BINARY_DIR}/blocked_images")
 add_test(
   NAME pcd_app_failed_run
   COMMAND
-    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=depth_000000.pgm.*verdict=FAIL"
-    "-DMAKE_DIRECTORY=${_blocked}/depth_000000.pgm" -P "${_run_and_match}" --
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=depth_000001.pgm.*verdict=FAIL"
+    "-DMAKE_DIRECTORY=${_blocked}/depth_000001.pgm" -P "${_run_and_match}" --
     $<TARGET_FILE:point_cloud_to_depth> --count 5 --period-ms 5 --image-dir "${_blocked}"
 )
 
@@ -332,7 +352,7 @@ add_test(
      \"$1\" --count 100000 --period-ms 10 --width 64 --height 48 --image-dir \"$2\" &
      for i in $(seq 600)
      do
-       [ -e \"$2/depth_000000.pgm\" ] && break
+       [ -e \"$2/depth_000000.pgm\" ] || [ -e \"$2/depth_000001.pgm\" ] && break
        sleep 0.05
      done
      kill -TERM $! && wait $!"

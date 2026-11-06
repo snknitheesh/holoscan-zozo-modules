@@ -27,8 +27,9 @@ Videos of the demo on synthetic input and on real input go in [tests/video](test
   and Sensor I/O (Testing for the tests), CUDA 13, CMake 4.0 or later and a C++20 compiler.
 
 The demo downloads nothing and needs no models. The `files` mode reads your own point clouds and a
-`camera_info` file; every other mode makes its clouds and writes the synthetic camera's
-`camera_info` file to the temporary folder, removing it when the run ends.
+`camera_info` file; every other mode makes its clouds and, unless `--camera-info-per-frame true`,
+writes the synthetic camera's `camera_info` file to a folder of its own in the temporary folder,
+removing it when the run ends.
 
 ## Build and run
 
@@ -67,7 +68,8 @@ the run. `--depth-format uint16` makes uint16 millimeters instead of float32 met
 `--point-size 3` or `5` draws each point as a square, `--host-input true` sends the clouds from host
 instead of GPU memory, and `--camera-info-per-frame true` sends the camera info with every cloud
 instead, its focal length changing from cloud to cloud. `--image-dir DIR` writes each depth image
-as `DIR/depth_NNNNNN.pgm`, 16-bit millimeters, and each color image as `DIR/color_NNNNNN.ppm`. The
+as `DIR/depth_NNNNNN.pgm`, 16-bit millimeters, and each color image as `DIR/color_NNNNNN.ppm`,
+`NNNNNN` the frame from 0. The
 PGM rounds each depth to the nearest millimeter: below 0.5 mm it shows as 0, and beyond 65.535 m as
 65535. `--help` lists every option.
 
@@ -86,7 +88,8 @@ support.
 Give the camera's ROS `camera_info` file, whose size the images have, and the extrinsics if the
 points are not in the camera optical frame, as twelve comma-separated numbers, `R` and `t` row by
 row. `R` must be a rotation, without scale or mirroring. The camera must be undistorted or
-rectified: the operator refuses one whose distortion coefficients are not all zero.
+rectified, without skew: the demo refuses one whose distortion coefficients are not all zero, or
+that has a skew.
 
 ```bash
 build/point_cloud_to_depth/point_cloud_to_depth --source files --clouds path/to/ply/folder \
@@ -96,7 +99,7 @@ build/point_cloud_to_depth/point_cloud_to_depth --source files --clouds path/to/
 ## Output
 
 Each run prints the images and clouds, the clouds that came before the first camera info (which
-give no image), the pixel counts, the filled pixels and their depth range and, for synthetic input,
+give no image; at most one may), the pixel counts, the filled pixels and their depth range and, for synthetic input,
 how many depths and colors differ from the truth and the largest error. Every cloud after the first
 camera info must give an image; a gap in the frame ids fails the run and is printed too. So does a run whose images, unchecked against a
 truth, are all empty, which most likely means a wrong camera or extrinsics. Then comes a
@@ -136,7 +139,7 @@ slower than its clock and the reporter's frame-id check, completion at the last 
 settings, and the demo's runs: synthetic clouds in every variant (float32 and uint16, host and GPU
 memory, the camera from a `camera_info` file and with every cloud, every splat size, narrower and
 wider ranges) against ground truth; folders of PLY files with and without colors and their
-`camera_info` file, once and looped; image output; cameras that are missing or raw; and the exit
+`camera_info` file, once and looped; image output; cameras that are missing, raw or skewed; and the exit
 status and verdict of failed, empty, slow, timed-out, stopped and invalid runs, and of a run without
 managed signal handling. The PLY, PGM and PPM file test in [tests/host/](tests/host/) needs neither the SDK nor a
 GPU, and also runs on the hosted CI job. None of it needs data.

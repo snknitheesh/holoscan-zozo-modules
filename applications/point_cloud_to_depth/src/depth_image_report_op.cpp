@@ -189,7 +189,7 @@ holoscan::expected<void, holoscan::Error> DepthImageReportOp::process(
     }
   }
   if (!config_.image_dir.empty()) {
-    if (auto written = write_images(width, height, rgb != nullptr); !written) {
+    if (auto written = write_images(frame_id, width, height, rgb != nullptr); !written) {
       return written;
     }
   }
@@ -229,7 +229,8 @@ void DepthImageReportOp::measure(int width, int height) {
   report.filled_pixels += filled;
 }
 
-holoscan::expected<void, holoscan::Error> DepthImageReportOp::write_images(int width, int height,
+holoscan::expected<void, holoscan::Error> DepthImageReportOp::write_images(std::uint64_t frame_id,
+                                                                           int width, int height,
                                                                            bool with_color) {
   DepthReport& report = *config_.report;
   const std::size_t pixels = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
@@ -240,11 +241,13 @@ holoscan::expected<void, holoscan::Error> DepthImageReportOp::write_images(int w
     millimeters_[i] = static_cast<std::uint16_t>(
         std::clamp(std::round(static_cast<double>(z) * 1000.0), 0.0, 65535.0));
   }
-  // Numbered from 0 by this reporter's images.
+  // Named by frame, from 0, as the synthetic camera numbers its frames.
+  // (Sources count at most 2^32 - 1 frames.)
+  const auto frame = static_cast<unsigned>(frame_id - 1U);
   char depth_name[32];
   char color_name[32];
-  std::snprintf(depth_name, sizeof(depth_name), "depth_%06u.pgm", seen_);
-  std::snprintf(color_name, sizeof(color_name), "color_%06u.ppm", seen_);
+  std::snprintf(depth_name, sizeof(depth_name), "depth_%06u.pgm", frame);
+  std::snprintf(color_name, sizeof(color_name), "color_%06u.ppm", frame);
   try {
     write_pgm(config_.image_dir / depth_name, width, height, millimeters_);
     ++report.files_written;

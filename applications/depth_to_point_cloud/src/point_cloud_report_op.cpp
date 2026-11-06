@@ -139,8 +139,10 @@ holoscan::expected<void, holoscan::Error> PointCloudReportOp::compute(
     verify(static_cast<std::uint32_t>(frame_id - 1U), xyz_, rgb, width, height);
   }
   if (!config_.ply_dir.empty()) {
+    // Named by frame, from 0, as the synthetic camera numbers its frames.
     char name[32];
-    std::snprintf(name, sizeof(name), "frame_%06u.ply", report.frames);
+    // (Sources count at most 2^32 - 1 frames.)
+    std::snprintf(name, sizeof(name), "frame_%06u.ply", static_cast<unsigned>(frame_id - 1U));
     try {
       write_ply(config_.ply_dir / name, xyz_, rgb);
     } catch (const std::exception& error) {

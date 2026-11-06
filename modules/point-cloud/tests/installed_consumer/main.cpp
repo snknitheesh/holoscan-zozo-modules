@@ -12,9 +12,11 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -280,17 +282,44 @@ class DepthCheckOp final : public holoscan::Operator<> {
   std::shared_ptr<std::atomic<int>> remaining_;
 };
 
-// Whether a sink saw every frame from its first one to the last.
+// Whether a sink saw every frame from its first one to the last, and at most
+// the first frame came before the first camera info (both sources start with
+// the run).
 bool complete(std::uint64_t first, std::uint32_t seen) {
-  return seen != 0 && first + seen - 1U == kFrames;
+  return seen != 0 && first <= 2U && first + seen - 1U == kFrames;
 }
+
+// A folder of its own for the camera_info file, which mkdtemp() names
+// unpredictably, so that runs do not clobber each other; removed, with the
+// file, on every path out of main().
+class TemporaryFolder {
+ public:
+  TemporaryFolder() {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / "point_cloud_consumer_XXXXXX").string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    path_ = folder;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
 
 }  // namespace
 
 int main() {
   // The camera, as a camera_info file: the one input calibration has.
-  const std::filesystem::path camera_file =
-      std::filesystem::temp_directory_path() / "point_cloud_consumer_camera_info.yaml";
+  const TemporaryFolder folder;
+  const std::filesystem::path camera_file = folder.path() / "camera_info.yaml";
   hm::write_camera_info_yaml(
       pc::synthetic_camera_info(pc::synthetic_frame(kWidth, kHeight, 0, false), "depth_optical"),
       camera_file);
@@ -343,8 +372,6 @@ int main() {
     return 1;
   }
   const int status = holoscan::run(plan);
-  std::error_code ignored;
-  std::filesystem::remove(camera_file, ignored);
   if (status != 0) {
     std::cerr << "point_cloud_consumer: run failed with " << status << '\n';
     return 1;

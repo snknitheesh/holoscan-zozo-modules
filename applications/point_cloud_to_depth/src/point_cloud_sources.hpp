@@ -25,6 +25,8 @@
 #include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/point_cloud/synthetic_depth.hpp>
 
+#include "cloud_io.hpp"
+
 namespace point_cloud_to_depth_app {
 
 struct SyntheticCloudSourceConfig {
@@ -43,6 +45,10 @@ struct SyntheticCloudSourceConfig {
   bool camera_info{false};
   // Emit points and colors in CUDA device memory instead of host memory.
   bool device_output{true};
+  // Send the first cloud one period after the run starts, not when it
+  // starts: a camera info source that sends when the run starts, as
+  // CameraInfoSourceOp does, then goes first, and no cloud comes before it.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -78,9 +84,12 @@ class SyntheticCloudSourceOp final : public holoscan::Operator<> {
   SyntheticCloudSourceConfig config_;
   std::uint32_t point_count_{};
   std::uint32_t emitted_{};
-  // The frame being sent: its capture time and which outputs are out.
+  // With delay_first_frame: whether the first tick has passed.
+  bool delayed_{};
+  // The frame being sent: its capture time, and whether its camera info is
+  // out.
   std::optional<holoscan::TimePoint> pending_capture_;
-  std::uint32_t sent_{};
+  bool camera_info_sent_{};
   // Generation scratch for host output, and the stream it uses when the
   // runtime gives none.
   void* scratch_{};
@@ -99,6 +108,9 @@ struct CloudFileSourceConfig {
   // Start over after the last file until `count` clouds are out.
   bool loop{false};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
+  // Send the first cloud one period after the run starts; see
+  // SyntheticCloudSourceConfig::delay_first_frame.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -125,6 +137,10 @@ class CloudFileSourceOp final : public holoscan::Operator<> {
   CloudFileSourceConfig config_;
   std::uint32_t total_{};
   std::uint32_t emitted_{};
+  bool delayed_{};
+  // The file being sent, read once: a cloud the consumers were too busy for
+  // goes out on the next tick without reading the file again.
+  std::optional<PointCloud> pending_;
 };
 
 }  // namespace point_cloud_to_depth_app

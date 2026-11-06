@@ -3,9 +3,9 @@
 //
 // Writes synthetic depth frames as 16-bit PGM files (millimeters), for the
 // tests that feed the application a folder of depth images, with the camera's
-// camera_info file, camera_info.yaml, and two the operator must refuse:
-// other_size.yaml, the camera at half the size, and raw.yaml, the camera with
-// lens distortion.
+// camera_info file, camera_info.yaml, and three the operator must refuse:
+// other_size.yaml, the camera at half the size, raw.yaml, the camera with
+// lens distortion, and skewed.yaml, the camera with a skew.
 //
 // Usage: write_test_images DIR COUNT WIDTH HEIGHT
 
@@ -56,6 +56,9 @@ int main(int argc, char** argv) try {
   raw.distortion_model = hm::DistortionModel::kPlumbBob;
   raw.coefficients = {-0.1, 0.02, 0.0, 0.0, 0.0};
   hm::write_camera_info_yaml(raw, directory / "raw.yaml");
+  hm::CameraInfo skewed = camera;
+  skewed.skew = 0.5;
+  hm::write_camera_info_yaml(skewed, directory / "skewed.yaml");
   for (int frame = 0; frame < count; ++frame) {
     const auto f = holoscan::point_cloud::synthetic_frame(width, height,
                                                           static_cast<std::uint32_t>(frame), false);

@@ -154,6 +154,9 @@ class ImageSourceOp final : public holoscan::Operator<> {
 };
 
 struct Tally {
+  // The frame id of the first cloud: the frames before it came before the
+  // first camera info.
+  std::uint64_t first_frame_id{};
   std::atomic<std::uint32_t> clouds{};
   std::atomic<std::uint32_t> images{};
   std::uint64_t valid_points{};
@@ -225,7 +228,9 @@ class CheckOp final : public holoscan::Operator<> {
         tally_->filled_pixels += counts[i] != 0U;
       }
     }
-    tally_->clouds.fetch_add(1U);
+    if (tally_->clouds.fetch_add(1U) == 0U) {
+      tally_->first_frame_id = cloud->metadata.frame_id;
+    }
     tally_->images.fetch_add(1U);
     if (cloud->metadata.frame_id == images_->size()) {
       context.request_completion();
@@ -319,9 +324,12 @@ void check_clip(const fs::path& clip) {
   VERIFY_MSG(
       session.termination() == holoscan::RunTermination::kRequestedCompleted,
       clip.string() + ": " + holoscan::format_diagnostics(session.diagnostics(), plan.graph()));
-  // The frames before the first camera info give no cloud.
-  VERIFY_MSG(tally->clouds.load() >= kFrames - 1U,
-             std::to_string(tally->clouds.load()) + " clouds of " + std::to_string(images->size()));
+  // The frames before the first camera info give no cloud: at most the first,
+  // as both sources start with the run. Every frame after it gives one.
+  VERIFY_MSG(tally->clouds.load() != 0U && tally->first_frame_id <= 2U &&
+                 tally->first_frame_id + tally->clouds.load() - 1U == images->size(),
+             std::to_string(tally->clouds.load()) + " clouds of " + std::to_string(images->size()) +
+                 " images, from frame " + std::to_string(tally->first_frame_id));
   VERIFY(tally->valid_points != 0 && tally->filled_pixels == tally->valid_points);
   VERIFY_MSG(tally->wrong_points == 0, std::to_string(tally->wrong_points) + " points wrong");
   VERIFY_MSG(tally->wrong_depths == 0, std::to_string(tally->wrong_depths) + " depths wrong");

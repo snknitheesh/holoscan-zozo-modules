@@ -330,7 +330,9 @@ holoscan::expected<void, holoscan::Error> PointCloudToDepthOp::compute(
     return {};  // No camera info yet: this cloud gives no image.
   }
   const hm::CameraInfo& camera = **info;
-  if (info_.changed()) {
+  // A camera refused before is checked again, and refused again, rather than
+  // used: intrinsics_ is empty until a camera passes.
+  if (info_.changed() || !intrinsics_) {
     intrinsics_.reset();
     auto intrinsics = detail::pinhole_intrinsics(camera, "PointCloudToDepthOp");
     if (!intrinsics) {

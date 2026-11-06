@@ -7,7 +7,10 @@
 
 add_executable(depth_report_op_test report_op_test.cpp)
 target_link_libraries(depth_report_op_test PRIVATE depth_to_point_cloud_ops holoscan::testing)
-add_test(NAME depth_report_op COMMAND depth_report_op_test)
+add_test(
+  NAME depth_report_op
+  COMMAND depth_report_op_test "${CMAKE_CURRENT_BINARY_DIR}/report_op_files"
+)
 
 add_executable(depth_write_test_images write_test_images.cpp)
 target_link_libraries(depth_write_test_images PRIVATE depth_to_point_cloud_ops)
@@ -30,8 +33,9 @@ endfunction()
 # The demo on the synthetic camera, every point and color checked against ground truth:
 # float32 and uint16 depth, from GPU and host memory, with the camera from a camera_info
 # file or with every frame. The frames before the first camera info give no cloud; the
-# demo reports how many (before_camera_info) and checks every cloud after them.
-set(_pass "wrong_points=0 wrong_colors=0 .*verdict=PASS")
+# demo reports how many (before_camera_info), at most one, and checks every cloud after
+# them.
+set(_pass "before_camera_info=[01] .*wrong_points=0 wrong_colors=0 .*verdict=PASS")
 depth_app_test(depth_app_meters 0 "${_pass}" --count 20 --period-ms 5)
 depth_app_test(depth_app_millimeters 0 "${_pass}"
   --count 20 --period-ms 5 --depth-format millimeters
@@ -40,16 +44,22 @@ depth_app_test(depth_app_host_input 0 "${_pass}" --count 20 --period-ms 5 --host
 # With every frame, the camera's intrinsics change from frame to frame, and every frame
 # gives a cloud.
 depth_app_test(depth_app_camera_info_per_frame 0
-  "frames=20/20 before_camera_info=0 .*${_pass}"
+  "frames=20/20 before_camera_info=0 .*wrong_points=0 wrong_colors=0 .*verdict=PASS"
   --count 20 --period-ms 5 --camera-info-per-frame true
 )
-depth_app_test(depth_app_without_color 0 "wrong_points=0 .*verdict=PASS"
+# A run of one frame: the source sends it a period after the camera info, which
+# CameraInfoSourceOp sends when the run starts, so it gives a cloud and ends the run.
+depth_app_test(depth_app_one_frame 0
+  "frames=1/1 before_camera_info=0 .*wrong_points=0 wrong_colors=0 .*verdict=PASS"
+  --count 1 --period-ms 5 --timeout-seconds 30
+)
+depth_app_test(depth_app_without_color 0 "before_camera_info=[01] .*wrong_points=0 .*verdict=PASS"
   --count 20 --period-ms 5 --color false
 )
 # A narrower valid range reaches the operator: the truth applies the same one,
 # and the reported depths stay inside it.
 depth_app_test(depth_app_depth_range 0
-  "depth_m=\\[1\\.200, 1\\.800\\] truth: wrong_points=0 wrong_colors=0 .*verdict=PASS"
+  "before_camera_info=[01] .*depth_m=\\[1\\.200, 1\\.800\\] truth: wrong_points=0 wrong_colors=0 .*verdict=PASS"
   --count 20 --period-ms 5 --depth-min 1.2 --depth-max 1.8
 )
 # Only the plan's verdict: an accepted plan has no warnings. With CameraInfoSourceOp
@@ -80,11 +90,12 @@ add_test(
 set_tests_properties(depth_images_setup PROPERTIES FIXTURES_SETUP depth_images)
 set(_camera_info --camera-info "${_images}/camera_info.yaml")
 depth_app_test(depth_app_images 0
-  "(frames=5/5 before_camera_info=0 points=384000 valid=369920|frames=4/5 before_camera_info=1 points=307200 valid=295936) depth_m=\\[1\\.[0-9]+, 1\\.9[0-9]+\\].*verdict=PASS"
+  "(frames=5/5 before_camera_info=0 points=384000 valid=369920 depth_m=\\[1\\.040|frames=4/5 before_camera_info=1 points=307200 valid=295936 depth_m=\\[1\\.055), 1\\.956\\].*verdict=PASS"
   --source images --images "${_images}" ${_camera_info} --period-ms 5
 )
 # --loop starts over after the last image: 12 frames from 5 images.
-depth_app_test(depth_app_images_loop 0 "frames=[0-9]+/12 .*verdict=PASS"
+depth_app_test(depth_app_images_loop 0
+  "(frames=12/12 before_camera_info=0 points=921600 valid=887808|frames=11/12 before_camera_info=1 points=844800 valid=813824) depth_m=\\[1\\.040, 1\\.956\\].*verdict=PASS"
   --source images --images "${_images}" ${_camera_info} --period-ms 5
   --loop true --count 12
 )
@@ -102,11 +113,17 @@ depth_app_test(depth_app_rejects_camera_of_other_size 2
   "^error: .*the camera is for 160x120 images, the depth images are 320x240"
   --source images --images "${_images}" --camera-info "${_images}/other_size.yaml"
 )
-depth_app_test(depth_app_rejects_raw_camera 1
-  "camera info 'depth_camera' describes raw images.*verdict=FAIL"
-  --source images --images "${_images}" --camera-info "${_images}/raw.yaml" --period-ms 5
+depth_app_test(depth_app_rejects_raw_camera 2 "^error: .*raw\\.yaml: the camera describes raw images"
+  --source images --images "${_images}" --camera-info "${_images}/raw.yaml"
 )
-depth_app_test(depth_app_rejects_size_with_images 2 "^error: .*--width and --height"
+depth_app_test(depth_app_rejects_skewed_camera 2 "^error: .*skewed\\.yaml: the camera has a skew"
+  --source images --images "${_images}" --camera-info "${_images}/skewed.yaml"
+)
+# Options that do not apply to the input are refused, not ignored.
+depth_app_test(depth_app_rejects_verify_with_images 2 "^error: .*--verify apply to synthetic"
+  --source images --images "${_images}" ${_camera_info} --verify true
+)
+depth_app_test(depth_app_rejects_size_with_images 2 "^error: .*--width, --height"
   --source images --images "${_images}" ${_camera_info} --width 320
 )
 depth_app_test(depth_app_rejects_zero_depth_scale 2 "^error: depth_scale"
@@ -120,8 +137,30 @@ set_tests_properties(
   depth_app_rejects_missing_camera_info
   depth_app_rejects_camera_of_other_size
   depth_app_rejects_raw_camera
+  depth_app_rejects_skewed_camera
+  depth_app_rejects_verify_with_images
   depth_app_rejects_size_with_images
   depth_app_rejects_zero_depth_scale
+  PROPERTIES FIXTURES_REQUIRED depth_images
+)
+# Invalid input fails fast with a usage error (exit status 2) instead of
+# starting a run.
+depth_app_test(depth_app_rejects_unknown_option 2 "^error: unknown option" --colour true)
+depth_app_test(depth_app_rejects_zero_count 2 "^error: synthetic runs need --count > 0" --count 0)
+depth_app_test(depth_app_rejects_loop_with_synthetic 2 "^error: --loop applies to --source images"
+  --loop true
+)
+# An 8-bit PGM image needs its depth scale: the default, millimeters, would put every depth
+# below 0.256 m.
+set(_images_8bit "${CMAKE_CURRENT_BINARY_DIR}/depth_images_8bit")
+file(MAKE_DIRECTORY "${_images_8bit}")
+file(WRITE "${_images_8bit}/depth_0000.pgm" "P5\n4 2\n255\nAAAAAAAA")
+depth_app_test(depth_app_rejects_8bit_without_depth_scale 2
+  "^error: .*depth_0000\\.pgm: 8-bit depth images need --depth-scale"
+  --source images --images "${_images_8bit}" --camera-info "${_images}/camera_info.yaml"
+)
+set_tests_properties(
+  depth_app_rejects_8bit_without_depth_scale
   PROPERTIES FIXTURES_REQUIRED depth_images
 )
 depth_app_test(depth_app_rejects_camera_info_for_synthetic 2 "^error: .*drop --camera-info"
@@ -145,13 +184,14 @@ add_test(
     "${CMAKE_CURRENT_BINARY_DIR}/camera_info.yaml"
 )
 
-# A failed run reports its cause and exits 1.
+# A failed run reports its cause and exits 1. The second frame's file is blocked: it is
+# written whether or not the first frame came before the first camera info.
 set(_blocked "${CMAKE_CURRENT_BINARY_DIR}/blocked_ply")
 add_test(
   NAME depth_app_failed_run
   COMMAND
-    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=frame_000000.ply.*verdict=FAIL"
-    "-DMAKE_DIRECTORY=${_blocked}/frame_000000.ply" -P "${_run_and_match}" --
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=frame_000001.ply.*verdict=FAIL"
+    "-DMAKE_DIRECTORY=${_blocked}/frame_000001.ply" -P "${_run_and_match}" --
     $<TARGET_FILE:depth_to_point_cloud> --count 5 --period-ms 5 --ply-dir "${_blocked}"
 )
 
@@ -178,7 +218,7 @@ add_test(
      \"$1\" --count 100000 --period-ms 10 --width 64 --height 48 --ply-dir \"$2\" &
      for i in $(seq 600)
      do
-       [ -e \"$2/frame_000000.ply\" ] && break
+       [ -e \"$2/frame_000000.ply\" ] || [ -e \"$2/frame_000001.ply\" ] && break
        sleep 0.05
      done
      kill -TERM $! && wait $!"

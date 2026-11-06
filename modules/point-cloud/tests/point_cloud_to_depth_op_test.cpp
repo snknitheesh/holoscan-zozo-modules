@@ -6,12 +6,20 @@
 // the depth image they were made from exactly; unorganized synthetic clouds
 // with colors in the body frame, from host and device memory, with camera
 // info at its own rate or with every cloud and changing from cloud to cloud,
-// checked against the synthetic camera; images of the camera's size; the
-// capture time and frame id carried to the outputs; clouds before the first
-// camera info and clouds whose camera info has another capture time; and
-// unusable cameras, clouds and configurations rejected. Through a graph:
-// pinned host input held until its copy is done, and misaligned or
-// foreign-device input rejected. Also the image headers.
+// checked against the synthetic camera; camera info at its own rate changing
+// between clouds, to a usable camera and to one it refuses; images of the
+// camera's size; the capture time and frame id carried to the outputs; clouds
+// before the first camera info and clouds whose camera info has another
+// capture time; and unusable cameras, clouds and configurations rejected.
+// Through a graph: clouds from a producer's host, pinned and device pools.
+// Also the image headers.
+//
+// Not tested: that the operator holds pinned points a producer still owns, and
+// rejects misaligned points and points on another GPU. A PointCloud message's
+// tensors always come from the producer's runtime pool (the SDK 5.0 refuses an
+// emit of tensors of other memory), so such clouds cannot reach the operator
+// on a single-GPU machine. The holding itself is tested below on its own
+// (detail::hold_until_done()).
 
 #include <cuda_runtime_api.h>
 
@@ -364,6 +372,68 @@ void check_changing_camera(bool device) {
                 config);
     check_provenance(depths[frame], number, 0U);
   }
+}
+
+// With camera info at its own rate, a new calibration is picked up from the
+// next cloud on, and the clouds between keep the one before: camera A, two
+// clouds, camera B, one cloud. (Synthetic frames 0 and 5 share A's
+// intrinsics; frame 4 has B's, 4 % longer focal lengths, enough to move most
+// points to another pixel.)
+void check_camera_change_at_own_rate() {
+  const PointCloudToDepthConfig config = synthetic_config(DepthFormat::kUint16);
+  auto h = holoscan::testing::create_operator_test<PointCloudToDepthOp>(config);
+  const std::array<std::uint32_t, 3> frames{0U, 5U, 4U};
+  for (std::uint32_t i = 0; i < frames.size(); ++i) {
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frames[i], true);
+    if (i != 1) {
+      h.push_frame(holoscan::testing::frame_at(
+          capture_time(i) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+    }
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(i),
+        holoscan::testing::input("point_cloud", synthetic_cloud_message(f, true, false))));
+  }
+  h.output_device("depth", holoscan::DeviceId{0});
+  h.output_device("color", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("depth", kCaptures);
+  h.capture_snapshot<holoscan::schema::ImageT>("color", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto depths = result.snapshots<holoscan::schema::ImageT>("depth");
+  const auto colors = result.snapshots<holoscan::schema::ImageT>("color");
+  VERIFY(depths.size() == 3 && colors.size() == 3);
+  for (std::size_t i = 0; i < depths.size() && i < colors.size() && i < frames.size(); ++i) {
+    check_truth(depths[i], &colors[i], synthetic_frame(kWidth, kHeight, frames[i], true), config);
+  }
+}
+
+// A calibration that changes, at the camera info's own rate, to one the
+// kernels cannot model fails the next cloud.
+void check_camera_change_to_unusable() {
+  const PointCloudToDepthConfig config = base_config(DepthFormat::kFloat32);
+  auto h = holoscan::testing::create_operator_test<PointCloudToDepthOp>(config);
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  const std::vector<float> xyz = organized_cloud(f, false);
+  hm::CameraInfo skewed = synthetic_camera_info(f, "camera_optical");
+  skewed.skew = -1.0;
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0),
+      holoscan::testing::input("point_cloud", cloud_message(points_tensor(xyz, false)))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1) - 1ms, holoscan::testing::input("camera_info", hm::to_message(skewed))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1),
+      holoscan::testing::input("point_cloud", cloud_message(points_tensor(xyz, false)))));
+  h.output_device("depth", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("depth", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(!result.ok(), "the cloud after the skewed camera info fails");
+  VERIFY_MSG(result.describe_failure().find("camera info 'camera_optical' has a skew") !=
+                 std::string::npos,
+             result.describe_failure());
 }
 
 // Camera info sent with every cloud pairs with it by exact capture time: a
@@ -870,6 +940,11 @@ void check_rejected_inputs() {
   check_rejects(config, cloud_message(points_tensor(xyz, false)), large,
                 "camera info 'camera_optical' is for 97x72 images, larger than the configured "
                 "96x72");
+  hm::CameraInfo tall = info;
+  tall.height = kHeight + 1;
+  check_rejects(config, cloud_message(points_tensor(xyz, false)), tall,
+                "camera info 'camera_optical' is for 96x73 images, larger than the configured "
+                "96x72");
 }
 
 // Cameras the kernels cannot model fail the frame, naming what is wrong.
@@ -942,6 +1017,9 @@ int main() {
       {"a changing camera with every cloud, host", [] { pcd::check_changing_camera(false); }},
       {"a changing camera with every cloud, device", [] { pcd::check_changing_camera(true); }},
       {"camera info with another capture time gives no image", pcd::check_unmatched_camera_info},
+      {"a camera that changes at its own rate is picked up", pcd::check_camera_change_at_own_rate},
+      {"a camera that changes to an unusable one fails the cloud",
+       pcd::check_camera_change_to_unusable},
       {"clouds before the first camera info give no image", pcd::check_clouds_before_camera_info},
       {"the image has the camera's size", pcd::check_camera_sets_image_size},
       {"a cloud without points gives an empty image", pcd::check_empty_cloud},

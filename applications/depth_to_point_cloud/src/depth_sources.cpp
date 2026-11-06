@@ -136,6 +136,7 @@ holoscan::Contract SyntheticDepthSourceOp::contract() const {
 
 void SyntheticDepthSourceOp::start() {
   emitted_ = 0;
+  delayed_ = false;
   pending_capture_.reset();
   sent_ = 0U;
 }
@@ -158,6 +159,10 @@ holoscan::expected<void, holoscan::Error> SyntheticDepthSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the consumers request completion.
+  }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
@@ -201,7 +206,8 @@ holoscan::expected<void, holoscan::Error> SyntheticDepthSourceOp::compute(
   };
 
   if (config_.camera_info && (sent_ & kSentCameraInfo) == 0U) {
-    holoscan::messages::CameraInfo info = synthetic_camera_info(frame);
+    holoscan::messages::CameraInfo info =
+        synthetic_camera_info(frame, std::string(kSyntheticFrameId));
     info.header.capture_timestamp_ns = pending_capture_->timestamp_ns;
     if (auto settled =
             settle(camera_info.emit(holoscan::messages::to_message(info), emit), kSentCameraInfo);
@@ -397,11 +403,18 @@ holoscan::Contract DepthFileSourceOp::contract() const {
   return result;
 }
 
-void DepthFileSourceOp::start() { emitted_ = 0; }
+void DepthFileSourceOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+}
 
 holoscan::expected<void, holoscan::Error> DepthFileSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= total_) {
+    return {};
+  }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
     return {};
   }
   const auto& path = config_.files[emitted_ % config_.files.size()];

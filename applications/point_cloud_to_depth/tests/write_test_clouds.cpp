@@ -4,8 +4,8 @@
 // Writes synthetic clouds (frames 0, 1, ...) as PLY files, in the body frame
 // and with colors unless `xyz` is given, for the tests that feed the
 // application a folder of PLY files; and the synthetic camera's camera_info
-// file, camera_info.yaml, and the camera with lens distortion, raw.yaml,
-// which the operator must refuse.
+// file, camera_info.yaml, and two the operator must refuse: the camera with
+// lens distortion, raw.yaml, and with a skew, skewed.yaml.
 //
 // Usage: write_test_clouds DIR COUNT WIDTH HEIGHT [xyz]
 
@@ -55,6 +55,9 @@ int main(int argc, char** argv) try {
   raw.distortion_model = hm::DistortionModel::kEquidistant;
   raw.coefficients = {0.05, -0.01, 0.0, 0.0};
   hm::write_camera_info_yaml(raw, directory / "raw.yaml");
+  hm::CameraInfo skewed = camera;
+  skewed.skew = 0.5;
+  hm::write_camera_info_yaml(skewed, directory / "skewed.yaml");
   for (int frame = 0; frame < count; ++frame) {
     std::vector<float> xyz;
     std::vector<std::uint8_t> rgb;

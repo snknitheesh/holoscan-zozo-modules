@@ -3,8 +3,9 @@
 //
 // The demo's operators on their own: the file source with a consumer far
 // slower than its clock, and the reporter's frame-id check, its completion at
-// the last frame and its truth settings, through the SDK's operator test
-// harness.
+// the last frame, its truth settings, the report's verdict on how many clouds
+// came before the camera info and the image files' names, through the SDK's
+// operator test harness.
 //
 // Usage: pcd_app_ops_test DIR (a scratch folder for the files)
 
@@ -75,8 +76,8 @@ std::chrono::nanoseconds capture_time(std::uint32_t frame) {
 }
 
 // Records the frame ids of the clouds it receives, and checks that each
-// cloud's points and colors belong together, taking long enough over each
-// that the source must wait for it.
+// cloud's colors come from the same file as its points, taking long enough
+// over each that the source must wait for it.
 struct SlowSinkLog {
   std::vector<std::uint64_t> frame_ids;
   int mismatched{};
@@ -124,10 +125,10 @@ class SlowCloudSinkOp final : public holoscan::Operator<> {
 };
 
 // A consumer twenty times slower than the file source's clock still gets
-// every frame whole, once, in order. The runtime holds the source back, so
-// its emits do not fail today; should one be refused as backpressured, the
-// source sends the rest of the frame on its next tick, and this checks that
-// the frame still arrives whole.
+// every cloud once, in order, with its own file's colors. The runtime holds
+// the source back, so its emits do not fail today; should one be refused as
+// backpressured, the source sends the same cloud, read once, again on its
+// next tick.
 void check_file_source_waits_for_consumer() {
   const std::filesystem::path folder = g_directory / "slow_sink_clouds";
   std::filesystem::create_directories(folder);
@@ -219,6 +220,49 @@ holoscan::testing::TestSample<holoscan::schema::ImageT> depth_sample(std::uint64
   return sample;
 }
 
+// Runs images of `frame_ids` through the reporter, writing files into
+// `image_dir` when it is given, and returns its report.
+std::shared_ptr<DepthReport> report_of(const std::vector<std::uint64_t>& frame_ids,
+                                       const std::filesystem::path& image_dir = {}) {
+  auto report = std::make_shared<DepthReport>();
+  auto h = holoscan::testing::create_operator_test<DepthImageReportOp>(
+      DepthImageReportConfig{.report = report, .image_dir = image_dir});
+  std::vector<holoscan::testing::TestSample<holoscan::schema::ImageT>> samples;
+  for (const std::uint64_t id : frame_ids) samples.push_back(depth_sample(id));
+  h.push_samples("depth", std::move(samples));
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  return report;
+}
+
+// A run of five clouds is complete with an image for every cloud from the
+// first camera info on, and no more clouds before it than allowed: one with a
+// camera info source, none with camera info sent with every cloud.
+void check_report_complete() {
+  VERIFY(report_of({1, 2, 3, 4, 5})->complete(5, 0));
+  VERIFY(report_of({2, 3, 4, 5})->complete(5, 1));
+  VERIFY(report_of({2, 3, 4, 5})->before_camera_info() == 1U);
+  VERIFY_MSG(!report_of({2, 3, 4, 5})->complete(5, 0),
+             "a cloud before the camera info sent with every cloud");
+  VERIFY_MSG(!report_of({3, 4, 5})->complete(5, 1), "two clouds before the first camera info");
+  VERIFY_MSG(!report_of({5})->complete(5, 1), "only the last cloud checked");
+  VERIFY_MSG(!report_of({1, 2, 3, 4})->complete(5, 1), "the last cloud missing");
+  VERIFY(!DepthReport{}.complete(5, 1));
+}
+
+// Image files are named by frame, from 0 for frame id 1, whatever clouds came
+// before the first image.
+void check_report_names_files_by_frame() {
+  const std::filesystem::path folder = g_directory / "images";
+  std::filesystem::create_directories(folder);
+  const auto report = report_of({2, 3}, folder);
+  VERIFY(report->files_written == 2U);
+  VERIFY_MSG(std::filesystem::is_regular_file(folder / "depth_000001.pgm") &&
+                 std::filesystem::is_regular_file(folder / "depth_000002.pgm") &&
+                 !std::filesystem::exists(folder / "depth_000000.pgm"),
+             "frame ids 2 and 3 write depth_000001.pgm and depth_000002.pgm");
+}
+
 // The reporter completes at the image of the last frame, whatever the shared
 // report counted before it, and however many frames came before its first.
 void check_report_completes_at_last_frame() {
@@ -301,5 +345,8 @@ int main(int argc, char** argv) {
        [] { app::check_report_frame_gaps({3, 4, 5}, 0); }},
       {"the reporter completes at the last frame", app::check_report_completes_at_last_frame},
       {"the reporter refuses a truth that does not fit", app::check_report_rejects_unfit_truth},
+      {"a run is complete only with at most the allowed clouds before the camera info",
+       app::check_report_complete},
+      {"image files are named by frame", app::check_report_names_files_by_frame},
   });
 }

@@ -51,6 +51,18 @@ struct CloudReport {
     return frames != 0 && frame_gaps == 0 &&
            (!verified || (wrong_points == 0 && wrong_colors == 0));
   }
+  // The frames before the first cloud, which came before the first camera
+  // info; 0 without a cloud.
+  [[nodiscard]] std::uint64_t before_camera_info() const noexcept {
+    return frames == 0 ? 0U : first_frame_id - 1U;
+  }
+  // Whether the run accounts for all `expected` frames: it passed, at most
+  // `max_before` frames came before the first camera info, and every frame
+  // from it on gave a cloud.
+  [[nodiscard]] bool complete(std::uint32_t expected, std::uint64_t max_before) const noexcept {
+    return passed() && before_camera_info() <= max_before &&
+           before_camera_info() + frames == expected;
+  }
 };
 
 // The synthetic camera and operator settings the clouds should match.
@@ -75,7 +87,8 @@ struct PointCloudReportConfig {
   // The camera's frame, which every cloud's header names.
   std::string frame_id;
   std::optional<CloudTruth> truth;
-  // Where to write frame_NNNNNN.ply; none when empty.
+  // Where to write each cloud as frame_NNNNNN.ply, NNNNNN its frame from 0
+  // (frame id 1); none when empty.
   std::filesystem::path ply_dir;
 };
 

@@ -26,10 +26,6 @@ using holoscan::point_cloud::synthetic_cloud_layout;
 using holoscan::point_cloud::synthetic_frame;
 using holoscan::point_cloud::SyntheticFrame;
 
-// Which outputs of the frame being sent are out.
-constexpr std::uint32_t kSentCameraInfo = 1U;
-constexpr std::uint32_t kSentCloud = 2U;
-
 holoscan::Error failure(std::string message) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, std::move(message)};
 }
@@ -40,7 +36,7 @@ holoscan::Error cuda_failure(const char* what, cudaError_t status) {
 
 using Result = holoscan::expected<void, holoscan::Error>;
 
-// Records the outcome of sending one output of a frame. Consumers still busy
+// Settles the outcome of sending one output of a frame. Consumers still busy
 // with earlier frames make an emit fail with kBackpressured before anything
 // is delivered, or an allocation with kResourceExhausted while every slot of
 // the output's pool is still held, by frames they have not finished with or
@@ -50,9 +46,8 @@ using Result = holoscan::expected<void, holoscan::Error>;
 // run or skipping the frame. Returns nothing to go on with the frame's other
 // outputs, or what compute() returns now: success when the consumers are
 // busy, else the error.
-std::optional<Result> settle(Result sent, std::uint32_t output, std::uint32_t& sent_outputs) {
+std::optional<Result> settle(Result sent) {
   if (sent) {
-    sent_outputs |= output;
     return std::nullopt;
   }
   if (sent.error().code == holoscan::ErrorCode::kBackpressured ||
@@ -129,8 +124,9 @@ holoscan::Contract SyntheticCloudSourceOp::contract() const {
 
 void SyntheticCloudSourceOp::start() {
   emitted_ = 0;
+  delayed_ = false;
   pending_capture_.reset();
-  sent_ = 0U;
+  camera_info_sent_ = false;
 }
 
 void SyntheticCloudSourceOp::stop() { release(); }
@@ -229,6 +225,10 @@ holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::compute(
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the consumers request completion.
   }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
+  }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     // The runtime writes device loans only on the stream it assigns to an
@@ -251,31 +251,30 @@ holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::compute(
   // sent on a retry still pair with those sent before it.
   if (!pending_capture_) {
     pending_capture_ = context.activation_time();
-    sent_ = 0U;
+    camera_info_sent_ = false;
   }
   // Frame ids count from 1; 0 means none.
   const holoscan::EmitOptions emit{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U};
   const SyntheticFrame frame =
       synthetic_frame(config_.width, config_.height, emitted_, config_.camera_info);
 
-  if (config_.camera_info && (sent_ & kSentCameraInfo) == 0U) {
+  if (config_.camera_info && !camera_info_sent_) {
     hm::CameraInfo info = synthetic_camera_info(frame);
     info.header.capture_timestamp_ns = pending_capture_->timestamp_ns;
-    if (auto stop = settle(camera_info.emit(hm::to_message(info), emit), kSentCameraInfo, sent_)) {
+    if (auto stop = settle(camera_info.emit(hm::to_message(info), emit))) {
       return *stop;
     }
+    camera_info_sent_ = true;
   }
   auto cloud = hm::allocate_point_cloud(point_cloud, hm::unorganized_cloud(point_count_),
                                         {.colors = config_.color}, ::cuda::stream_ref(stream));
   if (!cloud) {
-    return settle(holoscan::make_unexpected(std::move(cloud).error()), kSentCloud, sent_)
-        .value_or(Result{});
+    return settle(holoscan::make_unexpected(std::move(cloud).error())).value_or(Result{});
   }
   if (auto filled = fill(*cloud, frame, stream); !filled) {
     return filled;
   }
-  if (auto stop = settle(send_cloud(point_cloud, std::move(*cloud), point_count_, "body", emit),
-                         kSentCloud, sent_)) {
+  if (auto stop = settle(send_cloud(point_cloud, std::move(*cloud), point_count_, "body", emit))) {
     return *stop;
   }
   // Every output of this frame is out.
@@ -318,20 +317,30 @@ holoscan::Contract CloudFileSourceOp::contract() const {
   return result;
 }
 
-void CloudFileSourceOp::start() { emitted_ = 0; }
+void CloudFileSourceOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+  pending_.reset();
+}
 
 holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= total_) {
     return {};
   }
-  const auto& path = config_.files[emitted_ % config_.files.size()];
-  PointCloud cloud;
-  try {
-    cloud = read_ply(path);
-  } catch (const std::exception& error) {
-    return holoscan::make_unexpected(failure(error.what()));
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
   }
+  const auto& path = config_.files[emitted_ % config_.files.size()];
+  if (!pending_) {
+    try {
+      pending_ = read_ply(path);
+    } catch (const std::exception& error) {
+      return holoscan::make_unexpected(failure(error.what()));
+    }
+  }
+  const PointCloud& cloud = *pending_;
   if (cloud.size() > config_.max_points) {
     return holoscan::make_unexpected(
         holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
@@ -344,13 +353,11 @@ holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
   }
   const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
                                    .frame_id = emitted_ + 1U};
-  std::uint32_t sent = 0U;
   auto loan = hm::allocate_point_cloud(
       point_cloud, hm::unorganized_cloud(static_cast<std::int64_t>(cloud.size())),
       {.colors = config_.color}, context.cuda_stream());
   if (!loan) {
-    return settle(holoscan::make_unexpected(std::move(loan).error()), kSentCloud, sent)
-        .value_or(Result{});
+    return settle(holoscan::make_unexpected(std::move(loan).error())).value_or(Result{});
   }
   if (auto written = fill_host(*loan, hm::PointCloudFields::points, cloud.xyz.data(),
                                cloud.xyz.size() * sizeof(float));
@@ -364,10 +371,10 @@ holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
       return written;
     }
   }
-  if (auto stop = settle(send_cloud(point_cloud, std::move(*loan), cloud.size(), "points", emit),
-                         kSentCloud, sent)) {
+  if (auto stop = settle(send_cloud(point_cloud, std::move(*loan), cloud.size(), "points", emit))) {
     return *stop;
   }
+  pending_.reset();
   ++emitted_;
   return {};
 }

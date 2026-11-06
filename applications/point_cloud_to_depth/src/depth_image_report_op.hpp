@@ -58,6 +58,18 @@ struct DepthReport {
     return frames.load() != 0 && frame_gaps == 0 &&
            (!verified || (wrong_depths == 0 && wrong_colors == 0));
   }
+  // The clouds before the first image, which came before the first camera
+  // info; 0 without an image.
+  [[nodiscard]] std::uint64_t before_camera_info() const noexcept {
+    return frames.load() == 0 ? 0U : first_frame_id - 1U;
+  }
+  // Whether the run accounts for all `expected` clouds: it passed, at most
+  // `max_before` clouds came before the first camera info, and every cloud
+  // from it on gave an image.
+  [[nodiscard]] bool complete(std::uint32_t expected, std::uint64_t max_before) const noexcept {
+    return passed() && before_camera_info() <= max_before &&
+           before_camera_info() + frames.load() == expected;
+  }
 };
 
 // The synthetic camera the images should match.
@@ -82,8 +94,8 @@ struct DepthImageReportConfig {
   // Its format must be `depth_format`, and uint16 depth must be in whole
   // millimeters of a millimeter-depth scene (see SceneTruth).
   std::optional<DepthImageTruth> truth;
-  // Where to write depth_NNNNNN.pgm (millimeters) and color_NNNNNN.ppm; none
-  // when empty.
+  // Where to write depth_NNNNNN.pgm (millimeters) and color_NNNNNN.ppm,
+  // NNNNNN the frame from 0 (frame id 1); none when empty.
   std::filesystem::path image_dir;
 };
 
@@ -108,7 +120,8 @@ class DepthImageReportOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> process(
       holoscan::ExecutionContext& context);
   void measure(int width, int height);
-  [[nodiscard]] holoscan::expected<void, holoscan::Error> write_images(int width, int height,
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> write_images(std::uint64_t frame_id,
+                                                                       int width, int height,
                                                                        bool with_color);
 
   DepthImageReportConfig config_;
@@ -119,7 +132,7 @@ class DepthImageReportOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> rgb_;
   std::vector<std::uint16_t> millimeters_;
   std::uint64_t last_frame_id_{};
-  // Images this reporter has seen, which number its files.
+  // Images this reporter has seen.
   std::uint32_t seen_{};
 };
 

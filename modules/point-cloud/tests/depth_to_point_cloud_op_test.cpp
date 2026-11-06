@@ -5,19 +5,22 @@
 // float32 and uint16 depth from host and device memory with camera info,
 // aligned color in every encoding with camera info sent with every frame and
 // changing from frame to frame, every point and color checked against the
-// synthetic camera; the cloud message's header, layout and provenance; frames
+// synthetic camera; camera info at its own rate changing between frames, to a
+// usable camera and to one it refuses; the cloud message's header, layout and
+// provenance; frames
 // before the first camera info and frames whose camera info has another
 // capture time; and unusable cameras, inputs and configurations rejected.
 // Through graphs: CameraInfoSourceOp reading a camera_info file, how host
 // input is held until its copy is done, and misaligned data rejected.
 
 #include <cuda_runtime_api.h>
-#include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -317,6 +320,60 @@ void check_frames_before_camera_info() {
   }
 }
 
+// With camera info at its own rate, a new calibration is picked up from the
+// next frame on, and the frames between keep the one before: camera A, two
+// frames, camera B, one frame. (Synthetic frames 0 and 5 share A's
+// intrinsics; frame 1 has B's.)
+void check_camera_change_at_own_rate() {
+  const DepthToPointCloudConfig config = base_config(true);
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const std::array<std::uint32_t, 3> frames{0U, 5U, 1U};
+  for (std::uint32_t i = 0; i < frames.size(); ++i) {
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frames[i], true);
+    if (i != 1) {
+      h.push_frame(holoscan::testing::frame_at(
+          capture_time(i) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+    }
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(i), holoscan::testing::input("depth", depth_image(f, true, false))));
+  }
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY_MSG(clouds.size() == 3, std::to_string(clouds.size()) + " clouds from 3 frames");
+  for (std::size_t i = 0; i < clouds.size() && i < frames.size(); ++i) {
+    check_cloud(clouds[i], false, synthetic_frame(kWidth, kHeight, frames[i], true), true, config);
+  }
+}
+
+// A calibration that changes, at the camera info's own rate, to one the
+// kernel cannot model fails the next frame.
+void check_camera_change_to_unusable() {
+  const DepthToPointCloudConfig config = base_config(true);
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  hm::CameraInfo skewed = synthetic_camera_info(f, "depth_optical");
+  skewed.skew = 0.5;
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0), holoscan::testing::input("depth", depth_image(f, true, false))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1) - 1ms, holoscan::testing::input("camera_info", hm::to_message(skewed))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1), holoscan::testing::input("depth", depth_image(f, true, false))));
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(!result.ok(), "the frame after the skewed camera info fails");
+  VERIFY_MSG(
+      result.describe_failure().find("camera info 'depth_optical' has a skew") != std::string::npos,
+      result.describe_failure());
+}
+
 // Camera info sent with every frame pairs with it by exact capture time: a
 // frame whose camera info carries another time gives no cloud, while the
 // frames around it still do.
@@ -568,6 +625,10 @@ std::shared_ptr<CloudCount> run_graph(const DepthToPointCloudConfig& config,
     graph.add_flow(info->camera_info, cloud->camera_info, hm::latest_camera_info_connection());
   }
   graph.add_flow(cloud->point_cloud, sink->point_cloud);
+  // One worker for the whole graph, which has two sources with a
+  // CameraInfoSourceOp: across workers the operator could run while the sink's
+  // queue is full, and fail on the refused emit.
+  graph.partition("depth_to_point_cloud_test").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   holoscan::CompileOptions options;
   options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
@@ -575,6 +636,10 @@ std::shared_ptr<CloudCount> run_graph(const DepthToPointCloudConfig& config,
   const auto plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
     failure = holoscan::format_diagnostics(plan.diagnostics(), plan.graph());
+    return report;
+  }
+  if (plan.execution_lanes().size() != 1U) {
+    failure = "the graph runs on " + std::to_string(plan.execution_lanes().size()) + " workers";
     return report;
   }
   auto session = holoscan::run_async(plan);
@@ -611,34 +676,37 @@ std::pair<holoscan::schema::ImageT, std::shared_ptr<TestMemory>> given_depth(
           memory};
 }
 
-// A camera_info file of the synthetic camera, removed when it goes.
+// A camera_info file of the synthetic camera, in a folder of its own that
+// mkdtemp() names unpredictably; both are removed when it goes.
 class CameraInfoFile {
  public:
-  explicit CameraInfoFile(const hm::CameraInfo& info)
-      : path_(std::filesystem::temp_directory_path() /
-              ("point_cloud_test_" + std::to_string(::getpid()) + "_" + std::to_string(next_id()) +
-               ".yaml")) {
+  explicit CameraInfoFile(const hm::CameraInfo& info) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / "point_cloud_test_XXXXXX").string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
     hm::write_camera_info_yaml(info, path_);
   }
   ~CameraInfoFile() {
     std::error_code ignored;
-    std::filesystem::remove(path_, ignored);
+    std::filesystem::remove_all(folder_, ignored);
   }
   CameraInfoFile(const CameraInfoFile&) = delete;
   CameraInfoFile& operator=(const CameraInfoFile&) = delete;
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
 
  private:
-  static int next_id() {
-    static int id = 0;
-    return id++;
-  }
+  std::filesystem::path folder_;
   std::filesystem::path path_;
 };
 
 // CameraInfoSourceOp reads the camera from its file and sends it at its own
 // rate; every frame from the first camera info on gives a cloud in the file's
-// camera frame.
+// camera frame. Both sources start with the run, so at most the first frame
+// comes before the first camera info.
 void check_camera_info_source() {
   const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
   const CameraInfoFile file(synthetic_camera_info(f, "depth_from_file"));
@@ -649,11 +717,11 @@ void check_camera_info_source() {
   std::string failure;
   const auto report = run_graph(base_config(true), std::move(frames), failure, file.path());
   VERIFY_MSG(failure.empty(), failure);
-  VERIFY_MSG(report->clouds >= 1 && report->clouds + report->first_frame_id - 1U == 10U &&
-                 report->last_frame_id == 10U,
-             std::to_string(report->clouds) + " clouds from frame " +
-                 std::to_string(report->first_frame_id) + " to " +
-                 std::to_string(report->last_frame_id));
+  VERIFY_MSG(
+      report->clouds >= 1 && report->first_frame_id <= 2U &&
+          report->clouds + report->first_frame_id - 1U == 10U && report->last_frame_id == 10U,
+      std::to_string(report->clouds) + " clouds from frame " +
+          std::to_string(report->first_frame_id) + " to " + std::to_string(report->last_frame_id));
   VERIFY(report->frame_id == "depth_from_file");
 }
 
@@ -818,6 +886,9 @@ int main() {
        [] { dpc::check_color_and_changing_camera(holoscan::schema::ImageEncoding_BGRA8, true); }},
       {"frames before the first camera info give no cloud", dpc::check_frames_before_camera_info},
       {"camera info with another capture time gives no cloud", dpc::check_unmatched_camera_info},
+      {"a camera that changes at its own rate is picked up", dpc::check_camera_change_at_own_rate},
+      {"a camera that changes to an unusable one fails the frame",
+       dpc::check_camera_change_to_unusable},
       {"a cloud carries its depth image's device sequence", dpc::check_frame_ids},
       {"CameraInfoSourceOp reads the camera from its file", dpc::check_camera_info_source},
       {"host input is held until its copy is done", dpc::check_host_input_held},
