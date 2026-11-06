@@ -169,6 +169,26 @@ bool env_set(const char* name) {
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
+// Closes the signal domain, once no session runs, so that a failure to
+// restore the signal state is reported rather than left to its destructor.
+void close_signals(SignalDomain& signals) {
+  if (!signals) {
+    return;
+  }
+  if (auto closed = signals->close(); !closed) {
+    std::cerr << kAppName << ": warning: closing the signal domain failed: "
+              << holoscan::runtime_error_message(closed.error()) << '\n';
+  }
+}
+
+// The time allowed for each frame's filters and checks, by its points: well
+// above what the slowest platform takes.
+constexpr std::chrono::duration<double, std::micro> kAllowancePerPoint{1.0};
+// The longest run the deadline allows, so that no size or count overflows it.
+constexpr std::chrono::hours kLongestRun{24 * 365};
+// How long a stopped run may take to wind down before the process exits anyway.
+constexpr std::chrono::seconds kStopGrace{10};
+
 int execute(const Options& opts, SignalDomain& signals) {
   const bool display_available =
       env_set("DISPLAY") || (env_set("WAYLAND_DISPLAY") && env_set("XDG_RUNTIME_DIR"));
@@ -288,11 +308,13 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
   }
   if (!plan.ok()) {
+    close_signals(signals);
     return 1;
   }
   if (opts.compile_only) {
     // The workers the graph runs on, one per partition.
     std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
+    close_signals(signals);
     return 0;
   }
   if (!signals) {
@@ -301,9 +323,14 @@ int execute(const Options& opts, SignalDomain& signals) {
               << "; an interrupt ends the process without a report\n";
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
+  const double point_frames = static_cast<double>(opts.width) * opts.height * opts.count;
+  const std::chrono::duration<double> allowance =
+      std::chrono::seconds(opts.timeout_seconds) +
+      std::chrono::milliseconds(2LL * opts.count * opts.period_ms) +
+      kAllowancePerPoint * point_frames;
   const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(opts.timeout_seconds) +
-                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::min(allowance, std::chrono::duration<double>(kLongestRun)));
   while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(10ms);
   }
@@ -311,6 +338,12 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
+    if (!session.wait_for(kStopGrace)) {
+      // A callback does not return: waiting for it would hang the process.
+      std::cerr << kAppName << ": did not stop within " << kStopGrace.count() << " s\n"
+                << kAppName << ": verdict=FAIL" << std::endl;
+      std::_Exit(1);
+    }
   }
   session.wait();
   const holoscan::RunTermination termination = session.termination();
@@ -320,12 +353,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!session.diagnostics().empty() && !sdk_reported) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
   }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
-  }
+  close_signals(signals);
 
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
   const bool passed = !timed_out && session.diagnostics().empty() &&
@@ -365,21 +393,26 @@ void validate(const Options& opts) {
 
 }  // namespace
 
-int main(int argc, char** argv) try {
+int main(int argc, char** argv) {
   // Take over SIGINT and SIGTERM while this is the only thread; the SDK
   // refuses a process that already runs others.
   SignalDomain signals = holoscan::ManagedShutdownSignals::create();
-  const Options opts = parse_args(argc, argv);
-  if (opts.help) {
-    usage(argv[0]);
-    return 0;
+  try {
+    const Options opts = parse_args(argc, argv);
+    if (opts.help) {
+      usage(argv[0]);
+      close_signals(signals);
+      return 0;
+    }
+    validate(opts);
+    return execute(opts, signals);
+  } catch (const std::invalid_argument& error) {
+    std::cerr << "error: " << error.what() << '\n';
+    close_signals(signals);
+    return 2;
+  } catch (const std::exception& error) {
+    std::cerr << "error: " << error.what() << '\n';
+    close_signals(signals);
+    return 1;
   }
-  validate(opts);
-  return execute(opts, signals);
-} catch (const std::invalid_argument& error) {
-  std::cerr << "error: " << error.what() << '\n';
-  return 2;
-} catch (const std::exception& error) {
-  std::cerr << "error: " << error.what() << '\n';
-  return 1;
 }

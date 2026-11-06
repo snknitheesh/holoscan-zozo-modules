@@ -12,10 +12,12 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/messages/conversion.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
@@ -27,6 +29,10 @@ namespace {
 
 namespace hm = holoscan::messages;
 using FieldSelector = holoscan::TensorFieldSelector<hm::schema::PointCloudT>;
+
+// How the SDK's message of a publication refused by a stop begins
+// (ExecutionContext::request_stop()).
+constexpr std::string_view kPublicationStopped = "RUNTIME_PUBLICATION_STOPPED";
 
 // The message's four tensors, in the order of CloudFields.
 constexpr std::size_t kPoints = 0;
@@ -166,6 +172,8 @@ struct CloudFilterOp::Impl {
   detail::DeviceBuffer keep;
   Compactor compactor;
   std::uint32_t* host_count{};  // Pinned.
+  // Whether the copy of host input to the GPU was logged.
+  bool host_copy_logged{};
 
   Impl() = default;
   Impl(const Impl&) = delete;
@@ -190,6 +198,11 @@ holoscan::Error CloudFilterOp::invalid(const std::string& message) const {
 
 holoscan::unexpected<holoscan::Error> CloudFilterOp::emit_failure(const char* port,
                                                                   holoscan::Error error) const {
+  // A publication refused because the run is stopping goes back unchanged:
+  // only then does the SDK still end the run stopped rather than failed.
+  if (error.message.starts_with(kPublicationStopped)) {
+    return holoscan::make_unexpected(std::move(error));
+  }
   // Keeps the code, so that a caller can still tell backpressure from failure.
   const char* hint = error.code == holoscan::ErrorCode::kBackpressured
                          ? " (its queue is full: the consumer is behind)"
@@ -197,6 +210,19 @@ holoscan::unexpected<holoscan::Error> CloudFilterOp::emit_failure(const char* po
   error.message = name_ + ": emitting " + port + " failed" +
                   (error.message.empty() ? std::string(hint) : ": " + error.message);
   return holoscan::make_unexpected(std::move(error));
+}
+
+void CloudFilterOp::log_host_copy(const std::string& fields, std::size_t bytes) const {
+  // "points, colors and normals"
+  std::string named = fields;
+  if (const std::size_t last = named.rfind(", "); last != std::string::npos) {
+    named.replace(last, 2, " and ");
+  }
+  HOLOSCAN_LOG_INFO(
+      "{}: the cloud's {} are in host memory, so every frame they are copied to the GPU, {} bytes "
+      "({:.1f} MB) this frame, and the operator may wait for the copy; to avoid both, send the "
+      "cloud in CUDA device memory",
+      name_, named, bytes, static_cast<double>(bytes) / 1e6);
 }
 
 holoscan::Error CloudFilterOp::cuda_failure(const char* what, cudaError_t status) const {
@@ -267,13 +293,15 @@ holoscan::expected<CloudFilterOp::Cloud, holoscan::Error> CloudFilterOp::receive
   // Checks every field the cloud carries, then copies the host ones to the
   // GPU through staging buffers. The runtime orders the release of device,
   // managed and stream-ready pinned inputs after this operator's stream, but
-  // may reuse pinned memory of its own pools once compute() returns, which
-  // is held here until the copies are done. Pageable memory needs nothing:
-  // cudaMemcpyAsync has staged it by the time it returns.
+  // may reuse host memory once compute() returns, so host input is held
+  // until the copies are done. That holds for pageable memory too: CUDA does
+  // not promise that cudaMemcpyAsync has read it when the call returns.
   const auto tensors = tensors_of(message);
   std::array<const void*, kFields> data{};
-  std::array<const holoscan::Tensor*, kFields> pinned{};
-  std::size_t pinned_count = 0;
+  std::array<const holoscan::Tensor*, kFields> host{};
+  std::size_t host_tensors = 0;
+  std::size_t host_bytes = 0;
+  std::string host_fields;  // Only until the copy is logged.
   cloud.contents = hm::PointCloudContents{
       .colors = hm::is_present(message.colors),
       .normals = hm::is_present(message.normals),
@@ -319,14 +347,20 @@ holoscan::expected<CloudFilterOp::Cloud, holoscan::Error> CloudFilterOp::receive
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
     }
-    if (tensor.device().device_type == kDLCUDAHost) {
-      pinned[pinned_count++] = &tensor;
+    host[host_tensors++] = &tensor;
+    host_bytes += bytes;
+    if (!impl_->host_copy_logged) {
+      host_fields += (host_fields.empty() ? "" : ", ") + name;
     }
     data[field] = staging.as<void>();
   }
-  if (pinned_count != 0U) {
+  if (host_tensors != 0U) {
+    if (!impl_->host_copy_logged) {
+      impl_->host_copy_logged = true;
+      log_host_copy(host_fields, host_bytes);
+    }
     if (auto held =
-            detail::hold_until_done(std::span(pinned.data(), pinned_count), cloud.stream, name_);
+            detail::hold_until_done(std::span(host.data(), host_tensors), cloud.stream, name_);
         !held) {
       return holoscan::make_unexpected(std::move(held).error());
     }

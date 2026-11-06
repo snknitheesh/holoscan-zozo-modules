@@ -23,6 +23,7 @@
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/run.hpp>
@@ -125,6 +126,7 @@ class CheckOp final : public holoscan::Operator<> {
   explicit CheckOp(std::shared_ptr<Tally> tally) : tally_(std::move(tally)) {}
 
   void setup(holoscan::OperatorSpec& spec) override {
+    // Two slots each: one frame in compute() while the next one arrives.
     spec.input(voxels, "voxels").queue_depth(2U);
     spec.input(plane, "plane").queue_depth(2U);
   }
@@ -240,10 +242,13 @@ int main() {
       .operator_path = "ground", .output_port = "plane", .device = holoscan::DeviceId{0}});
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
-    std::cerr << plan.json() << '\n';
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
     return 1;
   }
-  if (const int status = holoscan::run(plan); status != 0) {
+  // The caller's signal handling: a test needs no managed SIGINT, and the managed
+  // kind refuses a process that already runs other threads, as under compute-sanitizer.
+  if (const int status = holoscan::run(plan, holoscan::RunSignalPolicy::kCallerManaged);
+      status != 0) {
     std::cerr << "pcl_filters_consumer: run failed with " << status << '\n';
     return 1;
   }

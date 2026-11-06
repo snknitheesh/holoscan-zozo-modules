@@ -11,22 +11,38 @@
 // clouds; and the rejection of unusable clouds and settings.
 
 #include <cuda_runtime_api.h>
+#include <dlfcn.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <holoscan/core/compile.hpp>
+#include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/core/graph.hpp>
+#include <holoscan/core/run.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
 #include <holoscan/messages/conversion.hpp>
@@ -37,6 +53,7 @@
 #include <holoscan/pcl_filters/synthetic_scene.hpp>
 #include <holoscan/pcl_filters/voxel_downsample_op.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
+#include <holoscan/time/realtime_clock.hpp>
 
 #include "reference.hpp"
 #include "test_support.hpp"
@@ -743,6 +760,440 @@ void check_rejected_configs() {
       "radius must be finite and positive");
 }
 
+// A platform whose copies from pageable host memory read it only when the
+// stream gets to them, as one whose GPU reads pageable memory in place does:
+// while `late_pageable_reads` is on, cudaMemcpyAsync from pageable memory to
+// the GPU reads the host memory in a host function queued on the stream,
+// 20 ms later, and records an event after the copy. This program's
+// definition takes the place of the CUDA runtime's for the module's library.
+struct LatePageableReads {
+  std::mutex mutex;
+  bool on{};
+  std::vector<cudaEvent_t> copied;
+  std::vector<void*> bounce;  // Pinned, freed with the reads.
+};
+
+LatePageableReads& late_pageable_reads() {
+  static LatePageableReads reads;
+  return reads;
+}
+
+struct LateRead {
+  void* to;
+  const void* from;
+  std::size_t bytes;
+};
+
+void late_read(void* data) {
+  const auto* read = static_cast<const LateRead*>(data);
+  std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  std::memcpy(read->to, read->from, read->bytes);
+  delete read;
+}
+
+}  // namespace
+}  // namespace holoscan::pcl_filters
+
+extern "C" cudaError_t cudaMemcpyAsync(void* dst, const void* src, std::size_t count,
+                                       cudaMemcpyKind kind, cudaStream_t stream) {
+  using Real = cudaError_t (*)(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
+  static const auto real = reinterpret_cast<Real>(dlsym(RTLD_NEXT, "cudaMemcpyAsync"));
+  auto& reads = holoscan::pcl_filters::late_pageable_reads();
+  const std::lock_guard lock(reads.mutex);
+  if (!reads.on || count == 0 || (kind != cudaMemcpyHostToDevice && kind != cudaMemcpyDefault)) {
+    return real(dst, src, count, kind, stream);
+  }
+  cudaPointerAttributes from{};
+  cudaPointerAttributes to{};
+  const bool known = cudaPointerGetAttributes(&from, src) == cudaSuccess &&
+                     cudaPointerGetAttributes(&to, dst) == cudaSuccess;
+  if (!known) {
+    (void)cudaGetLastError();  // Leaves no error behind for the caller.
+  }
+  if (!known || from.type != cudaMemoryTypeUnregistered ||
+      (to.type != cudaMemoryTypeDevice && to.type != cudaMemoryTypeManaged)) {
+    return real(dst, src, count, kind, stream);
+  }
+  void* bounce = nullptr;
+  if (const cudaError_t status = cudaMallocHost(&bounce, count); status != cudaSuccess) {
+    return status;
+  }
+  reads.bounce.push_back(bounce);
+  if (const cudaError_t status = cudaLaunchHostFunc(
+          stream, holoscan::pcl_filters::late_read,
+          new holoscan::pcl_filters::LateRead{.to = bounce, .from = src, .bytes = count});
+      status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status = real(dst, bounce, count, cudaMemcpyHostToDevice, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  cudaEvent_t copied = nullptr;
+  if (const cudaError_t status = cudaEventCreateWithFlags(&copied, cudaEventDisableTiming);
+      status != cudaSuccess) {
+    return status;
+  }
+  reads.copied.push_back(copied);
+  return cudaEventRecord(copied, stream);
+}
+
+namespace holoscan::pcl_filters {
+namespace {
+
+// What a graph run of host clouds sends and gets back.
+struct HostRun {
+  std::vector<std::vector<float>> frames;
+  std::vector<std::vector<float>> outputs;
+  std::atomic<std::uint32_t> received{0};
+  // Copies from the host that were still running when a cloud came out.
+  std::atomic<std::uint32_t> unfinished_reads{0};
+};
+
+// Sends each of the run's clouds, points only, in a runtime pool of plain
+// host memory, once the previous one came back.
+class HostCloudSourceOp final : public holoscan::Operator<> {
+ public:
+  explicit HostCloudSourceOp(std::shared_ptr<HostRun> run) : run_(std::move(run)) {}
+
+  void setup(holoscan::OperatorSpec& spec) override {
+    std::uint64_t points = 1;
+    for (const std::vector<float>& frame : run_->frames) {
+      points = std::max<std::uint64_t>(points, frame.size() / 3);
+    }
+    hm::declare_point_cloud_output(
+        spec, point_cloud, "point_cloud",
+        {.max_points = points, .memory_kind = holoscan::MemoryKind::kHost});
+  }
+
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnClock{.period = std::chrono::milliseconds{2}});
+    return result;
+  }
+
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& context) override {
+    if (emitted_ >= run_->frames.size() ||
+        run_->received.load(std::memory_order_acquire) < emitted_) {
+      return {};
+    }
+    const std::vector<float>& xyz = run_->frames[emitted_];
+    const hm::PointCloudShape shape =
+        hm::unorganized_cloud(static_cast<std::int64_t>(xyz.size() / 3));
+    auto loan = hm::allocate_point_cloud(point_cloud, shape, {}, context.cuda_stream());
+    if (!loan) {
+      return holoscan::make_unexpected(std::move(loan).error());
+    }
+    if (auto filled = loan->write_host_and_commit(
+            hm::PointCloudFields::points,
+            [&](const holoscan::TensorOutputWriteGuard& writer)
+                -> holoscan::expected<void, holoscan::Error> {
+              std::memcpy(writer.data(), xyz.data(), xyz.size() * sizeof(float));
+              return {};
+            });
+        !filled) {
+      return filled;
+    }
+    if (auto sent = hm::emit_point_cloud(
+            point_cloud, std::move(*loan), {.frame_id = kFrameId}, shape, -1,
+            {.capture_time = context.activation_time(), .frame_id = emitted_ + 1U});
+        !sent) {
+      return sent;
+    }
+    ++emitted_;
+    return {};
+  }
+
+  holoscan::Output<CloudMessage> point_cloud;
+
+ private:
+  std::shared_ptr<HostRun> run_;
+  std::uint32_t emitted_{};
+};
+
+// Counts the copies from the host still running as each cloud arrives, after
+// the filter's compute() returned, then copies its points back to the host.
+class PointsSinkOp final : public holoscan::Operator<> {
+ public:
+  explicit PointsSinkOp(std::shared_ptr<HostRun> run) : run_(std::move(run)) {}
+
+  void setup(holoscan::OperatorSpec& spec) override { spec.input(point_cloud, "point_cloud"); }
+
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnEach{point_cloud});
+    return result;
+  }
+
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& context) override {
+    {
+      auto& reads = late_pageable_reads();
+      const std::lock_guard lock(reads.mutex);
+      for (cudaEvent_t copied : reads.copied) {
+        run_->unfinished_reads += cudaEventQuery(copied) == cudaErrorNotReady ? 1U : 0U;
+      }
+    }
+    auto cloud = point_cloud.receive();
+    if (!cloud) {
+      return holoscan::make_unexpected(std::move(cloud).error());
+    }
+    const holoscan::Tensor& points = *cloud->data.points;
+    std::vector<float> host(static_cast<std::size_t>(points.size()));
+    if (auto copied =
+            points.copy_to_host(host.data(), host.size() * sizeof(float), context.cuda_stream());
+        !copied) {
+      return copied;
+    }
+    run_->outputs.push_back(std::move(host));
+    const std::uint32_t received = run_->received.fetch_add(1U, std::memory_order_release) + 1U;
+    if (received == run_->frames.size()) {
+      context.request_completion();
+    }
+    return {};
+  }
+
+  holoscan::Input<CloudMessage> point_cloud;
+
+ private:
+  std::shared_ptr<HostRun> run_;
+};
+
+// Clouds in plain host memory, on a platform where the copy reads it late:
+// the producer may reuse that memory once the crop box's compute() returns,
+// so the copy must be done by then. The clouds grow, so the operator's
+// staging and scratch buffers are replaced on the way. This pins the SDK
+// 5.0.0's runtime pools of host memory, which do not take a deallocation
+// stream, so the operator itself waits; a pool that did could defer the
+// reuse instead, and this test would then need to check that.
+void check_pageable_input_copied_before_release() {
+  auto run = std::make_shared<HostRun>();
+  for (const std::uint32_t points : {20'000U, 200'000U, 400'000U, 400'000U}) {
+    test::Random random(points);
+    std::vector<float> xyz(3 * std::size_t{points});
+    for (float& value : xyz) {
+      value = random.uniform(-2.0F, 2.0F);
+    }
+    run->frames.push_back(std::move(xyz));
+  }
+  holoscan::Graph graph{"pageable_input"};
+  auto source = graph.op<HostCloudSourceOp>("source", run);
+  // The box keeps every valid point, so the output is the input.
+  CropBoxConfig keep_all;
+  keep_all.cloud = {.max_points = 400'000U, .fields = {}};
+  auto crop = graph.op<CropBoxOp>("crop", keep_all);
+  auto sink = graph.op<PointsSinkOp>("sink", run);
+  const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
+  graph.add_flow(source->point_cloud, crop->point_cloud, lossless);
+  graph.add_flow(crop->filtered_point_cloud, sink->point_cloud, lossless);
+  graph.partition("pageable_input").include_all();
+  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+  holoscan::CompileOptions options;
+  options.deployment.bind_tensor_output_device(
+      holoscan::TensorOutputDevicePlacement{.operator_path = "crop",
+                                            .output_port = "filtered_point_cloud",
+                                            .device = holoscan::DeviceId{0}});
+  const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
+  VERIFY_MSG(plan.ok(), holoscan::format_diagnostics(plan.diagnostics(), plan.graph()));
+  if (!plan.ok()) return;
+  auto& reads = late_pageable_reads();
+  {
+    const std::lock_guard lock(reads.mutex);
+    reads.on = true;
+  }
+  const int status = holoscan::run(plan, holoscan::RunSignalPolicy::kCallerManaged);
+  VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+  {
+    const std::lock_guard lock(reads.mutex);
+    reads.on = false;
+    VERIFY_MSG(reads.copied.size() == run->frames.size(),
+               std::to_string(reads.copied.size()) + " copies from pageable memory, expected " +
+                   std::to_string(run->frames.size()));
+    for (cudaEvent_t copied : reads.copied) {
+      cudaEventDestroy(copied);
+    }
+    for (void* bounce : reads.bounce) {
+      cudaFreeHost(bounce);
+    }
+    reads.copied.clear();
+    reads.bounce.clear();
+  }
+  VERIFY(status == 0);
+  VERIFY_MSG(run->unfinished_reads == 0,
+             std::to_string(run->unfinished_reads.load()) +
+                 " copies from pageable input were still running after compute() returned");
+  VERIFY(run->outputs.size() == run->frames.size());
+  for (std::size_t frame = 0; frame < run->outputs.size() && frame < run->frames.size(); ++frame) {
+    const std::vector<float>& got = run->outputs[frame];
+    const std::vector<float>& want = run->frames[frame];
+    VERIFY_MSG(got.size() == want.size() &&
+                   std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) == 0,
+               "frame " + std::to_string(frame) + ": the output is not the input");
+  }
+}
+
+// Takes the plane.
+class PlaneSinkOp final : public holoscan::Operator<> {
+ public:
+  void setup(holoscan::OperatorSpec& spec) override { spec.input(plane, "plane"); }
+
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnEach{plane});
+    return result;
+  }
+
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& /*context*/) override {
+    auto got = plane.receive();
+    return got ? holoscan::expected<void, holoscan::Error>{}
+               : holoscan::make_unexpected(std::move(got).error());
+  }
+
+  holoscan::Input<holoscan::Tensor> plane;
+};
+
+// The README's live graph: every edge kDropOldest with depth 1, the ground
+// filter forking to the voxel filter and the plane's consumer, split by the
+// automatic partitioning. It compiles and runs a cloud through.
+void check_live_graph() {
+  auto run = std::make_shared<HostRun>();
+  run->frames.push_back(scene_cloud(0, false, Fields::kPoints).xyz);
+  holoscan::Graph graph{"live"};
+  auto camera = graph.op<HostCloudSourceOp>("camera", run);
+  GroundRemovalConfig ground = ground_config();
+  ground.cloud.fields = {};
+  auto ground_filter = graph.op<GroundRemovalOp>("ground", ground);
+  auto voxels = graph.op<VoxelDownsampleOp>(
+      "voxels", VoxelDownsampleConfig{.voxel_size = 0.05F,
+                                      .cloud = {.layout = OutputLayout::kDense, .fields = {}}});
+  auto planner = graph.op<PlaneSinkOp>("planner");
+  auto mapper = graph.op<PointsSinkOp>("mapper", run);
+  const holoscan::ConnectionOptions live{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                         .queue_depth = 1U};
+  graph.add_flow(camera->point_cloud, ground_filter->point_cloud, live);
+  graph.add_flow(ground_filter->filtered_point_cloud, voxels->point_cloud, live);
+  graph.add_flow(ground_filter->plane, planner->plane, live);
+  graph.add_flow(voxels->filtered_point_cloud, mapper->point_cloud, live);
+  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+  holoscan::CompileOptions options;
+  for (const auto& [op, port] :
+       {std::pair{"ground", "filtered_point_cloud"}, std::pair{"ground", "plane"},
+        std::pair{"voxels", "filtered_point_cloud"}}) {
+    options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
+        .operator_path = op, .output_port = port, .device = holoscan::DeviceId{0}});
+  }
+  const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
+  VERIFY_MSG(plan.ok(), holoscan::format_diagnostics(plan.diagnostics(), plan.graph()));
+  if (!plan.ok()) return;
+  VERIFY(holoscan::run(plan, holoscan::RunSignalPolicy::kCallerManaged) == 0);
+  VERIFY(run->outputs.size() == 1);
+}
+
+// What the process writes to stdout and stderr, where the SDK logs, while
+// `body` runs.
+std::string capture_output(const std::function<void()>& body) {
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  FILE* file = std::tmpfile();
+  VERIFY(file != nullptr);
+  if (file == nullptr) return {};
+  const int saved_out = dup(STDOUT_FILENO);
+  const int saved_err = dup(STDERR_FILENO);
+  dup2(fileno(file), STDOUT_FILENO);
+  dup2(fileno(file), STDERR_FILENO);
+  struct Restore {
+    int out;
+    int err;
+    ~Restore() {
+      std::cout.flush();
+      std::cerr.flush();
+      std::fflush(nullptr);
+      dup2(out, STDOUT_FILENO);
+      dup2(err, STDERR_FILENO);
+      close(out);
+      close(err);
+    }
+  };
+  {
+    const Restore restore{saved_out, saved_err};
+    body();
+  }
+  std::string output;
+  std::rewind(file);
+  char buffer[4096];
+  for (std::size_t n; (n = std::fread(buffer, 1, sizeof(buffer), file)) > 0;) {
+    output.append(buffer, n);
+  }
+  std::fclose(file);
+  return output;
+}
+
+std::size_t count_of(const std::string& text, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t at = text.find(needle); at != std::string::npos;
+       at = text.find(needle, at + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+// Host clouds are copied to the GPU every frame, which is logged once, at the
+// first, naming the operator, the fields and the bytes; device clouds log
+// nothing.
+void check_host_copy_logged_once() {
+  const holoscan::LogLevel level = holoscan::log_level();
+  holoscan::set_log_level(holoscan::LogLevel::INFO);
+  const std::vector<TestCloud> clouds{scene_cloud(0, true, Fields::kAll),
+                                      scene_cloud(1, true, Fields::kAll)};
+  for (const Memory memory : {Memory::kDevice, Memory::kPinned}) {
+    Outputs out;
+    const std::string output =
+        capture_output([&] { out = run_op<CropBoxOp>(crop_config(), clouds, memory); });
+    VERIFY_MSG(out.ok, out.failure);
+    const std::size_t logged = count_of(output, "copied to the GPU");
+    const std::size_t expected = memory == Memory::kDevice ? 0U : 1U;
+    VERIFY_MSG(logged == expected, std::string(memory_name(memory)) + ": the copy was logged " +
+                                       std::to_string(logged) + " times:\n" + output);
+    if (expected == 0 || logged != 1) continue;
+    const std::size_t bytes = std::size_t{kWidth} * kHeight * (12U + 3U + 12U + 4U);
+    for (const std::string& part :
+         {std::string("CropBoxOp"), std::string("points, colors, normals and intensity"),
+          std::to_string(bytes) + " bytes", std::string("device memory")}) {
+      VERIFY_MSG(output.find(part) != std::string::npos, "the copy log names '" + part + "'");
+    }
+  }
+  holoscan::set_log_level(level);
+}
+
+// CloudFilterOp's emit error, as the operators return it.
+class EmitErrorProbe final : public CloudFilterOp {
+ public:
+  EmitErrorProbe() : CloudFilterOp("ProbeOp", CloudSettings{}) {}
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& /*context*/) override {
+    return {};
+  }
+  using CloudFilterOp::emit_failure;
+};
+
+// A failed emit names the operator and the port and keeps its code; one a
+// stop refused goes back unchanged, as the SDK ends the run stopped only then.
+void check_emit_errors() {
+  const EmitErrorProbe probe;
+  const holoscan::Error stopped{holoscan::ErrorCode::kBackpressured,
+                                "RUNTIME_PUBLICATION_STOPPED: the run is stopping"};
+  const holoscan::Error got = probe.emit_failure("filtered_point_cloud", stopped).value();
+  VERIFY_MSG(got.code == stopped.code && got.message == stopped.message,
+             "a stop's error comes back unchanged, not as '" + got.message + "'");
+  const holoscan::Error full =
+      probe.emit_failure("plane", holoscan::Error{holoscan::ErrorCode::kBackpressured, ""}).value();
+  VERIFY(full.code == holoscan::ErrorCode::kBackpressured);
+  VERIFY_MSG(full.message.starts_with("ProbeOp: emitting plane failed"), full.message);
+}
+
 }  // namespace
 }  // namespace holoscan::pcl_filters
 
@@ -757,5 +1208,10 @@ int main() {
       TestCase{"empty and all-invalid clouds", pf::check_empty_and_invalid},
       TestCase{"rejected inputs", pf::check_rejected_inputs},
       TestCase{"rejected settings", pf::check_rejected_configs},
+      TestCase{"pageable input copied before compute() returns, growing clouds",
+               pf::check_pageable_input_copied_before_release},
+      TestCase{"host-to-device copy logged once", pf::check_host_copy_logged_once},
+      TestCase{"emit errors", pf::check_emit_errors},
+      TestCase{"the README's live graph", pf::check_live_graph},
   });
 }

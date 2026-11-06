@@ -83,7 +83,8 @@ __global__ void voxel_write_kernel(CloudFields in, const std::uint64_t* __restri
   const std::uint32_t start = starts[voxel];
   const std::uint64_t key = keys[start];
   double sum[3] = {0.0, 0.0, 0.0};
-  std::uint32_t color[3] = {0U, 0U, 0U};
+  // Up to 2^30 points of up to 255: wider than 32 bits.
+  std::uint64_t color[3] = {0U, 0U, 0U};
   double normal[3] = {0.0, 0.0, 0.0};
   std::uint32_t normals = 0;
   double intensity = 0.0;
@@ -181,11 +182,11 @@ cudaError_t VoxelGrid::group(const float* xyz, std::uint32_t count, float voxel_
   if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
     return status;
   }
-  // kNoCell has all 63 low bits set, so it sorts after every voxel.
+  // kNoCell sorts after every voxel.
   if (const cudaError_t status =
           detail::sort_pairs(s.keys.as<std::uint64_t>(), s.sorted_keys.as<std::uint64_t>(),
                              s.indices.as<std::uint32_t>(), s.sorted_indices.as<std::uint32_t>(),
-                             count, detail::kKeyBits, s.temp, stream);
+                             count, s.temp, stream);
       status != cudaSuccess) {
     return status;
   }

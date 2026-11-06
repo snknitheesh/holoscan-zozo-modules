@@ -49,6 +49,9 @@ __global__ void crop_box_kernel(const float* __restrict__ xyz, std::uint32_t cou
 
 cudaError_t launch_crop_box(const float* xyz, std::uint32_t count, const CropBoxParams& params,
                             std::uint8_t* keep, cudaStream_t stream) {
+  if (count > kMaxPointsLimit) {
+    return cudaErrorInvalidValue;  // 3 * i would wrap.
+  }
   if (count == 0U) {
     return cudaSuccess;
   }

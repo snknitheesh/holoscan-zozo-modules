@@ -20,6 +20,7 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/pcl_filters/filters.hpp>
 #include <holoscan/pcl_filters/synthetic_scene.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
@@ -87,6 +88,7 @@ FilterReportOp::FilterReportOp(FilterReportConfig config) : config_(std::move(co
 }
 
 void FilterReportOp::setup(holoscan::OperatorSpec& spec) {
+  // Two slots each: one frame in compute() while the next one arrives.
   spec.input(ground_cloud, "ground_cloud").queue_depth(2U);
   spec.input(plane, "plane").queue_depth(2U);
   spec.input(voxels, "voxels").queue_depth(2U);
@@ -206,8 +208,17 @@ holoscan::expected<void, holoscan::Error> FilterReportOp::compute(
     return checked;
   }
   if (config_.view_output) {
-    // Best effort: the display keeps only the newest view and never holds this back.
-    (void)send_view(voxel_xyz_.size() / 3, holoscan::sensor_io::derive_from(*cloud));
+    // Best effort: the display keeps only the newest view and never holds this
+    // back, so a view with no free slot is dropped. Any other failure is a fault,
+    // reported once.
+    if (auto sent = send_view(voxel_xyz_.size() / 3, holoscan::sensor_io::derive_from(*cloud));
+        !sent && sent.error().code != holoscan::ErrorCode::kBackpressured &&
+        sent.error().code != holoscan::ErrorCode::kResourceExhausted && !view_failure_logged_) {
+      view_failure_logged_ = true;
+      HOLOSCAN_LOG_WARN(
+          "FilterReportOp: sending the view failed, and later failures are not logged: {}",
+          sent.error().message);
+    }
   }
 
   ++report.frames;

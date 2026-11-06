@@ -21,9 +21,9 @@ flowchart LR
 
 Every filter keeps the cloud organized (`OutputLayout::kKeep`) up to the voxel grid, so the
 reporter can tell, pixel by pixel, what is left of the ground, the objects and the flying pixels.
-The voxels are padded (`kPadded`) by default, so no operator of the chain waits for the GPU; with
-`--voxel-layout dense` the voxel grid waits once per frame for its count and sends exactly the
-voxels.
+The voxels are padded (`kPadded`) by default, so no filter of the chain waits for the GPU (the
+reporter does: it copies each frame back to the host to check it); with `--voxel-layout dense` the
+voxel grid waits once per frame for its count and sends exactly the voxels.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ build/pcl_filters/pcl_filters --count 30 --period-ms 10 --display false  # ci mo
 | `--voxel-layout padded\|dense` | `padded` | The voxels as many points as the input, the rest NaN, with no wait; or exactly as many as there are, waiting for their count |
 | `--outliers radius\|statistical` | `radius` | Outlier removal: 3 cm and 3 neighbors, or k 8 within 10 cm and 2 deviations |
 | `--display auto\|true\|false` | `auto` | Show the voxels in HoloViz; `auto` when `DISPLAY` or Wayland is set |
-| `--timeout-seconds N` | `120` | Allowance beyond the expected run time |
+| `--timeout-seconds N` | `120` | Allowance beyond the expected run time, which is two periods and 1 µs per point for each frame |
 | `--compile-only true\|false` | `false` | Build and check the graph without running it |
 
 | CMake option | Default | |
@@ -93,8 +93,9 @@ The `ci` mode passes only when every frame passes. A stop request (Ctrl+C) ends 
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest --test-dir build/pcl_filters` runs the demo with each outlier mode,
-at 1280x720 and with dense voxels, all checked against the truth; compiles the display graph without a display; and
-checks that unusable arguments are usage errors.
+at 1280x720, at 2048x2048 with a 1 s `--timeout-seconds` and with dense voxels, all checked against
+the truth; compiles the display graph without a display; checks that unusable arguments are usage
+errors; and runs the reporter alone, checking that a view it cannot send is logged once.
 
 ## Licenses
 

@@ -3,6 +3,10 @@
 
 # These tests need the SDK, CUDA and a GPU.
 
+add_executable(pcl_report_op_test report_op_test.cpp)
+target_link_libraries(pcl_report_op_test PRIVATE pcl_filters_app_ops holoscan::testing)
+add_test(NAME pcl_report_op COMMAND pcl_report_op_test)
+
 # Runs the demo through run_and_match.cmake, which checks its exit status as well as its
 # output: pcl_app_test(<name> <exit status> <output regex> <arguments>...).
 set(_run_and_match "${CMAKE_CURRENT_SOURCE_DIR}/run_and_match.cmake")
@@ -23,6 +27,10 @@ pcl_app_test(pcl_app_statistical 0 "${_pass}"
 )
 pcl_app_test(pcl_app_720p 0 "${_pass}"
   --count 5 --period-ms 20 --width 1280 --height 720 --voxel-size 0.05 --display false
+)
+# Large frames: the time allowed grows with the points, beyond --timeout-seconds.
+pcl_app_test(pcl_app_large_frames 0 "${_pass}"
+  --count 10 --period-ms 1 --width 2048 --height 2048 --timeout-seconds 1 --display false
 )
 # The voxels exactly as many as there are, waiting for their count.
 pcl_app_test(pcl_app_dense_voxels 0 "${_pass}"

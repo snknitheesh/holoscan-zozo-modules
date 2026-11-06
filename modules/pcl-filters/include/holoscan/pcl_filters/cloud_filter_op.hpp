@@ -17,13 +17,16 @@
 //
 // Waits: a kDense output's size is known only once the filter has run, so the
 // operator waits for its GPU work once per frame before allocating it. kKeep
-// and kPadded never wait. Input in pinned host memory costs one wait per frame
-// too, since the runtime may reuse that memory once compute() returns.
+// and kPadded never wait. Input in host memory costs up to one wait per frame
+// too, for its copy to the GPU: its producer may reuse that memory once
+// compute() returns, unless its allocator can defer the reuse until the copy
+// is done.
 
 #pragma once
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -57,10 +60,11 @@ enum class OutputLayout : std::uint8_t {
 struct CloudSettings {
   OutputLayout layout{OutputLayout::kKeep};
   // Largest cloud accepted, 1..kMaxPointsLimit points; a larger one fails the
-  // frame. It sizes the outputs. The default fits 1920x1080.
+  // run (compute() returns its error). It sizes the outputs. The default fits
+  // 1920x1080.
   std::uint32_t max_points{1920U * 1080U};
   // The optional fields the output has room for: each takes max_points
-  // values in every output buffer. A cloud carrying another fails its frame.
+  // values in every output buffer. A cloud carrying another fails the run.
   holoscan::messages::PointCloudContents fields{.colors = true, .normals = true, .intensity = true};
 };
 
@@ -114,7 +118,9 @@ class CloudFilterOp : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::Error invalid(const std::string& message) const;
   [[nodiscard]] holoscan::Error cuda_failure(const char* what, cudaError_t status) const;
-  // The error of a failed emit on `port`, naming the operator and the port.
+  // The error of a failed emit on `port`, naming the operator and the port;
+  // a stop's RUNTIME_PUBLICATION_STOPPED error unchanged, so that the run
+  // still ends stopped.
   [[nodiscard]] holoscan::unexpected<holoscan::Error> emit_failure(const char* port,
                                                                    holoscan::Error error) const;
   [[nodiscard]] const CloudSettings& settings() const noexcept { return settings_; }
@@ -122,6 +128,8 @@ class CloudFilterOp : public holoscan::Operator<> {
  private:
   struct Impl;
 
+  // Says, once, that host input is copied to the GPU every frame, and how not to.
+  void log_host_copy(const std::string& fields, std::size_t bytes) const;
   // Allocates a cloud of `shape` with the input's fields, runs `write` on
   // all of them on the cloud's stream and sends it.
   [[nodiscard]] holoscan::expected<void, holoscan::Error> emit_cloud(

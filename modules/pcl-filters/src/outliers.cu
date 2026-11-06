@@ -362,12 +362,15 @@ cudaError_t OutlierFilter::filter(const float* xyz, std::uint32_t count,
   if (const cudaError_t status =
           detail::sort_pairs(s.keys.as<std::uint64_t>(), s.sorted_keys.as<std::uint64_t>(),
                              s.indices.as<std::uint32_t>(), s.sorted_indices.as<std::uint32_t>(),
-                             count, detail::kKeyBits, s.temp, stream);
+                             count, s.temp, stream);
       status != cudaSuccess) {
     return status;
   }
   heads_kernel<<<blocks_for(count), kBlock, 0, stream>>>(s.sorted_keys.as<std::uint64_t>(), count,
                                                          s.heads.as<std::uint32_t>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   if (const cudaError_t status = detail::exclusive_sum(
           s.heads.as<std::uint32_t>(), s.offsets.as<std::uint32_t>(), count, s.temp, stream);
       status != cudaSuccess) {
@@ -377,11 +380,17 @@ cudaError_t OutlierFilter::filter(const float* xyz, std::uint32_t count,
       s.sorted_keys.as<std::uint64_t>(), s.heads.as<std::uint32_t>(), s.offsets.as<std::uint32_t>(),
       count, s.cell_keys.as<std::uint64_t>(), s.starts.as<std::uint32_t>(),
       s.cells.as<std::uint32_t>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   const Grid grid{s.sorted_keys.as<std::uint64_t>(), s.sorted_indices.as<std::uint32_t>(),
                   s.cell_keys.as<std::uint64_t>(), s.starts.as<std::uint32_t>(),
                   s.cells.as<std::uint32_t>()};
   fill_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
       count, statistical ? s.mean.as<float>() : nullptr, keep);
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   if (!statistical) {
     radius_kernel<<<blocks_for(count), kBlock, 0, stream>>>(xyz, count, grid, params.radius,
                                                             params.min_neighbors, keep);
@@ -389,11 +398,20 @@ cudaError_t OutlierFilter::filter(const float* xyz, std::uint32_t count,
   }
   knn_kernel<<<blocks_for(count), kBlock, 0, stream>>>(xyz, count, grid, cell_size, params.k,
                                                        params.search_radius, s.mean.as<float>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   stats_kernel<<<kStatBlocks, kBlock, 0, stream>>>(s.mean.as<float>(), count,
                                                    s.partials.as<double>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   threshold_kernel<<<1, 1, 0, stream>>>(s.partials.as<double>(), kStatBlocks,
                                         static_cast<double>(params.std_multiplier),
                                         s.threshold.as<double>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
   statistical_keep_kernel<<<blocks_for(count), kBlock, 0, stream>>>(s.mean.as<float>(), count,
                                                                     s.threshold.as<double>(), keep);
   return cudaGetLastError();

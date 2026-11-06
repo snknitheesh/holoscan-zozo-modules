@@ -26,7 +26,8 @@ class DeviceBuffer {
 
   // Makes the buffer at least `bytes` long. Grows by at least half, so that a
   // slowly growing cloud does not reallocate every frame; an old buffer is
-  // freed after `stream` is done with it, the only time this waits.
+  // freed after `stream` is done with it, the only time this waits (cudaFree
+  // also waits for the whole device).
   cudaError_t reserve(std::size_t bytes, cudaStream_t stream) {
     if (bytes <= bytes_) {
       return cudaSuccess;

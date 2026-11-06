@@ -69,6 +69,9 @@ __global__ void pad_kernel(CloudOutput out, const std::uint32_t* __restrict__ de
 
 cudaError_t pad_cloud(const CloudOutput& out, const std::uint32_t* device_count,
                       std::uint32_t capacity, cudaStream_t stream) {
+  if (capacity > kMaxPointsLimit) {
+    return cudaErrorInvalidValue;  // 3 * i would wrap.
+  }
   if (capacity == 0U) {
     return cudaSuccess;
   }
@@ -81,6 +84,9 @@ cudaError_t pad_cloud(const CloudOutput& out, const std::uint32_t* device_count,
 
 cudaError_t apply_mask(const CloudFields& in, const std::uint8_t* keep, std::uint32_t count,
                        const CloudOutput& out, cudaStream_t stream) {
+  if (count > kMaxPointsLimit) {
+    return cudaErrorInvalidValue;  // 3 * i would wrap.
+  }
   if (count == 0U) {
     return cudaSuccess;
   }
@@ -103,6 +109,9 @@ Compactor::Compactor() : impl_(std::make_unique<Impl>()) {}
 Compactor::~Compactor() = default;
 
 cudaError_t Compactor::count(const std::uint8_t* keep, std::uint32_t count, cudaStream_t stream) {
+  if (count > kMaxPointsLimit) {
+    return cudaErrorInvalidValue;  // 3 * i would wrap in write().
+  }
   Impl& s = *impl_;
   s.count = count;
   for (auto [buffer, bytes] :

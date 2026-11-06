@@ -25,7 +25,7 @@ demo](../../applications/pcl_filters/) runs them all end to end on synthetic clo
 | C++ namespace | `holoscan::pcl_filters` |
 | Debian package | `holoscan-pcl-filters` |
 | Depends on | [holoscan-messages](../messages/) |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, with JetPack 7.2) |
 
 ## The cloud
 
@@ -57,19 +57,25 @@ What each frame costs besides the filter, per operator:
 | Input | Copies | Host waits |
 | --- | --- | --- |
 | Device memory | None: the filter's kernels read the input in place and write the output once | None with `kKeep` and `kPadded`; one with `kDense` (and a 4-byte read of the count) |
-| Pinned host memory | One host-to-device copy per field, asynchronous | One more: the runtime may reuse its own pinned memory once `compute()` returns, so the operator waits for the copies |
-| Pageable host memory | One host-to-device copy per field, which the driver stages before the call returns | None more |
+| Host memory, pinned or pageable | One host-to-device copy per field, asynchronous | Up to one more: the producer may reuse the memory once `compute()` returns, and CUDA does not promise that an asynchronous copy from pageable memory has read it by then, so the operator waits for the copies unless the memory's allocator can wait for them itself |
+
+The first frame in host memory is logged once, at `INFO`, with the fields and bytes it copies.
 
 `GroundRemovalOp` writes the plane straight into its output. Scratch buffers grow with the largest
-cloud seen and are freed when the run stops; growing one waits for the stream once.
+cloud seen and are freed when the run stops; growing one waits once for the stream and, as
+`cudaFree` does, for the whole GPU.
 
 Every operator's config has a `cloud` (`CloudSettings`), besides its own settings:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `layout` | `OutputLayout::kKeep` (`kDense` for `VoxelDownsampleOp`) | As above |
-| `max_points` | `2073600` (1920x1080) | Largest cloud accepted, up to 2^30 points; a larger one fails the frame. It sizes the output's memory pool |
-| `fields` | colors, normals and intensity | The optional fields the output has room for: each takes `max_points` values in every output buffer. A cloud carrying another fails its frame, so turn off only what the producer never sends |
+| `max_points` | `2073600` (1920x1080) | Largest cloud accepted, up to 2^30 points; a larger one fails the run. It sizes the output's memory pool |
+| `fields` | colors, normals and intensity | The optional fields the output has room for: each takes `max_points` values in every output buffer. A cloud carrying another fails the run, so turn off only what the producer never sends |
+
+A cloud the operator cannot take fails the run: `compute()` returns the error, and the SDK ends the
+run. With the defaults, every slot of an operator's output pool takes about 64 MB (31 bytes for each
+of the 2073600 points); size `max_points` and `fields` to the producer to keep the pools small.
 
 ## Operators
 
@@ -184,10 +190,13 @@ auto voxels = graph.op<pf::VoxelDownsampleOp>(
                                                                        .max_points = 640 * 480,
                                                                        .fields = {.colors = true}}});
 
-graph.add_flow(camera->point_cloud, ground_filter->point_cloud);
-graph.add_flow(ground_filter->filtered_point_cloud, voxels->point_cloud);
-graph.add_flow(ground_filter->plane, planner->ground);
-graph.add_flow(voxels->filtered_point_cloud, mapper->point_cloud);
+// Live: a consumer that falls behind gets the newest cloud, and nothing waits.
+const holoscan::ConnectionOptions live{.queue_policy = holoscan::QueuePolicy::kDropOldest,
+                                       .queue_depth = 1U};
+graph.add_flow(camera->point_cloud, ground_filter->point_cloud, live);
+graph.add_flow(ground_filter->filtered_point_cloud, voxels->point_cloud, live);
+graph.add_flow(ground_filter->plane, planner->ground, live);
+graph.add_flow(voxels->filtered_point_cloud, mapper->point_cloud, live);
 ```
 
 The outputs are in device memory, so bind their GPU when compiling, for every output of every
@@ -200,15 +209,17 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
 ```
 
 An operator cannot send a refused output again: a lossless (`kBlocking`) edge whose queue is full
-fails the frame. Keep a lossless chain on one worker, as the demo does:
-`graph.partition("name").include_all()` runs the whole graph on one, where no emit is refused. A
-graph with a second source, or one that forks or joins (above, the ground filter feeds the voxel
-filter and the planner), is split by the SDK's automatic partitioning onto several workers. Across
-workers, the SDK 5.0 runs a producer even while its consumer's lossless queue is full, and refuses
-what it sends: an emit fails with `kBackpressured`, and an allocation with `kResourceExhausted`
-while every slot of the output's pool is still held. A graph that must be split keeps its source at
-most one frame ahead of the slowest consumer, as the demo's source does, or connects consumers that
-only need the newest cloud with `QueuePolicy::kDropOldest`.
+fails the run. A live graph, like the one above, connects every edge with
+`QueuePolicy::kDropOldest` and depth 1, so that a consumer that falls behind drops old clouds
+instead. A graph with a second source, or one that forks or joins (above, the ground filter feeds
+the voxel filter and the planner), is split by the SDK's automatic partitioning onto several
+workers. Across workers, the SDK 5.0 runs a producer even while its consumer's lossless queue is
+full, and refuses what it sends: an emit fails with `kBackpressured`, and an allocation with
+`kResourceExhausted` while every slot of the output's pool is still held. A graph that must be
+lossless does what the demo does: `graph.partition("name").include_all()` runs the whole graph on
+one worker, and the source sends a cloud only once the previous one is through. With both, the demo
+and the tests have never had an emit refused on the SDK 5.0.0; the SDK's headers do not promise it
+for one worker alone.
 
 The filters need no Holoscan graph: `launch_crop_box()`, `apply_mask()`, `Compactor`, `pad_cloud()`,
 `VoxelGrid`, `GroundSegmenter` and `OutlierFilter` in `<holoscan/pcl_filters/filters.hpp>` work on
@@ -255,21 +266,25 @@ over 100; `pcl_filters_benchmark` measures it.
 | OutlierRemovalOp (statistical, k 8, 4 cm) | 1.307 | 3.465 | 17.404 | 45.472 |
 | OutlierRemovalOp (radius, 5 cm, 3) | 0.302 | 0.831 | 1.380 | 5.179 |
 
-The Jetson Orin ran JetPack 7.2 in the power mode it was set to. On an idle GPU, `kDense`'s wait
-for the count costs a few tens of microseconds on the RTX 5090 and up to about 0.1 ms on the Jetson
-Orin. On a GPU that another process keeps busy it costs a time slice: with another process holding
-the RTX 5090 fully, `kDense` took 2.5 to 3.5 ms where `kPadded` took what it takes on an idle GPU.
-`kPadded` also never holds the operator's thread, so the runtime can queue the next operators' work
-meanwhile; its cost is a full-size output, which the next operator reads in full. The statistical
-mode is the costly one: every flying pixel searches every ring of cells for its neighbors, one
-binary search per cell, and a warp waits for its slowest point. For a real-time pipeline prefer the
-radius mode, which stops counting at `min_neighbors`; it removes the same flying pixels here.
+All runs used the repository's CI image (CUDA 13.2, Holoscan SDK 5.0.0). The RTX 5090 had driver
+595.91.07. The Jetson Orin had JetPack 7.2 (L4T R39.2.1) with driver 595.78, in power mode MAXN
+without `jetson_clocks`, as it was found when checked afterwards, with no reboot in between. On an
+idle GPU, `kDense`'s wait for the count costs a few tens of microseconds on the RTX 5090 and up to
+about 0.1 ms on the Jetson Orin. On a GPU that another process keeps busy it costs a time slice:
+with another process holding the RTX 5090 fully, `kDense` took 2.5 to 3.5 ms where `kPadded` took
+what it takes on an idle GPU. `kPadded` also never holds the operator's thread, so the runtime can
+queue the next operators' work meanwhile; its cost is a full-size output, which the next operator
+reads in full. The statistical mode is the costly one: every flying pixel searches every ring of
+cells for its neighbors, one binary search per cell, and a warp waits for its slowest point. For a
+real-time pipeline prefer the radius mode, which stops counting at `min_neighbors`; it removes the
+same flying pixels here.
 
 ## Requirements
 
 - [holoscan-messages](../messages/), installed.
-- Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13 (with its CUB), CMake 4.0
-  or later and a C++20 compiler.
+- Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13, CMake 4.0 or later and a
+  C++20 compiler. CUB, header-only, comes from the CCCL found first on the include path: the SDK's
+  (CCCL 3.3.3 in SDK 5.0.0), then the CUDA Toolkit's.
 
 The module downloads nothing and needs no models or data.
 
@@ -296,8 +311,8 @@ The tests, all on synthetic clouds made at test time:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| `pcl_filters_filters` | GPU | The filters without a graph: the scene's GPU render against its host version; the crop box (boxes, pass-through, distance range, transforms, keep outside) against a CPU reference; masked, packed and padded clouds with every field against a host mask; the voxel grid at four sizes in both modes, with every field and far points dropped, against a CPU reference; the ground plane against the truth at three pitches, raw and refined, the height mode, a wall that is no ground, and rejected settings; statistical and radius outliers against brute force, and their rates on the scene; determinism across runs and fresh instances; empty, all-invalid and single-point clouds; a 4096x2048 cloud (8.4 million points) |
-| `pcl_filters_operators` | GPU | The four operators through the SDK's operator test harness on `PointCloud` messages: organized and unorganized clouds in device, pinned and pageable memory, with points only and with every field, in every output layout, field for field against the filters and the CPU references; the header, capture time, frame number, `organized` and `valid_count` of every output; the plane output; empty and all-invalid clouds; rejected clouds (wrong types and shapes, too many points, a field without room) and settings |
+| `pcl_filters_filters` | GPU | The filters without a graph: the scene's render against its host version; the crop box against a CPU reference; masked, packed and padded clouds against a host mask; the voxel grid at four sizes in both modes, with every field, against a CPU reference, its last cell among invalid points, and a voxel of 17.8 million points; the ground plane against the truth at three pitches, the height mode (on the plane, as the host decides), a wall, and bad settings; outliers against brute force, and their rates; determinism; growing clouds on one instance; a failed kernel launch, which ends each filter; empty, single-point, 8.4-million-point and over-2^30-point clouds |
+| `pcl_filters_operators` | GPU | The four operators through the SDK's operator test harness on `PointCloud` messages: organized and unorganized clouds in device, pinned and pageable memory, with points only and with every field, in every output layout, field for field against the filters and the CPU references; the header, capture time, frame number, `organized` and `valid_count` of every output; the plane output; empty and all-invalid clouds; rejected clouds (wrong types and shapes, too many points, a field without room) and settings; growing clouds in pageable memory whose copy is made to read the host memory late, which must be done when `compute()` returns; the one-time log of a host-to-device copy; emit errors, a stop's left unchanged |
 | `pcl_filters_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
@@ -322,4 +337,5 @@ current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)` an
 
 ## Licenses
 
-Apache-2.0. See [NOTICE](NOTICE).
+Apache-2.0. CUB, compiled into the library from the SDK's or the CUDA Toolkit's CCCL, is
+BSD-3-Clause; its notice is in [NOTICE](NOTICE), which the package installs.

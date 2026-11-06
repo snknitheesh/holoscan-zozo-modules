@@ -100,7 +100,7 @@ inline VoxelResult voxel_reference(const std::vector<float>& xyz,
   for (std::size_t start = 0; start < entries.size();) {
     std::size_t end = start;
     double sum[3] = {};
-    std::uint32_t color[3] = {};
+    std::uint64_t color[3] = {};
     double normal[3] = {};
     std::uint32_t normal_count = 0;
     double intensity_sum = 0.0;

@@ -32,7 +32,8 @@
 
 namespace holoscan::pcl_filters {
 
-// Largest cloud the filters accept.
+// Largest cloud the filters accept; every filter refuses a larger one with
+// cudaErrorInvalidValue.
 inline constexpr std::uint32_t kMaxPointsLimit = std::uint32_t{1} << 30;
 
 // A rigid (or any affine) transform, 3x4 row-major [R | t]: p' = R * p + t.

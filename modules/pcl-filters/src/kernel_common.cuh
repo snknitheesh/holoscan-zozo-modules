@@ -82,9 +82,10 @@ __device__ inline void remove_point(const CloudOutput& out, std::uint32_t at) {
 
 // A grid cell key: the cell's (x, y, z) index, each biased by
 // kVoxelIndexRange into 21 bits, x in the highest. Keys sort like the indices.
+// kNoCell sets the 64th bit too, which no cell's key does, so it sorts after
+// every cell, the last one on every axis (all 63 key bits set) included.
 inline constexpr std::uint64_t kNoCell = ~std::uint64_t{0};
 inline constexpr int kCellBits = 21;
-inline constexpr int kKeyBits = 3 * kCellBits;
 
 // The cell index of coordinate `value` in cells of `size`, or false when it is
 // out of range (or not finite).
@@ -136,11 +137,11 @@ inline cudaError_t exclusive_sum(const std::uint32_t* in, std::uint32_t* out, st
                                        stream);
 }
 
-// Sorts (key, value) pairs by the low `bits` bits of the key, stably.
+// Sorts (key, value) pairs by the whole key, stably.
 inline cudaError_t sort_pairs(const std::uint64_t* keys_in, std::uint64_t* keys_out,
                               const std::uint32_t* values_in, std::uint32_t* values_out,
-                              std::uint32_t count, int bits, DeviceBuffer& temp,
-                              cudaStream_t stream) {
+                              std::uint32_t count, DeviceBuffer& temp, cudaStream_t stream) {
+  constexpr int bits = 64;
   std::size_t bytes = 0;
   if (const cudaError_t status =
           cub::DeviceRadixSort::SortPairs(nullptr, bytes, keys_in, keys_out, values_in, values_out,

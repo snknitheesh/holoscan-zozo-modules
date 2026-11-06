@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numbers>
@@ -27,6 +28,7 @@
 #include <holoscan/pcl_filters/filters.hpp>
 #include <holoscan/pcl_filters/synthetic_scene.hpp>
 
+#include "launch_faults.hpp"
 #include "reference.hpp"
 #include "test_support.hpp"
 
@@ -630,6 +632,40 @@ void check_ground_modes() {
   }
   VERIFY_MSG(wrong == 0, std::to_string(wrong) + " points differ from the height threshold");
 
+  // Points on a tilted height plane, where only rounding decides: the kernel
+  // decides as the host computes the same expression.
+  GroundParams tilted;
+  tilted.mode = GroundMode::kHeight;
+  tilted.up[0] = 0.3F;
+  tilted.up[1] = -0.8F;
+  tilted.up[2] = 0.5F;
+  tilted.height = 0.7F;
+  const float length = std::sqrt(0.3F * 0.3F + 0.8F * 0.8F + 0.5F * 0.5F);
+  const float normal[3] = {0.3F / length, -0.8F / length, 0.5F / length};
+  std::vector<float> on_plane;
+  Random plane_random(21);
+  constexpr std::uint32_t kOnPlane = 200000;
+  for (std::uint32_t i = 0; i < kOnPlane; ++i) {
+    const float x = plane_random.uniform(-3.0F, 3.0F);
+    const float y = plane_random.uniform(-3.0F, 3.0F);
+    const float z = (tilted.height - normal[0] * x - normal[1] * y) / normal[2];
+    on_plane.insert(on_plane.end(), {x, y, z});
+  }
+  Device<float> on_plane_xyz(on_plane);
+  const GroundResult tilted_result = run_ground(segmenter, on_plane_xyz, kOnPlane, tilted);
+  std::size_t wrong_on_plane = 0;
+  std::size_t above = 0;
+  for (std::uint32_t i = 0; i < kOnPlane; ++i) {
+    const float* p = on_plane.data() + 3 * i;
+    const float* plane = tilted_result.plane;
+    const bool keep = plane[0] * p[0] + plane[1] * p[1] + plane[2] * p[2] + plane[3] > 0.0F;
+    above += keep ? 1U : 0U;
+    wrong_on_plane += keep != (tilted_result.keep[i] != 0U) ? 1U : 0U;
+  }
+  VERIFY_MSG(above != 0 && above != kOnPlane, "the points straddle the plane");
+  VERIFY_MSG(wrong_on_plane == 0, std::to_string(wrong_on_plane) +
+                                      " points on the plane differ from the host's decision");
+
   // A wall only (the plane x = 1) is never ground with up along z.
   std::vector<float> wall;
   Random random(9);
@@ -929,6 +965,202 @@ void check_huge() {
          static_cast<std::uint32_t>(std::count(mask.begin(), mask.end(), 1U)));
 }
 
+// The grid's last cell on every axis has the key with all 63 key bits set; its
+// points must still sort apart from the invalid points between them.
+void check_corner_cell() {
+  constexpr std::uint32_t n = 1000;
+  // In cell 2^20 - 1 on every axis, at a cell size of 1.
+  const float corner = static_cast<float>(kVoxelIndexRange) - 0.5F;
+  std::vector<float> xyz;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    if (i % 2 == 0) {
+      xyz.insert(xyz.end(), {corner, corner, corner});
+    } else {
+      xyz.insert(xyz.end(), {std::numeric_limits<float>::quiet_NaN(), 0.0F, 0.0F});
+    }
+  }
+  Device<float> device(xyz);
+  VoxelGrid grid;
+  const test::VoxelResult voxels = run_voxels(grid, device, {}, n, 1.0F, VoxelMode::kCentroid);
+  VERIFY_MSG(voxels.xyz == std::vector<float>({corner, corner, corner}),
+             std::to_string(voxels.xyz.size() / 3) + " voxels, expected the one at the corner");
+  // Each corner point has every other one as a neighbor.
+  OutlierFilter filter;
+  Device<std::uint8_t> keep(n);
+  OutlierParams radius;
+  radius.mode = OutlierMode::kRadius;
+  radius.radius = 1.0F;
+  radius.min_neighbors = 2;
+  VERIFY(filter.filter(device.get(), n, radius, keep.get(), nullptr) == cudaSuccess);
+  VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+  const std::vector<std::uint8_t> kept = keep.host();
+  std::size_t wrong = 0;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    wrong += (kept[i] != 0U) != (i % 2 == 0) ? 1U : 0U;
+  }
+  VERIFY_MSG(wrong == 0, std::to_string(wrong) + " corner-cell outlier decisions are wrong");
+}
+
+// More points in one voxel than a 32-bit sum of their colors holds.
+void check_crowded_voxel() {
+  constexpr std::uint32_t n = (1U << 24) + (1U << 20);  // 255 * n > 2^32
+  const std::vector<float> xyz(3 * std::size_t{n}, 0.5F);
+  const std::vector<std::uint8_t> rgb(3 * std::size_t{n}, 255U);
+  Device<float> device_xyz(xyz);
+  Device<std::uint8_t> device_rgb(rgb);
+  VoxelGrid grid;
+  const test::VoxelResult voxels =
+      run_voxels(grid, device_xyz, DeviceFields{.rgb = &device_rgb}, n, 1.0F, VoxelMode::kCentroid);
+  VERIFY(voxels.xyz == std::vector<float>({0.5F, 0.5F, 0.5F}));
+  VERIFY_MSG(voxels.rgb == std::vector<std::uint8_t>({255U, 255U, 255U}),
+             "the voxel's color is not its points' mean");
+  const test::VoxelResult want = test::voxel_reference(xyz, rgb, 1.0F, VoxelMode::kCentroid);
+  VERIFY_MSG(want.rgb == voxels.rgb, "the reference's color is not the points' mean");
+}
+
+// One instance of each filter on clouds that grow, which replaces its scratch
+// buffers, gives what a fresh instance gives.
+void check_growing_clouds() {
+  VoxelGrid grid;
+  OutlierFilter statistical_filter;
+  OutlierFilter radius_filter;
+  GroundSegmenter segmenter;
+  Compactor compactor;
+  for (const std::uint32_t frame : {0U, 1U, 2U}) {
+    const int width = 80 << frame;
+    const SceneCloud scene = scene_cloud(width, width * 3 / 4, frame);
+    const auto n = static_cast<std::uint32_t>(scene.labels.size());
+    const std::string name = std::to_string(n) + " points";
+    Device<float> xyz(scene.xyz);
+    Device<std::uint8_t> rgb(scene.rgb);
+
+    VoxelGrid fresh_grid;
+    const test::VoxelResult voxels =
+        run_voxels(grid, xyz, DeviceFields{.rgb = &rgb}, n, 0.03F, VoxelMode::kCentroid);
+    const test::VoxelResult fresh_voxels =
+        run_voxels(fresh_grid, xyz, DeviceFields{.rgb = &rgb}, n, 0.03F, VoxelMode::kCentroid);
+    VERIFY_MSG(same_bits(voxels.xyz, fresh_voxels.xyz) && voxels.rgb == fresh_voxels.rgb,
+               name + ": voxels");
+
+    const auto outliers = [&](OutlierFilter& filter, const OutlierParams& params) {
+      Device<std::uint8_t> keep(n);
+      VERIFY(filter.filter(xyz.get(), n, params, keep.get(), nullptr) == cudaSuccess);
+      VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+      return keep.host();
+    };
+    const OutlierParams statistical{.k = 6, .search_radius = 0.2F};
+    const OutlierParams radius{.mode = OutlierMode::kRadius, .radius = 0.03F, .min_neighbors = 3};
+    OutlierFilter fresh_filter;
+    VERIFY_MSG(outliers(statistical_filter, statistical) == outliers(fresh_filter, statistical),
+               name + ": statistical outliers");
+    VERIFY_MSG(outliers(radius_filter, radius) == outliers(fresh_filter, radius),
+               name + ": radius outliers");
+
+    GroundSegmenter fresh_segmenter;
+    const GroundParams params = scene_ground_params(scene.scene);
+    const GroundResult ground = run_ground(segmenter, xyz, n, params);
+    const GroundResult fresh_ground = run_ground(fresh_segmenter, xyz, n, params);
+    VERIFY_MSG(std::memcmp(ground.plane, fresh_ground.plane, sizeof(ground.plane)) == 0 &&
+                   ground.keep == fresh_ground.keep,
+               name + ": ground");
+
+    Device<std::uint8_t> keep(ground.keep);
+    Device<float> packed(3 * std::size_t{n});
+    VERIFY(compactor.count(keep.get(), n, nullptr) == cudaSuccess);
+    VERIFY(compactor.write(CloudFields{.xyz = xyz.get()}, CloudOutput{.xyz = packed.get()},
+                           nullptr) == cudaSuccess);
+    const std::uint32_t kept = read_count(compactor.device_count());
+    std::vector<float> want;
+    for (std::uint32_t i = 0; i < n; ++i) {
+      if (ground.keep[i] != 0U) {
+        want.insert(want.end(), scene.xyz.begin() + 3 * i, scene.xyz.begin() + 3 * i + 3);
+      }
+    }
+    VERIFY_MSG(same_bits(packed.host(3 * std::size_t{kept}), want), name + ": packed");
+  }
+}
+
+// A kernel that fails to launch ends its filter's chain there, with the
+// error: no later kernel runs on scratch that it did not write. `run` runs
+// one filter and returns its status.
+void check_stops_at(const std::string& name, const std::function<cudaError_t()>& run) {
+  test::LaunchFaults& faults = test::launch_faults();
+  faults = test::LaunchFaults{.armed = true};
+  VERIFY_MSG(run() == cudaSuccess, name);
+  VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+  const int launches = faults.launches;
+  VERIFY_MSG(launches > 1, name + ": several launches");
+  for (int at = 1; at <= launches; ++at) {
+    faults = test::LaunchFaults{.armed = true, .fail_at = at};
+    const cudaError_t status = run();
+    const int after = faults.after_failure;
+    faults = test::LaunchFaults{};
+    VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+    VERIFY_MSG(status == cudaErrorLaunchOutOfResources, name + ": launch " + std::to_string(at) +
+                                                            " failed, and the filter returned " +
+                                                            cudaGetErrorName(status));
+    VERIFY_MSG(after == 0, name + ": launch " + std::to_string(at) + " failed, and " +
+                               std::to_string(after) + " kernels ran after it");
+  }
+}
+
+void check_failed_launches() {
+  const SceneCloud scene = scene_cloud(80, 60, 2);
+  const auto n = static_cast<std::uint32_t>(scene.labels.size());
+  Device<float> xyz(scene.xyz);
+  Device<std::uint8_t> keep(n);
+  Device<float> plane(4);
+  GroundSegmenter segmenter;
+  const GroundParams ransac = scene_ground_params(scene.scene);
+  check_stops_at("ground RANSAC", [&] {
+    return segmenter.segment(xyz.get(), n, ransac, plane.get(), keep.get(), nullptr, nullptr);
+  });
+  GroundParams height;
+  height.mode = GroundMode::kHeight;
+  check_stops_at("ground height", [&] {
+    return segmenter.segment(xyz.get(), n, height, plane.get(), keep.get(), nullptr, nullptr);
+  });
+  OutlierFilter filter;
+  check_stops_at("statistical outliers", [&] {
+    return filter.filter(xyz.get(), n, OutlierParams{.search_radius = 0.2F}, keep.get(), nullptr);
+  });
+  check_stops_at("radius outliers", [&] {
+    return filter.filter(xyz.get(), n, OutlierParams{.mode = OutlierMode::kRadius}, keep.get(),
+                         nullptr);
+  });
+  VoxelGrid grid;
+  check_stops_at("voxel grid", [&] { return grid.group(xyz.get(), n, 0.05F, nullptr); });
+  Compactor compactor;
+  check_stops_at("compactor", [&] { return compactor.count(keep.get(), n, nullptr); });
+}
+
+// More points than the filters take, 2^30, are refused before any kernel
+// runs. Last, as without the check the kernels would read out of bounds.
+void check_point_limit() {
+  constexpr std::uint32_t kTooMany = kMaxPointsLimit + 1U;
+  Device<float> xyz(3);
+  Device<std::uint8_t> keep(1);
+  Device<std::uint32_t> count(1);
+  const CloudFields in{.xyz = xyz.get()};
+  const CloudOutput out{.xyz = xyz.get()};
+  VERIFY(launch_crop_box(xyz.get(), kTooMany, CropBoxParams{}, keep.get(), nullptr) ==
+         cudaErrorInvalidValue);
+  VERIFY(apply_mask(in, keep.get(), kTooMany, out, nullptr) == cudaErrorInvalidValue);
+  VERIFY(pad_cloud(out, count.get(), kTooMany, nullptr) == cudaErrorInvalidValue);
+  Compactor compactor;
+  VERIFY(compactor.count(keep.get(), kTooMany, nullptr) == cudaErrorInvalidValue);
+  VoxelGrid grid;
+  VERIFY(grid.group(xyz.get(), kTooMany, 0.1F, nullptr) == cudaErrorInvalidValue);
+  OutlierFilter filter;
+  VERIFY(filter.filter(xyz.get(), kTooMany, OutlierParams{}, keep.get(), nullptr) ==
+         cudaErrorInvalidValue);
+  GroundSegmenter segmenter;
+  Device<float> plane(4);
+  VERIFY(segmenter.segment(xyz.get(), kTooMany, GroundParams{}, plane.get(), keep.get(), nullptr,
+                           nullptr) == cudaErrorInvalidValue);
+  VERIFY(cudaDeviceSynchronize() == cudaSuccess);
+}
+
 }  // namespace
 }  // namespace holoscan::pcl_filters
 
@@ -948,5 +1180,10 @@ int main() {
       TestCase{"determinism across runs", pf::check_determinism},
       TestCase{"empty and all-invalid clouds", pf::check_degenerate},
       TestCase{"huge cloud", pf::check_huge},
+      TestCase{"the grid's corner cell", pf::check_corner_cell},
+      TestCase{"a voxel of 17.8 million points", pf::check_crowded_voxel},
+      TestCase{"growing clouds on one instance", pf::check_growing_clouds},
+      TestCase{"a failed launch ends the filter", pf::check_failed_launches},
+      TestCase{"too many points refused", pf::check_point_limit},
   });
 }

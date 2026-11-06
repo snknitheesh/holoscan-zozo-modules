@@ -341,8 +341,13 @@ __global__ void mark_kernel(const float* __restrict__ xyz, std::uint32_t count,
   const float z = xyz[3 * i + 2];
   bool on_ground = false;
   if (valid_point(x, y, z) && isfinite(plane.x)) {
-    on_ground = height_mode ? plane.x * x + plane.y * y + plane.z * z + plane.w <= 0.0F
-                            : near_plane(plane, x, y, z, threshold);
+    // The height cut without fused multiply-adds, as the host computes the
+    // same expression: a point on the plane is decided by rounding alone.
+    on_ground = height_mode
+                    ? __fadd_rn(__fadd_rn(__fadd_rn(__fmul_rn(plane.x, x), __fmul_rn(plane.y, y)),
+                                          __fmul_rn(plane.z, z)),
+                                plane.w) <= 0.0F
+                    : near_plane(plane, x, y, z, threshold);
   }
   keep[i] = valid_point(x, y, z) && !on_ground ? 1U : 0U;
   if (on_ground && ground != nullptr) {
@@ -398,6 +403,9 @@ cudaError_t GroundSegmenter::segment(const float* xyz, std::uint32_t count,
 
   if (!ransac) {
     height_plane_kernel<<<1, 1, 0, stream>>>(up, params.height, plane);
+    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+      return status;
+    }
   } else {
     Impl& s = *impl_;
     const std::size_t n = count;
@@ -433,6 +441,9 @@ cudaError_t GroundSegmenter::segment(const float* xyz, std::uint32_t count,
     } else {
       valid_flags_kernel<<<blocks_for(count), kBlock, 0, stream>>>(xyz, count,
                                                                    s.flags.as<std::uint32_t>());
+      if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
       if (const cudaError_t status = detail::exclusive_sum(
               s.flags.as<std::uint32_t>(), s.offsets.as<std::uint32_t>(), count, s.temp, stream);
           status != cudaSuccess) {
@@ -441,12 +452,18 @@ cudaError_t GroundSegmenter::segment(const float* xyz, std::uint32_t count,
       valid_indices_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
           s.flags.as<std::uint32_t>(), s.offsets.as<std::uint32_t>(), count,
           s.indices.as<std::uint32_t>(), s.valid.as<std::uint32_t>());
+      if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
     }
     const auto min_cos = static_cast<float>(
         std::cos(static_cast<double>(params.max_tilt_deg) * std::numbers::pi / 180.0));
     hypotheses_kernel<<<blocks_for(iterations), kBlock, 0, stream>>>(
         xyz, s.indices.as<std::uint32_t>(), s.valid.as<std::uint32_t>(), iterations, params.seed,
         up, min_cos, s.planes.as<float4>());
+    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+      return status;
+    }
     if (const cudaError_t status =
             cudaMemsetAsync(s.scores.as<void>(), 0, std::size_t{iterations} * 4U, stream);
         status != cudaSuccess) {
@@ -458,13 +475,25 @@ cudaError_t GroundSegmenter::segment(const float* xyz, std::uint32_t count,
       score_kernel<<<grid, kBlock, 0, stream>>>(xyz, count, s.planes.as<float4>(), iterations,
                                                 params.distance_threshold,
                                                 s.scores.as<std::uint32_t>());
+      if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
     }
     select_kernel<<<1, kBlock, 0, stream>>>(s.planes.as<float4>(), s.scores.as<std::uint32_t>(),
                                             iterations, plane);
+    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+      return status;
+    }
     if (params.refine && count != 0U) {
       sums_kernel<<<kSumBlocks, kBlock, 0, stream>>>(xyz, count, plane, params.distance_threshold,
                                                      s.partials.as<double>());
+      if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
       refit_kernel<<<1, 1, 0, stream>>>(s.partials.as<double>(), kSumBlocks, up, min_cos, plane);
+      if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
     }
   }
   if (count != 0U) {

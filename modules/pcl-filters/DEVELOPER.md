@@ -33,8 +33,8 @@ hold a hyphen, so the headers, namespace and target say `pcl_filters`.
 | Consumer form | `find_package(holoscan-pcl-filters)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Debian package | `holoscan-pcl-filters`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0)` |
 | Module dependencies | holoscan-messages (`module.dependencies`): `holoscan::messages` from the same build when the repository root added it, otherwise its installed package; the package config finds it for consumers |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB (header-only, BSD-3-Clause) from the CCCL found first on the include path: the SDK's, then the CUDA Toolkit's |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, with JetPack 7.2) |
 | Test labels | `pcl_filters` and `gpu` on all |
 
 ## Conventions
@@ -54,12 +54,14 @@ hold a hyphen, so the headers, namespace and target say `pcl_filters`.
   `voxel_grid.cu`, `outliers.cu` and `synthetic_scene.cu` are compiled with `--fmad=false`, and the
   library's and the tests' host code with `-ffp-contract=off`. Keep both for any code that is
   checked against a CPU reference. `ground.cu` is checked against the truth with a tolerance and
-  keeps fused multiply-adds for its scoring.
+  keeps fused multiply-adds for its scoring; its height cut uses `__fmul_rn` and `__fadd_rn`, so it
+  decides as the host does.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
-  gone; it fails the frame, with an error that names the port.
-- No host wait per frame unless the output's size needs it (`kDense`) or the runtime may reuse
-  pinned input: count the waits a change adds (`cudaStreamSynchronize`, a synchronous copy) and
-  say why in the README's cost table.
+  gone; compute() returns its error, naming the port, which fails the run. A stop's
+  `RUNTIME_PUBLICATION_STOPPED` error goes back unchanged, so that the run still ends stopped.
+- No host wait per frame unless the output's size needs it (`kDense`) or the producer may reuse
+  host input once compute() returns: count the waits a change adds (`cudaStreamSynchronize`, a
+  synchronous copy) and say why in the README's cost table.
 - A new filter option needs a case in `pcl_filters_filters` against a reference or the truth; a new
   port or behavior of an operator, a case in `pcl_filters_operators`.

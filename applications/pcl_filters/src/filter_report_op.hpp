@@ -118,6 +118,8 @@ class FilterReportOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> voxel_rgb_;
   std::uint64_t last_frame_id_{};
   bool finished_{};
+  // Whether a failure to send the view was logged.
+  bool view_failure_logged_{};
 };
 
 }  // namespace pcl_filters_app
