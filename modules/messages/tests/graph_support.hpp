@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -51,16 +52,34 @@ struct RunOutcome {
   }
 };
 
+// How a graph's operators are spread over workers.
+enum class Layout {
+  // The SDK's automatic partitioning: a worker for each source, fork and join.
+  kAutomatic,
+  // The whole graph on one worker, as the module's README advises for
+  // lossless chains.
+  kOneWorker,
+};
+
+inline const char* layout_name(Layout layout) {
+  return layout == Layout::kOneWorker ? "one worker" : "automatic partitioning";
+}
+
 // Compiles and runs `graph` on a real-time clock until it ends, or stops it
-// after `timeout`.
+// after `timeout`. An accepted plan's diagnostics (warnings) are printed.
 inline RunOutcome run_graph(holoscan::Graph& graph, holoscan::CompileOptions options = {},
+                            Layout layout = Layout::kAutomatic,
                             std::chrono::seconds timeout = std::chrono::seconds{60}) {
+  if (layout == Layout::kOneWorker) graph.partition("one_worker").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   RunOutcome outcome;
   const auto plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
     outcome.diagnostics = holoscan::format_diagnostics(plan.diagnostics(), plan.graph());
     return outcome;
+  }
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
   }
   outcome.compiled = true;
   auto session = holoscan::run_async(plan);
@@ -131,6 +150,8 @@ class CaptureOp final : public holoscan::Operator<> {
   CaptureOp(std::shared_ptr<std::vector<Received<T>>> received, std::size_t count)
       : received_(std::move(received)), count_(count) {}
 
+  // Four: room for a few messages while this sink is busy, so that a source on
+  // another worker is rarely refused (it sends a refused one again).
   void setup(holoscan::OperatorSpec& spec) override { spec.input(input, "input").queue_depth(4U); }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;

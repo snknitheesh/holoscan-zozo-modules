@@ -27,11 +27,12 @@
 //   };
 //
 // Why this contract: with kLatest, camera info is selected LatestWithin with
-// a SafeDefault, and LatestCameraInfo keeps the newest one. In the SDK 5.0,
-// LatestWithin takes each camera info once, and a Skip or ReuseLast policy
-// holds back every frame that comes before the first camera info, which
-// stalls the pipeline for good when a frame arrives first; so the operator
-// keeps the camera info itself, and a frame before the first one is skipped.
+// a SafeDefault, and LatestCameraInfo keeps the newest one. As measured with
+// the SDK 5.0 (its documentation does not promise either), LatestWithin takes
+// each camera info once, and a Skip or ReuseLast policy holds back every
+// frame that comes before the first camera info, which stalls the pipeline
+// for good when a frame arrives first; so the operator keeps the camera info
+// itself, and a frame before the first one is skipped.
 
 #pragma once
 
@@ -48,6 +49,7 @@
 #include <holoscan/core/expected.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/messages/conversion.hpp>
 
 namespace holoscan::messages {
@@ -67,9 +69,10 @@ enum class CameraInfoTiming : std::uint8_t {
 
 struct CameraInfoInputOptions {
   CameraInfoTiming timing{CameraInfoTiming::kLatest};
-  // kLatest: a camera info older than this when a frame arrives is not taken
-  // for it (one already taken stays in use). Keep it above the camera info
-  // producer's period: CameraInfoSourceOp sends one a second by default.
+  // kLatest: a camera info captured more than this before a frame's capture
+  // time is not taken for it (one already taken stays in use). Keep it above
+  // the camera info producer's period: CameraInfoSourceOp sends one a second
+  // by default.
   std::chrono::nanoseconds max_age{std::chrono::seconds{10}};
 };
 
@@ -117,12 +120,26 @@ template <typename Info, typename... Frames>
   return camera_info_contract(CameraInfoInputOptions{}, camera_info, frames...);
 }
 
-// The edge for camera info with kLatest: the newest one replaces one the
-// consumer has not taken yet, and the producer never waits for the consumer.
-// (With kEveryFrame, give camera info the frames' own edge options.)
-[[nodiscard]] inline holoscan::ConnectionOptions latest_camera_info_connection() noexcept {
+// The edge for camera info with kLatest: it keeps the newest `depth` camera
+// infos the consumer has not taken (> 0: Graph::add_flow() refuses 0),
+// dropping the oldest, so the producer never waits for the consumer. (With kEveryFrame, give camera
+// info the frames' own edge options.)
+//
+// A frame takes the newest camera info captured at or before it. When frames
+// reach the consumer later after their capture than the camera info's period
+// (a long chain before it, or a fast CameraInfoSourceOp), every camera info
+// kept is newer than the frame, and none is taken: keep more, with
+// depth > that latency / the period.
+[[nodiscard]] inline holoscan::ConnectionOptions latest_camera_info_connection(
+    std::uint32_t depth) noexcept {
   return holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                     .queue_depth = 1U};
+                                     .queue_depth = depth};
+}
+
+// The same, keeping only the newest camera info: for frames that reach the
+// consumer sooner after their capture than the camera info's period.
+[[nodiscard]] inline holoscan::ConnectionOptions latest_camera_info_connection() noexcept {
+  return latest_camera_info_connection(1U);
 }
 
 namespace detail {
@@ -134,10 +151,18 @@ namespace detail {
 // The newest valid camera info an operator received, for
 // schema::CameraInfoT (Value CameraInfo) or schema::StereoCameraInfoT (Value
 // StereoCameraInfo). Not thread-safe: one per operator, used from compute().
+//
+// When update() has found no camera info at all for `warn_after` (5 s by
+// default) since its first call, it logs a warning, once: none arrives, or
+// each one is newer than the frames (see latest_camera_info_connection()).
 template <typename Message>
 class LatestCameraInfo {
  public:
   using Value = decltype(from_message(std::declval<const Message&>()));
+
+  LatestCameraInfo() = default;
+  explicit LatestCameraInfo(std::chrono::nanoseconds warn_after) noexcept
+      : warn_after_(warn_after) {}
 
   // Takes this activation's camera info from `port` when there is a new one,
   // checks it with validate() and keeps it.
@@ -151,6 +176,7 @@ class LatestCameraInfo {
       if (auto error = detail::selection_error(port.selection().reason)) {
         return holoscan::make_unexpected(std::move(*error));
       }
+      if (!latest_) warn_if_starved();
       return get();
     }
     auto sample = port.receive();
@@ -176,11 +202,28 @@ class LatestCameraInfo {
   void reset() noexcept {
     latest_.reset();
     changed_ = false;
+    first_update_.reset();
+    warned_ = false;
   }
 
  private:
+  void warn_if_starved() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!first_update_) first_update_ = now;
+    if (warned_ || now - *first_update_ < warn_after_) return;
+    warned_ = true;
+    HOLOSCAN_LOG_WARN(
+        "LatestCameraInfo: no camera info for any frame in {} ms: none has arrived, or each one "
+        "is newer than the frames; when frames reach this operator later than the camera "
+        "info's period, connect it with latest_camera_info_connection(depth)",
+        std::chrono::duration_cast<std::chrono::milliseconds>(warn_after_).count());
+  }
+
   std::optional<Value> latest_;
   bool changed_{};
+  std::chrono::nanoseconds warn_after_{std::chrono::seconds{5}};
+  std::optional<std::chrono::steady_clock::time_point> first_update_;
+  bool warned_{};
 };
 
 }  // namespace holoscan::messages

@@ -34,7 +34,11 @@ struct CameraInfoSourceConfig {
   std::filesystem::path right_camera_info_path;
   // How often the calibration is sent, > 0. The first one goes out when the
   // run starts, so a consumer's frames wait at most this long for it at the
-  // start; keep it below the consumer's max_age (10 s by default).
+  // start; keep it below the consumer's max_age (10 s by default). Each one is
+  // stamped with its send time, and a frame takes only one captured at or
+  // before it: keep the period above the time frames take from their capture
+  // to the consumer, or connect it with latest_camera_info_connection(depth)
+  // (camera_info_input.hpp).
   std::chrono::nanoseconds period{std::chrono::seconds{1}};
   // How many to send, then stay idle; 0 sends until the run ends.
   std::uint64_t count{0};

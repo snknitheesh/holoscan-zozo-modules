@@ -3,9 +3,8 @@
 //
 // CameraInfoSourceOp: what it sends for one camera_info file and for a stereo
 // pair's two (the files' calibration, stamped with the send time, `count`
-// times on its period), and what it refuses when constructed.
-
-#include <unistd.h>
+// times on its period), to a consumer too slow for it, in a second run of the
+// same plan, and what it refuses when constructed.
 
 #include <chrono>
 #include <cstdint>
@@ -14,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -34,27 +34,22 @@ constexpr std::size_t kCount = 4;
 constexpr auto kPeriod = std::chrono::milliseconds{15};
 
 struct Folder {
-  Folder() : path(fs::temp_directory_path() / ("messages_source_" + std::to_string(::getpid()))) {
-    fs::create_directories(path);
-  }
-  ~Folder() { fs::remove_all(path); }
-  Folder(const Folder&) = delete;
-  Folder& operator=(const Folder&) = delete;
-  fs::path path;
+  test::TemporaryFolder folder{"messages_source"};
+  const fs::path& path = folder.path();
 };
 
-// The capture times step by the period (to a millisecond of scheduling) and
-// equal the headers'.
+// The capture times are the clock's ticks, a whole number of periods apart
+// (a tick the source ran late for is coalesced into the next), and equal the
+// headers'.
 template <typename Message>
-void check_times(const std::vector<test::Received<Message>>& received) {
+void check_times(const std::vector<test::Received<Message>>& received,
+                 std::chrono::nanoseconds period = kPeriod) {
   for (std::size_t i = 0; i < received.size(); ++i) {
     VERIFY(received[i].data.header->capture_timestamp_ns == received[i].capture_timestamp_ns);
     if (i == 0) continue;
     const std::int64_t step =
         received[i].capture_timestamp_ns - received[i - 1].capture_timestamp_ns;
-    VERIFY_MSG(step > 0 && std::abs(step - std::chrono::nanoseconds(kPeriod).count()) <
-                               std::chrono::nanoseconds(std::chrono::milliseconds{5}).count(),
-               "step " + std::to_string(step) + " ns");
+    VERIFY_MSG(step > 0 && step % period.count() == 0, "step " + std::to_string(step) + " ns");
   }
 }
 
@@ -116,6 +111,128 @@ void test_stereo() {
   check_times(received);
 }
 
+// Takes one message at a time and holds each for 25 ms: on another worker
+// than the source, which sends faster than it takes them, so that the source
+// is refused (kBackpressured) while its one queue slot is full.
+class SlowSinkOp final : public holoscan::Operator<> {
+ public:
+  SlowSinkOp(std::shared_ptr<std::vector<test::Received<schema::CameraInfoT>>> received,
+             std::size_t count)
+      : received_(std::move(received)), count_(count) {}
+
+  void setup(holoscan::OperatorSpec& spec) override { spec.input(input, "input").queue_depth(1U); }
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnEach{input});
+    return result;
+  }
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& context) override {
+    auto sample = input.receive();
+    if (!sample) return holoscan::make_unexpected(std::move(sample).error());
+    received_->push_back({sample->data, sample->metadata.capture_timestamp_ns});
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    if (received_->size() == count_) context.request_completion();
+    return {};
+  }
+
+  holoscan::Input<schema::CameraInfoT> input;
+
+ private:
+  std::shared_ptr<std::vector<test::Received<schema::CameraInfoT>>> received_;
+  std::size_t count_;
+};
+
+void test_slow_consumer() {
+  // Every 5 ms into a lossless queue of one, taken every 25 ms: a refused send
+  // is no failure, and every one of the `count` is sent in the end.
+  const Folder folder;
+  const CameraInfo truth = synthetic_stereo_camera_info(DistortionModel::kPlumbBob, 640, 480).left;
+  write_camera_info_yaml(truth, folder.path / "camera.yaml");
+  constexpr std::size_t kSent = 8;
+  constexpr auto kFast = std::chrono::milliseconds{5};
+  auto received = std::make_shared<std::vector<test::Received<schema::CameraInfoT>>>();
+  holoscan::Graph graph{"slow"};
+  auto source = graph.op<CameraInfoSourceOp>(
+      "camera_info",
+      CameraInfoSourceConfig{
+          .camera_info_path = folder.path / "camera.yaml", .period = kFast, .count = kSent});
+  auto sink = graph.op<SlowSinkOp>("sink", received, kSent);
+  graph.add_flow(source->camera_info, sink->input, test::lossless());
+  // A worker each: one chain would otherwise run on one.
+  graph.partition("source").add(source);
+  graph.partition("sink").add(sink);
+  const test::RunOutcome outcome = test::run_graph(graph);
+  VERIFY_MSG(outcome.ok(), outcome.diagnostics);
+  VERIFY(received->size() == kSent);
+  check_times(*received, kFast);
+  // Faster than it is taken: some ticks were refused and sent again later.
+  if (received->size() == kSent) {
+    VERIFY(received->back().capture_timestamp_ns - received->front().capture_timestamp_ns >
+           static_cast<std::int64_t>(kSent - 1) * std::chrono::nanoseconds(kFast).count());
+  }
+}
+
+// Counts what each run of a plan receives; ends a run at the `count`th.
+class RunCountOp final : public holoscan::Operator<> {
+ public:
+  RunCountOp(std::shared_ptr<std::vector<std::size_t>> runs, std::size_t count)
+      : runs_(std::move(runs)), count_(count) {}
+
+  void setup(holoscan::OperatorSpec& spec) override { spec.input(input, "input").queue_depth(4U); }
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnEach{input});
+    return result;
+  }
+  void start() override { runs_->push_back(0); }
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& context) override {
+    auto sample = input.receive();
+    if (!sample) return holoscan::make_unexpected(std::move(sample).error());
+    if (++runs_->back() == count_) context.request_completion();
+    return {};
+  }
+
+  holoscan::Input<schema::CameraInfoT> input;
+
+ private:
+  std::shared_ptr<std::vector<std::size_t>> runs_;
+  std::size_t count_;
+};
+
+void test_second_run() {
+  // A limited count is per run: a second run of the same plan sends it all again.
+  const Folder folder;
+  write_camera_info_yaml(synthetic_stereo_camera_info(DistortionModel::kPlumbBob).left,
+                         folder.path / "camera.yaml");
+  auto runs = std::make_shared<std::vector<std::size_t>>();
+  holoscan::Graph graph{"twice"};
+  auto source = graph.op<CameraInfoSourceOp>(
+      "camera_info",
+      CameraInfoSourceConfig{
+          .camera_info_path = folder.path / "camera.yaml", .period = kPeriod, .count = kCount});
+  auto sink = graph.op<RunCountOp>("sink", runs, kCount);
+  graph.add_flow(source->camera_info, sink->input, test::lossless());
+  graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+  const auto plan = holoscan::compile(graph);
+  VERIFY_MSG(plan.ok(), holoscan::format_diagnostics(plan.diagnostics(), plan.graph()));
+  if (!plan.ok()) return;
+  for (int run = 0; run < 2; ++run) {
+    auto session = holoscan::run_async(plan);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    if (session.is_running()) session.request_stop();
+    session.wait();
+    VERIFY_MSG(session.termination() == holoscan::RunTermination::kRequestedCompleted,
+               "run " + std::to_string(run + 1) + " completed");
+  }
+  VERIFY_MSG(*runs == (std::vector<std::size_t>{kCount, kCount}),
+             "each run gets the count: " + std::to_string(runs->size()) + " runs");
+}
+
 void test_refusals() {
   const Folder folder;
   const fs::path missing = folder.path / "missing.yaml";
@@ -154,6 +271,8 @@ int main() {
   return holoscan::messages::test::run({
       {"one camera_info file", m::test_mono},
       {"a stereo pair's files, until stopped", m::test_stereo},
+      {"a consumer slower than the period", m::test_slow_consumer},
+      {"a second run of the same plan", m::test_second_run},
       {"refusals at construction", m::test_refusals},
   });
 }
