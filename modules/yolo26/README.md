@@ -26,7 +26,7 @@ its output into detections. YOLO26 needs no non-maximum suppression, so nothing 
 | C++ namespace | `holoscan::yolo26` |
 | Debian package | `holoscan-yolo26` |
 | Model tool | `tools/prepare_model.py`, installed as `share/holoscan-yolo26/prepare_model.py` |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## Operators
 
