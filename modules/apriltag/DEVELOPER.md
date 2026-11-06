@@ -35,7 +35,7 @@ keeps the template's `holohub_configure_deb()` and `PKG_holoscan_apriltag` switc
 | Consumer form | `find_package(holoscan-apriltag [COMPONENTS overlay])`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Debian package | `holoscan-apriltag`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and, with VPI, `libnvvpi4 (>= 4.0)` |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `visualization` for the overlay; `testing` for the tests), the CUDA runtime, AprilTag 3 (installed, or 3.4.5 fetched, built static and hidden inside the library), VPI 4 (optional) |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 | Test labels | `apriltag` on all; `gpu` for the GPU tests; `host` for the SDK-free test |
 
 ## Conventions
