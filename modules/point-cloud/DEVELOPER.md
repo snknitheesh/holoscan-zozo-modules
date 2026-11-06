@@ -27,11 +27,12 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
 | --- | --- |
 | Build contexts | Top-level CMake project, or included by another project (`add_subdirectory()`, `FetchContent`, the repository root); it is not built inside the SDK tree |
 | Options | Top level: `BUILD_TESTING` (`OFF`), `BUILD_SHARED_LIBS` (`ON`). Included: `HOLOSCAN_POINT_CLOUD_BUILD_TESTING` (`OFF`), always shared, the includer's `BUILD_TESTING` and `BUILD_SHARED_LIBS` left alone. Both: `PKG_holoscan_point_cloud` (`OFF`) |
-| Public targets | `holoscan::point_cloud` (`libholoscan_point_cloud.so.1`) |
+| Public targets | `holoscan::point_cloud` (`libholoscan_point_cloud.so.2`) |
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-point-cloud/holoscan-point-cloud-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-point-cloud)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-point-cloud`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
+| Debian package | `holoscan-point-cloud`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0)` |
+| Module dependencies | `holoscan-messages` 1.0 (`module.dependencies`): `holoscan::messages` when the root build defined it, else `find_package(holoscan-messages)`; the package config finds it too |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime |
 | Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
 | Test labels | `point_cloud` and `gpu` on all |
@@ -40,7 +41,11 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
 
 - Code lives in `holoscan::point_cloud`. The kernels' launchers and the synthetic depth camera are
   public and need no Holoscan graph; helpers shared by the operators stay private in `src/`.
-- Public headers carry only SDK, CUDA runtime and standard types.
+- Public headers carry only SDK, holoscan-messages, CUDA runtime and standard types. The
+  operators take their camera as a `CameraInfo` and send and receive points as `PointCloud`
+  messages; they use the messages module's `camera_info_contract()`, `LatestCameraInfo` and point
+  cloud helpers rather than their own. `src/pinhole_camera.cpp` is the one place that decides
+  which cameras the kernels can model.
 - Device code needs nothing newer than CUDA 13.0 (no CCCL header beyond its own), so the module
   also builds with JetPack 7's toolkit.
 - Exact checks hold because nothing contracts floating-point arithmetic: `project.cu`,
@@ -51,4 +56,9 @@ hold a hyphen, so the headers, namespace and target say `point_cloud`.
   and an emit into an unconnected output fails.
 - A new kernel option needs a case in `point_cloud_deproject` or `point_cloud_project`; a new port
   or behavior of an operator, a case in `point_cloud_depth_to_point_cloud_op` or
-  `point_cloud_point_cloud_to_depth_op`.
+  `point_cloud_point_cloud_to_depth_op`. Tests that CI runs make their own data;
+  `point_cloud_real_data` reads the local recordings from `HOLOSCAN_TEST_DATA` and skips
+  (exit 77) without it.
+- A descriptor-schema message such as `PointCloudT` carries tensors from a runtime pool only, so
+  a test that controls an input's memory (pinned, misaligned, another GPU) can do so for depth and
+  color images, but not for clouds.

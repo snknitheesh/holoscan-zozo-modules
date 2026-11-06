@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Point cloud sources for the application: the synthetic cloud, and a folder
-// of PLY files. Both emit a fixed number of clouds on a clock, then idle.
+// of PLY files. Both emit a fixed number of clouds on a clock as PointCloud
+// messages, then idle.
 
 #pragma once
 
@@ -14,13 +15,17 @@
 #include <optional>
 #include <vector>
 
-#include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
 #include <holoscan/core/operator.hpp>
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
+#include <holoscan/messages/point_cloud.hpp>
+#include <holoscan/point_cloud/synthetic_depth.hpp>
+
+#include "cloud_io.hpp"
 
 namespace point_cloud_to_depth_app {
 
@@ -33,20 +38,25 @@ struct SyntheticCloudSourceConfig {
   // Scene depths in whole millimeters, which a uint16 depth image in
   // millimeters reproduces exactly.
   bool millimeter_depth{false};
-  // Also emit each point's RGB8 color on `colors`.
+  // Each point's RGB8 color goes with the points.
   bool color{false};
-  // Also emit each frame's intrinsics on `intrinsics`, varying by frame.
-  bool intrinsics{false};
+  // Also emit each frame's camera info on `camera_info`, with the cloud's
+  // capture time and intrinsics that vary by frame.
+  bool camera_info{false};
   // Emit points and colors in CUDA device memory instead of host memory.
   bool device_output{true};
+  // Send the first cloud one period after the run starts, not when it
+  // starts: a camera info source that sends when the run starts, as
+  // CameraInfoSourceOp does, then goes first, and no cloud comes before it.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const SyntheticCloudSourceConfig& config);
 
 // Clouds of the synthetic camera in synthetic_scene.hpp, frame = 0, 1, ...,
-// in the body frame (synthetic_body_from_camera()), as float32 [N, 3] with N the same for
-// every frame.
+// in the body frame (synthetic_body_from_camera(), frame id "body"), as
+// unorganized clouds of N points, N the same for every frame.
 class SyntheticCloudSourceOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument if `config` is not valid.
@@ -60,20 +70,26 @@ class SyntheticCloudSourceOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  holoscan::Output<holoscan::Tensor> points;
-  holoscan::Output<holoscan::Tensor> colors;
-  holoscan::Output<holoscan::Tensor> intrinsics;
+  holoscan::Output<holoscan::messages::schema::PointCloudT> point_cloud;
+  holoscan::Output<holoscan::messages::schema::CameraInfoT> camera_info;
 
  private:
   void release() noexcept;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> ensure_scratch();
+  // Fills the points and colors of `cloud` with the frame on `stream`.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> fill(
+      holoscan::messages::PointCloudLoan& cloud, const holoscan::point_cloud::SyntheticFrame& frame,
+      cudaStream_t stream);
 
   SyntheticCloudSourceConfig config_;
   std::uint32_t point_count_{};
   std::uint32_t emitted_{};
-  // The frame being sent: its capture time and which outputs are out.
+  // With delay_first_frame: whether the first tick has passed.
+  bool delayed_{};
+  // The frame being sent: its capture time, and whether its camera info is
+  // out.
   std::optional<holoscan::TimePoint> pending_capture_;
-  std::uint32_t sent_{};
+  bool camera_info_sent_{};
   // Generation scratch for host output, and the stream it uses when the
   // runtime gives none.
   void* scratch_{};
@@ -85,21 +101,25 @@ struct CloudFileSourceConfig {
   // The most points in any file, which sizes the outputs: read the headers
   // with read_ply_header() before building the graph.
   std::uint64_t max_points{};
-  // Every file has colors, and they are emitted on `colors`.
+  // Every file has colors, and they go with the points.
   bool color{false};
   // Clouds to emit; 0 emits every file once.
   std::uint32_t count{0};
   // Start over after the last file until `count` clouds are out.
   bool loop{false};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
+  // Send the first cloud one period after the run starts; see
+  // SyntheticCloudSourceConfig::delay_first_frame.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const CloudFileSourceConfig& config);
 
-// float32 [N, 3] clouds, and with `color` uint8 [N, 3] colors, in host
-// memory, from PLY files, in order. A file that cannot be read, or that has
-// more points than configured or not the configured colors, fails the run.
+// Unorganized clouds of the PLY files' points, with their colors with
+// `color`, in host memory, in order; frame id "points". A file that cannot be
+// read, or that has more points than configured or not the configured
+// colors, fails the run.
 class CloudFileSourceOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument if `config` is not valid.
@@ -111,15 +131,16 @@ class CloudFileSourceOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  holoscan::Output<holoscan::Tensor> points;
-  holoscan::Output<holoscan::Tensor> colors;
+  holoscan::Output<holoscan::messages::schema::PointCloudT> point_cloud;
 
  private:
   CloudFileSourceConfig config_;
   std::uint32_t total_{};
   std::uint32_t emitted_{};
-  std::optional<holoscan::TimePoint> pending_capture_;
-  std::uint32_t sent_{};
+  bool delayed_{};
+  // The file being sent, read once: a cloud the consumers were too busy for
+  // goes out on the next tick without reading the file again.
+  std::optional<PointCloud> pending_;
 };
 
 }  // namespace point_cloud_to_depth_app

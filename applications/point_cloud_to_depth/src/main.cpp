@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Point Cloud to Depth: point clouds in, depth images out, on the GPU. A
-// source (a synthetic cloud with known ground truth, or a folder of PLY files)
-// feeds PointCloudToDepthOp, whose depth and color images a reporter checks,
-// measures and optionally writes as PGM and PPM files.
+// Point Cloud to Depth: point clouds and a camera's info in, depth images
+// out, on the GPU. A source (a synthetic cloud with known ground truth, or a
+// folder of PLY files) feeds PointCloudToDepthOp, with the camera from a
+// camera_info file through CameraInfoSourceOp (or, for the synthetic cloud,
+// with every cloud), and a reporter checks, measures and optionally writes
+// the depth and color images as PGM and PPM files.
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -35,6 +38,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/point_cloud_to_depth_op.hpp>
 #include <holoscan/point_cloud/synthetic_scene.hpp>
 #include <holoscan/time/realtime_clock.hpp>
@@ -47,6 +53,7 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 namespace app = point_cloud_to_depth_app;
+namespace hm = holoscan::messages;
 namespace pc = holoscan::point_cloud;
 
 constexpr std::string_view kAppName = "point_cloud_to_depth";
@@ -63,22 +70,28 @@ struct Options {
   bool loop{false};
   std::optional<std::uint32_t> count;
   std::uint32_t period_ms{33};
-  bool width_given{false};
-  bool height_given{false};
+  // The synthetic camera's size; validate() sets it to the camera's for
+  // --source files.
+  bool size_given{false};
   int width{640};
   int height{480};
   pc::DepthFormat depth_format{pc::DepthFormat::kFloat32};
   std::optional<bool> color;
-  bool intrinsics_input{false};
+  // The synthetic source sends the camera info with every cloud.
+  bool camera_info_per_frame{false};
   bool host_input{false};
-  std::optional<pc::CameraIntrinsics> intrinsics;
+  // The camera_info file for --source files, and the camera read from it by
+  // validate().
+  std::filesystem::path camera_info_file;
+  std::optional<hm::CameraInfo> camera;
   std::optional<pc::Extrinsics> extrinsics;
   std::optional<float> depth_scale;
   float depth_min{0.1F};
   float depth_max{10.0F};
   int point_size{1};
   std::filesystem::path image_dir;
-  bool verify{true};
+  // Synthetic clouds only; checked unless false.
+  std::optional<bool> verify;
   std::uint32_t timeout_seconds{120};
   bool compile_only{false};
   bool help{false};
@@ -124,7 +137,6 @@ pc::Extrinsics parse_extrinsics(std::string_view value, std::string_view option)
 
 Options parse_args(int argc, char** argv) {
   Options opts;
-  std::optional<float> fx, fy, cx, cy;
   for (int i = 1; i < argc; ++i) {
     const std::string_view option{argv[i]};
     if (option == "--help" || option == "-h") {
@@ -153,10 +165,10 @@ Options parse_args(int argc, char** argv) {
       opts.period_ms = parse_number<std::uint32_t>(value, option);
     } else if (option == "--width") {
       opts.width = parse_number<int>(value, option);
-      opts.width_given = true;
+      opts.size_given = true;
     } else if (option == "--height") {
       opts.height = parse_number<int>(value, option);
-      opts.height_given = true;
+      opts.size_given = true;
     } else if (option == "--depth-format") {
       if (value == "float32") {
         opts.depth_format = pc::DepthFormat::kFloat32;
@@ -167,18 +179,12 @@ Options parse_args(int argc, char** argv) {
       }
     } else if (option == "--color") {
       opts.color = parse_bool(value, option);
-    } else if (option == "--intrinsics-input") {
-      opts.intrinsics_input = parse_bool(value, option);
+    } else if (option == "--camera-info-per-frame") {
+      opts.camera_info_per_frame = parse_bool(value, option);
     } else if (option == "--host-input") {
       opts.host_input = parse_bool(value, option);
-    } else if (option == "--fx") {
-      fx = parse_number<float>(value, option);
-    } else if (option == "--fy") {
-      fy = parse_number<float>(value, option);
-    } else if (option == "--cx") {
-      cx = parse_number<float>(value, option);
-    } else if (option == "--cy") {
-      cy = parse_number<float>(value, option);
+    } else if (option == "--camera-info") {
+      opts.camera_info_file = value;
     } else if (option == "--extrinsics") {
       opts.extrinsics = parse_extrinsics(value, option);
     } else if (option == "--depth-scale") {
@@ -201,13 +207,6 @@ Options parse_args(int argc, char** argv) {
       throw std::invalid_argument("unknown option: " + std::string(option));
     }
   }
-  const int given = fx.has_value() + fy.has_value() + cx.has_value() + cy.has_value();
-  if (given != 0 && given != 4) {
-    throw std::invalid_argument("--fx, --fy, --cx and --cy go together");
-  }
-  if (given == 4) {
-    opts.intrinsics = pc::CameraIntrinsics{*fx, *fy, *cx, *cy};
-  }
   return opts;
 }
 
@@ -223,15 +222,16 @@ void usage(const char* argv0) {
          "  --count N                  Clouds (default: 100 synthetic, every file once)\n"
          "  --period-ms N              Source period, 1..1000 ms (default: 33)\n"
          "Synthetic cloud:\n"
-         "  --intrinsics-input true|false\n"
-         "                             Send per-frame intrinsics instead of configuring them\n"
-         "                             (default: false)\n"
+         "  --width N --height N       The camera's size, 64..4096 x 48..4096 (default: 640x480)\n"
+         "  --camera-info-per-frame true|false\n"
+         "                             Send the camera info with every cloud, its intrinsics\n"
+         "                             changing, instead of from a camera_info file written\n"
+         "                             at run time (default: false)\n"
          "  --host-input true|false    Send clouds in host instead of GPU memory\n"
          "                             (default: false)\n"
          "Projection:\n"
-         "  --width N --height N       Depth image size; synthetic: 64..4096 x 48..4096\n"
-         "                             (default: 640x480), files: required, 1..16384\n"
-         "  --fx F --fy F --cx C --cy C  Camera intrinsics in pixels (--source files)\n"
+         "  --camera-info FILE         The camera's ROS camera_info YAML file, whose size the\n"
+         "                             images have (--source files)\n"
          "  --extrinsics R00,R01,R02,TX,R10,R11,R12,TY,R20,R21,R22,TZ\n"
          "                             Row-major [R | t] from the files' frame into the camera\n"
          "                             optical frame (--source files; default: identity)\n"
@@ -264,8 +264,9 @@ app::SyntheticCloudSourceConfig synthetic_source_config(const Options& opts) {
       .period = std::chrono::milliseconds(opts.period_ms),
       .millimeter_depth = opts.depth_format == pc::DepthFormat::kUint16,
       .color = color_enabled(opts),
-      .intrinsics = opts.intrinsics_input,
-      .device_output = !opts.host_input};
+      .camera_info = opts.camera_info_per_frame,
+      .device_output = !opts.host_input,
+      .delay_first_frame = !opts.camera_info_per_frame};
 }
 
 app::CloudFileSourceConfig file_source_config(const Options& opts) {
@@ -274,7 +275,8 @@ app::CloudFileSourceConfig file_source_config(const Options& opts) {
                                     .color = color_enabled(opts),
                                     .count = opts.count.value_or(0),
                                     .loop = opts.loop,
-                                    .period = std::chrono::milliseconds(opts.period_ms)};
+                                    .period = std::chrono::milliseconds(opts.period_ms),
+                                    .delay_first_frame = true};
 }
 
 std::uint32_t max_points(const Options& opts) {
@@ -285,19 +287,59 @@ std::uint32_t max_points(const Options& opts) {
 }
 
 pc::PointCloudToDepthConfig projection_config(const Options& opts) {
-  return pc::PointCloudToDepthConfig{.width = opts.width,
-                                     .height = opts.height,
-                                     .intrinsics = opts.intrinsics,
-                                     .extrinsics = opts.extrinsics,
-                                     .depth_min = opts.depth_min,
-                                     .depth_max = opts.depth_max,
-                                     .depth_format = opts.depth_format,
-                                     .depth_scale = opts.depth_scale.value_or(0.001F),
-                                     .point_size = opts.point_size,
-                                     .color = color_enabled(opts),
-                                     .intrinsics_input = opts.intrinsics_input,
-                                     .max_points = max_points(opts)};
+  return pc::PointCloudToDepthConfig{
+      .max_width = opts.width,
+      .max_height = opts.height,
+      .extrinsics = opts.extrinsics,
+      .depth_min = opts.depth_min,
+      .depth_max = opts.depth_max,
+      .depth_format = opts.depth_format,
+      .depth_scale = opts.depth_scale.value_or(0.001F),
+      .point_size = opts.point_size,
+      .color = color_enabled(opts),
+      .camera_info = {.timing = opts.camera_info_per_frame ? hm::CameraInfoTiming::kEveryFrame
+                                                           : hm::CameraInfoTiming::kLatest},
+      .max_points = max_points(opts)};
 }
+
+// A camera_info file of the synthetic camera, written for CameraInfoSourceOp
+// to read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every path out of the run.
+class SyntheticCameraInfoFile {
+ public:
+  explicit SyntheticCameraInfoFile(const Options& opts) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(
+          pc::synthetic_camera_info(pc::synthetic_frame(opts.width, opts.height, 0, false)), path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~SyntheticCameraInfoFile() { remove(); }
+  SyntheticCameraInfoFile(const SyntheticCameraInfoFile&) = delete;
+  SyntheticCameraInfoFile& operator=(const SyntheticCameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
 
 // Lists the files and reads their headers, so a missing folder or an
 // unreadable file is a usage error rather than a failed run.
@@ -361,15 +403,32 @@ void validate(Options& opts) {
     if (opts.clouds.empty()) {
       throw std::invalid_argument("--source files needs --clouds DIR");
     }
-    if (!opts.width_given || !opts.height_given) {
-      throw std::invalid_argument("--source files needs --width and --height");
+    if (opts.camera_info_file.empty()) {
+      throw std::invalid_argument("--source files needs --camera-info FILE");
     }
-    if (!opts.intrinsics) {
-      throw std::invalid_argument("--source files needs --fx, --fy, --cx and --cy");
+    if (opts.camera_info_per_frame || opts.host_input || opts.size_given ||
+        opts.verify.value_or(false)) {
+      throw std::invalid_argument(
+          "--camera-info-per-frame, --host-input, --width, --height and --verify apply to "
+          "synthetic clouds; the images have the camera's size");
     }
-    if (opts.intrinsics_input || opts.host_input) {
-      throw std::invalid_argument("--intrinsics-input and --host-input apply to synthetic clouds");
+    // The camera's size sizes the images; a file that cannot be read, or a
+    // camera the operator cannot model (undistorted or rectified, without
+    // skew), is a usage error.
+    opts.camera = hm::read_camera_info_yaml(opts.camera_info_file);
+    if (opts.camera->state == hm::CameraState::kRaw) {
+      throw std::invalid_argument(opts.camera_info_file.string() +
+                                  ": the camera describes raw images, with lens distortion; the "
+                                  "operator models undistorted or rectified images only: "
+                                  "undistort or rectify the images first");
     }
+    if (opts.camera->skew != 0.0) {
+      throw std::invalid_argument(opts.camera_info_file.string() +
+                                  ": the camera has a skew; the operator models cameras without "
+                                  "skew only");
+    }
+    opts.width = static_cast<int>(opts.camera->width);
+    opts.height = static_cast<int>(opts.camera->height);
     inspect_files(opts);
     if (!opts.count) {
       opts.count = static_cast<std::uint32_t>(opts.cloud_files.size());
@@ -382,10 +441,13 @@ void validate(Options& opts) {
     if (!opts.clouds.empty()) {
       throw std::invalid_argument("--clouds needs --source files");
     }
-    if (opts.intrinsics || opts.extrinsics) {
+    if (opts.loop) {
+      throw std::invalid_argument("--loop applies to --source files");
+    }
+    if (!opts.camera_info_file.empty() || opts.extrinsics) {
       throw std::invalid_argument(
-          "the synthetic camera sets its own intrinsics and extrinsics; drop --fx..--cy and "
-          "--extrinsics");
+          "the synthetic camera writes its own camera_info file and sets its own extrinsics; "
+          "drop --camera-info and --extrinsics");
     }
     if (opts.depth_scale) {
       throw std::invalid_argument("synthetic uint16 depth is in millimeters; drop --depth-scale");
@@ -397,9 +459,6 @@ void validate(Options& opts) {
       throw std::invalid_argument("--count must be positive");
     }
     app::validate_config(synthetic_source_config(opts));
-    if (!opts.intrinsics_input) {
-      opts.intrinsics = pc::synthetic_frame(opts.width, opts.height, 0, false).intrinsics;
-    }
     // The clouds are in the body frame; the operator moves them back.
     opts.extrinsics = pc::rigid_inverse(pc::synthetic_body_from_camera());
   }
@@ -413,7 +472,7 @@ void validate(Options& opts) {
                                   (error ? " (" + error.message() + ")" : ""));
     }
   }
-  // The operator's own checks, such as the intrinsics and the depth range.
+  // The operator's own checks, such as the depth range.
   pc::validate_config(projection_config(opts));
   // The operator takes any finite [R | t]; the application promises a camera
   // pose, which a scale, a shear or a mirror is not.
@@ -429,28 +488,23 @@ int execute(const Options& opts, SignalDomain& signals) {
   holoscan::Graph graph{std::string(kAppName)};
   const std::uint32_t frames = *opts.count;
   const bool color = color_enabled(opts);
-  const holoscan::Output<holoscan::Tensor>* points_out = nullptr;
-  const holoscan::Output<holoscan::Tensor>* colors_out = nullptr;
-  const holoscan::Output<holoscan::Tensor>* intrinsics_out = nullptr;
+  const holoscan::Output<hm::schema::PointCloudT>* cloud_out = nullptr;
   std::optional<holoscan::OperatorHandle<app::SyntheticCloudSourceOp>> synthetic;
   std::optional<holoscan::OperatorHandle<app::CloudFileSourceOp>> files;
   if (opts.source == Source::kSynthetic) {
     synthetic.emplace(
         graph.op<app::SyntheticCloudSourceOp>("source", synthetic_source_config(opts)));
-    points_out = &(*synthetic)->points;
-    colors_out = &(*synthetic)->colors;
-    intrinsics_out = &(*synthetic)->intrinsics;
+    cloud_out = &(*synthetic)->point_cloud;
   } else {
     files.emplace(graph.op<app::CloudFileSourceOp>("source", file_source_config(opts)));
-    points_out = &(*files)->points;
-    colors_out = &(*files)->colors;
+    cloud_out = &(*files)->point_cloud;
   }
 
   const pc::PointCloudToDepthConfig projection = projection_config(opts);
   auto project = graph.op<pc::PointCloudToDepthOp>("project", projection);
   auto report = std::make_shared<app::DepthReport>();
   std::optional<app::DepthImageTruth> truth;
-  if (opts.source == Source::kSynthetic && opts.verify) {
+  if (opts.source == Source::kSynthetic && opts.verify.value_or(true)) {
     truth = app::DepthImageTruth{
         .width = opts.width,
         .height = opts.height,
@@ -473,15 +527,32 @@ int execute(const Options& opts, SignalDomain& signals) {
   // Lossless edges: every image is checked, in order, against its frame. The
   // queue depth is the one each input declares in its operator's setup().
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(*points_out, project->points, lossless);
+  graph.add_flow(*cloud_out, project->point_cloud, lossless);
   if (color) {
-    graph.add_flow(*colors_out, project->colors, lossless);
     graph.add_flow(project->color, reporter->color, lossless);
   }
-  if (opts.intrinsics_input) {
-    graph.add_flow(*intrinsics_out, project->intrinsics, lossless);
+  // The camera: with every synthetic cloud, or from a camera_info file, the
+  // synthetic camera's written for this run. The file is read again when the
+  // run starts, so it stays until the run is over.
+  std::optional<SyntheticCameraInfoFile> synthetic_file;
+  if (opts.camera_info_per_frame) {
+    graph.add_flow((*synthetic)->camera_info, project->camera_info, lossless);
+  } else {
+    std::filesystem::path camera_info_file = opts.camera_info_file;
+    if (opts.source == Source::kSynthetic) {
+      camera_info_file = synthetic_file.emplace(opts).path();
+    }
+    auto camera = graph.op<hm::CameraInfoSourceOp>(
+        "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file});
+    graph.add_flow(camera->camera_info, project->camera_info, hm::latest_camera_info_connection());
   }
   graph.add_flow(project->depth, reporter->depth, lossless);
+  // One worker for the whole graph, as with a single source. With
+  // CameraInfoSourceOp the graph has two sources, and the automatic
+  // partitioning would give the frame source a worker of its own; it would
+  // then run ahead of the projection and the reporter, which waits for each
+  // image, and could find every slot of its output pool held.
+  graph.partition(kAppName).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // GPU outputs are on device 0.
@@ -497,10 +568,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     on_gpu("project", "color");
   }
   if (opts.source == Source::kSynthetic && !opts.host_input) {
-    on_gpu("source", "points");
-    if (color) {
-      on_gpu("source", "colors");
-    }
+    on_gpu("source", "point_cloud");
   }
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   // Warnings on an accepted plan, as well as the reasons for a rejected one.
@@ -511,7 +579,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
     return 0;
   }
   if (!signals) {
@@ -578,11 +647,19 @@ int execute(const Options& opts, SignalDomain& signals) {
               << ": warning: no point reached the image; check the intrinsics, the extrinsics "
                  "and the depth range\n";
   }
+  // The clouds before the first camera info give no image; every one after
+  // it, up to the last, must. Camera info sent with every cloud comes before
+  // it; CameraInfoSourceOp sends when the run starts, a period before the
+  // source's first cloud, so at most one cloud, should the worker run it
+  // a period late, comes first. A run of one cloud relies on that period: should
+  // its only cloud come first, it times out.
+  const std::uint64_t before_camera_info = report->before_camera_info();
   const bool passed = !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
-                      report->frames == frames && report->passed() && !all_empty;
+                      report->complete(frames, opts.camera_info_per_frame ? 0U : 1U) && !all_empty;
   std::cout << std::fixed << std::setprecision(3) << kAppName
-            << ": frames=" << report->frames.load() << '/' << frames << " pixels=" << report->pixels
+            << ": frames=" << report->frames.load() << '/' << frames
+            << " before_camera_info=" << before_camera_info << " pixels=" << report->pixels
             << " filled=" << report->filled_pixels << " depth_m=[" << report->min_depth_m << ", "
             << report->max_depth_m << ']';
   if (!opts.image_dir.empty()) {

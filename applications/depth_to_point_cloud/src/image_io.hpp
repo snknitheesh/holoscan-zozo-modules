@@ -19,6 +19,8 @@ struct DepthImage {
   int width{};
   int height{};
   std::vector<std::uint16_t> pixels;  // Rows packed; 8-bit images are widened.
+  // Read from an 8-bit file (maxval up to 255).
+  bool one_byte_samples{false};
 };
 
 // Reads a binary PGM (P5) with maxval up to 65535; 16-bit samples are

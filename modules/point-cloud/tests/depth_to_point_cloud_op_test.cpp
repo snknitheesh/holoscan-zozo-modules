@@ -2,27 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // DepthToPointCloudOp on its own, through the SDK's operator test harness:
-// float32 and uint16 depth from host and device memory, with aligned color in
-// every encoding and per-frame intrinsics, every point and color checked
-// against the synthetic camera; the capture time and frame id carried to the
-// outputs; frames whose intrinsics do not match their capture time; and
-// unusable inputs and configurations rejected. Also how host input is held
-// until its copy is done.
+// float32 and uint16 depth from host and device memory with camera info,
+// aligned color in every encoding with camera info sent with every frame and
+// changing from frame to frame, every point and color checked against the
+// synthetic camera; camera info at its own rate changing between frames, to a
+// usable camera and to one it refuses; the cloud message's header, layout and
+// provenance; frames
+// before the first camera info and frames whose camera info has another
+// capture time; and unusable cameras, inputs and configurations rejected.
+// Through graphs: CameraInfoSourceOp reading a camera_info file, how host
+// input is held until its copy is done, and misaligned data rejected.
 
 #include <cuda_runtime_api.h>
 
 #include <array>
-#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -34,6 +40,9 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 #include <holoscan/point_cloud/synthetic_depth.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
@@ -46,15 +55,21 @@
 namespace holoscan::point_cloud {
 namespace {
 
+namespace hm = holoscan::messages;
 using test::make;
 using test::stall;
 using test::TestMemory;
 using test::wrap;
 
 using std::chrono_literals::operator""ms;
+using CloudSnapshot = holoscan::testing::Snapshot<hm::schema::PointCloudT>;
 
 constexpr int kWidth = 96;
 constexpr int kHeight = 72;
+// Clouds a test captures at most: the harness gives each capture a pool slot
+// per tensor, and a channel holds at most 4096 buffers, so the default 1024
+// clouds of four tensors would not fit.
+constexpr std::size_t kCaptures = 16;
 
 holoscan::schema::ImageT image(holoscan::Tensor tensor, int width, int height,
                                holoscan::schema::ImageEncoding encoding) {
@@ -110,15 +125,44 @@ holoscan::schema::ImageT color_image(const SyntheticFrame& f,
       f.width, f.height, encoding);
 }
 
-// Checks a captured [H, W, 3] cloud (and colors) against frame `f`.
-template <typename Snapshot>
-void check_cloud(const Snapshot& cloud, const Snapshot* colors, const SyntheticFrame& f,
-                 bool millimeters, const DepthToPointCloudConfig& config) {
-  VERIFY(cloud.shape() == (std::vector<std::int64_t>{f.height, f.width, 3}));
-  std::vector<float> xyz(static_cast<std::size_t>(f.width) * f.height * 3);
-  VERIFY(cloud.bytes().size() == xyz.size() * sizeof(float));
-  if (cloud.bytes().size() != xyz.size() * sizeof(float)) return;
-  std::memcpy(xyz.data(), cloud.bytes().data(), cloud.bytes().size());
+// The camera info of frame `f`'s camera, as a message.
+hm::schema::CameraInfoT camera_info(const SyntheticFrame& f) {
+  return hm::to_message(synthetic_camera_info(f, "depth_optical"));
+}
+
+// The bytes of one present field of a captured cloud.
+template <typename T>
+std::vector<T> field(const CloudSnapshot& cloud,
+                     holoscan::TensorFieldSelector<hm::schema::PointCloudT> selector) {
+  const auto& tensor = cloud.tensor(selector);
+  std::vector<T> values(tensor.bytes().size() / sizeof(T));
+  std::memcpy(values.data(), tensor.bytes().data(), values.size() * sizeof(T));
+  return values;
+}
+
+// Checks a captured cloud against frame `f`: an organized [H, W, 3] cloud,
+// NaN where the depth is not valid, colors when `colors`, absent normals and
+// intensities, not counted.
+void check_cloud(const CloudSnapshot& cloud, bool colors, const SyntheticFrame& f, bool millimeters,
+                 const DepthToPointCloudConfig& config) {
+  const hm::schema::PointCloudT metadata = cloud.metadata();
+  VERIFY(metadata.organized);
+  VERIFY(metadata.valid_count == -1);
+  const std::vector<std::int64_t> shape{f.height, f.width, 3};
+  VERIFY(cloud.tensor(hm::PointCloudFields::points).shape() == shape);
+  VERIFY(cloud.tensor(hm::PointCloudFields::colors).shape() ==
+         (colors ? shape : std::vector<std::int64_t>{0}));
+  VERIFY(cloud.tensor(hm::PointCloudFields::normals).shape() == std::vector<std::int64_t>{0});
+  VERIFY(cloud.tensor(hm::PointCloudFields::intensity).shape() == std::vector<std::int64_t>{0});
+  const std::vector<float> xyz = field<float>(cloud, hm::PointCloudFields::points);
+  VERIFY(xyz.size() == static_cast<std::size_t>(f.width) * f.height * 3);
+  if (xyz.size() != static_cast<std::size_t>(f.width) * f.height * 3) return;
+  std::vector<std::uint8_t> rgb;
+  if (colors) {
+    rgb = field<std::uint8_t>(cloud, hm::PointCloudFields::colors);
+    VERIFY(rgb.size() == xyz.size());
+    if (rgb.size() != xyz.size()) return;
+  }
   int wrong = 0;
   int wrong_colors = 0;
   for (int v = 0; v < f.height; ++v) {
@@ -129,21 +173,17 @@ void check_cloud(const Snapshot& cloud, const Snapshot* colors, const SyntheticF
       const bool valid = z > 0 && z >= config.depth_min && z <= config.depth_max;
       const float* p = xyz.data() + 3 * i;
       if (!valid) {
-        const auto is_invalid = [&config](float value) {
-          return std::isnan(config.invalid_value) ? std::isnan(value)
-                                                  : value == config.invalid_value;
-        };
-        wrong += !(is_invalid(p[0]) && is_invalid(p[1]) && is_invalid(p[2]));
+        wrong += !(std::isnan(p[0]) && std::isnan(p[1]) && std::isnan(p[2]));
       } else {
         const CameraIntrinsics& k = f.intrinsics;
         wrong +=
             std::hypot(p[0] - (u - k.cx) * z / k.fx, p[1] - (v - k.cy) * z / k.fy, p[2] - z) > 1e-4;
       }
-      if (colors != nullptr) {
-        std::uint8_t rgb[3];
-        synthetic_color(f, u, v, rgb);
-        const auto* got = reinterpret_cast<const std::uint8_t*>(colors->bytes().data()) + 3 * i;
-        wrong_colors += got[0] != rgb[0] || got[1] != rgb[1] || got[2] != rgb[2];
+      if (colors) {
+        std::uint8_t want[3];
+        synthetic_color(f, u, v, want);
+        const std::uint8_t* got = rgb.data() + 3 * i;
+        wrong_colors += got[0] != want[0] || got[1] != want[1] || got[2] != want[2];
       }
     }
   }
@@ -153,7 +193,6 @@ void check_cloud(const Snapshot& cloud, const Snapshot* colors, const SyntheticF
 
 DepthToPointCloudConfig base_config(bool millimeters) {
   DepthToPointCloudConfig config;
-  config.intrinsics = synthetic_frame(kWidth, kHeight, 0, false).intrinsics;
   config.depth_scale = millimeters ? 0.001F : 1.0F;
   config.depth_min = 0.1F;
   config.depth_max = 10.0F;
@@ -162,14 +201,20 @@ DepthToPointCloudConfig base_config(bool millimeters) {
   return config;
 }
 
+DepthToPointCloudConfig every_frame_config() {
+  DepthToPointCloudConfig config = base_config(true);
+  config.camera_info.timing = hm::CameraInfoTiming::kEveryFrame;
+  return config;
+}
+
 // The capture time of frame `frame` in the tests' frames.
 std::chrono::nanoseconds capture_time(std::uint32_t frame) {
   return std::chrono::milliseconds(100 * (frame + 1));
 }
 
-// Checks that a cloud carries frame `frame`'s capture time and `frame_id`.
-template <typename Snapshot>
-void check_provenance(const Snapshot& cloud, std::uint32_t frame, std::uint64_t frame_id) {
+// Checks that a cloud carries frame `frame`'s capture time and `frame_id`, in
+// its sample and in its header with the camera info's frame.
+void check_provenance(const CloudSnapshot& cloud, std::uint32_t frame, std::uint64_t frame_id) {
   const holoscan::SampleMetadata& metadata = cloud.sample_metadata();
   VERIFY_MSG(metadata.capture_timestamp_ns == capture_time(frame).count(),
              "frame " + std::to_string(frame) + " carries capture time " +
@@ -177,125 +222,209 @@ void check_provenance(const Snapshot& cloud, std::uint32_t frame, std::uint64_t 
   VERIFY_MSG(
       metadata.frame_id == frame_id,
       "frame " + std::to_string(frame) + " carries frame id " + std::to_string(metadata.frame_id));
+  const hm::schema::PointCloudT message = cloud.metadata();
+  VERIFY(message.header != nullptr);
+  if (message.header == nullptr) return;
+  VERIFY(message.header->frame_id == "depth_optical");
+  VERIFY(message.header->capture_timestamp_ns == capture_time(frame).count());
 }
 
-void check_depth_only(bool millimeters, bool device, float invalid_value = std::nanf("")) {
-  DepthToPointCloudConfig config = base_config(millimeters);
-  config.invalid_value = invalid_value;
+// Depth with camera info at the same capture time, without color.
+void check_depth_only(bool millimeters, bool device) {
+  const DepthToPointCloudConfig config = base_config(millimeters);
   auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
-  std::vector<holoscan::testing::TestSample<holoscan::schema::ImageT>> samples;
+  const SyntheticFrame first = synthetic_frame(kWidth, kHeight, 0, false);
   for (std::uint32_t frame = 0; frame < 2; ++frame) {
-    holoscan::testing::TestSample<holoscan::schema::ImageT> sample = holoscan::testing::sample_at(
-        depth_image(synthetic_frame(kWidth, kHeight, frame, false), millimeters, device),
-        capture_time(frame));
-    sample.metadata.frame_id = 41U + frame;
-    samples.push_back(std::move(sample));
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frame, false);
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(frame), holoscan::testing::input("camera_info", camera_info(first)),
+        holoscan::testing::input("depth", depth_image(f, millimeters, device))));
   }
-  h.push_samples("depth", std::move(samples));
   if (device) {
     h.input_source_device("depth", holoscan::DeviceId{0});
   }
   h.output_device("point_cloud", holoscan::DeviceId{0});
-  h.capture_snapshot<holoscan::Tensor>("point_cloud");
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return;
-  const auto clouds = result.snapshots<holoscan::Tensor>("point_cloud");
-  VERIFY(clouds.size() == 2);
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY_MSG(clouds.size() == 2, std::to_string(clouds.size()) + " clouds from 2 frames");
   for (std::size_t frame = 0; frame < clouds.size(); ++frame) {
     const auto number = static_cast<std::uint32_t>(frame);
-    check_cloud<std::decay_t<decltype(clouds[frame])>>(
-        clouds[frame], nullptr, synthetic_frame(kWidth, kHeight, number, false), millimeters,
-        config);
-    check_provenance(clouds[frame], number, 41U + number);
+    check_cloud(clouds[frame], false, synthetic_frame(kWidth, kHeight, number, false), millimeters,
+                config);
+    check_provenance(clouds[frame], number, 0U);
   }
 }
 
-holoscan::Tensor intrinsics_tensor(const SyntheticFrame& f, bool device) {
-  const std::array<float, 4> k{f.intrinsics.fx, f.intrinsics.fy, f.intrinsics.cx, f.intrinsics.cy};
-  return make({4}, {kDLFloat, 32, 1}, k.data(), sizeof(k), device);
-}
-
-DepthToPointCloudConfig color_and_intrinsics_config() {
-  DepthToPointCloudConfig config = base_config(true);
+// Color, and camera info sent with every frame, its intrinsics changing from
+// frame to frame.
+void check_color_and_changing_camera(holoscan::schema::ImageEncoding encoding, bool device) {
+  DepthToPointCloudConfig config = every_frame_config();
   config.color = true;
-  config.intrinsics.reset();
-  config.intrinsics_input = true;
-  return config;
-}
-
-// Color and per-frame intrinsics arrive aligned with the depth.
-void check_color_and_intrinsics(holoscan::schema::ImageEncoding encoding, bool device) {
-  const DepthToPointCloudConfig config = color_and_intrinsics_config();
   auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
   for (std::uint32_t frame = 0; frame < 3; ++frame) {
     const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frame, true);
     h.push_frame(holoscan::testing::frame_at(
         capture_time(frame), holoscan::testing::input("depth", depth_image(f, true, device)),
         holoscan::testing::input("color", color_image(f, encoding, device)),
-        holoscan::testing::input("intrinsics", intrinsics_tensor(f, device))));
+        holoscan::testing::input("camera_info", camera_info(f))));
   }
   if (device) {
-    for (const char* port : {"depth", "color", "intrinsics"}) {
-      h.input_source_device(port, holoscan::DeviceId{0});
-    }
+    h.input_source_device("depth", holoscan::DeviceId{0});
+    h.input_source_device("color", holoscan::DeviceId{0});
   }
   h.output_device("point_cloud", holoscan::DeviceId{0});
-  h.output_device("colors", holoscan::DeviceId{0});
-  h.capture_snapshot<holoscan::Tensor>("point_cloud");
-  h.capture_snapshot<holoscan::Tensor>("colors");
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return;
-  const auto clouds = result.snapshots<holoscan::Tensor>("point_cloud");
-  const auto colors = result.snapshots<holoscan::Tensor>("colors");
-  VERIFY(clouds.size() == 3 && colors.size() == 3);
-  for (std::size_t frame = 0; frame < clouds.size() && frame < colors.size(); ++frame) {
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY(clouds.size() == 3);
+  for (std::size_t frame = 0; frame < clouds.size(); ++frame) {
     const auto number = static_cast<std::uint32_t>(frame);
-    check_cloud(clouds[frame], &colors[frame], synthetic_frame(kWidth, kHeight, number, true), true,
-                config);
+    check_cloud(clouds[frame], true, synthetic_frame(kWidth, kHeight, number, true), true, config);
     check_provenance(clouds[frame], number, 0U);
-    check_provenance(colors[frame], number, 0U);
   }
 }
 
-// Intrinsics pair with depth by exact capture time: a frame whose intrinsics
-// carry another time never completes, and gives no cloud, while the frames
-// around it still do.
-void check_unmatched_intrinsics() {
-  const DepthToPointCloudConfig config = color_and_intrinsics_config();
+// With camera info at its own rate, a frame that comes before the first one
+// gives no cloud; the frames after it all do, with the newest camera info.
+void check_frames_before_camera_info() {
+  const DepthToPointCloudConfig config = base_config(true);
   auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const SyntheticFrame first = synthetic_frame(kWidth, kHeight, 0, false);
   for (std::uint32_t frame = 0; frame < 3; ++frame) {
-    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frame, true);
-    // Frame 1's intrinsics are a millisecond late.
-    const auto intrinsics_time =
-        capture_time(frame) + std::chrono::milliseconds(frame == 1 ? 1 : 0);
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frame, false);
+    if (frame == 1) {
+      h.push_frame(holoscan::testing::frame_at(
+          capture_time(frame) - 1ms, holoscan::testing::input("camera_info", camera_info(first))));
+    }
     h.push_frame(holoscan::testing::frame_at(
-        capture_time(frame), holoscan::testing::input("depth", depth_image(f, true, false)),
-        holoscan::testing::input("color",
-                                 color_image(f, holoscan::schema::ImageEncoding_RGB8, false))));
-    h.push_frame(holoscan::testing::frame_at(
-        intrinsics_time, holoscan::testing::input("intrinsics", intrinsics_tensor(f, false))));
+        capture_time(frame), holoscan::testing::input("depth", depth_image(f, true, false))));
   }
   h.output_device("point_cloud", holoscan::DeviceId{0});
-  h.output_device("colors", holoscan::DeviceId{0});
-  h.capture_snapshot<holoscan::Tensor>("point_cloud");
-  h.capture_snapshot<holoscan::Tensor>("colors");
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return;
-  const auto clouds = result.snapshots<holoscan::Tensor>("point_cloud");
-  const auto colors = result.snapshots<holoscan::Tensor>("colors");
-  VERIFY_MSG(clouds.size() == 2 && colors.size() == 2,
-             std::to_string(clouds.size()) + " clouds and " + std::to_string(colors.size()) +
-                 " color images from 2 matched frames");
-  const std::array<std::uint32_t, 2> matched{0U, 2U};
-  for (std::size_t i = 0; i < clouds.size() && i < colors.size() && i < matched.size(); ++i) {
-    check_cloud(clouds[i], &colors[i], synthetic_frame(kWidth, kHeight, matched[i], true), true,
-                config);
-    check_provenance(clouds[i], matched[i], 0U);
-    check_provenance(colors[i], matched[i], 0U);
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY_MSG(clouds.size() == 2, std::to_string(clouds.size()) +
+                                     " clouds from 2 frames after "
+                                     "the camera info");
+  for (std::size_t i = 0; i < clouds.size(); ++i) {
+    const auto number = static_cast<std::uint32_t>(i + 1);
+    check_cloud(clouds[i], false, synthetic_frame(kWidth, kHeight, number, false), true, config);
+    check_provenance(clouds[i], number, 0U);
   }
+}
+
+// With camera info at its own rate, a new calibration is picked up from the
+// next frame on, and the frames between keep the one before: camera A, two
+// frames, camera B, one frame. (Synthetic frames 0 and 5 share A's
+// intrinsics; frame 1 has B's.)
+void check_camera_change_at_own_rate() {
+  const DepthToPointCloudConfig config = base_config(true);
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const std::array<std::uint32_t, 3> frames{0U, 5U, 1U};
+  for (std::uint32_t i = 0; i < frames.size(); ++i) {
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frames[i], true);
+    if (i != 1) {
+      h.push_frame(holoscan::testing::frame_at(
+          capture_time(i) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+    }
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(i), holoscan::testing::input("depth", depth_image(f, true, false))));
+  }
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY_MSG(clouds.size() == 3, std::to_string(clouds.size()) + " clouds from 3 frames");
+  for (std::size_t i = 0; i < clouds.size() && i < frames.size(); ++i) {
+    check_cloud(clouds[i], false, synthetic_frame(kWidth, kHeight, frames[i], true), true, config);
+  }
+}
+
+// A calibration that changes, at the camera info's own rate, to one the
+// kernel cannot model fails the next frame.
+void check_camera_change_to_unusable() {
+  const DepthToPointCloudConfig config = base_config(true);
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  hm::CameraInfo skewed = synthetic_camera_info(f, "depth_optical");
+  skewed.skew = 0.5;
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0) - 1ms, holoscan::testing::input("camera_info", camera_info(f))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0), holoscan::testing::input("depth", depth_image(f, true, false))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1) - 1ms, holoscan::testing::input("camera_info", hm::to_message(skewed))));
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(1), holoscan::testing::input("depth", depth_image(f, true, false))));
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(!result.ok(), "the frame after the skewed camera info fails");
+  VERIFY_MSG(
+      result.describe_failure().find("camera info 'depth_optical' has a skew") != std::string::npos,
+      result.describe_failure());
+}
+
+// Camera info sent with every frame pairs with it by exact capture time: a
+// frame whose camera info carries another time gives no cloud, while the
+// frames around it still do.
+void check_unmatched_camera_info() {
+  const DepthToPointCloudConfig config = every_frame_config();
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  for (std::uint32_t frame = 0; frame < 3; ++frame) {
+    const SyntheticFrame f = synthetic_frame(kWidth, kHeight, frame, true);
+    // Frame 1's camera info is a millisecond late.
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(frame), holoscan::testing::input("depth", depth_image(f, true, false))));
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(frame) + std::chrono::milliseconds(frame == 1 ? 1 : 0),
+        holoscan::testing::input("camera_info", camera_info(f))));
+  }
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY_MSG(clouds.size() == 2, std::to_string(clouds.size()) + " clouds from 2 matched frames");
+  const std::array<std::uint32_t, 2> matched{0U, 2U};
+  for (std::size_t i = 0; i < clouds.size() && i < matched.size(); ++i) {
+    check_cloud(clouds[i], false, synthetic_frame(kWidth, kHeight, matched[i], true), true, config);
+    check_provenance(clouds[i], matched[i], 0U);
+  }
+}
+
+// A cloud carries its depth image's frame id and device sequence.
+void check_frame_ids() {
+  const DepthToPointCloudConfig config = base_config(false);
+  auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  holoscan::schema::ImageT depth = depth_image(f, false, false);
+  depth.header = std::make_shared<holoscan::schema::HeaderT>();
+  depth.header->device_sequence = 1234U;
+  holoscan::testing::TestFrame staged = holoscan::testing::frame_at(
+      capture_time(0), holoscan::testing::input("camera_info", camera_info(f)),
+      holoscan::testing::input("depth", depth));
+  h.push_frame(staged);
+  h.output_device("point_cloud", holoscan::DeviceId{0});
+  h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+  VERIFY(clouds.size() == 1);
+  if (clouds.empty()) return;
+  const hm::schema::PointCloudT message = clouds[0].metadata();
+  VERIFY(message.header != nullptr && message.header->device_sequence == 1234U);
 }
 
 // Host input is held until the stream that copies it is done: by its allocator
@@ -325,12 +454,13 @@ void check_host_input_held() {
 
 // The test harness copies staged inputs into its own storage, so a tensor whose
 // memory the test controls reaches the operator only through a graph: this
-// source sends the given frames as they are, one per tick, each with the
-// given color image and intrinsics when there are any.
+// source sends the given frames as they are, one per tick, each with its
+// color image when there are any, and with its camera info unless a separate
+// camera info source is used.
 struct GivenFramesConfig {
   std::vector<holoscan::schema::ImageT> depth;
   std::vector<holoscan::schema::ImageT> color;
-  std::vector<holoscan::Tensor> intrinsics;
+  bool camera_info{true};
 };
 
 class GivenFramesSourceOp final : public holoscan::Operator<> {
@@ -343,8 +473,8 @@ class GivenFramesSourceOp final : public holoscan::Operator<> {
     if (!config_.color.empty()) {
       spec.output(color, "color").payload_options(image_payload);
     }
-    if (!config_.intrinsics.empty()) {
-      spec.output(intrinsics, "intrinsics");
+    if (config_.camera_info) {
+      spec.output(camera_info, "camera_info");
     }
   }
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -378,11 +508,16 @@ class GivenFramesSourceOp final : public holoscan::Operator<> {
       return true;
     };
     const std::size_t i = next_;
+    const SyntheticFrame f = synthetic_frame(config_.depth[i].width, config_.depth[i].height,
+                                             static_cast<std::uint32_t>(i), false);
     for (auto part : {0, 1, 2}) {
       holoscan::expected<bool, holoscan::Error> done = true;
-      if (part == 0 && !config_.intrinsics.empty()) {
-        done =
-            send(sent_intrinsics_, [&] { return intrinsics.emit(config_.intrinsics[i], options); });
+      if (part == 0 && config_.camera_info) {
+        done = send(sent_camera_info_, [&] {
+          hm::CameraInfo value = synthetic_camera_info(f, "depth_optical");
+          value.header.capture_timestamp_ns = capture_->timestamp_ns;
+          return camera_info.emit(hm::to_message(value), options);
+        });
       } else if (part == 1 && !config_.color.empty()) {
         done = send(sent_color_, [&] { return color.emit(config_.color[i], options); });
       } else if (part == 2) {
@@ -397,105 +532,115 @@ class GivenFramesSourceOp final : public holoscan::Operator<> {
     }
     ++next_;
     capture_.reset();
-    sent_intrinsics_ = sent_color_ = sent_depth_ = false;
+    sent_camera_info_ = sent_color_ = sent_depth_ = false;
     return {};
   }
 
   holoscan::Output<holoscan::schema::ImageT> depth;
   holoscan::Output<holoscan::schema::ImageT> color;
-  holoscan::Output<holoscan::Tensor> intrinsics;
+  holoscan::Output<hm::schema::CameraInfoT> camera_info;
 
  private:
   GivenFramesConfig config_;
   std::uint64_t next_{};
   std::optional<holoscan::TimePoint> capture_;
-  bool sent_intrinsics_{};
+  bool sent_camera_info_{};
   bool sent_color_{};
   bool sent_depth_{};
 };
 
-// Counts the clouds (with their colors) it receives, and completes the run
-// after `expected` of them.
+// What the sink below saw.
+struct CloudCount {
+  std::uint32_t clouds{};
+  std::uint64_t first_frame_id{};
+  std::uint64_t last_frame_id{};
+  std::string frame_id;
+};
+
+// Counts the clouds it receives, and completes the run at the cloud of frame
+// id `last_frame_id`.
 class CloudCountOp final : public holoscan::Operator<> {
  public:
-  CloudCountOp(std::shared_ptr<std::atomic<std::uint32_t>> count, std::uint32_t expected,
-               bool colors)
-      : count_(std::move(count)), expected_(expected), colors_(colors) {}
+  CloudCountOp(std::shared_ptr<CloudCount> count, std::uint64_t last_frame_id)
+      : count_(std::move(count)), last_frame_id_(last_frame_id) {}
   void setup(holoscan::OperatorSpec& spec) override {
     spec.input(point_cloud, "point_cloud").queue_depth(2U);
-    if (colors_) {
-      spec.input(colors, "colors").queue_depth(2U);
-    }
   }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
-    if (!colors_) {
-      result.trigger(holoscan::OnEach{point_cloud});
-      return result;
-    }
-    result.trigger(holoscan::OnAligned{
-        .ports = holoscan::PortList{std::vector<holoscan::PortRef>{point_cloud, colors}},
-        .window = std::chrono::nanoseconds{0}});
-    result.input(point_cloud, holoscan::Exact{});
-    result.input(colors, holoscan::Exact{});
+    result.trigger(holoscan::OnEach{point_cloud});
     return result;
   }
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    if (auto cloud = point_cloud.receive(); !cloud) {
+    auto cloud = point_cloud.receive();
+    if (!cloud) {
       return holoscan::make_unexpected(std::move(cloud).error());
     }
-    if (colors_) {
-      if (auto rgb = colors.receive(); !rgb) {
-        return holoscan::make_unexpected(std::move(rgb).error());
-      }
+    if (auto checked = hm::check_point_cloud(cloud->data); !checked) {
+      return checked;
     }
-    if (count_->fetch_add(1U) + 1U == expected_) {
+    if (count_->clouds++ == 0) {
+      count_->first_frame_id = cloud->metadata.frame_id;
+    }
+    count_->last_frame_id = cloud->metadata.frame_id;
+    count_->frame_id = cloud->data.header ? cloud->data.header->frame_id : std::string{};
+    if (cloud->metadata.frame_id == last_frame_id_) {
       context.request_completion();
     }
     return {};
   }
 
-  holoscan::Input<holoscan::Tensor> point_cloud;
-  holoscan::Input<holoscan::Tensor> colors;
+  holoscan::Input<hm::schema::PointCloudT> point_cloud;
 
  private:
-  std::shared_ptr<std::atomic<std::uint32_t>> count_;
-  std::uint32_t expected_{};
-  bool colors_{};
+  std::shared_ptr<CloudCount> count_;
+  std::uint64_t last_frame_id_{};
 };
 
-// Runs `frames` through the operator into a counting sink. Returns the number
-// of clouds, and in `failure` the run's diagnostics when it did not complete.
-std::uint32_t run_graph(const DepthToPointCloudConfig& config, GivenFramesConfig frames,
-                        std::string& failure) {
+// Runs `frames` through the operator into a counting sink, with the camera
+// info of the source or, given a file, of a CameraInfoSourceOp reading it.
+// Returns what the sink saw, and in `failure` the run's diagnostics when it
+// did not complete.
+std::shared_ptr<CloudCount> run_graph(const DepthToPointCloudConfig& config,
+                                      GivenFramesConfig frames, std::string& failure,
+                                      const std::filesystem::path& camera_info_file = {}) {
   holoscan::Graph graph{"depth_to_point_cloud_test"};
-  const auto count = static_cast<std::uint32_t>(frames.depth.size());
+  const auto count = static_cast<std::uint64_t>(frames.depth.size());
+  frames.camera_info = camera_info_file.empty();
   auto source = graph.op<GivenFramesSourceOp>("source", std::move(frames));
   auto cloud = graph.op<DepthToPointCloudOp>("deproject", config);
-  auto clouds = std::make_shared<std::atomic<std::uint32_t>>(0U);
-  auto sink = graph.op<CloudCountOp>("count", clouds, count, config.color);
+  auto report = std::make_shared<CloudCount>();
+  auto sink = graph.op<CloudCountOp>("count", report, count);
   graph.add_flow(source->depth, cloud->depth);
   if (config.color) {
     graph.add_flow(source->color, cloud->color);
-    graph.add_flow(cloud->colors, sink->colors);
   }
-  if (config.intrinsics_input) {
-    graph.add_flow(source->intrinsics, cloud->intrinsics);
+  if (camera_info_file.empty()) {
+    graph.add_flow(source->camera_info, cloud->camera_info);
+  } else {
+    auto info = graph.op<hm::CameraInfoSourceOp>(
+        "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file,
+                                                  .period = std::chrono::milliseconds(20)});
+    graph.add_flow(info->camera_info, cloud->camera_info, hm::latest_camera_info_connection());
   }
   graph.add_flow(cloud->point_cloud, sink->point_cloud);
+  // One worker for the whole graph, which has two sources with a
+  // CameraInfoSourceOp: across workers the operator could run while the sink's
+  // queue is full, and fail on the refused emit.
+  graph.partition("depth_to_point_cloud_test").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   holoscan::CompileOptions options;
-  for (const char* port : {"point_cloud", "colors"}) {
-    if (std::string(port) == "point_cloud" || config.color) {
-      options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
-          .operator_path = "deproject", .output_port = port, .device = holoscan::DeviceId{0}});
-    }
-  }
+  options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
+      .operator_path = "deproject", .output_port = "point_cloud", .device = holoscan::DeviceId{0}});
   const auto plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
     failure = holoscan::format_diagnostics(plan.diagnostics(), plan.graph());
-    return 0U;
+    return report;
+  }
+  if (plan.execution_lanes().size() != 1U) {
+    failure = "the graph runs on " + std::to_string(plan.execution_lanes().size()) + " workers";
+    return report;
   }
   auto session = holoscan::run_async(plan);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -510,7 +655,7 @@ std::uint32_t run_graph(const DepthToPointCloudConfig& config, GivenFramesConfig
     failure = "run did not complete: " +
               holoscan::format_diagnostics(session.diagnostics(), plan.graph());
   }
-  return clouds->load();
+  return report;
 }
 
 // The synthetic frame's depth in millimeters, at `offset` bytes into new
@@ -531,16 +676,53 @@ std::pair<holoscan::schema::ImageT, std::shared_ptr<TestMemory>> given_depth(
           memory};
 }
 
-// The frame's intrinsics at `offset` bytes into new pinned host or device memory.
-std::pair<holoscan::Tensor, std::shared_ptr<TestMemory>> given_intrinsics(const SyntheticFrame& f,
-                                                                          bool device,
-                                                                          std::size_t offset = 0) {
-  const std::array<float, 4> k{f.intrinsics.fx, f.intrinsics.fy, f.intrinsics.cx, f.intrinsics.cy};
-  auto memory = std::make_shared<TestMemory>(sizeof(k) + offset, device, true);
-  if (cudaMemcpy(memory->base() + offset, k.data(), sizeof(k), cudaMemcpyDefault) != cudaSuccess) {
-    throw std::runtime_error("cudaMemcpy failed");
+// A camera_info file of the synthetic camera, in a folder of its own that
+// mkdtemp() names unpredictably; both are removed when it goes.
+class CameraInfoFile {
+ public:
+  explicit CameraInfoFile(const hm::CameraInfo& info) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / "point_cloud_test_XXXXXX").string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    hm::write_camera_info_yaml(info, path_);
   }
-  return {wrap(memory, offset, {4}, {kDLFloat, 32, 1}, device), memory};
+  ~CameraInfoFile() {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+  CameraInfoFile(const CameraInfoFile&) = delete;
+  CameraInfoFile& operator=(const CameraInfoFile&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
+
+// CameraInfoSourceOp reads the camera from its file and sends it at its own
+// rate; every frame from the first camera info on gives a cloud in the file's
+// camera frame. Both sources start with the run, so at most the first frame
+// comes before the first camera info.
+void check_camera_info_source() {
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  const CameraInfoFile file(synthetic_camera_info(f, "depth_from_file"));
+  GivenFramesConfig frames;
+  for (std::uint32_t frame = 0; frame < 10; ++frame) {
+    frames.depth.push_back(depth_image(synthetic_frame(kWidth, kHeight, frame, false), true, true));
+  }
+  std::string failure;
+  const auto report = run_graph(base_config(true), std::move(frames), failure, file.path());
+  VERIFY_MSG(failure.empty(), failure);
+  VERIFY_MSG(
+      report->clouds >= 1 && report->first_frame_id <= 2U &&
+          report->clouds + report->first_frame_id - 1U == 10U && report->last_frame_id == 10U,
+      std::to_string(report->clouds) + " clouds from frame " +
+          std::to_string(report->first_frame_id) + " to " + std::to_string(report->last_frame_id));
+  VERIFY(report->frame_id == "depth_from_file");
 }
 
 // Depth in pinned host memory reaches the operator as it is; the operator
@@ -548,33 +730,15 @@ std::pair<holoscan::Tensor, std::shared_ptr<TestMemory>> given_intrinsics(const 
 void check_pinned_depth_held_by_operator() {
   const auto [depth, memory] = given_depth(synthetic_frame(kWidth, kHeight, 0, false), false);
   std::string failure;
-  const std::uint32_t clouds =
-      run_graph(base_config(true), GivenFramesConfig{.depth = {depth}}, failure);
+  const auto report = run_graph(every_frame_config(), GivenFramesConfig{.depth = {depth}}, failure);
   VERIFY_MSG(failure.empty(), failure);
-  VERIFY(clouds == 1U);
+  VERIFY(report->clouds == 1U);
   VERIFY_MSG(memory->streams() > 0, "the operator asks the pinned depth's memory to wait");
-}
-
-// Intrinsics in pinned host memory are read by the host, so the operator waits
-// for their producer on the host, not only on its stream.
-void check_pinned_intrinsics_waited_for() {
-  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, true);
-  const auto [depth, depth_memory] = given_depth(f, false);
-  const auto [k, k_memory] = given_intrinsics(f, false);
-  DepthToPointCloudConfig config = base_config(true);
-  config.intrinsics.reset();
-  config.intrinsics_input = true;
-  std::string failure;
-  const std::uint32_t clouds =
-      run_graph(config, GivenFramesConfig{.depth = {depth}, .intrinsics = {k}}, failure);
-  VERIFY_MSG(failure.empty(), failure);
-  VERIFY(clouds == 1U);
-  VERIFY_MSG(k_memory->host_waits() > 0, "the host waits for pinned intrinsics before reading");
 }
 
 // Device data the kernel cannot load its elements from in place is rejected.
 void check_misaligned_device_data() {
-  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, true);
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
   const auto expect_failure = [](const DepthToPointCloudConfig& config, GivenFramesConfig frames,
                                  const std::string& what) {
     std::string failure;
@@ -583,17 +747,8 @@ void check_misaligned_device_data() {
   };
   {
     const auto [depth, memory] = given_depth(f, true, 1);
-    expect_failure(base_config(true), GivenFramesConfig{.depth = {depth}},
+    expect_failure(every_frame_config(), GivenFramesConfig{.depth = {depth}},
                    "depth data must be aligned");
-  }
-  {
-    const auto [depth, depth_memory] = given_depth(f, true);
-    const auto [k, k_memory] = given_intrinsics(f, true, 2);
-    DepthToPointCloudConfig config = base_config(true);
-    config.intrinsics.reset();
-    config.intrinsics_input = true;
-    expect_failure(config, GivenFramesConfig{.depth = {depth}, .intrinsics = {k}},
-                   "intrinsics data must be aligned");
   }
   {
     const auto [depth, depth_memory] = given_depth(f, true);
@@ -604,27 +759,28 @@ void check_misaligned_device_data() {
            cudaSuccess);
     bgra.data = std::make_shared<holoscan::Tensor>(
         wrap(memory, 2, {f.height, f.width, 4}, {kDLUInt, 8, 1}, true));
-    DepthToPointCloudConfig config = base_config(true);
+    DepthToPointCloudConfig config = every_frame_config();
     config.color = true;
     expect_failure(config, GivenFramesConfig{.depth = {depth}, .color = {bgra}},
                    "color data must be aligned");
   }
 }
 
-// Runs the operator on one unusable input and checks the failure names `what`.
+// Runs the operator on one frame and checks that its failure names `what`.
 void check_rejects(const DepthToPointCloudConfig& config, holoscan::schema::ImageT depth,
-                   std::optional<holoscan::schema::ImageT> color, const std::string& what) {
+                   std::optional<holoscan::schema::ImageT> color, const hm::CameraInfo& info,
+                   const std::string& what) {
   auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
   if (color) {
-    h.push_frame(holoscan::testing::frame_at(100ms, holoscan::testing::input("depth", depth),
-                                             holoscan::testing::input("color", *color)));
+    h.push_frame(holoscan::testing::frame_at(
+        100ms, holoscan::testing::input("camera_info", hm::to_message(info)),
+        holoscan::testing::input("depth", depth), holoscan::testing::input("color", *color)));
   } else {
-    h.push("depth", depth);
+    h.push_frame(holoscan::testing::frame_at(
+        100ms, holoscan::testing::input("camera_info", hm::to_message(info)),
+        holoscan::testing::input("depth", depth)));
   }
   h.output_device("point_cloud", holoscan::DeviceId{0});
-  if (config.color) {
-    h.output_device("colors", holoscan::DeviceId{0});
-  }
   const auto result = h.run();
   VERIFY_MSG(!result.ok(), what + " is rejected");
   VERIFY_MSG(result.describe_failure().find(what) != std::string::npos,
@@ -633,48 +789,81 @@ void check_rejects(const DepthToPointCloudConfig& config, holoscan::schema::Imag
 
 void check_rejected_inputs() {
   const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  const hm::CameraInfo info = synthetic_camera_info(f, "depth_optical");
   const DepthToPointCloudConfig config = base_config(false);
   // A color image where depth belongs.
   check_rejects(config, color_image(f, holoscan::schema::ImageEncoding_RGB8, false), std::nullopt,
-                "unsupported depth encoding");
-  // A depth image larger than the outputs are sized for.
+                info, "unsupported depth encoding");
+  // A depth image larger than the output is sized for.
   DepthToPointCloudConfig small = config;
   small.max_width = kWidth / 2;
-  check_rejects(small, depth_image(f, false, false), std::nullopt, "exceeds the configured");
+  check_rejects(small, depth_image(f, false, false), std::nullopt, info, "exceeds the configured");
   // A color image of another size.
   DepthToPointCloudConfig with_color = config;
   with_color.color = true;
   const SyntheticFrame other = synthetic_frame(kWidth / 2, kHeight / 2, 0, false);
   check_rejects(with_color, depth_image(f, false, false),
-                color_image(other, holoscan::schema::ImageEncoding_RGB8, false),
+                color_image(other, holoscan::schema::ImageEncoding_RGB8, false), info,
                 "color image size must match");
+  // Camera info for images of another size.
+  check_rejects(config, depth_image(f, false, false), std::nullopt,
+                synthetic_camera_info(other, "depth_optical"),
+                "the depth image is 96x72 but camera info 'depth_optical' is for 48x36 images");
+}
+
+// Cameras the kernel cannot model fail the frame, naming what is wrong.
+void check_rejected_cameras() {
+  const SyntheticFrame f = synthetic_frame(kWidth, kHeight, 0, false);
+  const DepthToPointCloudConfig config = base_config(false);
+  hm::CameraInfo raw = synthetic_camera_info(f, "depth_optical");
+  raw.state = hm::CameraState::kRaw;
+  raw.distortion_model = hm::DistortionModel::kPlumbBob;
+  raw.coefficients = {0.1, -0.05, 0.0, 0.0, 0.0};
+  check_rejects(config, depth_image(f, false, false), std::nullopt, raw,
+                "camera info 'depth_optical' describes raw images, with plumb_bob distortion");
+  hm::CameraInfo skewed = synthetic_camera_info(f, "depth_optical");
+  skewed.skew = 0.5;
+  check_rejects(config, depth_image(f, false, false), std::nullopt, skewed,
+                "camera info 'depth_optical' has a skew");
+  // Undistorted with a distortion model whose coefficients are all zero, and
+  // rectified: both deproject.
+  for (const hm::CameraState state : {hm::CameraState::kUndistorted, hm::CameraState::kRectified}) {
+    hm::CameraInfo usable = synthetic_camera_info(f, "depth_optical");
+    usable.state = state;
+    usable.distortion_model = hm::DistortionModel::kPlumbBob;
+    usable.coefficients = {0.0, 0.0, 0.0, 0.0, 0.0};
+    auto h = holoscan::testing::create_operator_test<DepthToPointCloudOp>(config);
+    h.push_frame(holoscan::testing::frame_at(
+        capture_time(0), holoscan::testing::input("camera_info", hm::to_message(usable)),
+        holoscan::testing::input("depth", depth_image(f, false, false))));
+    h.output_device("point_cloud", holoscan::DeviceId{0});
+    h.capture_snapshot<hm::schema::PointCloudT>("point_cloud", kCaptures);
+    const auto result = h.run();
+    VERIFY_MSG(result.ok(), result.describe_failure());
+    if (!result.ok()) continue;
+    const auto clouds = result.snapshots<hm::schema::PointCloudT>("point_cloud");
+    VERIFY(clouds.size() == 1);
+    if (clouds.size() == 1) check_cloud(clouds[0], false, f, false, config);
+  }
 }
 
 void check_rejected_config() {
-  VERIFY(test::throws<std::invalid_argument>([] {
-    DepthToPointCloudOp op(DepthToPointCloudConfig{});  // Neither intrinsics nor their input.
-  }));
-  VERIFY(test::throws<std::invalid_argument>([] {
+  const auto rejects = [](const auto& change, const std::string& what) {
     DepthToPointCloudConfig config = base_config(false);
-    config.intrinsics->fx = 0.0F;
-    DepthToPointCloudOp op(config);
-  }));
-  VERIFY(test::throws<std::invalid_argument>([] {
-    DepthToPointCloudConfig config = base_config(false);
-    config.depth_max = config.depth_min;
-    DepthToPointCloudOp op(config);
-  }));
-  VERIFY(test::throws<std::invalid_argument>([] {
-    DepthToPointCloudConfig config = base_config(false);
-    config.depth_scale = 0.0F;
-    DepthToPointCloudOp op(config);
-  }));
-  VERIFY(test::throws<std::invalid_argument>([] {
-    // Configured intrinsics that per-frame ones would make unused.
-    DepthToPointCloudConfig config = base_config(false);
-    config.intrinsics_input = true;
-    DepthToPointCloudOp op(config);
-  }));
+    change(config);
+    try {
+      DepthToPointCloudOp op(config);
+      VERIFY_MSG(false, what + " is rejected");
+    } catch (const std::invalid_argument& error) {
+      VERIFY_MSG(std::string(error.what()).find(what) != std::string::npos,
+                 "'" + std::string(error.what()) + "' names '" + what + "'");
+    }
+  };
+  rejects([](auto& c) { c.depth_max = c.depth_min; }, "depth range");
+  rejects([](auto& c) { c.depth_scale = 0.0F; }, "depth_scale");
+  rejects([](auto& c) { c.max_width = 0; }, "max_width and max_height");
+  rejects([](auto& c) { c.camera_info.max_age = std::chrono::nanoseconds::zero(); },
+          "camera_info.max_age");
 }
 
 }  // namespace
@@ -687,21 +876,26 @@ int main() {
       {"float32 depth from device memory", [] { dpc::check_depth_only(false, true); }},
       {"uint16 depth from host memory", [] { dpc::check_depth_only(true, false); }},
       {"uint16 depth from device memory", [] { dpc::check_depth_only(true, true); }},
-      {"a finite invalid value", [] { dpc::check_depth_only(false, true, -1.0F); }},
-      {"RGB8 color and per-frame intrinsics, host",
-       [] { dpc::check_color_and_intrinsics(holoscan::schema::ImageEncoding_RGB8, false); }},
-      {"BGR8 color and per-frame intrinsics, device",
-       [] { dpc::check_color_and_intrinsics(holoscan::schema::ImageEncoding_BGR8, true); }},
-      {"RGBA8 color and per-frame intrinsics, host",
-       [] { dpc::check_color_and_intrinsics(holoscan::schema::ImageEncoding_RGBA8, false); }},
-      {"BGRA8 color and per-frame intrinsics, device",
-       [] { dpc::check_color_and_intrinsics(holoscan::schema::ImageEncoding_BGRA8, true); }},
-      {"intrinsics with another capture time give no cloud", dpc::check_unmatched_intrinsics},
+      {"RGB8 color and a changing camera with every frame, host",
+       [] { dpc::check_color_and_changing_camera(holoscan::schema::ImageEncoding_RGB8, false); }},
+      {"BGR8 color and a changing camera with every frame, device",
+       [] { dpc::check_color_and_changing_camera(holoscan::schema::ImageEncoding_BGR8, true); }},
+      {"RGBA8 color and a changing camera with every frame, host",
+       [] { dpc::check_color_and_changing_camera(holoscan::schema::ImageEncoding_RGBA8, false); }},
+      {"BGRA8 color and a changing camera with every frame, device",
+       [] { dpc::check_color_and_changing_camera(holoscan::schema::ImageEncoding_BGRA8, true); }},
+      {"frames before the first camera info give no cloud", dpc::check_frames_before_camera_info},
+      {"camera info with another capture time gives no cloud", dpc::check_unmatched_camera_info},
+      {"a camera that changes at its own rate is picked up", dpc::check_camera_change_at_own_rate},
+      {"a camera that changes to an unusable one fails the frame",
+       dpc::check_camera_change_to_unusable},
+      {"a cloud carries its depth image's device sequence", dpc::check_frame_ids},
+      {"CameraInfoSourceOp reads the camera from its file", dpc::check_camera_info_source},
       {"host input is held until its copy is done", dpc::check_host_input_held},
       {"pinned depth is held by the operator", dpc::check_pinned_depth_held_by_operator},
-      {"pinned intrinsics are waited for on the host", dpc::check_pinned_intrinsics_waited_for},
       {"misaligned device data is rejected", dpc::check_misaligned_device_data},
       {"unusable inputs are rejected", dpc::check_rejected_inputs},
+      {"raw and skewed cameras are rejected", dpc::check_rejected_cameras},
       {"unusable configurations are rejected", dpc::check_rejected_config},
   });
 }

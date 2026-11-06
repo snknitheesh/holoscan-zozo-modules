@@ -3,20 +3,26 @@
 //
 // A project built against the installed holoscan-point-cloud package: a source
 // sends frames of the synthetic depth camera as uint16 millimeters in host
-// memory, DepthToPointCloudOp deprojects them on the GPU, and
+// memory, CameraInfoSourceOp sends the camera from a camera_info file written
+// at run time, DepthToPointCloudOp deprojects the frames on the GPU, and
 // PointCloudToDepthOp projects the clouds back into the same camera. One sink
 // checks every point against the camera, another that every depth comes back
-// exactly.
+// exactly. Frames before the first camera info give no cloud; every one after
+// it is checked, up to the last.
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -28,6 +34,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 #include <holoscan/point_cloud/point_cloud_to_depth_op.hpp>
 #include <holoscan/point_cloud/synthetic_depth.hpp>
@@ -35,6 +44,7 @@
 
 namespace {
 
+namespace hm = holoscan::messages;
 namespace pc = holoscan::point_cloud;
 
 constexpr int kWidth = 160;
@@ -82,7 +92,10 @@ class DepthSourceOp final : public holoscan::Operator<> {
     auto loan =
         depth.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt16});
     if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
+      // Every slot of the pool is still held downstream. Send it next tick.
+      return loan.error().code == holoscan::ErrorCode::kResourceExhausted
+                 ? holoscan::expected<void, holoscan::Error>{}
+                 : holoscan::make_unexpected(std::move(loan).error());
     }
     auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
                                                    -> holoscan::expected<void, holoscan::Error> {
@@ -122,6 +135,9 @@ class DepthSourceOp final : public holoscan::Operator<> {
 };
 
 struct Tally {
+  // Frame ids of the first cloud and the first depth image.
+  std::uint64_t first_cloud{};
+  std::uint64_t first_depth{};
   std::uint32_t frames{};
   std::uint64_t valid_points{};
   std::uint64_t wrong_points{};
@@ -137,7 +153,7 @@ std::uint16_t expected_depth(const pc::SyntheticFrame& frame, int u, int v) {
   return z > 0.0F && z >= kDepthMin && z <= kDepthMax ? mm : std::uint16_t{0};
 }
 
-// The last of the sinks to see kFrames frames ends the run.
+// The last of the sinks to see the last frame ends the run.
 void finish(std::atomic<int>& remaining, holoscan::ExecutionContext& context) {
   if (remaining.fetch_sub(1) == 1) {
     context.request_completion();
@@ -166,11 +182,17 @@ class CheckOp final : public holoscan::Operator<> {
     if (!cloud) {
       return holoscan::make_unexpected(std::move(cloud).error());
     }
+    if (auto checked = hm::check_point_cloud(cloud->data); !checked) {
+      return checked;
+    }
     std::vector<float> xyz(static_cast<std::size_t>(kWidth) * kHeight * 3U);
-    if (auto copied =
-            cloud->data.copy_to_host(xyz.data(), xyz.size() * sizeof(float), context.cuda_stream());
+    if (auto copied = cloud->data.points->copy_to_host(xyz.data(), xyz.size() * sizeof(float),
+                                                       context.cuda_stream());
         !copied) {
       return copied;
+    }
+    if (tally_->frames == 0) {
+      tally_->first_cloud = cloud->metadata.frame_id;
     }
     const pc::SyntheticFrame frame = pc::synthetic_frame(
         kWidth, kHeight, static_cast<std::uint32_t>(cloud->metadata.frame_id - 1U), false);
@@ -189,13 +211,14 @@ class CheckOp final : public holoscan::Operator<> {
         tally_->valid_points += valid;
       }
     }
-    if (++tally_->frames == kFrames) {
+    ++tally_->frames;
+    if (cloud->metadata.frame_id == kFrames) {
       finish(*remaining_, context);
     }
     return {};
   }
 
-  holoscan::Input<holoscan::Tensor> point_cloud;
+  holoscan::Input<hm::schema::PointCloudT> point_cloud;
 
  private:
   std::shared_ptr<Tally> tally_;
@@ -233,6 +256,9 @@ class DepthCheckOp final : public holoscan::Operator<> {
         !copied) {
       return copied;
     }
+    if (tally_->depth_frames == 0) {
+      tally_->first_depth = image->metadata.frame_id;
+    }
     const pc::SyntheticFrame frame = pc::synthetic_frame(
         kWidth, kHeight, static_cast<std::uint32_t>(image->metadata.frame_id - 1U), false);
     for (int v = 0; v < kHeight; ++v) {
@@ -242,7 +268,8 @@ class DepthCheckOp final : public holoscan::Operator<> {
         tally_->filled_pixels += got != 0U;
       }
     }
-    if (++tally_->depth_frames == kFrames) {
+    ++tally_->depth_frames;
+    if (image->metadata.frame_id == kFrames) {
       finish(*remaining_, context);
     }
     return {};
@@ -255,39 +282,82 @@ class DepthCheckOp final : public holoscan::Operator<> {
   std::shared_ptr<std::atomic<int>> remaining_;
 };
 
+// Whether a sink saw every frame from its first one to the last, and at most
+// the first frame came before the first camera info (both sources start with
+// the run).
+bool complete(std::uint64_t first, std::uint32_t seen) {
+  return seen != 0 && first <= 2U && first + seen - 1U == kFrames;
+}
+
+// A folder of its own for the camera_info file, which mkdtemp() names
+// unpredictably, so that runs do not clobber each other; removed, with the
+// file, on every path out of main().
+class TemporaryFolder {
+ public:
+  TemporaryFolder() {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / "point_cloud_consumer_XXXXXX").string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp");
+    }
+    path_ = folder;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
 }  // namespace
 
 int main() {
+  // The camera, as a camera_info file: the one input calibration has.
+  const TemporaryFolder folder;
+  const std::filesystem::path camera_file = folder.path() / "camera_info.yaml";
+  hm::write_camera_info_yaml(
+      pc::synthetic_camera_info(pc::synthetic_frame(kWidth, kHeight, 0, false), "depth_optical"),
+      camera_file);
+
   holoscan::Graph graph{"point_cloud_consumer"};
   auto source = graph.op<DepthSourceOp>("source");
+  auto camera = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_file,
+                                                .period = std::chrono::milliseconds{20}});
   auto deproject = graph.op<pc::DepthToPointCloudOp>(
-      "deproject", pc::DepthToPointCloudConfig{
-                       .intrinsics = pc::synthetic_frame(kWidth, kHeight, 0, false).intrinsics,
-                       .depth_scale = kDepthScale,
-                       .depth_min = kDepthMin,
-                       .depth_max = kDepthMax,
-                       .max_width = kWidth,
-                       .max_height = kHeight});
+      "deproject", pc::DepthToPointCloudConfig{.depth_scale = kDepthScale,
+                                               .depth_min = kDepthMin,
+                                               .depth_max = kDepthMax,
+                                               .max_width = kWidth,
+                                               .max_height = kHeight});
   // The organized cloud, projected back into the camera it came from.
   auto project = graph.op<pc::PointCloudToDepthOp>(
-      "project", pc::PointCloudToDepthConfig{
-                     .width = kWidth,
-                     .height = kHeight,
-                     .intrinsics = pc::synthetic_frame(kWidth, kHeight, 0, false).intrinsics,
-                     .depth_min = kDepthMin,
-                     .depth_max = kDepthMax,
-                     .depth_format = pc::DepthFormat::kUint16,
-                     .depth_scale = kDepthScale,
-                     .max_points = std::uint32_t{kWidth} * kHeight});
+      "project", pc::PointCloudToDepthConfig{.max_width = kWidth,
+                                             .max_height = kHeight,
+                                             .depth_min = kDepthMin,
+                                             .depth_max = kDepthMax,
+                                             .depth_format = pc::DepthFormat::kUint16,
+                                             .depth_scale = kDepthScale,
+                                             .max_points = std::uint32_t{kWidth} * kHeight});
   auto tally = std::make_shared<Tally>();
   auto remaining = std::make_shared<std::atomic<int>>(2);
   auto check = graph.op<CheckOp>("check", tally, remaining);
   auto depth_check = graph.op<DepthCheckOp>("depth_check", tally, remaining);
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->depth, deproject->depth, lossless);
+  graph.add_flow(camera->camera_info, deproject->camera_info, hm::latest_camera_info_connection());
+  graph.add_flow(camera->camera_info, project->camera_info, hm::latest_camera_info_connection());
   graph.add_flow(deproject->point_cloud, check->point_cloud, lossless);
-  graph.add_flow(deproject->point_cloud, project->points, lossless);
+  graph.add_flow(deproject->point_cloud, project->point_cloud, lossless);
   graph.add_flow(project->depth, depth_check->depth, lossless);
+  // One worker for the whole graph, as the module's README advises with a
+  // CameraInfoSourceOp.
+  graph.partition("point_cloud_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // The cloud and the depth image are in device memory, on GPU 0.
@@ -301,12 +371,14 @@ int main() {
     std::cerr << plan.json() << '\n';
     return 1;
   }
-  if (const int status = holoscan::run(plan); status != 0) {
+  const int status = holoscan::run(plan);
+  if (status != 0) {
     std::cerr << "point_cloud_consumer: run failed with " << status << '\n';
     return 1;
   }
-  const bool passed = tally->frames == kFrames && tally->wrong_points == 0 &&
-                      tally->valid_points != 0 && tally->depth_frames == kFrames &&
+  const bool passed = complete(tally->first_cloud, tally->frames) && tally->wrong_points == 0 &&
+                      tally->valid_points != 0 &&
+                      complete(tally->first_depth, tally->depth_frames) &&
                       tally->wrong_depths == 0 && tally->filled_pixels == tally->valid_points;
   std::cout << "point_cloud_consumer: frames=" << tally->frames
             << " valid_points=" << tally->valid_points << " wrong_points=" << tally->wrong_points

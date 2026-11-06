@@ -16,7 +16,7 @@ endif()
 
 project(
   holoscan_point_cloud
-  VERSION 1.1.0
+  VERSION 2.0.0
   DESCRIPTION "Depth images to point clouds and point clouds to depth images on the GPU"
   LANGUAGES CXX CUDA
 )
@@ -45,6 +45,11 @@ if(HOLOSCAN_POINT_CLOUD_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info and point cloud messages: in this build when the repository root added
+# holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::point_cloud: DepthToPointCloudOp and PointCloudToDepthOp, their kernels, the
 # synthetic depth camera and cloud, and the cloud's ground truth.
@@ -54,8 +59,10 @@ add_library(
   src/depth_to_point_cloud_op.cpp
   src/depth_truth.cpp
   src/host_input.cpp
+  src/pinhole_camera.cpp
   src/point_cloud_to_depth_op.cpp
   src/project.cu
+  src/synthetic_camera_info.cpp
   src/synthetic_depth.cu
   src/synthetic_scene.cu
 )
@@ -85,7 +92,10 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_point_cloud PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_point_cloud
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
 set_target_properties(
   holoscan_point_cloud
   PROPERTIES

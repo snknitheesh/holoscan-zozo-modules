@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "Point Cloud to Depth",
-    "description": "Projects point clouds into a pinhole camera on the GPU with holoscan-point-cloud's PointCloudToDepthOp, making z-buffered depth images (float32 meters or uint16) and color images, from synthetic clouds checked pixel by pixel against ground truth, or from a folder of PLY files, and can write the images as PGM and PPM files.",
+    "description": "Projects PointCloud messages into the pinhole camera a CameraInfo describes, on the GPU, with holoscan-point-cloud's PointCloudToDepthOp, the camera from a ROS camera_info file through holoscan-messages' CameraInfoSourceOp, making z-buffered depth images (float32 meters or uint16) and color images, from synthetic clouds checked pixel by pixel against ground truth, or from a folder of PLY files, and can write the images as PGM and PPM files.",
     "authors": [
       {
         "name": "zozo",
@@ -12,8 +12,9 @@
     "language": [
       "C++"
     ],
-    "version": "1.0.0",
+    "version": "2.0.0",
     "changelog": {
+      "2.0.0": "holoscan-point-cloud 2.0: the clouds are PointCloud messages, and the camera comes from a camera_info file through CameraInfoSourceOp (written at run time for the synthetic camera, --camera-info for PLY files, whose size the images take) or with every synthetic cloud; --width and --height for files, --fx, --fy, --cx, --cy and --intrinsics-input are gone.",
       "1.0.0": "Initial release: the holoscan-point-cloud demo of PointCloudToDepthOp, with synthetic and PLY point cloud sources, a ground-truth reporter and PGM and PPM output."
     },
     "holoscan_sdk": {
@@ -45,6 +46,9 @@
     "dependencies": {
       "modules": [
         {
+          "name": "messages"
+        },
+        {
           "name": "point-cloud"
         }
       ]
@@ -59,16 +63,16 @@
         }
       },
       "files": {
-        "description": "Project the binary little-endian PLY files in the data directory. Pass the image size and the camera's intrinsics with --run-args.",
+        "description": "Project the binary little-endian PLY files in the data directory into the camera of the camera_info.yaml file next to them. Pass the extrinsics with --run-args if the points are not in the camera's optical frame.",
         "run": {
-          "command": "\"<holohub_app_bin>/point_cloud_to_depth\" --source files --clouds \"<holohub_data_dir>/point_cloud_to_depth\"",
+          "command": "\"<holohub_app_bin>/point_cloud_to_depth\" --source files --clouds \"<holohub_data_dir>/point_cloud_to_depth\" --camera-info \"<holohub_data_dir>/point_cloud_to_depth/camera_info.yaml\"",
           "workdir": "holohub_app_bin"
         }
       },
       "ci": {
-        "description": "Finite headless check: 30 synthetic clouds in a body frame with colors and per-frame intrinsics, projected to uint16 depth, every pixel checked against ground truth.",
+        "description": "Finite headless check: 30 synthetic clouds in a body frame with colors and the camera from a camera_info file, projected to uint16 depth, every pixel checked against ground truth.",
         "run": {
-          "command": "\"<holohub_app_bin>/point_cloud_to_depth\" --count 30 --period-ms 5 --depth-format uint16 --intrinsics-input true",
+          "command": "\"<holohub_app_bin>/point_cloud_to_depth\" --count 30 --period-ms 5 --depth-format uint16",
           "workdir": "holohub_app_bin"
         }
       }

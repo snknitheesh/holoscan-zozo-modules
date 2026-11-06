@@ -17,6 +17,7 @@ find_dependency(
   sensor_io
 )
 find_dependency(CUDAToolkit)
+find_dependency(holoscan-messages 1.0 CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/holoscan-point-cloud-targets.cmake")
 

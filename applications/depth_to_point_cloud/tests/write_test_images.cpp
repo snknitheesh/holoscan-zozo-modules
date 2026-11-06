@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Writes synthetic depth frames as 16-bit PGM files (millimeters), for the
-// tests that feed the application a folder of depth images.
+// tests that feed the application a folder of depth images, with the camera's
+// camera_info file, camera_info.yaml, and three the operator must refuse:
+// other_size.yaml, the camera at half the size, raw.yaml, the camera with
+// lens distortion, and skewed.yaml, the camera with a skew.
 //
 // Usage: write_test_images DIR COUNT WIDTH HEIGHT
 
@@ -13,6 +16,7 @@
 #include <iostream>
 #include <string_view>
 
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/synthetic_depth.hpp>
 
 #include "image_io.hpp"
@@ -38,6 +42,23 @@ int main(int argc, char** argv) try {
   const int width = number(argv[3]);
   const int height = number(argv[4]);
   std::filesystem::create_directories(directory);
+  namespace hm = holoscan::messages;
+  namespace pc = holoscan::point_cloud;
+  const hm::CameraInfo camera =
+      pc::synthetic_camera_info(pc::synthetic_frame(width, height, 0, false), "depth_camera");
+  hm::write_camera_info_yaml(camera, directory / "camera_info.yaml");
+  hm::write_camera_info_yaml(
+      pc::synthetic_camera_info(pc::synthetic_frame(width / 2, height / 2, 0, false),
+                                "depth_camera"),
+      directory / "other_size.yaml");
+  hm::CameraInfo raw = camera;
+  raw.state = hm::CameraState::kRaw;
+  raw.distortion_model = hm::DistortionModel::kPlumbBob;
+  raw.coefficients = {-0.1, 0.02, 0.0, 0.0, 0.0};
+  hm::write_camera_info_yaml(raw, directory / "raw.yaml");
+  hm::CameraInfo skewed = camera;
+  skewed.skew = 0.5;
+  hm::write_camera_info_yaml(skewed, directory / "skewed.yaml");
   for (int frame = 0; frame < count; ++frame) {
     const auto f = holoscan::point_cloud::synthetic_frame(width, height,
                                                           static_cast<std::uint32_t>(frame), false);
