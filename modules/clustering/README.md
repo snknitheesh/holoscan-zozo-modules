@@ -133,8 +133,8 @@ points is linked exactly when the CPU reference links it.
 
 `kEuclidean` is the default: it is exact for any cloud, organized or not, and on an RTX 5090 it
 costs about as much as `kImage` (and less on the wall, where every `kImage` link contends for one
-root). `kImage` skips the sort and the grid, and on the Jetson Orin it is 2 to 3 times faster on
-the demo's scene, so it is the choice for organized clouds on a Jetson when milliseconds count. It
+root). `kImage` skips the sort and the grid, and on the Jetson Orin it is about twice as fast on
+the demo's scene, so it is the choice for organized clouds on a Jetson Orin when milliseconds count. It
 links only points that are close in the image as well as in space, though: across an occlusion
 edge, or where a grazing surface is sampled sparsely, two points within the tolerance but more than
 `image_window` pixels apart stay apart. On the demo's scene the two agree to an adjusted Rand index
@@ -164,30 +164,32 @@ both connectivities.
 
 ## Timings
 
-`clustering_benchmark`, organized clouds of the demo's scene (about 62 000 valid points of 307 200
-at 640x480 and 190 000 of 921 600 at 1280x720, 8 objects, tolerance as listed, minimum size 300),
-the clusterer as the operator runs it: cluster, write the labels and the summaries, host waits
-included. Mean milliseconds of 100 runs (RTX 5090, x86_64) and 50 runs (Jetson AGX Orin, JetPack
-7.2), in the CI image.
+`clustering_benchmark` times the clusterer as the operator runs it: cluster, write the labels and
+the summaries, the host's wait included. That leaves out the operator's input staging (none for a
+cloud in device memory) and its output loans, which the table
+[above](#cpu-waits-and-copies-per-frame) counts. Its clouds are organized clouds of the demo's
+scene: about 62 000 valid points of 307 200 at 640x480 and 190 000 of 921 600 at 1280x720, 8
+objects, the tolerance as listed, minimum size 300. Mean milliseconds of 100 runs on an RTX 5090
+(x86_64, driver 595.99.02; idle at the start of the run, though another process held memory on it)
+and 50 runs on a Jetson Orin (JetPack 7.2, L4T R39.2.1, power mode MAXN), in the CI image.
 
-| Case | RTX 5090 640x480 | RTX 5090 1280x720 | Orin 640x480 | Orin 1280x720 |
+| Case | RTX 5090 640x480 | RTX 5090 1280x720 | Jetson Orin 640x480 | Jetson Orin 1280x720 |
 | --- | --- | --- | --- | --- |
-| Euclidean, 2.5 cm | 0.257 | 0.306 | 1.859 | 3.274 |
-| Euclidean, 1 cm | 0.321 | 0.468 | 2.568 | 4.261 |
-| Euclidean, 5 cm | 0.238 | 0.866 | 1.700 | 4.602 |
-| Euclidean, 2.5 cm, oriented boxes | 0.299 | 0.343 | 1.580 | 3.230 |
-| Euclidean, 2.5 cm, `kDense` | 0.257 | 0.310 | 1.598 | 3.651 |
-| Image window 2, 2.5 cm | 0.170 | 0.286 | 0.656 | 1.490 |
-| Image window 1, 2.5 cm | 0.107 | 0.187 | 0.700 | 1.314 |
-| Image window 2, 2.5 cm, oriented boxes | 0.207 | 0.329 | 0.704 | 1.505 |
-| Wall filling the image, Euclidean, oriented boxes | 0.337 | 0.712 | 2.179 | 6.191 |
-| Wall filling the image, image window 2, oriented boxes | 0.486 | 1.358 | 1.543 | 4.789 |
+| Euclidean, 2.5 cm | 0.243 | 0.316 | 1.467 | 3.128 |
+| Euclidean, 1 cm | 0.291 | 0.447 | 2.124 | 4.260 |
+| Euclidean, 5 cm | 0.238 | 0.827 | 1.386 | 4.467 |
+| Euclidean, 2.5 cm, oriented boxes | 0.286 | 0.354 | 1.616 | 3.370 |
+| Euclidean, 2.5 cm, `kDense` | 0.243 | 0.312 | 1.470 | 3.240 |
+| Image window 2, 2.5 cm | 0.172 | 0.266 | 0.695 | 1.563 |
+| Image window 1, 2.5 cm | 0.115 | 0.183 | 0.621 | 1.443 |
+| Image window 2, 2.5 cm, oriented boxes | 0.213 | 0.308 | 0.690 | 1.557 |
+| Wall filling the image, Euclidean, oriented boxes | 0.347 | 0.699 | 2.072 | 5.679 |
+| Wall filling the image, image window 2, oriented boxes | 0.476 | 1.453 | 1.503 | 4.781 |
 
 The wall is the worst case: a tilted plane at 1 to 1.5 m with every pixel valid, one cluster of
 all 307 200 or 921 600 points. At 5 cm the two nearly touching spheres merge, hence 7 clusters at
-1280x720. Sorting the grid dominates `kEuclidean` on the Orin.
-
-The x86 GPU was shared with other work during the runs.
+1280x720. Sorting the grid dominates `kEuclidean` on the Jetson Orin. Every case waits for the GPU
+once per frame, `kDense` included.
 
 ## Use it in your graph
 
