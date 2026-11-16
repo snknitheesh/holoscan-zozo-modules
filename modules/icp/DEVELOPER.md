@@ -26,8 +26,8 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
 | `src/odometry.cpp` | `IcpOdometry`: frame-to-frame registration and the pose |
 | `src/normal_equations.hpp` | The layout of the summed normal equations and their 6x6 solve, header-only so the host tests reach it |
 | `include/holoscan/icp/rigid_transform.hpp` | `Matrix4` and its helpers, header-only, free of CUDA |
-| `include/holoscan/icp/icp_op.hpp`, `src/icp_op.cpp` | `IcpOp` and the layout of its `stats` output |
-| `include/holoscan/icp/synthetic_scene.hpp`, `src/synthetic_scene.cu` | The scenes, the ray caster and the camera path |
+| `include/holoscan/icp/icp_op.hpp`, `src/icp_op.cpp` | `IcpOp`, its `PointCloud` inputs and `aligned` output, and the layout of its `stats` output |
+| `include/holoscan/icp/synthetic_scene.hpp`, `src/synthetic_scene.cu` | The scenes, the ray caster through a `CameraInfo`, the synthetic camera and the camera path |
 
 ## Build and package boundary
 
@@ -39,24 +39,32 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-icp/holoscan-icp-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-icp)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-icp`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime and the toolkit's CUB |
-| Module dependencies | None; the clouds have holoscan-point-cloud's layout |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
-| Test labels | `icp` and `gpu`; `icp` and `host` for the SDK-free test |
+| Debian package | `holoscan-icp`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)`, `holoscan-messages` 1.x and `libcudart.so.13-dev` |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime and the toolkit's CUB and NVTX |
+| Module dependencies | holoscan-messages 1.x (`PointCloud`, `CameraInfo`), found with `find_package` unless the including build has `holoscan::messages` |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
+| Test labels | `icp` and `gpu`; also `benchmark` for the benchmarks; `icp` and `host` for the SDK-free test |
 
 ## Conventions
 
 - Code lives in `holoscan::icp`. The registration, the odometry and the synthetic scenes are public
   and need no Holoscan graph; helpers shared within the module stay private in `src/`.
-- Public headers carry only SDK, CUDA runtime and standard types.
+- Public headers carry only SDK, holoscan-messages, CUDA runtime and standard types.
 - Device code uses CUB's long-standing device and block algorithms only, so the module also builds
-  with JetPack 7's CUDA 13.0 toolkit.
+  with the CUDA 13.0 toolkit.
 - Determinism is a requirement: no atomics in a sum, no grid size that depends on the device, ties
   broken by index, and stable sorts. `icp_registration` checks repeated runs bit for bit; a change
   to a kernel keeps that check passing.
-- `IcpRegistration` synchronizes its stream before each call returns: every iteration needs the sums
-  on the host. `IcpOp` relies on it to release host input safely after its copy.
+- `IcpRegistration::align()` and `target_points()` wait for their stream before they return (once
+  per batch of iterations); `set_target()` and `promote_source_to_target()` only queue work. `IcpOp`
+  relies on the wait to release host input safely after its copy, and waits for its stream itself
+  before it returns an error with work queued; the `aligned` kernels that read its staging buffers
+  after compute() returns are fenced by an event that the next copy waits for on the GPU.
+- `IcpOp`'s ports carry holoscan-messages' `PointCloud`; inputs are checked with
+  `check_point_cloud()`, and the output allocated and sent with `allocate_point_cloud()` and
+  `emit_point_cloud()`, so every optional field and the header come along.
+- NVTX ranges `icp/prepare`, `icp/index_target` and `icp/iterate` mark the registration's stages
+  for Nsight Systems.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. That is why every `IcpOp` output has a flag.
 - A new option of the registration needs a case in `icp_registration`, against the truth of a
