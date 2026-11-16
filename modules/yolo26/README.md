@@ -286,7 +286,7 @@ directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
 
 ## Performance
 
-On an RTX 5090 (driver 595.91.07, shared with another process) with SDK 5.0.0, CUDA 13.2 and
+On an RTX 5090 (shared with another process) with SDK 5.0.0, CUDA 13.2 and
 TensorRT 10.16, for YOLO26n at 640 on the 640x480 COCO image, the GPU work per frame is a median
 of:
 
@@ -300,9 +300,8 @@ of:
 Measured with Nsight Systems over 300 frames of the demo, tracing CUDA graph nodes; the demo's
 README has the command and the latency from capture to detections on the host.
 
-The operator's code was validated, before it became this module, with SDK 5.0.0 on x86_64 (RTX
-5090, CUDA 13.2, TensorRT 10.16; RTX 5080 Laptop GPU, CUDA 13.0, TensorRT 10.13) and on Jetson AGX
-Thor (JetPack 7, CUDA 13.0, TensorRT 10.15), where the real model's FP32 and FP16 engines give the
+The operator's code was validated, before it became this module, with SDK 5.0.0 on an RTX 5090
+(CUDA 13.2, TensorRT 10.16) and on Jetson Thor (JetPack 7, CUDA 13.0, TensorRT 10.15), where the real model's FP32 and FP16 engines give the
 same detections as on x86_64.
 
 ## Licenses

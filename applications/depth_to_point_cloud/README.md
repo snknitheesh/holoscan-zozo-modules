@@ -79,7 +79,7 @@ depth_to_point_cloud: verdict=PASS
 
 ## Performance
 
-On an RTX 5090 (driver 595.91.07) with SDK 5.0.0 and CUDA 13.2, the deprojection kernel takes a
+On an RTX 5090 with SDK 5.0.0 and CUDA 13.2, the deprojection kernel takes a
 median of 6.5 µs per 1280x720 float32 frame and 6.4 µs per uint16 frame, colors included. Measured
 with Nsight Systems 2026.4.1 over 200 frames, from the kernel summary
 (`nsys stats --report cuda_gpu_kern_sum`) of:

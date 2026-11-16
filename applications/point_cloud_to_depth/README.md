@@ -103,7 +103,7 @@ point_cloud_to_depth: verdict=PASS
 
 ## Performance
 
-On an RTX 5090 (driver 595.91.07) with SDK 5.0.0 and CUDA 13.2, projecting a synthetic cloud of
+On an RTX 5090 with SDK 5.0.0 and CUDA 13.2, projecting a synthetic cloud of
 1,050,624 points with colors into a 1280x720 image takes a median of 24.4 µs on the GPU: 2.5 µs to
 clear the z-buffer, 11.4 µs to project and 10.5 µs to resolve depth and color; uint16 depth takes
 24.5 µs. With 5x5 splats the projection takes 258.6 µs, as each point writes 25 pixels. Measured
