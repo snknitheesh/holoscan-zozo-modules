@@ -154,9 +154,9 @@ The time grows with the points left after subsampling (57 000, 117 000 and 143 0
 voxels; 37 000, 57 000 and 58 000 with 3 cm) and with the iterations a frame needs (15 to 33). The
 Jetson Orin and Jetson Thor numbers are from CI runs, whose boards may run other work at the same
 time; on the Jetson Thor one host round trip took about 2 ms, which each wait for the GPU adds to a
-frame. 3 cm voxels are 2 to 4 times faster on the Jetsons, but cost accuracy when the camera
-moves less than a voxel per frame: around the same path in 300 frames instead of 150, they drift
-2.6% at 640x480 and 7.7% at 1280x720, against 0.45% and 1.7% for 2 cm.
+frame. 3 cm voxels are 2 to 4 times faster on the Jetson Orin and Jetson Thor, but cost accuracy
+when the camera moves less than a voxel per frame: around the same path in 300 frames instead of
+150, they drift 2.6% at 640x480 and 7.7% at 1280x720, against 0.45% and 1.7% for 2 cm.
 
 ## Use it in your graph
 
