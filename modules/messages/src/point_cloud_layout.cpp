@@ -62,7 +62,8 @@ bool is_present(const TensorLayout& field) noexcept {
 std::int64_t point_count(const PointCloudLayout& layout) noexcept {
   const auto& shape = layout.points.shape;
   if (shape.size() == 2) return shape[0];
-  if (shape.size() == 3) return shape[0] * shape[1];
+  std::int64_t count = 0;
+  if (shape.size() == 3 && !__builtin_mul_overflow(shape[0], shape[1], &count)) return count;
   return 0;
 }
 
@@ -73,6 +74,10 @@ void validate(const PointCloudLayout& layout, std::string_view name) {
   bool extents_ok = shape.size() == rank && shape.back() == 3;
   for (const std::int64_t extent : shape) extents_ok = extents_ok && extent >= 0;
   if (layout.organized) extents_ok = extents_ok && shape[0] > 0 && shape[1] > 0;
+  std::int64_t values = 1;
+  for (const std::int64_t extent : shape) {
+    extents_ok = extents_ok && !__builtin_mul_overflow(values, extent, &values);
+  }
   if (layout.points.element_type != ElementType::kFloat32 || !extents_ok) {
     throw std::invalid_argument(points + " must be float32 " +
                                 (layout.organized

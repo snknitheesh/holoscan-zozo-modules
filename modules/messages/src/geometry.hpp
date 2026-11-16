@@ -53,11 +53,28 @@ inline constexpr double kRotationTolerance = 1e-9;
          m[2] * (m[3] * m[7] - m[4] * m[6]);
 }
 
-// Orthonormal with determinant +1, to kRotationTolerance.
-[[nodiscard]] inline bool is_rotation(const Matrix3& m) noexcept {
-  return all_finite(m) &&
-         max_abs_difference(multiply(m, transpose(m)), kIdentity3) <= kRotationTolerance &&
-         std::abs(determinant(m) - 1.0) <= kRotationTolerance;
+// A rotation read from a file is taken to this: ROS's stereo calibration
+// writes R with 8 decimals, whose rounding leaves R R^T up to ~1e-8 from I.
+inline constexpr double kRotationFileTolerance = 1e-6;
+
+// Orthonormal with determinant +1, to `tolerance`.
+[[nodiscard]] inline bool is_rotation(const Matrix3& m,
+                                      double tolerance = kRotationTolerance) noexcept {
+  return all_finite(m) && max_abs_difference(multiply(m, transpose(m)), kIdentity3) <= tolerance &&
+         std::abs(determinant(m) - 1.0) <= tolerance;
+}
+
+// The rotation nearest to `m`, a rotation to kRotationFileTolerance: the
+// iteration m <- m (3 I - m^T m) / 2, which converges quadratically to it
+// (each step squares the distance from orthonormal).
+[[nodiscard]] inline Matrix3 nearest_rotation(Matrix3 m) noexcept {
+  for (int step = 0; step < 4; ++step) {
+    Matrix3 correction = multiply(transpose(m), m);
+    for (std::size_t i = 0; i < 9; ++i)
+      correction[i] = 0.5 * ((i % 4 == 0 ? 3.0 : 0.0) - correction[i]);
+    m = multiply(m, correction);
+  }
+  return m;
 }
 
 [[nodiscard]] inline double norm(const Vector3& v) noexcept {
@@ -74,8 +91,9 @@ inline constexpr double kRotationTolerance = 1e-9;
 inline constexpr double kPairTolerance = 1e-9;
 
 // Whether the cameras' rectifications (an absent one is the identity) turn
-// the pair into one frame with the right camera on its -x axis, as the ROS
-// format and a rectifier need them to.
+// the pair into one frame in which the right camera lies along +x of the left
+// one (right_from_left's translation, rotated, along -x), as the ROS format
+// and a rectifier need them to.
 [[nodiscard]] inline bool rectifications_agree(const StereoCameraInfo& info) noexcept {
   const Matrix3 rect_left = info.left.rectification.value_or(kIdentity3);
   const Matrix3 rect_right = info.right.rectification.value_or(kIdentity3);

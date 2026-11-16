@@ -4,6 +4,7 @@
 #include "holoscan/messages/point_cloud.hpp"
 
 #include <array>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -22,6 +23,15 @@ constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 using Loan = PointCloudLoan;
 using Field = holoscan::TensorFieldSelector<schema::PointCloudT>;
 
+// a * b, or throws for a product past 64 bits.
+std::uint64_t checked_product(std::uint64_t a, std::uint64_t b) {
+  std::uint64_t product = 0;
+  if (__builtin_mul_overflow(a, b, &product)) {
+    throw std::invalid_argument("declare_point_cloud_output: max_points is too large");
+  }
+  return product;
+}
+
 holoscan::TensorOutputSpec field_spec(DLDataType dtype, std::uint64_t values,
                                       holoscan::MemoryKind memory_kind) {
   return holoscan::TensorOutputSpec{
@@ -32,7 +42,8 @@ holoscan::TensorOutputSpec field_spec(DLDataType dtype, std::uint64_t values,
               .strides = holoscan::TensorStridePolicy::kContiguousOnly,
           },
       // Rank 3 for [H, W, 3]; [N, 3], [N], [H, W] and [0] fit as well.
-      .bounds = holoscan::TensorBounds{.max_rank = 3U, .max_byte_span = values * (dtype.bits / 8U)},
+      .bounds = holoscan::TensorBounds{.max_rank = 3U,
+                                       .max_byte_span = checked_product(values, dtype.bits / 8U)},
       .storage = holoscan::TensorOutputStorage::kRuntimePool,
   };
 }
@@ -51,6 +62,32 @@ TensorLayout field_layout(const std::shared_ptr<holoscan::Tensor>& tensor) {
 
 holoscan::Error invalid(const std::string& what) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, what};
+}
+
+std::string shape_text(std::span<const std::int64_t> shape) {
+  std::string text = "[";
+  for (std::size_t i = 0; i < shape.size(); ++i) {
+    text += (i == 0 ? "" : ", ") + std::to_string(shape[i]);
+  }
+  return text + "]";
+}
+
+// Each element directly after the one before, in row-major order. Any stride
+// is taken on an axis of extent 1, which no element steps along.
+bool packed(const holoscan::Tensor& tensor) {
+  const std::span<const std::int64_t> strides = tensor.dlpack_strides_span();
+  if (strides.empty()) return true;  // DLPack's compact row-major layout.
+  const std::span<const std::int64_t> shape = tensor.shape_span();
+  std::int64_t expected = 1;  // In elements, as DLPack counts strides.
+  for (std::size_t axis = shape.size(); axis-- > 0;) {
+    if (shape[axis] > 1 && strides[axis] != expected) return false;
+    expected *= shape[axis];
+  }
+  return true;
+}
+
+bool same_device(const DLDevice& a, const DLDevice& b) {
+  return a.device_type == b.device_type && a.device_id == b.device_id;
 }
 
 // An absent field has nothing to write; commit it so the cloud can be sent.
@@ -75,23 +112,31 @@ void declare_point_cloud_output(holoscan::OperatorSpec& spec,
     throw std::invalid_argument("declare_point_cloud_output: max_points must be > 0");
   }
   if (output.memory_kind != holoscan::MemoryKind::kCudaDevice &&
-      output.memory_kind != holoscan::MemoryKind::kHost) {
+      output.memory_kind != holoscan::MemoryKind::kHost &&
+      output.memory_kind != holoscan::MemoryKind::kPinnedHost) {
     throw std::invalid_argument(
-        "declare_point_cloud_output: the memory kind must be host or CUDA device memory");
+        "declare_point_cloud_output: the memory kind must be host, pinned host or CUDA device "
+        "memory");
   }
   const std::uint64_t points = output.max_points;
   // An absent field is [0]: no bytes, but a pool slot needs a positive size.
   const auto values = [points](bool present, std::uint64_t per_point) {
-    return present ? points * per_point : 1U;
+    return present ? checked_product(points, per_point) : 1U;
   };
   const holoscan::MemoryKind memory = output.memory_kind;
+  // Every size first, so that one too large declares nothing.
+  const holoscan::TensorOutputSpec points_spec = field_spec(kFloat32, values(true, 3U), memory);
+  const holoscan::TensorOutputSpec colors_spec =
+      field_spec(kUInt8, values(output.colors, 3U), memory);
+  const holoscan::TensorOutputSpec normals_spec =
+      field_spec(kFloat32, values(output.normals, 3U), memory);
+  const holoscan::TensorOutputSpec intensity_spec =
+      field_spec(kFloat32, values(output.intensity, 1U), memory);
   spec.output(port, name)
-      .tensor_field(PointCloudFields::points, field_spec(kFloat32, points * 3U, memory))
-      .tensor_field(PointCloudFields::colors, field_spec(kUInt8, values(output.colors, 3U), memory))
-      .tensor_field(PointCloudFields::normals,
-                    field_spec(kFloat32, values(output.normals, 3U), memory))
-      .tensor_field(PointCloudFields::intensity,
-                    field_spec(kFloat32, values(output.intensity, 1U), memory));
+      .tensor_field(PointCloudFields::points, points_spec)
+      .tensor_field(PointCloudFields::colors, colors_spec)
+      .tensor_field(PointCloudFields::normals, normals_spec)
+      .tensor_field(PointCloudFields::intensity, intensity_spec);
 }
 
 holoscan::expected<Loan, holoscan::Error> allocate_point_cloud(
@@ -146,6 +191,26 @@ holoscan::expected<void, holoscan::Error> emit_point_cloud(
     return holoscan::make_unexpected(invalid("emit_point_cloud: the frame id has more than " +
                                              std::to_string(kMaxFrameIdBytes) + " bytes"));
   }
+  // The organization and the count describe the points allocated: a cloud
+  // that says otherwise would be refused by every consumer.
+  const std::span<const std::int64_t> allocated = loan.shape(PointCloudFields::points);
+  const bool matches = shape.organized ? allocated.size() == 3 && allocated[0] == shape.height &&
+                                             allocated[1] == shape.width
+                                       : allocated.size() == 2 && allocated[0] == shape.width;
+  if (!matches) {
+    return holoscan::make_unexpected(invalid(
+        "emit_point_cloud: the points were allocated as " + shape_text(allocated) + ", not as " +
+        (shape.organized ? "the organized " + std::to_string(shape.height) + "x" +
+                               std::to_string(shape.width) + " cloud"
+                         : "an unorganized cloud of " + std::to_string(shape.width) + " points") +
+        " given"));
+  }
+  const std::int64_t count = shape.organized ? shape.height * shape.width : shape.width;
+  if (valid_count < -1 || valid_count > count) {
+    return holoscan::make_unexpected(invalid("emit_point_cloud: valid_count must be -1 or 0.." +
+                                             std::to_string(count) + ", not " +
+                                             std::to_string(valid_count)));
+  }
   schema::PointCloudT metadata;
   metadata.header = std::make_shared<holoscan::schema::HeaderT>(to_message(header));
   metadata.organized = shape.organized;
@@ -155,8 +220,9 @@ holoscan::expected<void, holoscan::Error> emit_point_cloud(
 
 PointCloudLayout layout_of(const schema::PointCloudT& cloud) {
   PointCloudLayout layout;
+  // A missing tensor reads as [0], an absent field.
   const auto read = [](const std::shared_ptr<holoscan::Tensor>& tensor) {
-    return tensor ? field_layout(tensor) : TensorLayout{};
+    return tensor ? field_layout(tensor) : TensorLayout{{0}, ElementType::kOther};
   };
   layout.points = read(cloud.points);
   layout.colors = read(cloud.colors);
@@ -179,6 +245,26 @@ holoscan::expected<void, holoscan::Error> check_point_cloud(const schema::PointC
     validate(layout_of(cloud));
   } catch (const std::invalid_argument& error) {
     return holoscan::make_unexpected(invalid(error.what()));
+  }
+  const DLDevice points_device = cloud.points->device();
+  const std::array<std::pair<const char*, const holoscan::Tensor*>, 4> fields{{
+      {"points", cloud.points.get()},
+      {"colors", cloud.colors.get()},
+      {"normals", cloud.normals.get()},
+      {"intensity", cloud.intensity.get()},
+  }};
+  for (const auto& [name, tensor] : fields) {
+    if (!packed(*tensor)) {
+      return holoscan::make_unexpected(invalid(std::string("point_cloud.") + name +
+                                               " must be packed: each value directly after "
+                                               "the one before, row by row"));
+    }
+    // An absent field holds nothing, wherever its [0] is.
+    const bool present = !(tensor->ndim() == 1 && tensor->size() == 0);
+    if (present && !same_device(tensor->device(), points_device)) {
+      return holoscan::make_unexpected(invalid(std::string("point_cloud.") + name +
+                                               " must be in the same memory as the points"));
+    }
   }
   return {};
 }

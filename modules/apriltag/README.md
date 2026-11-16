@@ -13,7 +13,7 @@ VPI 4). `AprilTagOverlayOp` turns those detections into HoloViz layers. The
 | Headers | `<holoscan/apriltag/...>` |
 | C++ namespace | `holoscan::apriltag` |
 | Debian package | `holoscan-apriltag` |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## Operators
 

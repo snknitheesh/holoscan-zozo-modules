@@ -412,6 +412,10 @@ const YamlNode* YamlNode::find(std::string_view key) const noexcept {
   return nullptr;
 }
 
-YamlNode parse_yaml(std::string_view text) { return BlockParser(logical_lines(text)).document(); }
+YamlNode parse_yaml(std::string_view text) {
+  // A UTF-8 byte order mark, which some editors write, is no content.
+  if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
+  return BlockParser(logical_lines(text)).document();
+}
 
 }  // namespace holoscan::messages::detail
