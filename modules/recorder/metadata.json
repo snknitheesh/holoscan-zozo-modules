@@ -1,0 +1,67 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-recorder",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Records named streams of a Holoscan graph (images of any pixel format, or tensors, in host or device memory) to disk with their capture times, without holding the graph back, and replays them deterministically: as fast as possible and lossless for tests, in real time by the recorded timestamps, or looped, over a frame range and stream subset, into host or device memory. Also replays stereo camera recordings (PGM/PPM with index.csv) read-only.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::recorder"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Recording",
+      "Replay",
+      "Testing",
+      "Data Logging",
+      "Sensor I/O"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/recorder",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "RecorderOp",
+      "ReplayerOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for device-memory streams and pinned host memory."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-recorder",
+      "install_commands": [
+        "sudo apt install ./holoscan-recorder_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}

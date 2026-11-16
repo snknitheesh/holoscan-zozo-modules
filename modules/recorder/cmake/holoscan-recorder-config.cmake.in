@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+# SPDX-License-Identifier: Apache-2.0
+#
+# find_package(holoscan-recorder) defines:
+#   holoscan::recorder  RecorderOp, ReplayerOp, and the recording format they share
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(
+  holoscan
+  5.0
+  CONFIG
+  COMPONENTS
+  core
+  sensor_io
+)
+find_dependency(CUDAToolkit)
+
+include("${CMAKE_CURRENT_LIST_DIR}/holoscan-recorder-targets.cmake")
+
+check_required_components(holoscan-recorder)
