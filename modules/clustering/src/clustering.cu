@@ -1095,10 +1095,11 @@ cudaError_t EuclideanClusterer::Impl::euclidean_graph(const float* xyz, const Cl
     return status;
   }
   // The pairs of cells, as many as 62 per cell, in a grid-stride loop sized
-  // for the GPU rather than for the number of cells, which only the GPU knows.
+  // for the stream's GPU rather than for the number of cells, which only the
+  // GPU knows.
   int device = 0;
   int processors = 0;
-  if (const cudaError_t status = cudaGetDevice(&device); status != cudaSuccess) {
+  if (const cudaError_t status = cudaStreamGetDevice(stream, &device); status != cudaSuccess) {
     return status;
   }
   if (const cudaError_t status =

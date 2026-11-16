@@ -109,6 +109,8 @@ void run(int width, int height, int iterations) {
       }
     }
     check(cudaMemcpy(wall, host.data(), host.size() * 4U, cudaMemcpyHostToDevice), "cudaMemcpy");
+    // The copy may still be landing, on the legacy stream: wait before `stream` reads it.
+    check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
 
   hc::EuclideanClusterer clusterer;

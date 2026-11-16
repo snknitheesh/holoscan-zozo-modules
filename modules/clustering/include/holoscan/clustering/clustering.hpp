@@ -19,7 +19,8 @@
 //
 // EuclideanClusterer keeps its device scratch between calls, grown as
 // needed in stream order (from the stream's device's memory pool), and is for
-// one stream at a time. All work is ordered on the given stream. cluster()
+// one stream at a time. All work is ordered on the given stream, so the cloud
+// must be ready on it (written on it, or waited for). cluster()
 // waits for the stream once, to learn how many components there are and how
 // many points they hold; clustered_count() then needs no other wait, unless
 // more components passed the size filter than max_clusters keeps. Nothing

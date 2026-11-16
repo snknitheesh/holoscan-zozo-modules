@@ -56,6 +56,10 @@ class Device {
   explicit Device(const std::vector<T>& host) : Device(host.size()) {
     check_cuda(cudaMemcpy(data_, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice),
                "cudaMemcpy");
+    // A copy from pageable memory may return before it lands, ordered only on
+    // the legacy default stream: wait for it, so that work on any stream,
+    // non-blocking ones included, reads the data.
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
   ~Device() { cudaFree(data_); }
   Device(const Device&) = delete;
@@ -565,12 +569,13 @@ void check_determinism() {
     EuclideanClusterer fresh;
     const Result again =
         run(i == 0 ? clusterer : fresh, scene.xyz, 0, params, true, i == 2 ? stream : nullptr);
-    VERIFY_MSG(again.labels == first.labels, "same labels on every run");
+    const std::string which = " (run " + std::to_string(i) + ")";
+    VERIFY_MSG(again.labels == first.labels, "same labels on every run" + which);
     VERIFY_MSG(again.summaries.size() == first.summaries.size() &&
                    same_bits(again.summaries.data(), first.summaries.data(),
                              first.summaries.size() * sizeof(ClusterSummary)),
-               "same summary bits on every run");
-    VERIFY_MSG(again.grouped_xyz == first.grouped_xyz, "same grouped points on every run");
+               "same summary bits on every run" + which);
+    VERIFY_MSG(again.grouped_xyz == first.grouped_xyz, "same grouped points on every run" + which);
   }
   cudaStreamDestroy(stream);
   // A smaller cloud next, then the large one again: scratch reuse changes nothing.

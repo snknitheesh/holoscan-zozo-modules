@@ -147,6 +147,7 @@ class CheckOp final : public holoscan::Operator<> {
   explicit CheckOp(std::shared_ptr<Tally> tally) : tally_(std::move(tally)) {}
 
   void setup(holoscan::OperatorSpec& spec) override {
+    // Two slots per input: one frame in compute() while the next one arrives.
     spec.input(labels, "labels").queue_depth(2U);
     spec.input(clusters, "clusters").queue_depth(2U);
     spec.input(cloud, "cloud").queue_depth(2U);
