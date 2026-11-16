@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# The ICP Odometry demo, built against the INSTALLED holoscan-icp and holoscan-point-cloud
-# packages, as any other project would use them: put the modules' install prefix on
-# CMAKE_PREFIX_PATH.
+# The ICP Odometry demo, built against the INSTALLED holoscan-icp, holoscan-point-cloud and
+# holoscan-messages packages, as any other project would use them: put the modules' install
+# prefix on CMAKE_PREFIX_PATH.
 cmake_minimum_required(VERSION 4.0)
 project(icp_odometry LANGUAGES CXX)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -16,8 +16,9 @@ if(ICP_ODOMETRY_ENABLE_VISUALIZATION)
   list(APPEND _holoscan_components visualization)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(holoscan-icp 1.0 REQUIRED CONFIG)
-find_package(holoscan-point-cloud 1.0 REQUIRED CONFIG)
+find_package(holoscan-point-cloud 2.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
 # The synthetic depth camera and the ground-truth reporter.
@@ -26,7 +27,7 @@ target_compile_features(icp_odometry_ops PUBLIC cxx_std_20)
 target_include_directories(icp_odometry_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   icp_odometry_ops
-  PUBLIC holoscan::icp holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::icp holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 
 add_executable(icp_odometry src/main.cpp)

@@ -3,18 +3,15 @@
 //
 // SyntheticDepthCameraOp: a depth camera moving through holoscan-icp's
 // synthetic room along its closed path. Each frame is a float32 depth image
-// in meters, ray cast on the GPU, with the camera's true pose beside it, both
-// with the frame's capture time and id.
+// in meters, ray cast on the GPU through the camera's calibration, with the
+// frame's capture time and id (frame i of the path has id i + 1).
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <memory>
 #include <optional>
 
-#include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
 #include <holoscan/core/operator.hpp>
@@ -22,14 +19,16 @@
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
 #include <holoscan/icp/synthetic_scene.hpp>
+#include <holoscan/messages/camera_info.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 #include <holoscan/time/time_point.hpp>
 
 namespace icp_odometry_app {
 
 struct DepthCameraConfig {
-  int width{640};
-  int height{480};
+  // The camera it renders through: holoscan-icp's synthetic_camera_info(),
+  // the camera the camera_info file the demo writes describes.
+  holoscan::messages::CameraInfo camera;
   // Frames to send, along a path that closes after `path_frames`.
   std::uint32_t count{300};
   std::uint32_t path_frames{300};
@@ -37,10 +36,6 @@ struct DepthCameraConfig {
   // Depth noise as a time-of-flight camera has it; none when false.
   bool noise{true};
   float max_depth{8.0F};
-  // When set, the count of frames done downstream: a frame goes out only
-  // when every frame before it is done, so a lossless pipeline never refuses
-  // one.
-  std::shared_ptr<const std::atomic<std::uint32_t>> done;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -63,16 +58,15 @@ class SyntheticDepthCameraOp final : public holoscan::Operator<> {
 
   // MONO32F [height, width], meters, 0 where there is no depth; on the GPU.
   holoscan::Output<holoscan::schema::ImageT> depth;
-  // float64 [4, 4] row-major, host: the camera's true pose in the world.
-  holoscan::Output<holoscan::Tensor> true_pose;
 
  private:
   DepthCameraConfig config_;
   holoscan::icp::SyntheticScene scene_;
   std::uint32_t emitted_{};
-  // The frame being sent: its capture time, and whether its depth is out.
+  // Whether the first tick, which sends nothing, has passed.
+  bool started_{};
+  // The frame being sent: its capture time, kept while consumers are busy.
   std::optional<holoscan::TimePoint> pending_capture_;
-  bool depth_sent_{};
 };
 
 }  // namespace icp_odometry_app

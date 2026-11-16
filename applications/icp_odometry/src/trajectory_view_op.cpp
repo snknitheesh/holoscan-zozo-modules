@@ -3,9 +3,12 @@
 
 #include "trajectory_view_op.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +21,7 @@
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/icp/icp_op.hpp>
+#include <holoscan/icp/synthetic_scene.hpp>
 #include <holoscan/logger/logger.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 #include <holoscan/visualization/holoviz_op.hpp>
@@ -27,6 +31,7 @@ namespace {
 
 using std::chrono_literals::operator""ns;
 namespace icp = holoscan::icp;
+namespace hm = holoscan::messages;
 
 constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 namespace viz = holoscan::visualization;
@@ -56,28 +61,40 @@ holoscan::TensorOutputSpec host_tensor(std::uint32_t rank, std::uint64_t bytes) 
   };
 }
 
-int panel_width(const icp::PinholeCamera& camera) { return std::min(camera.width, 640); }
+int panel_width(int width) { return std::min(width, 640); }
 
-int panel_height(const icp::PinholeCamera& camera) {
-  return static_cast<int>(
-      std::lround(static_cast<double>(camera.height) * panel_width(camera) / camera.width));
+int panel_height(int width, int height) {
+  return static_cast<int>(std::lround(static_cast<double>(height) * panel_width(width) / width));
 }
 
-// Reads a host or device tensor of `count` floats (or doubles) into `out`.
-template <typename T>
-holoscan::expected<void, holoscan::Error> read(const holoscan::Tensor& tensor, std::size_t count,
-                                               std::vector<T>& out, cudaStream_t stream) {
-  if (tensor.size() != static_cast<std::int64_t>(count) || tensor.dtype().bits != sizeof(T) * 8U ||
-      tensor.dtype().code != kDLFloat) {
-    return holoscan::make_unexpected(holoscan::Error{
-        holoscan::ErrorCode::kInvalidArgument, "TrajectoryViewOp: an input has the wrong size"});
+holoscan::Error invalid(const std::string& message) {
+  return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "TrajectoryViewOp: " + message};
+}
+
+// The float64 values of a host tensor of `count` elements, into `out`.
+holoscan::expected<void, holoscan::Error> read_doubles(const holoscan::Tensor& tensor,
+                                                       std::size_t count, double* out) {
+  const DLDataType dtype = tensor.dtype();
+  if (tensor.size() != static_cast<std::int64_t>(count) || dtype.code != kDLFloat ||
+      dtype.bits != 64U) {
+    return holoscan::make_unexpected(invalid("a pose or statistics input has the wrong size"));
   }
-  out.resize(count);
-  // The host reads it: wait for its producer first.
-  if (auto ready = tensor.synchronize_for_host(); !ready) {
-    return ready;
+  return tensor.copy_to_host(out, count * sizeof(double));
+}
+
+// Checks that a received cloud is an organized cloud of the camera's size.
+holoscan::expected<void, holoscan::Error> check_cloud(const hm::schema::PointCloudT& cloud,
+                                                      int width, int height, const char* name) {
+  if (auto checked = hm::check_point_cloud(cloud); !checked) {
+    return holoscan::make_unexpected(invalid(std::string(name) + ": " + checked.error().message));
   }
-  return tensor.copy_to_host(out.data(), count * sizeof(T), stream);
+  if (cloud.points->shape_span().size() != 3U || cloud.points->shape_span()[0] != height ||
+      cloud.points->shape_span()[1] != width) {
+    return holoscan::make_unexpected(invalid(std::string(name) + " must be organized [" +
+                                             std::to_string(height) + ", " + std::to_string(width) +
+                                             ", 3]"));
+  }
+  return {};
 }
 
 void put(std::uint8_t* rgba, int width, int height, int x, int y, const Color& c) {
@@ -122,13 +139,13 @@ void label(std::uint8_t* row, float y, std::uint32_t color, const std::string& t
 
 }  // namespace
 
-int view_width(const icp::PinholeCamera& camera) { return 2 * panel_width(camera); }
-int view_height(const icp::PinholeCamera& camera) { return panel_height(camera); }
+int view_width(int width, int /*height*/) { return 2 * panel_width(width); }
+int view_height(int width, int height) { return panel_height(width, height); }
 
 TrajectoryViewOp::TrajectoryViewOp(TrajectoryViewConfig config)
     : config_(std::move(config)),
-      panel_width_(panel_width(config_.camera)),
-      panel_height_(panel_height(config_.camera)) {
+      panel_width_(panel_width(config_.width)),
+      panel_height_(panel_height(config_.width, config_.height)) {
   // Fit the plot to the whole path, with a margin.
   min_x_ = min_z_ = std::numeric_limits<double>::max();
   max_x_ = max_z_ = std::numeric_limits<double>::lowest();
@@ -139,8 +156,6 @@ TrajectoryViewOp::TrajectoryViewOp(TrajectoryViewConfig config)
     min_z_ = std::min(min_z_, pose[11]);
     max_z_ = std::max(max_z_, pose[11]);
   }
-  // Odometry starts at the path's first pose: the estimate is relative to it.
-  first_truth_ = icp::synthetic_trajectory(0, config_.path_frames);
   const double margin = 0.25 * std::max(max_x_ - min_x_, max_z_ - min_z_) + 0.1;
   min_x_ -= margin;
   max_x_ += margin;
@@ -148,14 +163,17 @@ TrajectoryViewOp::TrajectoryViewOp(TrajectoryViewConfig config)
   max_z_ += margin;
 }
 
+TrajectoryViewOp::~TrajectoryViewOp() { release(); }
+
 void TrajectoryViewOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(pose, "pose").queue_depth(2U);
-  spec.input(true_pose, "true_pose").queue_depth(2U);
-  spec.input(stats, "stats").queue_depth(2U);
-  spec.input(point_cloud, "point_cloud").queue_depth(2U);
-  spec.input(aligned, "aligned").queue_depth(2U);
-  const auto pixels = static_cast<std::uint64_t>(view_width(config_.camera)) *
-                      static_cast<std::uint64_t>(view_height(config_.camera));
+  // One slot each: the display keeps the newest frame.
+  spec.input(pose, "pose").queue_depth(1U);
+  spec.input(stats, "stats").queue_depth(1U);
+  spec.input(point_cloud, "point_cloud").queue_depth(1U);
+  spec.input(aligned, "aligned").queue_depth(1U);
+  spec.input(camera_info, "camera_info").queue_depth(1U);
+  const auto pixels = static_cast<std::uint64_t>(view_width(config_.width, config_.height)) *
+                      static_cast<std::uint64_t>(view_height(config_.width, config_.height));
   spec.output(view, "view")
       .produces_tensor(host_tensor(3U, pixels * 4U))
       .payload_options(holoscan::PayloadOptions{
@@ -167,19 +185,26 @@ void TrajectoryViewOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract TrajectoryViewOp::contract() const {
-  holoscan::Contract result;
-  result.trigger(holoscan::OnAligned{
-      .ports = holoscan::ports(pose, true_pose, stats, point_cloud, aligned), .window = 0ns});
-  result.input(pose, holoscan::Exact{});
-  result.input(true_pose, holoscan::Exact{});
-  result.input(stats, holoscan::Exact{});
-  result.input(point_cloud, holoscan::Exact{});
-  result.input(aligned, holoscan::Exact{});
-  return result;
+  // The four inputs of one frame carry its capture time; the camera info
+  // comes at its own rate.
+  return hm::camera_info_contract(camera_info, pose, stats, point_cloud, aligned);
+}
+
+void TrajectoryViewOp::stop() { release(); }
+
+void TrajectoryViewOp::release() noexcept {
+  // Every copy into these was waited for before compute() returned.
+  for (float** buffer : {&current_, &previous_, &aligned_}) {
+    if (*buffer != nullptr) {
+      cudaFreeHost(*buffer);
+      *buffer = nullptr;
+    }
+  }
+  previous_frame_id_ = 0;
 }
 
 void TrajectoryViewOp::draw_trajectories(std::uint8_t* rgba) const {
-  const int width = view_width(config_.camera);
+  const int width = view_width(config_.width, config_.height);
   const int w = panel_width_;
   const int h = panel_height_;
   // One scale for both axes, so the path keeps its shape.
@@ -219,41 +244,45 @@ void TrajectoryViewOp::draw_trajectories(std::uint8_t* rgba) const {
   }
 }
 
-void TrajectoryViewOp::draw_alignment(std::uint8_t* rgba) const {
-  const int width = view_width(config_.camera);
-  const icp::PinholeCamera& k = config_.camera;
-  const double to_panel = static_cast<double>(panel_width_) / k.width;
-  const std::vector<float>& base = previous_.empty() ? current_ : previous_;
-  // The previous frame's depth in gray, nearer brighter.
+void TrajectoryViewOp::draw_alignment(std::uint8_t* rgba, const hm::CameraInfo& k,
+                                      bool with_previous) const {
+  const int width = view_width(config_.width, config_.height);
+  const int camera_width = config_.width;
+  const int camera_height = config_.height;
+  const double to_panel = static_cast<double>(panel_width_) / camera_width;
+  const float* base = with_previous ? previous_ : current_;
+  // The previous frame's depth in gray, nearer brighter (the current one's
+  // when the previous frame was not drawn).
   for (int y = 0; y < panel_height_; ++y) {
     for (int x = 0; x < panel_width_; ++x) {
-      const int u = std::min(k.width - 1, static_cast<int>(x / to_panel));
-      const int v = std::min(k.height - 1, static_cast<int>(y / to_panel));
-      const float z = base[3U * (static_cast<std::size_t>(v) * k.width + u) + 2U];
+      const int u = std::min(camera_width - 1, static_cast<int>(x / to_panel));
+      const int v = std::min(camera_height - 1, static_cast<int>(y / to_panel));
+      const float z = base[3U * (static_cast<std::size_t>(v) * camera_width + u) + 2U];
       if (!std::isfinite(z)) continue;
       const auto g = static_cast<std::uint8_t>(std::clamp(200.0F - 22.0F * z, 30.0F, 200.0F));
       put(rgba, width, panel_height_, panel_width_ + x, y, Color{g, g, g});
     }
   }
-  if (previous_.empty()) return;
+  if (!with_previous) return;
   // The current cloud in the previous camera, nearest point per panel pixel.
   std::vector<float> nearest(static_cast<std::size_t>(panel_width_) * panel_height_,
                              std::numeric_limits<float>::infinity());
-  for (std::size_t i = 0; i + 2U < aligned_.size(); i += 3U) {
+  const std::size_t floats = static_cast<std::size_t>(camera_width) * camera_height * 3U;
+  for (std::size_t i = 0; i + 2U < floats; i += 3U) {
     const float px = aligned_[i];
     const float py = aligned_[i + 1U];
     const float pz = aligned_[i + 2U];
     if (!(pz > 0.0F) || !std::isfinite(px) || !std::isfinite(py)) continue;
     const auto u = static_cast<int>(std::lround(k.fx * px / pz + k.cx));
     const auto v = static_cast<int>(std::lround(k.fy * py / pz + k.cy));
-    if (u < 0 || v < 0 || u >= k.width || v >= k.height) continue;
+    if (u < 0 || v < 0 || u >= camera_width || v >= camera_height) continue;
     const int x = static_cast<int>(u * to_panel);
     const int y = static_cast<int>(v * to_panel);
     if (x >= panel_width_ || y >= panel_height_) continue;
     float& z = nearest[static_cast<std::size_t>(y) * panel_width_ + x];
     if (pz >= z) continue;
     z = pz;
-    const float* q = previous_.data() + 3U * (static_cast<std::size_t>(v) * k.width + u);
+    const float* q = previous_ + 3U * (static_cast<std::size_t>(v) * camera_width + u);
     if (!std::isfinite(q[2])) continue;
     const float d = std::hypot(px - q[0], py - q[1], pz - q[2]);
     put(rgba, width, panel_height_, panel_width_ + x, y,
@@ -265,57 +294,113 @@ holoscan::expected<void, holoscan::Error> TrajectoryViewOp::compute(
     holoscan::ExecutionContext& context) {
   auto pose_sample = pose.receive();
   if (!pose_sample) return holoscan::make_unexpected(std::move(pose_sample).error());
-  auto truth_sample = true_pose.receive();
-  if (!truth_sample) return holoscan::make_unexpected(std::move(truth_sample).error());
   auto stats_sample = stats.receive();
   if (!stats_sample) return holoscan::make_unexpected(std::move(stats_sample).error());
   auto cloud_sample = point_cloud.receive();
   if (!cloud_sample) return holoscan::make_unexpected(std::move(cloud_sample).error());
   auto aligned_sample = aligned.receive();
   if (!aligned_sample) return holoscan::make_unexpected(std::move(aligned_sample).error());
+  auto info = info_.update(camera_info);
+  if (!info) return holoscan::make_unexpected(std::move(info).error());
+  if (*info == nullptr) return {};  // No camera info yet: nothing to project with.
+  const hm::CameraInfo& camera = **info;
+  if (std::cmp_not_equal(camera.width, config_.width) ||
+      std::cmp_not_equal(camera.height, config_.height)) {
+    return holoscan::make_unexpected(invalid(
+        "camera info '" + camera.header.frame_id + "' is for " + std::to_string(camera.width) +
+        "x" + std::to_string(camera.height) + " images, not the configured " +
+        std::to_string(config_.width) + "x" + std::to_string(config_.height)));
+  }
+  if (auto r = check_cloud(cloud_sample->data, config_.width, config_.height, "point_cloud"); !r) {
+    return r;
+  }
+  if (auto r = check_cloud(aligned_sample->data, config_.width, config_.height, "aligned"); !r) {
+    return r;
+  }
 
+  // The clouds into pinned host memory: both copies queued on the runtime's
+  // stream, then one wait. Without a runtime stream, each copy waits.
+  const std::size_t bytes = static_cast<std::size_t>(config_.width) *
+                            static_cast<std::size_t>(config_.height) * 3U * sizeof(float);
+  for (float** buffer : {&current_, &previous_, &aligned_}) {
+    if (*buffer == nullptr) {
+      if (const cudaError_t status = cudaMallocHost(reinterpret_cast<void**>(buffer), bytes);
+          status != cudaSuccess) {
+        *buffer = nullptr;
+        return holoscan::make_unexpected(holoscan::Error{
+            holoscan::ErrorCode::kFailure,
+            std::string("TrajectoryViewOp: cudaMallocHost: ") + cudaGetErrorString(status)});
+      }
+    }
+  }
+  // The cloud drawn last becomes the previous one.
+  std::swap(previous_, current_);
   cudaStream_t stream = context.cuda_stream().get();
-  const std::size_t floats = static_cast<std::size_t>(config_.camera.width) *
-                             static_cast<std::size_t>(config_.camera.height) * 3U;
   if (!logged_copy_) {
     logged_copy_ = true;
-    HOLOSCAN_LOG_INFO("TrajectoryViewOp: copies each frame's clouds to the host to draw them");
+    HOLOSCAN_LOG_INFO(
+        "TrajectoryViewOp: copies each frame's two clouds to pinned host memory to "
+        "draw them, {}",
+        stream != nullptr ? "on the runtime's stream, waiting once"
+                          : "waiting for each copy (no runtime stream)");
   }
-  std::vector<double> estimate, truth, values;
-  std::swap(previous_, current_);
-  if (auto r = read(pose_sample->data, 16U, estimate, stream); !r) {
-    return r;
-  }
-  if (auto r = read(truth_sample->data, 16U, truth, stream); !r) {
-    return r;
-  }
-  if (auto r = read(stats_sample->data, icp::kStatsSize, values, stream); !r) {
-    return r;
-  }
-  if (auto r = read(cloud_sample->data, floats, current_, stream); !r) {
-    return r;
-  }
-  if (auto r = read(aligned_sample->data, floats, aligned_, stream); !r) {
-    return r;
+  const holoscan::Tensor& cloud_points = *cloud_sample->data.points;
+  const holoscan::Tensor& aligned_points = *aligned_sample->data.points;
+  if (stream != nullptr) {
+    if (auto r = cloud_points.copy_to_host_async(current_, bytes, stream); !r) {
+      return r;
+    }
+    if (auto r = aligned_points.copy_to_host_async(aligned_, bytes, stream); !r) {
+      return r;
+    }
+    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(holoscan::Error{
+          holoscan::ErrorCode::kFailure,
+          std::string("TrajectoryViewOp: cudaStreamSynchronize: ") + cudaGetErrorString(status)});
+    }
+  } else {
+    if (auto r = cloud_points.copy_to_host(current_, bytes); !r) {
+      return r;
+    }
+    if (auto r = aligned_points.copy_to_host(aligned_, bytes); !r) {
+      return r;
+    }
   }
   icp::Matrix4 estimated{};
-  icp::Matrix4 world_from_camera{};
-  std::copy(estimate.begin(), estimate.end(), estimated.begin());
-  std::copy(truth.begin(), truth.end(), world_from_camera.begin());
-  // The plot shows both in the world: the estimate starts where the truth does.
-  estimated_.push_back(icp::compose(first_truth_, estimated));
+  std::array<double, icp::kStatsSize> values{};
+  if (auto r = read_doubles(pose_sample->data, 16U, estimated.data()); !r) {
+    return r;
+  }
+  if (auto r = read_doubles(stats_sample->data, icp::kStatsSize, values.data()); !r) {
+    return r;
+  }
+
+  // The frame's id gives its true pose (frame i of the path has id i + 1),
+  // and which cloud came before it.
+  const std::uint64_t frame_id = pose_sample->metadata.frame_id;
+  const icp::Matrix4 world_from_camera = icp::synthetic_trajectory(
+      static_cast<std::uint32_t>(frame_id == 0U ? 0U : frame_id - 1U), config_.path_frames);
+  const bool with_previous = previous_frame_id_ != 0U && previous_frame_id_ + 1U == frame_id;
+  previous_frame_id_ = frame_id;
+  // The plot shows both in the world: the estimate starts where the truth
+  // does, at the first frame drawn.
+  if (truth_.empty()) {
+    world_from_estimate_ = icp::compose(world_from_camera, icp::rigid_inverse(estimated));
+  }
+  const icp::Matrix4 estimated_world = icp::compose(world_from_estimate_, estimated);
+  estimated_.push_back(estimated_world);
   truth_.push_back(world_from_camera);
 
   const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*pose_sample);
-  const int width = view_width(config_.camera);
-  const int height = view_height(config_.camera);
+  const int width = view_width(config_.width, config_.height);
+  const int height = view_height(config_.width, config_.height);
   // The labels go first: the image triggers HoloViz's frame, which takes the
   // newest labels already there, so this frame's must not come after it.
-  const icp::TransformError error = icp::transform_error(
-      estimated, icp::compose(icp::rigid_inverse(first_truth_), world_from_camera));
+  const icp::TransformError error = icp::transform_error(estimated_world, world_from_camera);
   char lines[kViewLabelRows][kViewLabelBytes + 1];
-  std::snprintf(lines[0], sizeof(lines[0]), "frame %u/%u  green: truth  orange: estimate",
-                static_cast<unsigned>(truth_.size()), static_cast<unsigned>(config_.count));
+  std::snprintf(lines[0], sizeof(lines[0]),
+                "frame %" PRIu64 "/%u  green: truth  orange: estimate%s", frame_id,
+                static_cast<unsigned>(config_.count), with_previous ? "" : "  (no previous frame)");
   std::snprintf(lines[1], sizeof(lines[1]), "pose error %.1f mm  %.2f deg",
                 error.translation * 1000.0, error.rotation_rad * 180.0 / 3.14159265358979323846);
   std::snprintf(lines[2], sizeof(lines[2]), "fitness %.2f  rmse %.1f mm  iterations %d",
@@ -355,7 +440,7 @@ holoscan::expected<void, holoscan::Error> TrajectoryViewOp::compute(
               rgba[4 * i + 3] = 255;
             }
             draw_trajectories(rgba);
-            draw_alignment(rgba);
+            draw_alignment(rgba, camera, with_previous);
             return {};
           });
       !written) {

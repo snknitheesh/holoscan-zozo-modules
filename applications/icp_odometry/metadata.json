@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "ICP Odometry",
-    "description": "Depth odometry with holoscan-icp's IcpOp: a synthetic depth camera moves along a known path through a room, holoscan-point-cloud's DepthToPointCloudOp turns its depth images into point clouds, and IcpOp registers each cloud to the one before on the GPU and accumulates the pose. The estimated trajectory is checked against the true one, and a HoloViz window can show both and the current alignment.",
+    "description": "Depth odometry with holoscan-icp's IcpOp: a synthetic depth camera moves along a known path through a room, holoscan-point-cloud's DepthToPointCloudOp turns its depth images into PointCloud messages with the camera's CameraInfo from a ROS camera_info file (written at run time, read by holoscan-messages' CameraInfoSourceOp), and IcpOp registers each cloud to the one before on the GPU and accumulates the pose. The estimated trajectory is checked against the true one, and a HoloViz window can show both and the current alignment.",
     "authors": [
       {
         "name": "zozo",
@@ -47,6 +47,9 @@
       "modules": [
         {
           "name": "icp"
+        },
+        {
+          "name": "messages"
         },
         {
           "name": "point-cloud"

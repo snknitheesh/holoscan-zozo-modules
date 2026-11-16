@@ -4,18 +4,22 @@
 // ICP Odometry: depth odometry from a moving depth camera. A synthetic depth
 // camera moves through a room along a known, closed path;
 // holoscan-point-cloud's DepthToPointCloudOp turns each depth image into a
-// point cloud, and holoscan-icp's IcpOp registers each cloud to the one before
-// and accumulates the camera's pose. A reporter checks the estimated
-// trajectory against the true one; a HoloViz window can show both, and the
-// current alignment.
+// PointCloud with the camera's calibration, which holoscan-messages'
+// CameraInfoSourceOp reads from a camera_info file written for the run, and
+// holoscan-icp's IcpOp registers each cloud to the one before and accumulates
+// the camera's pose. A reporter checks the estimated trajectory against the
+// true one; a HoloViz window can show both, and the current alignment.
+
+#include <stdlib.h>  // mkdtemp
 
 #include <algorithm>
-#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -23,7 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -37,6 +41,9 @@
 #include <holoscan/icp/icp_op.hpp>
 #include <holoscan/icp/synthetic_scene.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 
@@ -51,9 +58,9 @@
 
 namespace {
 
-using std::chrono_literals::operator""ms;
 namespace app = icp_odometry_app;
 namespace icp = holoscan::icp;
+namespace hm = holoscan::messages;
 namespace pc = holoscan::point_cloud;
 
 constexpr std::string_view kAppName = "icp_odometry";
@@ -216,8 +223,7 @@ void usage(const char* argv0) {
 }
 
 app::DepthCameraConfig camera_config(const Options& opts) {
-  return app::DepthCameraConfig{.width = opts.width,
-                                .height = opts.height,
+  return app::DepthCameraConfig{.camera = icp::synthetic_camera_info(opts.width, opts.height),
                                 .count = opts.count,
                                 .path_frames = opts.path_frames.value_or(opts.count),
                                 .period = std::chrono::milliseconds(opts.period_ms),
@@ -225,14 +231,50 @@ app::DepthCameraConfig camera_config(const Options& opts) {
 }
 
 pc::DepthToPointCloudConfig deproject_config(const Options& opts) {
-  const icp::PinholeCamera k = icp::synthetic_camera(opts.width, opts.height);
-  return pc::DepthToPointCloudConfig{.intrinsics = pc::CameraIntrinsics{k.fx, k.fy, k.cx, k.cy},
-                                     .depth_scale = 1.0F,
+  return pc::DepthToPointCloudConfig{.depth_scale = 1.0F,
                                      .depth_min = 0.1F,
                                      .depth_max = 8.0F,
                                      .max_width = opts.width,
                                      .max_height = opts.height};
 }
+
+// A camera_info file of the synthetic camera, written for CameraInfoSourceOp
+// to read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every path out of the run.
+class SyntheticCameraInfoFile {
+ public:
+  explicit SyntheticCameraInfoFile(const Options& opts) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "depth.yaml";
+    try {
+      hm::write_camera_info_yaml(icp::synthetic_camera_info(opts.width, opts.height), path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~SyntheticCameraInfoFile() { remove(); }
+  SyntheticCameraInfoFile(const SyntheticCameraInfoFile&) = delete;
+  SyntheticCameraInfoFile& operator=(const SyntheticCameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
 
 icp::IcpConfig icp_config(const Options& opts, bool display) {
   icp::IcpConfig config;
@@ -283,36 +325,38 @@ int execute(const Options& opts, SignalDomain& signals) {
   holoscan::Graph graph{std::string(kAppName)};
   const bool display = opts.display == DisplayMode::kOn;
   auto report = std::make_shared<app::OdometryReport>();
-  // The camera sends a frame only once the reporter is done with the one
-  // before, so the lossless chain never meets a full queue: an operator in
-  // the middle cannot send a refused output again. The count is the signal,
-  // read by the camera; an edge back from the reporter would be a cycle,
-  // which the SDK refuses.
-  app::DepthCameraConfig camera = camera_config(opts);
-  camera.done = std::shared_ptr<const std::atomic<std::uint32_t>>(report, &report->frames);
-  auto source = graph.op<app::SyntheticDepthCameraOp>("camera", camera);
+  const std::uint32_t path_frames = opts.path_frames.value_or(opts.count);
+  auto source = graph.op<app::SyntheticDepthCameraOp>("camera", camera_config(opts));
+  // The camera's calibration, from the camera_info file written for this
+  // run. The file is read again when the run starts, so it stays until the
+  // run is over.
+  const SyntheticCameraInfoFile camera_info_file(opts);
+  auto camera_info = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file.path()});
   auto deproject = graph.op<pc::DepthToPointCloudOp>("deproject", deproject_config(opts));
   auto odometry = graph.op<icp::IcpOp>("odometry", icp_config(opts, display));
   auto reporter = graph.op<app::OdometryReportOp>(
-      "report", app::OdometryReportConfig{.report = report, .expected_frames = opts.count});
+      "report", app::OdometryReportConfig{
+                    .report = report, .expected_frames = opts.count, .path_frames = path_frames});
 
   // Lossless edges: every frame is registered and checked, in order.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->depth, deproject->depth, lossless);
+  graph.add_flow(camera_info->camera_info, deproject->camera_info,
+                 hm::latest_camera_info_connection());
   graph.add_flow(deproject->point_cloud, odometry->source, lossless);
   graph.add_flow(odometry->pose, reporter->pose, lossless);
   graph.add_flow(odometry->stats, reporter->stats, lossless);
-  graph.add_flow(source->true_pose, reporter->true_pose, lossless);
 
 #if ICP_ODOMETRY_ENABLE_VISUALIZATION
   if (display) {
     namespace viz = holoscan::visualization;
-    const icp::PinholeCamera k = icp::synthetic_camera(opts.width, opts.height);
-    const auto width = static_cast<std::uint32_t>(app::view_width(k));
-    const auto height = static_cast<std::uint32_t>(app::view_height(k));
+    const auto width = static_cast<std::uint32_t>(app::view_width(opts.width, opts.height));
+    const auto height = static_cast<std::uint32_t>(app::view_height(opts.width, opts.height));
     auto view = graph.op<app::TrajectoryViewOp>(
-        "view", app::TrajectoryViewConfig{.camera = k,
-                                          .path_frames = opts.path_frames.value_or(opts.count),
+        "view", app::TrajectoryViewConfig{.width = opts.width,
+                                          .height = opts.height,
+                                          .path_frames = path_frames,
                                           .count = opts.count});
     viz::LayerStack layers;
     layers.add_image_layer("view", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8A8Unorm,
@@ -330,21 +374,27 @@ int execute(const Options& opts, SignalDomain& signals) {
             .title = "ICP Odometry", .width = width * zoom, .height = height * zoom},
         viz::FrameTrigger{viz::LayerTrigger{0}},
         std::max(4 * std::chrono::milliseconds(opts.period_ms), std::chrono::milliseconds{250}));
-    // The display keeps the newest frames and never holds back the odometry:
-    // two slots, so that the view's five inputs of one frame meet.
-    const holoscan::ConnectionOptions recent{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                             .queue_depth = 2U};
+    // The display keeps the newest frame and never holds back the odometry.
+    // On one worker the view runs after each frame's last input, so the four
+    // inputs of one frame meet in one slot each.
     const holoscan::ConnectionOptions newest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
                                              .queue_depth = 1U};
-    graph.add_flow(odometry->pose, view->pose, recent);
-    graph.add_flow(odometry->stats, view->stats, recent);
-    graph.add_flow(odometry->aligned, view->aligned, recent);
-    graph.add_flow(deproject->point_cloud, view->point_cloud, recent);
-    graph.add_flow(source->true_pose, view->true_pose, recent);
+    graph.add_flow(odometry->pose, view->pose, newest);
+    graph.add_flow(odometry->stats, view->stats, newest);
+    graph.add_flow(odometry->aligned, view->aligned, newest);
+    graph.add_flow(deproject->point_cloud, view->point_cloud, newest);
+    graph.add_flow(camera_info->camera_info, view->camera_info,
+                   hm::latest_camera_info_connection());
     graph.add_flow(view->view, visualizer->image_layer_input(0), newest);
     graph.add_flow(view->labels, visualizer->tensor_layer_input(1), newest);
   }
 #endif
+  // One worker for the whole graph. The automatic partitioning would give
+  // the camera and CameraInfoSourceOp, two sources, workers of their own, and
+  // split it where it forks and joins: the camera would then run ahead of the
+  // lossless chain and see its frames refused (see holoscan-messages'
+  // README).
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // GPU outputs are on device 0.
@@ -369,7 +419,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -383,10 +434,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(opts.timeout_seconds) +
                         std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const bool timed_out = session.is_running();
+  const bool timed_out = !session.wait_for(deadline - std::chrono::steady_clock::now());
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
@@ -401,12 +449,6 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!session.diagnostics().empty() && !sdk_reported) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
   }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
-  }
 
   // A stop request (SIGINT, SIGTERM) ends the run early; that is not a
   // failure, but not a pass either.
@@ -414,10 +456,16 @@ int execute(const Options& opts, SignalDomain& signals) {
   const bool passed = !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
                       app::passed(*report, opts.count, opts.limits);
-  const std::uint32_t frames = report->frames.load();
+  const std::uint32_t frames = report->frames;
   const double registered = frames > 1U ? static_cast<double>(frames - 1U) : 1.0;
+  // The first frame gives no cloud when it comes before the first camera
+  // info; CameraInfoSourceOp sends when the run starts, a period before the
+  // camera's first frame, so that should not happen.
+  const std::uint64_t before_camera_info =
+      report->first_frame_id > 0U ? report->first_frame_id - 1U : 0U;
   std::cout << std::fixed << std::setprecision(2) << kAppName << ": frames=" << frames << '/'
-            << opts.count << ' ' << opts.width << 'x' << opts.height << " path_m=" << report->path_m
+            << opts.count << " before_camera_info=" << before_camera_info << ' ' << opts.width
+            << 'x' << opts.height << " path_m=" << report->path_m
             << " final_error_mm=" << report->final_error_m * 1000.0 << " final_rotation_error_deg="
             << report->final_rotation_error_rad * 180.0 / 3.14159265358979323846
             << " drift_percent=" << report->drift_percent()
@@ -451,7 +499,15 @@ int main(int argc, char** argv) try {
     return 0;
   }
   validate(opts);
-  return execute(opts, signals);
+  const int status = execute(opts, signals);
+  // On every path out of the run, the compile-only and rejected ones too.
+  if (signals) {
+    if (auto closed = signals->close(); !closed) {
+      std::cerr << kAppName << ": warning: closing the signal domain failed: "
+                << holoscan::runtime_error_message(closed.error()) << '\n';
+    }
+  }
+  return status;
 } catch (const std::invalid_argument& error) {
   std::cerr << "error: " << error.what() << '\n';
   return 2;

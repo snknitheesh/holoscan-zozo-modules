@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// OdometryReportOp: the demo's sink. Pairs each estimated pose and its
-// registration statistics with the camera's true pose by capture time,
-// measures the trajectory's error against the truth, and asks the run to
-// complete after its expected frames.
+// OdometryReportOp: the demo's sink. Pairs each estimated pose with its
+// registration statistics by capture time, measures the trajectory's error
+// against the camera's true path (the synthetic path at the frame's id), and
+// asks the run to complete after the last frame.
 
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -24,10 +23,13 @@
 namespace icp_odometry_app {
 
 // What one run saw. Written by the reporter during the run and read by main()
-// after it has stopped, except `frames`, which the camera reads to pace
-// itself.
+// after it has stopped.
 struct OdometryReport {
-  std::atomic<std::uint32_t> frames{};
+  std::uint32_t frames{};
+  // The first frame's id: 1, or 2 when the first frame came before the
+  // first camera info and gave no cloud.
+  std::uint64_t first_frame_id{};
+  std::uint64_t last_frame_id{};
   // Poses whose frame id is not the one after the previous pose's.
   std::uint32_t frame_gaps{};
   // Frames after the first whose registration did not converge.
@@ -55,11 +57,16 @@ struct OdometryLimits {
 
 struct OdometryReportConfig {
   std::shared_ptr<OdometryReport> report;
-  // Frames after which the run completes; 0 never completes.
+  // The camera's frames: the run completes after the one with this id; 0
+  // never completes.
   std::uint32_t expected_frames{};
+  // The length of the camera's closed path in frames, for its true poses.
+  std::uint32_t path_frames{300};
 };
 
-// Whether `report` covers `frames` frames, without gaps, within `limits`.
+// Whether `report` covers the camera's `frames` frames without gaps, from
+// the first or the second (when the first came before the camera info),
+// within `limits`.
 [[nodiscard]] bool passed(const OdometryReport& report, std::uint32_t frames,
                           const OdometryLimits& limits);
 
@@ -73,9 +80,8 @@ class OdometryReportOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  // float64 [4, 4] each: IcpOp's pose, and the camera's true pose.
+  // float64 [4, 4]: IcpOp's pose.
   holoscan::Input<holoscan::Tensor> pose;
-  holoscan::Input<holoscan::Tensor> true_pose;
   // IcpOp's float64 statistics.
   holoscan::Input<holoscan::Tensor> stats;
 
@@ -83,7 +89,6 @@ class OdometryReportOp final : public holoscan::Operator<> {
   OdometryReportConfig config_;
   holoscan::icp::Matrix4 first_truth_{holoscan::icp::identity_transform()};
   holoscan::icp::Matrix4 last_truth_{holoscan::icp::identity_transform()};
-  std::uint64_t last_frame_id_{};
   bool finished_{};
 };
 

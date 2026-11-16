@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# These tests need the SDK, CUDA and a GPU. Each runs the demo through run_and_match.cmake,
-# which checks its exit status as well as its output: icp_app_test(<name> <exit status>
-# <output regex> <arguments>...).
+# Each test runs the demo through run_and_match.cmake, which checks its exit status as well
+# as its output: icp_app_test(<name> <exit status> <output regex> <arguments>...). The runs
+# need the SDK, CUDA and a GPU; the plans and the argument checks start no GPU work.
 set(_run_and_match "${CMAKE_CURRENT_SOURCE_DIR}/run_and_match.cmake")
 function(icp_app_test name status output)
   add_test(
@@ -17,10 +17,10 @@ endfunction()
 # Odometry along the room's path, checked against the truth: point-to-plane at two sizes,
 # point-to-point, and without noise or subsampling.
 set(_pass "unconverged=0 .*verdict=PASS")
-icp_app_test(icp_app_point_to_plane 0 "frames=150/150 320x240 .*${_pass}"
+icp_app_test(icp_app_point_to_plane 0 "frames=150/150 before_camera_info=0 320x240 .*${_pass}"
   --width 320 --height 240 --count 150 --period-ms 2 --display false
 )
-icp_app_test(icp_app_640x480 0 "frames=60/60 640x480 .*${_pass}"
+icp_app_test(icp_app_640x480 0 "frames=60/60 before_camera_info=0 640x480 .*${_pass}"
   --count 60 --path-frames 150 --period-ms 2 --display false
 )
 icp_app_test(icp_app_point_to_point 0 "frames=150/150 .*${_pass}"
@@ -31,9 +31,17 @@ icp_app_test(icp_app_noiseless_full_resolution 0 "frames=40/40 .*${_pass}"
   --width 160 --height 120 --count 40 --path-frames 150 --period-ms 2 --display false
   --noise false --voxel-size 0 --normal-radius 0.15
 )
-# The display's graph, without a display server: compiled, not run.
+# The graphs, compiled, not run: both on one worker, as a lossless chain must be; the
+# display's without a display server.
+icp_app_test(icp_app_plan 0 "^icp_odometry: plan=OK workers=1\n*$"
+  --display false --compile-only true
+)
+set(_plans icp_app_plan)
 if(ICP_ODOMETRY_ENABLE_VISUALIZATION)
-  icp_app_test(icp_app_display_plan 0 "plan=OK" --display true --compile-only true)
+  icp_app_test(icp_app_display_plan 0 "^icp_odometry: plan=OK workers=1\n*$"
+    --display true --compile-only true
+  )
+  list(APPEND _plans icp_app_display_plan)
 endif()
 
 # Limits it cannot meet fail the run.
@@ -54,5 +62,16 @@ icp_app_test(icp_app_rejects_distances 2 "^error: min_correspondence_distance"
   --max-distance 0.05 --min-distance 0.1
 )
 
+set(
+  _rejections
+  icp_app_rejects_unknown_option
+  icp_app_rejects_zero_count
+  icp_app_rejects_small_image
+  icp_app_rejects_method
+  icp_app_rejects_distances
+)
+
 get_property(_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_tests} PROPERTIES LABELS "icp_odometry;gpu" TIMEOUT 300)
+# These start no GPU work.
+set_tests_properties(${_plans} ${_rejections} PROPERTIES LABELS "icp_odometry")

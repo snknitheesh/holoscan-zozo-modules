@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <holoscan/icp/icp_op.hpp>
+#include <holoscan/icp/synthetic_scene.hpp>
 
 namespace icp_odometry_app {
 namespace {
@@ -44,8 +45,7 @@ holoscan::expected<std::vector<double>, holoscan::Error> values_of(const holosca
 }  // namespace
 
 double OdometryReport::ate_rmse_m() const {
-  const std::uint32_t n = frames.load();
-  return n == 0U ? 0.0 : std::sqrt(sum_squared_error_m2 / n);
+  return frames == 0U ? 0.0 : std::sqrt(sum_squared_error_m2 / frames);
 }
 
 double OdometryReport::drift_percent() const {
@@ -53,8 +53,10 @@ double OdometryReport::drift_percent() const {
 }
 
 bool passed(const OdometryReport& report, std::uint32_t frames, const OdometryLimits& limits) {
-  return report.frames.load() == frames && report.frame_gaps == 0U &&
-         report.unconverged <= limits.max_unconverged &&
+  const bool complete = (report.first_frame_id == 1U || report.first_frame_id == 2U) &&
+                        report.last_frame_id == frames &&
+                        report.frames == frames + 1U - report.first_frame_id;
+  return complete && report.frame_gaps == 0U && report.unconverged <= limits.max_unconverged &&
          report.drift_percent() <= limits.max_drift_percent &&
          report.final_rotation_error_rad * 180.0 / 3.14159265358979323846 <=
              limits.max_rotation_error_deg;
@@ -68,17 +70,14 @@ OdometryReportOp::OdometryReportOp(OdometryReportConfig config) : config_(std::m
 
 void OdometryReportOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(pose, "pose").queue_depth(2U);
-  spec.input(true_pose, "true_pose").queue_depth(2U);
   spec.input(stats, "stats").queue_depth(2U);
 }
 
 holoscan::Contract OdometryReportOp::contract() const {
   holoscan::Contract result;
-  // The three belong to one frame when their capture times are equal.
-  result.trigger(
-      holoscan::OnAligned{.ports = holoscan::ports(pose, true_pose, stats), .window = 0ns});
+  // The two belong to one frame when their capture times are equal.
+  result.trigger(holoscan::OnAligned{.ports = holoscan::ports(pose, stats), .window = 0ns});
   result.input(pose, holoscan::Exact{});
-  result.input(true_pose, holoscan::Exact{});
   result.input(stats, holoscan::Exact{});
   return result;
 }
@@ -89,25 +88,17 @@ holoscan::expected<void, holoscan::Error> OdometryReportOp::compute(
   if (!pose_sample) {
     return holoscan::make_unexpected(std::move(pose_sample).error());
   }
-  auto truth_sample = true_pose.receive();
-  if (!truth_sample) {
-    return holoscan::make_unexpected(std::move(truth_sample).error());
-  }
   auto stats_sample = stats.receive();
   if (!stats_sample) {
     return holoscan::make_unexpected(std::move(stats_sample).error());
   }
   auto estimate = values_of(pose_sample->data, 16U, "pose");
   if (!estimate) return holoscan::make_unexpected(std::move(estimate).error());
-  auto truth = values_of(truth_sample->data, 16U, "true_pose");
-  if (!truth) return holoscan::make_unexpected(std::move(truth).error());
   auto values = values_of(stats_sample->data, icp::kStatsSize, "stats");
   if (!values) return holoscan::make_unexpected(std::move(values).error());
 
   icp::Matrix4 estimated{};
-  icp::Matrix4 world_from_camera{};
   std::copy(estimate->begin(), estimate->end(), estimated.begin());
-  std::copy(truth->begin(), truth->end(), world_from_camera.begin());
   icp::IcpResult result;
   try {
     result = icp::result_from(*values, estimated);
@@ -117,13 +108,18 @@ holoscan::expected<void, holoscan::Error> OdometryReportOp::compute(
 
   OdometryReport& report = *config_.report;
   const std::uint64_t frame_id = pose_sample->metadata.frame_id;
-  const std::uint32_t index = report.frames.load(std::memory_order_relaxed);
-  if (index > 0U && frame_id != last_frame_id_ + 1U) {
+  if (frame_id == 0U) {
+    return holoscan::make_unexpected(invalid("a pose without a frame id"));
+  }
+  // The camera's true pose at this frame: frame i of the path has id i + 1.
+  const icp::Matrix4 world_from_camera =
+      icp::synthetic_trajectory(static_cast<std::uint32_t>(frame_id - 1U), config_.path_frames);
+  if (report.frames > 0U && frame_id != report.last_frame_id + 1U) {
     ++report.frame_gaps;
   }
-  last_frame_id_ = frame_id;
-  if (index == 0U) {
-    // Odometry starts at the first frame: the truth is taken relative to it.
+  if (report.frames == 0U) {
+    // Odometry starts at its first frame: the truth is taken relative to it.
+    report.first_frame_id = frame_id;
     first_truth_ = world_from_camera;
   } else {
     report.path_m +=
@@ -134,16 +130,16 @@ holoscan::expected<void, holoscan::Error> OdometryReportOp::compute(
     report.iterations += static_cast<std::uint64_t>(result.iterations);
   }
   last_truth_ = world_from_camera;
+  report.last_frame_id = frame_id;
   const icp::TransformError error = icp::transform_error(
       estimated, icp::compose(icp::rigid_inverse(first_truth_), world_from_camera));
   report.sum_squared_error_m2 += error.translation * error.translation;
   report.max_error_m = std::max(report.max_error_m, error.translation);
   report.final_error_m = error.translation;
   report.final_rotation_error_rad = error.rotation_rad;
-  // Published last: the camera sends the next frame once it sees this.
-  report.frames.store(index + 1U, std::memory_order_release);
+  ++report.frames;
 
-  if (!finished_ && config_.expected_frames != 0U && index + 1U >= config_.expected_frames) {
+  if (!finished_ && config_.expected_frames != 0U && frame_id >= config_.expected_frames) {
     finished_ = true;
     context.request_completion();
   }
