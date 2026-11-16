@@ -7,8 +7,6 @@
 // recovered from R and P against known values; and the refusals, each
 // naming what is wrong.
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -141,6 +139,12 @@ g:
   // A list at its key's own indentation, as some writers put it.
   const YamlNode same_indent = parse_yaml("data:\n- 1\n- 2\nnext: 3\n");
   VERIFY(same_indent.find("data")->items.size() == 2 && same_indent.find("next")->scalar == "3");
+  // A UTF-8 byte order mark before the first key, as some editors write.
+  const YamlNode marked = parse_yaml(
+      "\xEF\xBB\xBF"
+      "a: 1\nb: 2\n");
+  VERIFY(marked.kind == YamlNode::Kind::kMapping && marked.find("a") != nullptr &&
+         marked.find("a")->scalar == "1");
 }
 
 void test_yaml_refusals() {
@@ -208,6 +212,19 @@ void test_mono_round_trips() {
                                    (rectification ? " with" : " without") + " rectification");
     }
   }
+  // The format has no region of interest or binning: such a camera is
+  // refused rather than written as the whole sensor.
+  CameraInfo cropped = synthetic_stereo_camera_info(DistortionModel::kPlumbBob).left;
+  cropped.roi = RegionOfInterest{16, 8, 640, 480};
+  VERIFY(test::refuses([&] { (void)format_camera_info_yaml(cropped); },
+                       "camera_info: a camera_info file has no region of interest or binning"));
+  CameraInfo binned = synthetic_stereo_camera_info(DistortionModel::kPlumbBob).left;
+  binned.binning_y = 2;
+  VERIFY(test::refuses([&] { (void)format_camera_info_yaml(binned); }, "or binning"));
+  StereoCameraInfo binned_pair = synthetic_stereo_camera_info(DistortionModel::kPlumbBob);
+  binned_pair.right.binning_x = 2;
+  VERIFY(test::refuses([&] { (void)format_stereo_camera_info_yaml(binned_pair); },
+                       "stereo_camera_info.right: a camera_info file has no region of interest"));
   // A camera whose frame id needs quotes keeps it.
   CameraInfo quoted = synthetic_stereo_camera_info(DistortionModel::kPlumbBob).left;
   quoted.header.frame_id = "cam #1: \"left\"\\";
@@ -231,6 +248,41 @@ void test_read_ros_stereo() {
                what + ": translation");
     VERIFY_MSG(read.baseline == 0.0 && read.doffs == 0.0, what + ": not rectified");
   }
+}
+
+void test_read_ros_calibrator_precision() {
+  // As the calibrator writes them: K and P with 5 decimals, D with 6, R with
+  // 8, whose rounding leaves R up to ~1e-8 from a rotation. Each R reads back
+  // as the rotation nearest to it, and the extrinsics to that rounding.
+  for (const DistortionModel model : all_models()) {
+    const StereoCameraInfo truth = synthetic_stereo_camera_info(model);
+    const auto [left_text, right_text] =
+        test::ros_stereo_camera_info(truth, 900.0, 640.5, 359.5, test::RosPrecision::kCalibrator);
+    const std::string what(distortion_model_name(model));
+    StereoCameraInfo read;
+    try {
+      read = parse_stereo_camera_info_yaml(left_text, right_text);
+    } catch (const std::invalid_argument& error) {
+      VERIFY_MSG(false, what + ": refused: " + error.what());
+      continue;
+    }
+    for (const auto& [got, want] :
+         {std::pair{&read.left, &truth.left}, std::pair{&read.right, &truth.right}}) {
+      CameraInfo expected = test::ros_calibrator_rounded(*want);
+      expected.rectification = got->rectification;
+      VERIFY_MSG(*got == expected, what + ": K and D as written");
+      VERIFY_MSG(got->rectification && close(*got->rectification, *want->rectification, 1e-7),
+                 what + ": R to its 8 decimals");
+    }
+    VERIFY_MSG(close(read.right_from_left.rotation, truth.right_from_left.rotation, 1e-7),
+               what + ": rotation");
+    VERIFY_MSG(close(read.right_from_left.translation, truth.right_from_left.translation, 1e-7),
+               what + ": translation");
+  }
+  // A matrix further from a rotation than that rounding is still refused.
+  VERIFY(mono_refused("data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]",
+                      "data: [ 1., 0.00001, 0., 0., 1., 0., 0., 0., 1. ]",
+                      "camera_info.rectification is not a rotation"));
 }
 
 void test_stereo_round_trips() {
@@ -290,6 +342,8 @@ void test_refusals() {
   VERIFY(mono_refused("412.34,", "abc,",
                       "camera_matrix.data[0] (line 7) holds 'abc', not a finite number"));
   VERIFY(mono_refused("412.34,", ".nan,", "not a finite number"));
+  VERIFY(mono_refused("[ -0.31,", "[ +-0.31,", "holds '+-0.31', not a finite number"));
+  VERIFY(mono_refused("[ -0.31,", "[ ++0.31,", "holds '++0.31', not a finite number"));
   VERIFY(mono_refused("  rows: 3\n  cols: 3\n  data: [ 412.34",
                       "  rows: 3\n  cols: 3\n  depth: 2\n  data: [ 412.34",
                       "camera_matrix.depth (line 7) is not a matrix key"));
@@ -328,9 +382,8 @@ void test_refusals() {
 }
 
 void test_files() {
-  const fs::path dir =
-      fs::temp_directory_path() / ("messages_yaml_test_" + std::to_string(::getpid()));
-  fs::create_directories(dir);
+  const test::TemporaryFolder folder("messages_yaml_test");
+  const fs::path& dir = folder.path();
   const StereoCameraInfo pair = synthetic_stereo_camera_info(DistortionModel::kRationalPolynomial);
   write_camera_info_yaml(pair.left, dir / "mono.yaml");
   VERIFY(read_camera_info_yaml(dir / "mono.yaml") == pair.left);
@@ -361,7 +414,6 @@ void test_files() {
   invalid.fx = 0;
   VERIFY(test::refuses([&] { write_camera_info_yaml(invalid, dir / "invalid.yaml"); },
                        "camera_info.fx"));
-  fs::remove_all(dir);
 }
 
 }  // namespace
@@ -375,6 +427,8 @@ int main() {
       {"read a ROS mono calibration", m::test_read_ros_mono},
       {"mono round trips, every model", m::test_mono_round_trips},
       {"read ROS stereo calibrations: extrinsics recovered", m::test_read_ros_stereo},
+      {"read ROS stereo calibrations at the calibrator's precision",
+       m::test_read_ros_calibrator_precision},
       {"stereo round trips, every model and rectified", m::test_stereo_round_trips},
       {"refusals name what is wrong", m::test_refusals},
       {"files", m::test_files},

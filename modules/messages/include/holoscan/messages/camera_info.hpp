@@ -72,10 +72,13 @@ struct RegionOfInterest {
   friend bool operator==(const RegionOfInterest&, const RegionOfInterest&) = default;
 };
 
-// One camera's calibration for the images it goes with.
+// One camera's calibration for the images it goes with. Every field but roi
+// and binning describes those images as they are: their size, and the
+// intrinsics in their pixels, whatever cropping or binning made them. roi and
+// binning record how they were read from the sensor.
 struct CameraInfo {
   Header header;
-  // Pixels, both > 0.
+  // The images' size in pixels, both > 0.
   std::uint32_t width{};
   std::uint32_t height{};
   CameraState state{CameraState::kRaw};
@@ -92,7 +95,9 @@ struct CameraInfo {
   // Rotation from this camera's frame to its stereo pair's rectified frame;
   // empty when there is none to apply (always for kRectified).
   std::optional<Matrix3> rectification;
-  // Empty: the images hold the whole sensor.
+  // The part of the sensor the images were read from, in full-resolution
+  // sensor pixels; empty: the whole sensor (or not known). Not tied to width
+  // and height, which may also have been scaled since.
   std::optional<RegionOfInterest> roi;
   // Sensor pixels per image pixel, at least 1.
   std::uint32_t binning_x{1};
@@ -141,8 +146,8 @@ struct StereoCameraInfo {
 // finite; the coefficients match the model's count and are finite; kRaw has a
 // coefficient that is not zero and the other states have none; a
 // rectification is a rotation (orthonormal, determinant +1) and kRectified
-// has none; the ROI lies in the sensor and is not empty; binning is >= 1; and
-// the frame id has at most kMaxFrameIdBytes bytes.
+// has none; the ROI is not empty and its pixels have 32-bit coordinates;
+// binning is >= 1; and the frame id has at most kMaxFrameIdBytes bytes.
 void validate(const CameraInfo& info, std::string_view name = "camera_info");
 
 // Checks both cameras and the pair, as above. Further, the rotation is a
@@ -151,7 +156,8 @@ void validate(const CameraInfo& info, std::string_view name = "camera_info");
 // rotation the identity, the translation (-baseline, 0, 0) with baseline > 0
 // and doffs = cx_right - cx_left; any other pair has baseline = doffs = 0;
 // and when a camera has a rectification (an absent one is the identity),
-// they rotate the pair into one frame with the right camera on its -x axis.
+// they rotate the pair into one frame in which the right camera lies along +x
+// of the left one (right_from_left's translation, rotated, along -x).
 void validate(const StereoCameraInfo& info, std::string_view name = "stereo_camera_info");
 
 // fx * baseline, in pixel metres: depth = fx_baseline / (disparity + doffs).

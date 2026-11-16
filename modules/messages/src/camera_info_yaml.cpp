@@ -62,7 +62,10 @@ double to_double(const YamlNode& node, const std::string& what) {
     fail(what + " (line " + std::to_string(node.line) + ") must be a number");
   }
   std::string_view text = node.scalar;
-  if (text.starts_with('+')) text.remove_prefix(1);
+  // from_chars takes no '+'; a sign after it ("+-1") is no number.
+  if (text.starts_with('+') && !text.starts_with("+-") && !text.starts_with("++")) {
+    text.remove_prefix(1);
+  }
   double value = 0.0;
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
   if (error != std::errc() || end != text.data() + text.size() || !std::isfinite(value)) {
@@ -209,6 +212,12 @@ ParsedCamera parse_camera(std::string_view text) {
     Matrix3 rotation{};
     const std::vector<double> values = matrix(*r, "rectification_matrix", 3, 3);
     std::copy(values.begin(), values.end(), rotation.begin());
+    // ROS's stereo calibration writes R with 8 decimals: a rotation to that
+    // rounding is the rotation it was written from.
+    if (!detail::is_rotation(rotation) &&
+        detail::is_rotation(rotation, detail::kRotationFileTolerance)) {
+      rotation = detail::nearest_rotation(rotation);
+    }
     if (detail::max_abs_difference(rotation, kIdentity3) > detail::kRotationTolerance) {
       info.rectification = rotation;
     }
@@ -341,7 +350,13 @@ void write_matrix(std::ostringstream& out, std::string_view key, std::size_t row
 }
 
 std::string format_camera(const CameraInfo& info, const Matrix3& rectification,
-                          const Projection& projection) {
+                          const Projection& projection, std::string_view name) {
+  // The format has no keys for them: a file would describe the whole sensor.
+  if (info.roi || info.binning_x != 1 || info.binning_y != 1) {
+    fail(std::string(name) +
+         ": a camera_info file has no region of interest or binning; write a camera without "
+         "them (roi empty, binning 1)");
+  }
   std::ostringstream out;
   out << "image_width: " << info.width << "\nimage_height: " << info.height
       << "\ncamera_name: " << format_name(info.header.frame_id) << '\n';
@@ -399,7 +414,8 @@ StereoCameraInfo read_stereo_camera_info_yaml(const std::filesystem::path& left_
 std::string format_camera_info_yaml(const CameraInfo& info) {
   validate(info);
   return format_camera(info, info.rectification.value_or(kIdentity3),
-                       projection_of(info.fx, info.fy, info.cx, info.cy, info.skew, 0.0));
+                       projection_of(info.fx, info.fy, info.cx, info.cy, info.skew, 0.0),
+                       "camera_info");
 }
 
 void write_camera_info_yaml(const CameraInfo& info, const std::filesystem::path& path) {
@@ -411,9 +427,11 @@ std::pair<std::string, std::string> format_stereo_camera_info_yaml(const StereoC
   const CameraInfo& l = info.left;
   const CameraInfo& r = info.right;
   if (l.state == CameraState::kRectified) {
-    return {format_camera(l, kIdentity3, projection_of(l.fx, l.fy, l.cx, l.cy, 0.0, 0.0)),
+    return {format_camera(l, kIdentity3, projection_of(l.fx, l.fy, l.cx, l.cy, 0.0, 0.0),
+                          "stereo_camera_info.left"),
             format_camera(r, kIdentity3,
-                          projection_of(r.fx, r.fy, r.cx, r.cy, 0.0, -r.fx * info.baseline))};
+                          projection_of(r.fx, r.fy, r.cx, r.cy, 0.0, -r.fx * info.baseline),
+                          "stereo_camera_info.right")};
   }
   // P holds the right camera's offset in the frame the rectifications rotate
   // both into. validate() checks that they agree with right_from_left only
@@ -422,15 +440,18 @@ std::pair<std::string, std::string> format_stereo_camera_info_yaml(const StereoC
     fail(
         "stereo_camera_info: a camera_info file holds the extrinsics only as the rectifying "
         "rotations R and the right camera's projection P; give both cameras the rectifications "
-        "that turn the pair into one frame with the right camera on its -x axis");
+        "that turn the pair into one frame in which the right camera lies along +x of the left "
+        "one");
   }
   const Matrix3 rect_left = l.rectification.value_or(kIdentity3);
   const Matrix3 rect_right = r.rectification.value_or(kIdentity3);
   const double baseline =
       detail::norm(detail::rotate(rect_right, info.right_from_left.translation));
   const double f = l.fy;
-  return {format_camera(l, rect_left, projection_of(f, f, l.cx, l.cy, 0.0, 0.0)),
-          format_camera(r, rect_right, projection_of(f, f, l.cx, l.cy, 0.0, -f * baseline))};
+  return {format_camera(l, rect_left, projection_of(f, f, l.cx, l.cy, 0.0, 0.0),
+                        "stereo_camera_info.left"),
+          format_camera(r, rect_right, projection_of(f, f, l.cx, l.cy, 0.0, -f * baseline),
+                        "stereo_camera_info.right")};
 }
 
 void write_stereo_camera_info_yaml(const StereoCameraInfo& info,

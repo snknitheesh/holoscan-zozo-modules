@@ -5,18 +5,22 @@
 // point_cloud_layout.hpp for its tensors).
 //
 // A producer declares its output, then per cloud allocates every tensor,
-// fills the ones it carries and sends the cloud:
+// fills the ones it carries and sends the cloud (namespace hm =
+// holoscan::messages):
 //
 //   void setup(holoscan::OperatorSpec& spec) override {
-//     holoscan::messages::declare_point_cloud_output(
-//         spec, cloud, "cloud", {.max_points = 640 * 480, .colors = true});
+//     hm::declare_point_cloud_output(spec, cloud, "cloud",
+//                                    {.max_points = 640 * 480, .colors = true});
 //   }
 //   compute():
-//     auto loan = holoscan::messages::allocate_point_cloud(
-//         cloud, holoscan::messages::organized_cloud(480, 640), {.colors = true}, stream);
-//     loan->write_and_commit(holoscan::messages::PointCloudFields::points, stream, fill_points);
-//     loan->write_and_commit(holoscan::messages::PointCloudFields::colors, stream, fill_colors);
-//     holoscan::messages::emit_point_cloud(cloud, std::move(*loan), header, shape, -1, options);
+//     const auto shape = hm::organized_cloud(480, 640);
+//     auto loan = hm::allocate_point_cloud(cloud, shape, {.colors = true}, stream);
+//     if (!loan) return holoscan::make_unexpected(std::move(loan).error());
+//     if (auto r = loan->write_and_commit(hm::PointCloudFields::points, stream, fill_points);
+//         !r) return r;
+//     if (auto r = loan->write_and_commit(hm::PointCloudFields::colors, stream, fill_colors);
+//         !r) return r;
+//     return hm::emit_point_cloud(cloud, std::move(*loan), header, shape, -1, options);
 //
 // A consumer declares a plain input (spec.input(cloud, "cloud")), and checks
 // what it receives with check_point_cloud().
@@ -54,13 +58,14 @@ struct PointCloudOutputSpec {
   bool colors{};
   bool normals{};
   bool intensity{};
+  // kCudaDevice, kHost or kPinnedHost.
   holoscan::MemoryKind memory_kind{holoscan::MemoryKind::kCudaDevice};
 };
 
 // Declares `port` as `name` with a runtime pool for each tensor, sized for
 // `output` (a field it does not carry gets room for [0] only).
-// @throws std::invalid_argument for max_points 0 or a memory kind other than
-// host or CUDA device memory.
+// @throws std::invalid_argument for max_points 0 or too large to size the
+// pools, or a memory kind other than host, pinned host or CUDA device memory.
 void declare_point_cloud_output(holoscan::OperatorSpec& spec,
                                 holoscan::Output<schema::PointCloudT>& port, std::string_view name,
                                 const PointCloudOutputSpec& output);
@@ -92,7 +97,7 @@ struct PointCloudContents {
 // `contents` names at `shape`, the others as [0], already committed (there is
 // nothing to write in them). Fill the others with the loan's
 // write_and_commit() (device memory, on `stream`) or write_host_and_commit()
-// (host memory), then send the loan with emit_point_cloud().
+// (host and pinned host memory), then send the loan with emit_point_cloud().
 [[nodiscard]] holoscan::expected<PointCloudLoan, holoscan::Error> allocate_point_cloud(
     holoscan::Output<schema::PointCloudT>& port, const PointCloudShape& shape,
     const PointCloudContents& contents, ::cuda::stream_ref stream);
@@ -100,16 +105,20 @@ struct PointCloudContents {
 // Sends a cloud allocated by allocate_point_cloud(), with `header`, the
 // organization of `shape` and `valid_count` (-1: not counted).
 // @return The send's result, or kInvalidArgument for a frame id longer than
-// kMaxFrameIdBytes.
+// kMaxFrameIdBytes, a `shape` other than the one the points were allocated
+// with, or a valid_count other than -1 or 0 .. the number of points.
 [[nodiscard]] holoscan::expected<void, holoscan::Error> emit_point_cloud(
     holoscan::Output<schema::PointCloudT>& port, PointCloudLoan loan, const Header& header,
     const PointCloudShape& shape, std::int64_t valid_count, holoscan::EmitOptions options = {});
 
-// The shapes and element types of a received cloud's tensors.
+// The shapes and element types of a received cloud's tensors; a missing
+// tensor reads as [0], an absent field.
 [[nodiscard]] PointCloudLayout layout_of(const schema::PointCloudT& cloud);
 
 // Checks a received cloud: all four tensors there, their layout (see
-// point_cloud_layout.hpp) and the frame id's length.
+// point_cloud_layout.hpp), each packed (row-major, without gaps), the fields
+// it carries in the same memory as the points (host, pinned host or the same
+// GPU's), and the frame id's length.
 // @return kInvalidArgument naming the first problem.
 [[nodiscard]] holoscan::expected<void, holoscan::Error> check_point_cloud(
     const schema::PointCloudT& cloud);
