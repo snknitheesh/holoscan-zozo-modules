@@ -18,7 +18,10 @@ target_link_libraries(clustering_consumer PRIVATE holoscan::clustering)
 set_target_properties(clustering_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
 add_test(NAME clustering_installed_consumer COMMAND clustering_consumer)
+# PASS includes the plan's one worker, which the consumer also checks itself.
 set_tests_properties(
   clustering_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "clustering_consumer: PASS" TIMEOUT 300
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION "clustering_consumer: workers=1\n.*clustering_consumer: PASS"
+    TIMEOUT 300
 )

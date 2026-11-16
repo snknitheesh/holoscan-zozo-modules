@@ -45,6 +45,11 @@ if(HOLOSCAN_CLUSTERING_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The point cloud message: in this build when the repository root added holoscan-messages
+# before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::clustering: EuclideanClusterOp, the clusterer it runs, drawing clusters for display,
 # and the synthetic scene.
@@ -81,7 +86,10 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_clustering PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_clustering
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
 set_target_properties(
   holoscan_clustering
   PROPERTIES

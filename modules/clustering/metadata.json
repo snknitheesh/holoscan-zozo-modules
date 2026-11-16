@@ -4,7 +4,7 @@
     "name": "holoscan-clustering",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Euclidean clustering of point clouds into objects on the GPU, for organized or unorganized XYZ clouds in holoscan-point-cloud's layout: connected components of points within a tolerance, found with a uniform grid and union-find on the GPU (or the faster image neighborhood of an organized cloud), filtered by size and sorted by it, deterministic. Emits a cluster label per point and a summary per cluster with its point count, centroid, axis-aligned box and optional PCA oriented box, and optionally the clustered points and colors, organized or packed by cluster.",
+    "description": "Euclidean clustering of point clouds into objects on the GPU, for organized or unorganized PointCloud messages of holoscan-messages: connected components of points within a tolerance, found with a uniform grid and union-find on the GPU (or the faster image neighborhood of an organized cloud), filtered by size and sorted by it, deterministic. Emits a cluster label per point and a summary per cluster with its point count, centroid, axis-aligned box and optional PCA oriented box, and optionally the clustered points as a PointCloud with their colors, normals and intensities, organized or packed by cluster.",
     "authors": [
       {
         "name": "zozo",
@@ -49,11 +49,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-clustering",
       "install_commands": [
-        "sudo apt install ./holoscan-clustering_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-clustering_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Device scratch for the clusterer and the operator: a buffer that grows, and is freed only after
-// the stream is done with it.
+// Device scratch for the clusterer and the operator: a buffer that grows in
+// stream order, without waiting for the host.
 
 #pragma once
 
@@ -17,6 +17,7 @@ class DeviceBuffer {
  public:
   DeviceBuffer() = default;
   ~DeviceBuffer() {
+    // cudaFree waits for the device to be done with stream-ordered memory.
     if (data_ != nullptr) {
       cudaFree(data_);
     }
@@ -24,23 +25,25 @@ class DeviceBuffer {
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
-  // Makes the buffer at least `bytes` long. Grows by at least half, so that a
-  // slowly growing cloud does not reallocate every frame; the old buffer is
-  // freed after `stream` is done with it.
+  // Makes the buffer at least `bytes` long, on the device of `stream` (from
+  // its device's memory pool). Grows by at least half, so that a slowly
+  // growing cloud does not reallocate every frame. The old buffer is freed in
+  // `stream`'s order, after the work queued on it so far, and the new one is
+  // usable by what is queued next: neither waits for the host. The contents
+  // are not kept.
   cudaError_t reserve(std::size_t bytes, cudaStream_t stream) {
     if (bytes <= bytes_) {
       return cudaSuccess;
     }
-    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-      return status;
-    }
+    const std::size_t grown = std::max(bytes, bytes_ + bytes_ / 2U);
     if (data_ != nullptr) {
-      cudaFree(data_);
+      if (const cudaError_t status = cudaFreeAsync(data_, stream); status != cudaSuccess) {
+        return status;
+      }
       data_ = nullptr;
       bytes_ = 0;
     }
-    const std::size_t grown = std::max(bytes, bytes_ + bytes_ / 2U);
-    if (const cudaError_t status = cudaMalloc(&data_, grown); status != cudaSuccess) {
+    if (const cudaError_t status = cudaMallocAsync(&data_, grown, stream); status != cudaSuccess) {
       data_ = nullptr;
       return status;
     }

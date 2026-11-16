@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <cuda/atomic>  // NOLINT(build/include_order): libcu++
@@ -57,6 +58,8 @@ constexpr std::uint64_t kNoCell = ~std::uint64_t{0};
 // The cells at most two apart on each axis that follow a cell in key order:
 // half of the 5 x 5 x 5 block around it, without itself.
 constexpr int kNeighborOffsets = 62;
+// Blocks per multiprocessor of the cell-pair search's grid-stride launch.
+constexpr std::uint64_t kPairBlocksPerSm = 32;
 // Points per block of the summary sums.
 constexpr std::uint32_t kChunk = 2048;
 // Shrinks the cell below tolerance / sqrt(3) by far more than rounding can
@@ -64,6 +67,14 @@ constexpr std::uint32_t kChunk = 2048;
 constexpr double kCellMargin = 1.0 - 1.0e-5;
 
 __device__ inline float nan_value() { return __int_as_float(0x7FC00000); }
+
+// The number of graph nodes: `*actual` when the GPU counted them (kEuclidean's
+// cells, which the host does not wait for), else `bound`. Kernels over nodes
+// are launched for `bound`, an upper limit, and skip the nodes beyond.
+__device__ inline std::uint32_t node_count(std::uint32_t bound,
+                                           const std::uint32_t* __restrict__ actual) {
+  return actual != nullptr ? *actual : bound;
+}
 
 // ---- Union-find ---------------------------------------------------------------------------------
 
@@ -114,10 +125,10 @@ __device__ inline void unite(int* parent, int a, int b) {
   }
 }
 
-__global__ void roots_kernel(const int* __restrict__ parent, std::uint32_t nodes,
-                             int* __restrict__ root) {
+__global__ void roots_kernel(const int* __restrict__ parent, std::uint32_t bound,
+                             const std::uint32_t* __restrict__ actual, int* __restrict__ root) {
   const std::uint32_t n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < nodes) {
+  if (n < node_count(bound, actual)) {
     int x = static_cast<int>(n);
     int p = 0;
     while ((p = parent[x]) != x) {
@@ -230,12 +241,14 @@ __global__ void gather_kernel(const float* __restrict__ xyz, std::uint32_t count
   }
 }
 
-// Each cell's bounding box, and its own parent.
+// Each cell's bounding box, and its own parent; launched for `bound` cells,
+// the number of points.
 __global__ void cell_bounds_kernel(const float* __restrict__ sorted_xyz,
-                                   const std::uint32_t* __restrict__ starts, std::uint32_t cells,
+                                   const std::uint32_t* __restrict__ starts, std::uint32_t bound,
+                                   const std::uint32_t* __restrict__ cells,
                                    float* __restrict__ bounds, int* __restrict__ parent) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= cells) {
+  if (c >= node_count(bound, cells)) {
     return;
   }
   float lo[3] = {INFINITY, INFINITY, INFINITY};
@@ -279,20 +292,16 @@ __device__ inline float squared_gap(const float* p, const float* lo, const float
   return gap[0] * gap[0] + gap[1] * gap[1] + gap[2] * gap[2];
 }
 
-// Thread (cell a, offset o) tests whether cell a and the cell at offset o hold
-// a pair of points within the tolerance, and joins them if so.
-__global__ void cell_pairs_kernel(const float* __restrict__ sorted_xyz,
-                                  const std::uint64_t* __restrict__ cell_keys,
-                                  const std::uint32_t* __restrict__ starts,
-                                  const float* __restrict__ bounds, std::uint32_t cells, float tol2,
-                                  int* __restrict__ parent) {
-  const std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (tid >= static_cast<std::uint64_t>(cells) * kNeighborOffsets) {
-    return;
-  }
-  const auto a = static_cast<std::uint32_t>(tid / kNeighborOffsets);
+// Whether cell a and the cell at offset `offset` (0..kNeighborOffsets - 1)
+// hold a pair of points within the tolerance; joins them if so.
+__device__ inline void test_cell_pair(const float* __restrict__ sorted_xyz,
+                                      const std::uint64_t* __restrict__ cell_keys,
+                                      const std::uint32_t* __restrict__ starts,
+                                      const float* __restrict__ bounds, std::uint32_t cells,
+                                      float tol2, int* __restrict__ parent, std::uint32_t a,
+                                      int offset) {
   // Offsets 63..124 of the 5 x 5 x 5 block in key order follow its center, 62.
-  const int index = 63 + static_cast<int>(tid % kNeighborOffsets);
+  const int index = 63 + offset;
   int ix = 0;
   int iy = 0;
   int iz = 0;
@@ -332,15 +341,35 @@ __global__ void cell_pairs_kernel(const float* __restrict__ sorted_xyz,
   }
 }
 
+// Every pair (cell a, offset o) of the `*cells` cells the GPU counted, in a
+// grid-stride loop: the host does not wait for the count to size the launch.
+__global__ void cell_pairs_kernel(const float* __restrict__ sorted_xyz,
+                                  const std::uint64_t* __restrict__ cell_keys,
+                                  const std::uint32_t* __restrict__ starts,
+                                  const float* __restrict__ bounds,
+                                  const std::uint32_t* __restrict__ cells, float tol2,
+                                  int* __restrict__ parent) {
+  const std::uint32_t count = *cells;
+  const std::uint64_t pairs = static_cast<std::uint64_t>(count) * kNeighborOffsets;
+  const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  for (std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       tid < pairs; tid += stride) {
+    test_cell_pair(sorted_xyz, cell_keys, starts, bounds, count, tol2, parent,
+                   static_cast<std::uint32_t>(tid / kNeighborOffsets),
+                   static_cast<int>(tid % kNeighborOffsets));
+  }
+}
+
 // A component's size and its lowest point index, from its cells. Within a
 // cell the stable sort keeps the points in input order.
 __global__ void cell_sizes_kernel(const std::uint32_t* __restrict__ starts,
                                   const std::uint32_t* __restrict__ sorted_indices,
-                                  const int* __restrict__ root, std::uint32_t cells,
+                                  const int* __restrict__ root, std::uint32_t bound,
+                                  const std::uint32_t* __restrict__ cells,
                                   std::uint32_t* __restrict__ size,
                                   std::uint32_t* __restrict__ min_index) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c < cells) {
+  if (c < node_count(bound, cells)) {
     const int r = root[c];
     atomicAdd(size + r, starts[c + 1U] - starts[c]);
     atomicMin(min_index + r, sorted_indices[starts[c]]);
@@ -401,36 +430,49 @@ __global__ void pixel_sizes_kernel(const int* __restrict__ node_of_point,
 
 // ---- Selecting, sorting and labeling the clusters -----------------------------------------------
 
+// A flag per node up to `bound`: 1 for the root of a component of a size
+// kept, 0 for any other node and beyond the nodes, so that the flags' scan
+// can run over `bound` without the host knowing the number of nodes.
 __global__ void flags_kernel(const int* __restrict__ root, const std::uint32_t* __restrict__ size,
-                             std::uint32_t nodes, std::uint32_t min_size, std::uint32_t max_size,
+                             std::uint32_t bound, const std::uint32_t* __restrict__ actual,
+                             std::uint32_t min_size, std::uint32_t max_size,
                              std::uint32_t* __restrict__ flags) {
   const std::uint32_t n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < nodes) {
-    const std::uint32_t s = size[n];
-    flags[n] = root[n] == static_cast<int>(n) && s >= min_size && s <= max_size ? 1U : 0U;
+  if (n >= bound) {
+    return;
   }
+  if (n >= node_count(bound, actual)) {
+    flags[n] = 0U;
+    return;
+  }
+  const std::uint32_t s = size[n];
+  flags[n] = root[n] == static_cast<int>(n) && s >= min_size && s <= max_size ? 1U : 0U;
 }
 
 // The kept components and their sort keys: larger first, then the lower
 // lowest point index. Without min_index, a node is its own lowest point.
+// totals[0] gets the number of components kept, and totals[1] (zeroed
+// before) the sum of their sizes: the clustered points when no more than
+// max_clusters are kept. Integer sums, so the same whatever the order.
 __global__ void candidates_kernel(const std::uint32_t* __restrict__ flags,
                                   const std::uint32_t* __restrict__ scan,
                                   const std::uint32_t* __restrict__ size,
-                                  const std::uint32_t* __restrict__ min_index, std::uint32_t nodes,
+                                  const std::uint32_t* __restrict__ min_index, std::uint32_t bound,
                                   std::uint32_t* __restrict__ candidates,
                                   std::uint64_t* __restrict__ keys,
-                                  std::uint32_t* __restrict__ total) {
+                                  std::uint32_t* __restrict__ totals) {
   const std::uint32_t n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n >= nodes) {
+  if (n >= bound) {
     return;
   }
   if (flags[n] != 0U) {
     const std::uint32_t lowest = min_index != nullptr ? min_index[n] : n;
     candidates[scan[n]] = n;
     keys[scan[n]] = (static_cast<std::uint64_t>(~size[n]) << 32U) | lowest;
+    atomicAdd(totals + 1, size[n]);
   }
-  if (n == nodes - 1U) {
-    *total = scan[n] + flags[n];
+  if (n == bound - 1U) {
+    totals[0] = scan[n] + flags[n];
   }
 }
 
@@ -505,6 +547,38 @@ __global__ void kept_kernel(const float* __restrict__ xyz, const std::uint8_t* _
     for (int channel = 0; channel < 3; ++channel) {
       out_rgb[3 * i + channel] = kept ? rgb[3 * i + channel] : std::uint8_t{0};
     }
+  }
+}
+
+// Per-point values (normals, intensities: `channels` float32 each) of the
+// clustered points, grouped as grouped_kernel groups the points.
+__global__ void grouped_values_kernel(const float* __restrict__ values, int channels,
+                                      const std::uint32_t* __restrict__ grouped,
+                                      const std::uint32_t* __restrict__ clustered,
+                                      std::uint32_t count, float* __restrict__ out) {
+  const std::uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= count || t >= *clustered) {
+    return;
+  }
+  const std::uint32_t i = grouped[t];
+  for (int c = 0; c < channels; ++c) {
+    out[static_cast<std::size_t>(channels) * t + c] =
+        values[static_cast<std::size_t>(channels) * i + c];
+  }
+}
+
+// The same values in input order, NaN where a point is not clustered.
+__global__ void kept_values_kernel(const float* __restrict__ values, int channels,
+                                   const std::int32_t* __restrict__ labels, std::uint32_t count,
+                                   float* __restrict__ out) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const bool kept = labels[i] >= 0;
+  for (int c = 0; c < channels; ++c) {
+    const std::size_t at = static_cast<std::size_t>(channels) * i + c;
+    out[at] = kept ? values[at] : nan_value();
   }
 }
 
@@ -912,13 +986,17 @@ struct EuclideanClusterer::Impl {
   detail::DeviceBuffer chunk_start;
   detail::DeviceBuffer partials;
   detail::DeviceBuffer extents;
-  detail::DeviceBuffer counters;  // cells, candidates
+  // [0] the cells, [1] the components kept, [2] their points.
+  detail::DeviceBuffer counters;
   detail::DeviceBuffer temp;
-  std::uint32_t* host_counters{};  // Pinned.
+  std::uint32_t* host_counters{};  // Pinned: counters[1] and [2].
 
   // What the last cluster() found.
   std::uint32_t count{};
   std::uint32_t clusters{};
+  // The clustered points, when cluster() knows them without another wait
+  // (no more components passed the size filter than max_clusters keeps).
+  std::optional<std::uint32_t> clustered;
 
   ~Impl() {
     if (host_counters != nullptr) {
@@ -926,7 +1004,9 @@ struct EuclideanClusterer::Impl {
     }
   }
 
-  cudaError_t read_counter(const std::uint32_t* device, std::uint32_t& value, cudaStream_t stream) {
+  // Copies `values` (1 or 2) counters from `device` to host_counters and
+  // waits for them: the host's one wait for the GPU in a frame.
+  cudaError_t read_counters(const std::uint32_t* device, std::size_t values, cudaStream_t stream) {
     if (host_counters == nullptr) {
       if (const cudaError_t status =
               cudaMallocHost(reinterpret_cast<void**>(&host_counters), 2 * sizeof(std::uint32_t));
@@ -935,16 +1015,12 @@ struct EuclideanClusterer::Impl {
         return status;
       }
     }
-    if (const cudaError_t status = cudaMemcpyAsync(host_counters, device, sizeof(std::uint32_t),
-                                                   cudaMemcpyDeviceToHost, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            host_counters, device, values * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream);
         status != cudaSuccess) {
       return status;
     }
-    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-      return status;
-    }
-    value = host_counters[0];
-    return cudaSuccess;
+    return cudaStreamSynchronize(stream);
   }
 
   cudaError_t reserve(std::initializer_list<std::pair<detail::DeviceBuffer*, std::size_t>> list,
@@ -958,16 +1034,16 @@ struct EuclideanClusterer::Impl {
     return cudaSuccess;
   }
 
-  // The grid's cells as nodes; returns their number.
-  cudaError_t euclidean_graph(const float* xyz, const ClusterParams& params, std::uint32_t& nodes,
-                              cudaStream_t stream);
+  // The grid's cells as nodes, at most one per point; the GPU writes their
+  // number to counters[0], and the host does not wait for it.
+  cudaError_t euclidean_graph(const float* xyz, const ClusterParams& params, cudaStream_t stream);
   // The pixels as nodes.
   cudaError_t image_graph(const float* xyz, std::uint32_t width, const ClusterParams& params,
                           cudaStream_t stream);
 };
 
 cudaError_t EuclideanClusterer::Impl::euclidean_graph(const float* xyz, const ClusterParams& params,
-                                                      std::uint32_t& nodes, cudaStream_t stream) {
+                                                      cudaStream_t stream) {
   const std::size_t n = count;
   if (const cudaError_t status = reserve({{&keys, n * 8U},
                                           {&sorted_keys, n * 8U},
@@ -978,7 +1054,8 @@ cudaError_t EuclideanClusterer::Impl::euclidean_graph(const float* xyz, const Cl
                                           {&cell_keys, n * 8U},
                                           {&starts, n * 4U + 4U},
                                           {&sorted_xyz, n * 12U},
-                                          {&bounds, n * 24U}},
+                                          {&bounds, n * 24U},
+                                          {&parent, n * 4U}},
                                          stream);
       status != cudaSuccess) {
     return status;
@@ -1002,6 +1079,7 @@ cudaError_t EuclideanClusterer::Impl::euclidean_graph(const float* xyz, const Cl
       status != cudaSuccess) {
     return status;
   }
+  const std::uint32_t* cells = counters.as<std::uint32_t>();
   cells_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
       sorted_keys.as<std::uint64_t>(), heads.as<std::uint32_t>(), offsets.as<std::uint32_t>(),
       count, cell_keys.as<std::uint64_t>(), starts.as<std::uint32_t>(),
@@ -1010,28 +1088,30 @@ cudaError_t EuclideanClusterer::Impl::euclidean_graph(const float* xyz, const Cl
       xyz, count, sorted_keys.as<std::uint64_t>(), sorted_indices.as<std::uint32_t>(),
       heads.as<std::uint32_t>(), offsets.as<std::uint32_t>(), sorted_xyz.as<float>(),
       node_of_point.as<int>());
+  cell_bounds_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+      sorted_xyz.as<float>(), starts.as<std::uint32_t>(), count, cells, bounds.as<float>(),
+      parent.as<int>());
   if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
     return status;
   }
-  // The number of cells sizes the pair search: wait for it.
-  if (const cudaError_t status = read_counter(counters.as<std::uint32_t>(), nodes, stream);
+  // The pairs of cells, as many as 62 per cell, in a grid-stride loop sized
+  // for the GPU rather than for the number of cells, which only the GPU knows.
+  int device = 0;
+  int processors = 0;
+  if (const cudaError_t status = cudaGetDevice(&device); status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status =
+          cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device);
       status != cudaSuccess) {
     return status;
   }
-  if (nodes == 0U) {
-    return cudaSuccess;
-  }
-  if (const cudaError_t status = reserve({{&parent, std::size_t{nodes} * 4U}}, stream);
-      status != cudaSuccess) {
-    return status;
-  }
-  cell_bounds_kernel<<<blocks_for(nodes), kBlock, 0, stream>>>(
-      sorted_xyz.as<float>(), starts.as<std::uint32_t>(), nodes, bounds.as<float>(),
-      parent.as<int>());
-  const std::uint64_t pairs = std::uint64_t{nodes} * kNeighborOffsets;
-  cell_pairs_kernel<<<blocks_for(pairs), kBlock, 0, stream>>>(
+  const std::uint64_t most = static_cast<std::uint64_t>(std::max(processors, 1)) * kPairBlocksPerSm;
+  const auto grid = static_cast<unsigned int>(
+      std::min<std::uint64_t>(blocks_for(std::uint64_t{count} * kNeighborOffsets), most));
+  cell_pairs_kernel<<<grid, kBlock, 0, stream>>>(
       sorted_xyz.as<float>(), cell_keys.as<std::uint64_t>(), starts.as<std::uint32_t>(),
-      bounds.as<float>(), nodes, params.tolerance * params.tolerance, parent.as<int>());
+      bounds.as<float>(), cells, params.tolerance * params.tolerance, parent.as<int>());
   return cudaGetLastError();
 }
 
@@ -1056,6 +1136,7 @@ cudaError_t EuclideanClusterer::cluster(const float* xyz, std::uint32_t count, s
   Impl& s = *impl_;
   s.count = 0;
   s.clusters = 0;
+  s.clustered = 0U;
   const bool image = params.connectivity == Connectivity::kImage;
   if (!valid_params(params) || count > kMaxPointsLimit || (width != 0U && count % width != 0U) ||
       (image && width == 0U)) {
@@ -1069,7 +1150,7 @@ cudaError_t EuclideanClusterer::cluster(const float* xyz, std::uint32_t count, s
                                             {&s.sorted_group_keys, n * 4U},
                                             {&s.group_indices, n * 4U},
                                             {&s.grouped, n * 4U},
-                                            {&s.counters, 2 * sizeof(std::uint32_t)},
+                                            {&s.counters, 3 * sizeof(std::uint32_t)},
                                             {&s.cluster_size, sizeof(std::uint32_t)},
                                             {&s.cluster_start, sizeof(std::uint32_t)}},
                                            stream);
@@ -1085,8 +1166,16 @@ cudaError_t EuclideanClusterer::cluster(const float* xyz, std::uint32_t count, s
   if (count == 0U) {
     return cudaSuccess;
   }
+  if (const cudaError_t status =
+          cudaMemsetAsync(s.counters.as<void>(), 0, 3 * sizeof(std::uint32_t), stream);
+      status != cudaSuccess) {
+    return status;
+  }
 
-  std::uint32_t nodes = count;
+  // The nodes: one per pixel with kImage; with kEuclidean one per cell, at
+  // most one per point, counted by the GPU in counters[0]. Every kernel over
+  // the nodes runs for `count` and skips those beyond.
+  const std::uint32_t* cells = image ? nullptr : s.counters.as<std::uint32_t>();
   if (image) {
     if (const cudaError_t status = s.reserve({{&s.parent, n * 4U}}, stream);
         status != cudaSuccess) {
@@ -1096,72 +1185,73 @@ cudaError_t EuclideanClusterer::cluster(const float* xyz, std::uint32_t count, s
         status != cudaSuccess) {
       return status;
     }
-  } else if (const cudaError_t status = s.euclidean_graph(xyz, params, nodes, stream);
+  } else if (const cudaError_t status = s.euclidean_graph(xyz, params, stream);
              status != cudaSuccess) {
     return status;
   }
 
-  std::uint32_t total = 0;
-  if (nodes != 0U) {
-    const std::size_t m = nodes;
-    if (const cudaError_t status = s.reserve({{&s.root, m * 4U},
-                                              {&s.size, m * 4U},
-                                              {&s.min_index, m * 4U},
-                                              {&s.flags, m * 4U},
-                                              {&s.scan, m * 4U},
-                                              {&s.candidates, m * 4U},
-                                              {&s.candidate_keys, m * 8U},
-                                              {&s.sorted_candidates, m * 4U},
-                                              {&s.sorted_candidate_keys, m * 8U},
-                                              {&s.rank_of, m * 4U}},
-                                             stream);
-        status != cudaSuccess) {
-      return status;
-    }
-    roots_kernel<<<blocks_for(nodes), kBlock, 0, stream>>>(s.parent.as<int>(), nodes,
-                                                           s.root.as<int>());
-    if (const cudaError_t status = cudaMemsetAsync(s.size.as<void>(), 0, m * 4U, stream);
-        status != cudaSuccess) {
-      return status;
-    }
-    if (image) {
-      pixel_sizes_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
-          s.node_of_point.as<int>(), s.root.as<int>(), count, s.size.as<std::uint32_t>());
-    } else {
-      if (const cudaError_t status = cudaMemsetAsync(s.min_index.as<void>(), 0xFF, m * 4U, stream);
-          status != cudaSuccess) {
-        return status;
-      }
-      cell_sizes_kernel<<<blocks_for(nodes), kBlock, 0, stream>>>(
-          s.starts.as<std::uint32_t>(), s.sorted_indices.as<std::uint32_t>(), s.root.as<int>(),
-          nodes, s.size.as<std::uint32_t>(), s.min_index.as<std::uint32_t>());
-    }
-    flags_kernel<<<blocks_for(nodes), kBlock, 0, stream>>>(
-        s.root.as<int>(), s.size.as<std::uint32_t>(), nodes, params.min_cluster_size,
-        params.max_cluster_size, s.flags.as<std::uint32_t>());
-    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
-      return status;
-    }
-    if (const cudaError_t status = detail::exclusive_sum(
-            s.flags.as<std::uint32_t>(), s.scan.as<std::uint32_t>(), nodes, s.temp, stream);
-        status != cudaSuccess) {
-      return status;
-    }
-    candidates_kernel<<<blocks_for(nodes), kBlock, 0, stream>>>(
-        s.flags.as<std::uint32_t>(), s.scan.as<std::uint32_t>(), s.size.as<std::uint32_t>(),
-        image ? nullptr : s.min_index.as<std::uint32_t>(), nodes, s.candidates.as<std::uint32_t>(),
-        s.candidate_keys.as<std::uint64_t>(), s.counters.as<std::uint32_t>() + 1);
-    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
-      return status;
-    }
-    // The number of components kept sizes their sort: wait for it.
-    if (const cudaError_t status =
-            s.read_counter(s.counters.as<std::uint32_t>() + 1, total, stream);
-        status != cudaSuccess) {
-      return status;
-    }
+  if (const cudaError_t status = s.reserve({{&s.root, n * 4U},
+                                            {&s.size, n * 4U},
+                                            {&s.min_index, n * 4U},
+                                            {&s.flags, n * 4U},
+                                            {&s.scan, n * 4U},
+                                            {&s.candidates, n * 4U},
+                                            {&s.candidate_keys, n * 8U},
+                                            {&s.sorted_candidates, n * 4U},
+                                            {&s.sorted_candidate_keys, n * 8U},
+                                            {&s.rank_of, n * 4U}},
+                                           stream);
+      status != cudaSuccess) {
+    return status;
   }
+  roots_kernel<<<blocks_for(count), kBlock, 0, stream>>>(s.parent.as<int>(), count, cells,
+                                                         s.root.as<int>());
+  if (const cudaError_t status = cudaMemsetAsync(s.size.as<void>(), 0, n * 4U, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  if (image) {
+    pixel_sizes_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+        s.node_of_point.as<int>(), s.root.as<int>(), count, s.size.as<std::uint32_t>());
+  } else {
+    if (const cudaError_t status = cudaMemsetAsync(s.min_index.as<void>(), 0xFF, n * 4U, stream);
+        status != cudaSuccess) {
+      return status;
+    }
+    cell_sizes_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+        s.starts.as<std::uint32_t>(), s.sorted_indices.as<std::uint32_t>(), s.root.as<int>(), count,
+        cells, s.size.as<std::uint32_t>(), s.min_index.as<std::uint32_t>());
+  }
+  flags_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+      s.root.as<int>(), s.size.as<std::uint32_t>(), count, cells, params.min_cluster_size,
+      params.max_cluster_size, s.flags.as<std::uint32_t>());
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status = detail::exclusive_sum(
+          s.flags.as<std::uint32_t>(), s.scan.as<std::uint32_t>(), count, s.temp, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  candidates_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+      s.flags.as<std::uint32_t>(), s.scan.as<std::uint32_t>(), s.size.as<std::uint32_t>(),
+      image ? nullptr : s.min_index.as<std::uint32_t>(), count, s.candidates.as<std::uint32_t>(),
+      s.candidate_keys.as<std::uint64_t>(), s.counters.as<std::uint32_t>() + 1);
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
+  // The number of components kept sizes their sort: the frame's one wait,
+  // which also brings the number of their points.
+  if (const cudaError_t status = s.read_counters(s.counters.as<std::uint32_t>() + 1, 2, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  const std::uint32_t total = s.host_counters[0];
   const std::uint32_t kept = std::min(total, params.max_clusters);
+  s.clustered.reset();
+  if (total <= params.max_clusters) {
+    s.clustered = s.host_counters[1];
+  }
   if (const cudaError_t status = s.reserve({{&s.cluster_size, (std::size_t{kept} + 1U) * 4U},
                                             {&s.cluster_start, (std::size_t{kept} + 1U) * 4U}},
                                            stream);
@@ -1173,37 +1263,29 @@ cudaError_t EuclideanClusterer::cluster(const float* xyz, std::uint32_t count, s
       status != cudaSuccess) {
     return status;
   }
-  if (nodes != 0U) {
-    if (total != 0U) {
-      if (const cudaError_t status = detail::sort_pairs(
-              s.candidate_keys.as<std::uint64_t>(), s.sorted_candidate_keys.as<std::uint64_t>(),
-              s.candidates.as<std::uint32_t>(), s.sorted_candidates.as<std::uint32_t>(), total, 64,
-              s.temp, stream);
-          status != cudaSuccess) {
-        return status;
-      }
-    }
-    if (const cudaError_t status =
-            cudaMemsetAsync(s.rank_of.as<void>(), 0xFF, std::size_t{nodes} * 4U, stream);
-        status != cudaSuccess) {
-      return status;
-    }
-    if (kept != 0U) {
-      rank_kernel<<<blocks_for(kept), kBlock, 0, stream>>>(
-          s.sorted_candidates.as<std::uint32_t>(), s.size.as<std::uint32_t>(), kept,
-          s.rank_of.as<int>(), s.cluster_size.as<std::uint32_t>());
-    }
-    labels_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
-        s.node_of_point.as<int>(), s.root.as<int>(), s.rank_of.as<int>(), count, kept,
-        s.labels.as<std::int32_t>(), s.group_keys.as<std::uint32_t>(),
-        s.group_indices.as<std::uint32_t>());
-  } else {
-    // No valid point: every label is -1.
-    if (const cudaError_t status = cudaMemsetAsync(s.labels.as<void>(), 0xFF, n * 4U, stream);
+  if (total != 0U) {
+    if (const cudaError_t status = detail::sort_pairs(
+            s.candidate_keys.as<std::uint64_t>(), s.sorted_candidate_keys.as<std::uint64_t>(),
+            s.candidates.as<std::uint32_t>(), s.sorted_candidates.as<std::uint32_t>(), total, 64,
+            s.temp, stream);
         status != cudaSuccess) {
       return status;
     }
   }
+  if (const cudaError_t status = cudaMemsetAsync(s.rank_of.as<void>(), 0xFF, n * 4U, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  if (kept != 0U) {
+    rank_kernel<<<blocks_for(kept), kBlock, 0, stream>>>(
+        s.sorted_candidates.as<std::uint32_t>(), s.size.as<std::uint32_t>(), kept,
+        s.rank_of.as<int>(), s.cluster_size.as<std::uint32_t>());
+  }
+  // A point in no node (invalid) or in a node of no kept cluster is -1.
+  labels_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
+      s.node_of_point.as<int>(), s.root.as<int>(), s.rank_of.as<int>(), count, kept,
+      s.labels.as<std::int32_t>(), s.group_keys.as<std::uint32_t>(),
+      s.group_indices.as<std::uint32_t>());
   if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
     return status;
   }
@@ -1238,12 +1320,22 @@ cudaError_t EuclideanClusterer::write_labels(std::int32_t* labels, cudaStream_t 
 }
 
 cudaError_t EuclideanClusterer::clustered_count(std::uint32_t& points, cudaStream_t stream) {
+  Impl& s = *impl_;
   points = 0;
-  if (impl_->count == 0U) {
+  if (s.clustered) {
+    points = *s.clustered;
     return cudaSuccess;
   }
-  return impl_->read_counter(impl_->cluster_start.as<std::uint32_t>() + impl_->clusters, points,
-                             stream);
+  // More components passed the size filter than max_clusters keeps: the sum
+  // of the kept ones' sizes is known only after their sort.
+  if (const cudaError_t status =
+          s.read_counters(s.cluster_start.as<std::uint32_t>() + s.clusters, 1, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  s.clustered = s.host_counters[0];
+  points = *s.clustered;
+  return cudaSuccess;
 }
 
 cudaError_t EuclideanClusterer::write_grouped(const float* xyz, const std::uint8_t* rgb,
@@ -1268,6 +1360,35 @@ cudaError_t EuclideanClusterer::write_kept(const float* xyz, const std::uint8_t*
   }
   kept_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(xyz, rgb, s.labels.as<std::int32_t>(),
                                                           s.count, out_xyz, out_rgb);
+  return cudaGetLastError();
+}
+
+cudaError_t EuclideanClusterer::write_grouped_values(const float* values, int channels, float* out,
+                                                     cudaStream_t stream) const {
+  const Impl& s = *impl_;
+  if (channels < 1 || channels > 3) {
+    return cudaErrorInvalidValue;
+  }
+  if (s.count == 0U || s.clusters == 0U) {
+    return cudaSuccess;
+  }
+  grouped_values_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(
+      values, channels, s.grouped.as<std::uint32_t>(),
+      s.cluster_start.as<std::uint32_t>() + s.clusters, s.count, out);
+  return cudaGetLastError();
+}
+
+cudaError_t EuclideanClusterer::write_kept_values(const float* values, int channels, float* out,
+                                                  cudaStream_t stream) const {
+  const Impl& s = *impl_;
+  if (channels < 1 || channels > 3) {
+    return cudaErrorInvalidValue;
+  }
+  if (s.count == 0U) {
+    return cudaSuccess;
+  }
+  kept_values_kernel<<<blocks_for(s.count), kBlock, 0, stream>>>(
+      values, channels, s.labels.as<std::int32_t>(), s.count, out);
   return cudaGetLastError();
 }
 

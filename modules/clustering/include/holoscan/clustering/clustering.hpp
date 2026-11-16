@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Euclidean clustering on the GPU, without a Holoscan graph. A cloud is
-// `count` packed float32 x, y, z triples in device memory, the layout of
-// holoscan-point-cloud's clouds: unorganized [N, 3], or organized
+// `count` packed float32 x, y, z triples in device memory, the layout of the
+// points of holoscan-messages' PointCloud: unorganized [N, 3], or organized
 // [height, width, 3] read as `count` = height * width points. A point is
-// invalid when any coordinate is not finite (DepthToPointCloudOp writes NaN).
+// invalid when any coordinate is not finite (an invalid point is NaN).
 //
 // Two valid points are linked when they are at most `tolerance` apart, and a
 // cluster is a connected component of these links: every point of a cluster
@@ -18,11 +18,12 @@
 // is deterministic: the same cloud gives the same bits on every run.
 //
 // EuclideanClusterer keeps its device scratch between calls, grown as
-// needed, and is for one stream at a time. All work is ordered on the given
-// stream. cluster() waits for the stream to learn how many components there
-// are (and before that, with kEuclidean, how many grid cells), and
-// clustered_count() waits once more; nothing else waits, except that growing
-// a scratch buffer first waits for the stream to finish with the old one.
+// needed in stream order (from the stream's device's memory pool), and is for
+// one stream at a time. All work is ordered on the given stream. cluster()
+// waits for the stream once, to learn how many components there are and how
+// many points they hold; clustered_count() then needs no other wait, unless
+// more components passed the size filter than max_clusters keeps. Nothing
+// else waits.
 
 #pragma once
 
@@ -97,8 +98,7 @@ class EuclideanClusterer {
 
   // Clusters the cloud and returns the number of clusters kept in
   // `clusters`. `width` is the organized cloud's width (count a multiple of
-  // it), or 0 for an unorganized cloud; kImage needs it. Waits once with
-  // kImage, twice with kEuclidean.
+  // it), or 0 for an unorganized cloud; kImage needs it. Waits once.
   cudaError_t cluster(const float* xyz, std::uint32_t count, std::uint32_t width,
                       const ClusterParams& params, std::uint32_t& clusters, cudaStream_t stream);
 
@@ -106,7 +106,8 @@ class EuclideanClusterer {
 
   // The label of every point, in input order: count int32.
   cudaError_t write_labels(std::int32_t* labels, cudaStream_t stream) const;
-  // The number of clustered points, the sum of the clusters' sizes. Waits.
+  // The number of clustered points, the sum of the clusters' sizes. Waits
+  // only when more components passed the size filter than max_clusters keeps.
   cudaError_t clustered_count(std::uint32_t& points, cudaStream_t stream);
   // The clustered points packed and grouped by cluster, in label order and in
   // input order within a cluster, into buffers of clustered_count() points:
@@ -119,6 +120,14 @@ class EuclideanClusterer {
   // in input order. `rgb` and `out_rgb` may both be null.
   cudaError_t write_kept(const float* xyz, const std::uint8_t* rgb, float* out_xyz,
                          std::uint8_t* out_rgb, cudaStream_t stream) const;
+  // Per-point values of `channels` (1..3) float32 each, such as normals (3)
+  // or intensities (1): grouped as write_grouped() groups the points, into a
+  // buffer of clustered_count() points, or in input order with NaN where a
+  // point is not clustered (write_kept_values()).
+  cudaError_t write_grouped_values(const float* values, int channels, float* out,
+                                   cudaStream_t stream) const;
+  cudaError_t write_kept_values(const float* values, int channels, float* out,
+                                cudaStream_t stream) const;
   // One ClusterSummary per cluster, by id: `clusters` rows of kSummaryFields
   // float32. With `oriented`, the oriented boxes too, which takes another
   // pass over the points. Sums are in double, in a fixed order.

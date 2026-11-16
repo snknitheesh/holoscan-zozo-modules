@@ -13,16 +13,31 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/sensor_io/provenance.hpp>
+
 namespace holoscan::clustering {
 namespace {
 
+namespace hm = holoscan::messages;
+
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 constexpr DLDataType kInt32{kDLInt, 32U, 1U};
-constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 
 CloudSettings settings_of(const EuclideanClusterConfig& config) {
-  return CloudSettings{
-      .color = config.color, .layout = config.layout, .max_points = config.max_points};
+  return CloudSettings{.layout = config.layout,
+                       .max_points = config.max_points,
+                       .fields = config.emit_points ? config.fields : hm::PointCloudContents{}};
+}
+
+// A device kernel's launch status as the loan's fill result.
+holoscan::expected<void, holoscan::Error> launched(cudaError_t status, const char* what) {
+  if (status != cudaSuccess) {
+    return holoscan::make_unexpected(holoscan::Error{
+        holoscan::ErrorCode::kFailure,
+        std::string("EuclideanClusterOp: writing ") + what + ": " + cudaGetErrorString(status)});
+  }
+  return {};
 }
 
 }  // namespace
@@ -46,8 +61,10 @@ void validate_config(const EuclideanClusterConfig& config) {
       (p.image_window < 1 || p.image_window > kMaxImageWindow)) {
     throw std::invalid_argument("image_window must be 1.." + std::to_string(kMaxImageWindow));
   }
-  if (config.color && !config.emit_points) {
-    throw std::invalid_argument("color needs emit_points: the colors go out with the points");
+  if ((config.fields.colors || config.fields.normals || config.fields.intensity) &&
+      !config.emit_points) {
+    throw std::invalid_argument(
+        "fields need emit_points: they go out in the clustered point cloud");
   }
 }
 
@@ -67,15 +84,14 @@ void EuclideanClusterOp::setup(holoscan::OperatorSpec& spec) {
   spec.output(clusters, "clusters")
       .produces_tensor(device_tensor_spec(
           kFloat32, 2U, std::uint64_t{config_.clustering.max_clusters} * sizeof(ClusterSummary)));
-  // Optional outputs exist only when configured: an emit into an unconnected
-  // output fails.
+  // An optional output exists only when configured: an emit into an
+  // unconnected output fails.
   if (config_.emit_points) {
-    spec.output(clustered_points, "clustered_points")
-        .produces_tensor(device_tensor_spec(kFloat32, 3U, points_max * 3U * sizeof(float)));
-  }
-  if (config_.color) {
-    spec.output(clustered_colors, "clustered_colors")
-        .produces_tensor(device_tensor_spec(kUInt8, 3U, points_max * 3U));
+    hm::declare_point_cloud_output(spec, clustered_point_cloud, "clustered_point_cloud",
+                                   {.max_points = points_max,
+                                    .colors = config_.fields.colors,
+                                    .normals = config_.fields.normals,
+                                    .intensity = config_.fields.intensity});
   }
 }
 
@@ -91,7 +107,7 @@ holoscan::expected<void, holoscan::Error> EuclideanClusterOp::compute(
     return holoscan::make_unexpected(std::move(received).error());
   }
   const Cloud& cloud = *received;
-  if (config_.clustering.connectivity == Connectivity::kImage && cloud.width == 0U) {
+  if (config_.clustering.connectivity == Connectivity::kImage && cloud.height == 0U) {
     return holoscan::make_unexpected(
         invalid("image connectivity needs an organized [H, W, 3] cloud"));
   }
@@ -109,11 +125,9 @@ holoscan::expected<void, holoscan::Error> EuclideanClusterOp::compute(
       return holoscan::make_unexpected(cuda_failure("counting the clustered points", status));
     }
   }
-  const std::span<const std::int64_t> shape = cloud.points.data.shape_span();
-  const std::vector<std::int64_t> keep_shape(shape.begin(), shape.end());
+  const std::span<const std::int64_t> shape = cloud.sample.data.points->shape_span();
   const std::vector<std::int64_t> keep_label_shape(shape.begin(), shape.end() - 1);
   const std::array<std::int64_t, 1> dense_label_shape{clustered};
-  const std::array<std::int64_t, 2> dense_shape{clustered, 3};
 
   if (auto sent = emit_tensor(labels, "labels", cloud,
                               dense ? std::span<const std::int64_t>(dense_label_shape)
@@ -139,35 +153,93 @@ holoscan::expected<void, holoscan::Error> EuclideanClusterOp::compute(
       !sent) {
     return sent;
   }
-  const std::span<const std::int64_t> points_shape =
-      dense ? std::span<const std::int64_t>(dense_shape)
-            : std::span<const std::int64_t>(keep_shape);
   if (config_.emit_points) {
-    if (auto sent = emit_tensor(
-            clustered_points, "clustered_points", cloud, points_shape, kFloat32,
-            [&](void* data) {
-              auto* out = static_cast<float*>(data);
-              return dense ? clusterer_->write_grouped(cloud.xyz, nullptr, out, nullptr, nullptr,
-                                                       cloud.stream)
-                           : clusterer_->write_kept(cloud.xyz, nullptr, out, nullptr, cloud.stream);
-            });
-        !sent) {
-      return sent;
+    return emit_clustered_cloud(context, cloud, clustered);
+  }
+  return {};
+}
+
+holoscan::expected<void, holoscan::Error> EuclideanClusterOp::emit_clustered_cloud(
+    holoscan::ExecutionContext& context, const Cloud& cloud, std::uint32_t clustered) {
+  const bool dense = config_.layout == OutputLayout::kDense;
+  const hm::PointCloudShape shape = dense ? hm::unorganized_cloud(clustered)
+                                    : cloud.height != 0U
+                                        ? hm::organized_cloud(cloud.height, cloud.width)
+                                        : hm::unorganized_cloud(cloud.count);
+  const std::uint32_t points = dense ? clustered : cloud.count;
+  const hm::PointCloudContents contents{.colors = cloud.rgb != nullptr,
+                                        .normals = cloud.normals != nullptr,
+                                        .intensity = cloud.intensity != nullptr};
+  auto loan =
+      hm::allocate_point_cloud(clustered_point_cloud, shape, contents, context.cuda_stream());
+  if (!loan) {
+    return emit_failure("clustered_point_cloud", std::move(loan).error());
+  }
+  const auto fill = [&](holoscan::TensorFieldSelector<hm::schema::PointCloudT> field,
+                        const char* what,
+                        const auto& write) -> holoscan::expected<void, holoscan::Error> {
+    return loan->write_and_commit(field, context.cuda_stream(),
+                                  [&](const holoscan::TensorOutputWriteGuard& guard)
+                                      -> holoscan::expected<void, holoscan::Error> {
+                                    if (points == 0U) {
+                                      return {};
+                                    }
+                                    return launched(write(guard), what);
+                                  });
+  };
+  if (auto written = fill(hm::PointCloudFields::points, "clustered points",
+                          [&](const holoscan::TensorOutputWriteGuard& guard) {
+                            auto* out = guard.data_as<float>();
+                            return dense ? clusterer_->write_grouped(cloud.xyz, nullptr, out,
+                                                                     nullptr, nullptr, cloud.stream)
+                                         : clusterer_->write_kept(cloud.xyz, nullptr, out, nullptr,
+                                                                  cloud.stream);
+                          });
+      !written) {
+    return written;
+  }
+  if (contents.colors) {
+    if (auto written = fill(hm::PointCloudFields::colors, "clustered colors",
+                            [&](const holoscan::TensorOutputWriteGuard& guard) {
+                              auto* out = guard.data_as<std::uint8_t>();
+                              return dense
+                                         ? clusterer_->write_grouped(cloud.xyz, cloud.rgb, nullptr,
+                                                                     out, nullptr, cloud.stream)
+                                         : clusterer_->write_kept(cloud.xyz, cloud.rgb, nullptr,
+                                                                  out, cloud.stream);
+                            });
+        !written) {
+      return written;
     }
   }
-  if (config_.color) {
-    if (auto sent = emit_tensor(clustered_colors, "clustered_colors", cloud, points_shape, kUInt8,
-                                [&](void* data) {
-                                  auto* out = static_cast<std::uint8_t*>(data);
-                                  return dense ? clusterer_->write_grouped(cloud.xyz, cloud.rgb,
-                                                                           nullptr, out, nullptr,
-                                                                           cloud.stream)
-                                               : clusterer_->write_kept(cloud.xyz, cloud.rgb,
-                                                                        nullptr, out, cloud.stream);
-                                });
-        !sent) {
-      return sent;
+  const auto values = [&](holoscan::TensorFieldSelector<hm::schema::PointCloudT> field,
+                          const char* what, const float* in, int channels) {
+    return fill(field, what, [&](const holoscan::TensorOutputWriteGuard& guard) {
+      auto* out = guard.data_as<float>();
+      return dense ? clusterer_->write_grouped_values(in, channels, out, cloud.stream)
+                   : clusterer_->write_kept_values(in, channels, out, cloud.stream);
+    });
+  };
+  if (contents.normals) {
+    if (auto written = values(hm::PointCloudFields::normals, "clustered normals", cloud.normals, 3);
+        !written) {
+      return written;
     }
+  }
+  if (contents.intensity) {
+    if (auto written =
+            values(hm::PointCloudFields::intensity, "clustered intensity", cloud.intensity, 1);
+        !written) {
+      return written;
+    }
+  }
+  // Packed by cluster, every point is valid; kept in place, they are not
+  // counted (that would take another wait).
+  const std::int64_t valid_count = dense ? std::int64_t{clustered} : -1;
+  if (auto sent = hm::emit_point_cloud(clustered_point_cloud, std::move(*loan), cloud.header, shape,
+                                       valid_count, holoscan::sensor_io::derive_from(cloud.sample));
+      !sent) {
+    return emit_failure("clustered_point_cloud", std::move(sent).error());
   }
   return {};
 }

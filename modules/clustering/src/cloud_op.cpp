@@ -3,21 +3,19 @@
 
 #include "holoscan/clustering/cloud_op.hpp"
 
-#include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include <holoscan/clustering/clustering.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
 #include "device_buffer.hpp"
@@ -26,10 +24,9 @@
 namespace holoscan::clustering {
 namespace {
 
-using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
 
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
-constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 
 bool is_dtype(const DLDataType& dtype, const DLDataType& expected) {
   return dtype.code == expected.code && dtype.bits == expected.bits &&
@@ -108,6 +105,11 @@ void validate_settings(const CloudSettings& settings) {
 struct CloudOp::Impl {
   detail::DeviceBuffer points_staging;
   detail::DeviceBuffer colors_staging;
+  detail::DeviceBuffer normals_staging;
+  detail::DeviceBuffer intensity_staging;
+  // Whether the copy of host input to the GPU has been logged, once per
+  // operator.
+  bool logged_host_copy{};
 };
 
 CloudOp::CloudOp(std::string name, CloudSettings settings)
@@ -138,26 +140,15 @@ holoscan::Error CloudOp::cuda_failure(const char* what, cudaError_t status) cons
 }
 
 void CloudOp::setup(holoscan::OperatorSpec& spec) {
-  // Two slots per input: one cloud in compute() while the next one arrives.
-  spec.input(points, "points").queue_depth(2U);
-  // An optional input exists only when configured: an unconnected input would
-  // never be satisfied.
-  if (settings_.color) {
-    spec.input(colors, "colors").queue_depth(2U);
-  }
+  // Two slots: one cloud in compute() while the next one arrives. An edge's
+  // ConnectionOptions::queue_depth replaces this, so a live edge that drops
+  // the oldest cloud sets its own depth (1, to keep only the newest).
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
 }
 
 holoscan::Contract CloudOp::contract() const {
   holoscan::Contract result;
-  if (!settings_.color) {
-    result.trigger(holoscan::OnEach{points});
-    return result;
-  }
-  // A cloud and its colors carry the same capture time.
-  result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, colors}}, .window = 0ns});
-  result.input(points, holoscan::Exact{});
-  result.input(colors, holoscan::Exact{});
+  result.trigger(holoscan::OnEach{point_cloud});
   return result;
 }
 
@@ -169,11 +160,19 @@ void CloudOp::stop() {
 
 holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
     holoscan::ExecutionContext& context) {
-  auto points_sample = points.receive();
-  if (!points_sample) {
-    return holoscan::make_unexpected(std::move(points_sample).error());
+  auto sample = point_cloud.receive();
+  if (!sample) {
+    return holoscan::make_unexpected(std::move(sample).error());
   }
-  Cloud cloud{std::move(*points_sample)};
+  Cloud cloud{std::move(*sample)};
+  const hm::schema::PointCloudT& message = cloud.sample.data;
+  // All four tensors there, their layout, packing and memory.
+  if (auto checked = hm::check_point_cloud(message); !checked) {
+    return holoscan::make_unexpected(invalid(checked.error().message));
+  }
+  if (message.header) {
+    cloud.header = hm::from_message(*message.header);
+  }
   // The runtime assigns a stream to an operator with device outputs, and
   // writes their loans on that stream only.
   cloud.stream = context.cuda_stream().get();
@@ -188,7 +187,7 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
     return holoscan::make_unexpected(cuda_failure("cudaStreamGetDevice", status));
   }
 
-  const holoscan::Tensor& tensor = cloud.points.data;
+  const holoscan::Tensor& tensor = *message.points;
   const std::span<const std::int64_t> shape = tensor.shape_span();
   if (!is_dtype(tensor.dtype(), kFloat32) || (shape.size() != 2 && shape.size() != 3) ||
       shape.back() != 3) {
@@ -211,7 +210,10 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
                                              std::to_string(settings_.max_points)));
   }
   cloud.count = static_cast<std::uint32_t>(count);
-  cloud.width = shape.size() == 3 ? static_cast<std::uint32_t>(shape[1]) : 0U;
+  if (shape.size() == 3) {
+    cloud.height = static_cast<std::uint32_t>(shape[0]);
+    cloud.width = static_cast<std::uint32_t>(shape[1]);
+  }
   if (!packed(tensor)) {
     return holoscan::make_unexpected(invalid("points must be packed"));
   }
@@ -221,31 +223,10 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
   if (!on_device_of(tensor, device)) {
     return holoscan::make_unexpected(invalid("points are on another GPU than the operator"));
   }
+  // check_point_cloud() has checked that the other fields are in the same
+  // memory, so one wait covers them.
   if (auto ready = wait_for_host(tensor); !ready) {
     return holoscan::make_unexpected(std::move(ready).error());
-  }
-
-  if (settings_.color) {
-    auto colors_sample = colors.receive();
-    if (!colors_sample) {
-      return holoscan::make_unexpected(std::move(colors_sample).error());
-    }
-    cloud.colors.emplace(std::move(*colors_sample));
-    const holoscan::Tensor& rgb = cloud.colors->data;
-    const std::span<const std::int64_t> rgb_shape = rgb.shape_span();
-    if (!is_dtype(rgb.dtype(), kUInt8) ||
-        !std::equal(rgb_shape.begin(), rgb_shape.end(), shape.begin(), shape.end())) {
-      return holoscan::make_unexpected(invalid("colors must be uint8 RGB of the points' shape"));
-    }
-    if (!packed(rgb)) {
-      return holoscan::make_unexpected(invalid("colors must be packed"));
-    }
-    if (!on_device_of(rgb, device)) {
-      return holoscan::make_unexpected(invalid("colors are on another GPU than the operator"));
-    }
-    if (auto ready = wait_for_host(rgb); !ready) {
-      return holoscan::make_unexpected(std::move(ready).error());
-    }
   }
 
   // Host input goes to the GPU through staging buffers. The runtime orders
@@ -253,6 +234,7 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
   // operator's stream, but not of host-written pinned memory, which is held
   // here until the copy is done. Pageable memory needs nothing:
   // cudaMemcpyAsync has staged it by the time it returns.
+  std::size_t copied = 0;
   const auto on_device =
       [&](const holoscan::Tensor& input, std::size_t bytes,
           detail::DeviceBuffer& staging) -> holoscan::expected<const void*, holoscan::Error> {
@@ -260,7 +242,7 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
       return input.data();
     }
     if (const cudaError_t status = staging.reserve(bytes, cloud.stream); status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
+      return holoscan::make_unexpected(cuda_failure("cudaMallocAsync", status));
     }
     if (const cudaError_t status = cudaMemcpyAsync(staging.as<void>(), input.data(), bytes,
                                                    cudaMemcpyHostToDevice, cloud.stream);
@@ -272,20 +254,50 @@ holoscan::expected<CloudOp::Cloud, holoscan::Error> CloudOp::receive(
         return holoscan::make_unexpected(std::move(held).error());
       }
     }
+    copied += bytes;
     return static_cast<const void*>(staging.as<void>());
   };
-  auto xyz =
-      on_device(tensor, std::size_t{cloud.count} * 3U * sizeof(float), impl_->points_staging);
+  const std::size_t n = cloud.count;
+  auto xyz = on_device(tensor, n * 3U * sizeof(float), impl_->points_staging);
   if (!xyz) {
     return holoscan::make_unexpected(std::move(xyz).error());
   }
   cloud.xyz = static_cast<const float*>(*xyz);
-  if (cloud.colors) {
-    auto rgb = on_device(cloud.colors->data, std::size_t{cloud.count} * 3U, impl_->colors_staging);
+  if (settings_.fields.colors && hm::is_present(message.colors)) {
+    auto rgb = on_device(*message.colors, n * 3U, impl_->colors_staging);
     if (!rgb) {
       return holoscan::make_unexpected(std::move(rgb).error());
     }
     cloud.rgb = static_cast<const std::uint8_t*>(*rgb);
+  }
+  if (settings_.fields.normals && hm::is_present(message.normals)) {
+    if (!aligned(*message.normals, sizeof(float))) {
+      return holoscan::make_unexpected(invalid("normals must be aligned to 4 bytes"));
+    }
+    auto normals = on_device(*message.normals, n * 3U * sizeof(float), impl_->normals_staging);
+    if (!normals) {
+      return holoscan::make_unexpected(std::move(normals).error());
+    }
+    cloud.normals = static_cast<const float*>(*normals);
+  }
+  if (settings_.fields.intensity && hm::is_present(message.intensity)) {
+    if (!aligned(*message.intensity, sizeof(float))) {
+      return holoscan::make_unexpected(invalid("intensity must be aligned to 4 bytes"));
+    }
+    auto intensity = on_device(*message.intensity, n * sizeof(float), impl_->intensity_staging);
+    if (!intensity) {
+      return holoscan::make_unexpected(std::move(intensity).error());
+    }
+    cloud.intensity = static_cast<const float*>(*intensity);
+  }
+  if (copied != 0U && !impl_->logged_host_copy) {
+    impl_->logged_host_copy = true;
+    const bool pinned = tensor.device().device_type == kDLCUDAHost;
+    HOLOSCAN_LOG_INFO(
+        "{}: point_cloud arrives in {} memory, so each cloud is copied to the GPU ({} bytes for "
+        "this one){}; send it in device memory to avoid that (logged once)",
+        name_, pinned ? "pinned host" : "host", copied,
+        pinned ? "" : ", after the host waits for its producer");
   }
   return cloud;
 }
@@ -314,7 +326,7 @@ holoscan::expected<void, holoscan::Error> CloudOp::emit_tensor(
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
   }
-  if (auto sent = port.emit(std::move(*loan), holoscan::sensor_io::derive_from(cloud.points));
+  if (auto sent = port.emit(std::move(*loan), holoscan::sensor_io::derive_from(cloud.sample));
       !sent) {
     return emit_failure(port_name, std::move(sent).error());
   }

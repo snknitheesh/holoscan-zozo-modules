@@ -109,12 +109,57 @@ Result run(EuclideanClusterer& clusterer, const std::vector<float>& xyz, std::ui
              "write_grouped");
   check_cuda(clusterer.write_kept(points.get(), nullptr, kept.get(), nullptr, stream),
              "write_kept");
+  // The per-point values go where the points go: the coordinates as three
+  // channels, and x alone as one.
+  Device<float> grouped_values(std::size_t{r.clustered} * 3U);
+  Device<float> kept_values(std::size_t{n} * 3U);
+  std::vector<float> x(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    x[i] = xyz[3 * i];
+  }
+  Device<float> x_values(x);
+  Device<float> grouped_x(r.clustered);
+  Device<float> kept_x(n);
+  check_cuda(clusterer.write_grouped_values(points.get(), 3, grouped_values.get(), stream),
+             "write_grouped_values");
+  check_cuda(clusterer.write_kept_values(points.get(), 3, kept_values.get(), stream),
+             "write_kept_values");
+  check_cuda(clusterer.write_grouped_values(x_values.get(), 1, grouped_x.get(), stream),
+             "write_grouped_values");
+  check_cuda(clusterer.write_kept_values(x_values.get(), 1, kept_x.get(), stream),
+             "write_kept_values");
   check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   r.labels = labels.host(n);
   r.summaries = summaries.host(r.clusters);
   r.grouped_xyz = grouped.host(std::size_t{r.clustered} * 3U);
   r.grouped_labels = grouped_labels.host(r.clustered);
   r.kept_xyz = kept.host(std::size_t{n} * 3U);
+  const auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](float u, float v) {
+             return std::memcmp(&u, &v, sizeof(float)) == 0 || (std::isnan(u) && std::isnan(v));
+           });
+  };
+  VERIFY_MSG(same(grouped_values.host(std::size_t{r.clustered} * 3U), r.grouped_xyz),
+             "grouped values go where write_grouped() puts the points");
+  VERIFY_MSG(same(kept_values.host(std::size_t{n} * 3U), r.kept_xyz),
+             "kept values go where write_kept() puts the points");
+  std::vector<float> grouped_first(r.clustered);
+  for (std::size_t t = 0; t < r.clustered; ++t) {
+    grouped_first[t] = r.grouped_xyz[3 * t];
+  }
+  std::vector<float> kept_first(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    kept_first[i] = r.kept_xyz[3 * i];
+  }
+  VERIFY_MSG(same(grouped_x.host(r.clustered), grouped_first), "one grouped channel");
+  VERIFY_MSG(same(kept_x.host(n), kept_first), "one kept channel");
+  // The clustered count, known after cluster() or read after it, is the
+  // summaries' total.
+  std::uint64_t total = 0;
+  for (const ClusterSummary& summary : r.summaries) {
+    total += static_cast<std::uint64_t>(summary.point_count);
+  }
+  VERIFY_MSG(total == r.clustered, "clustered_count() is the clusters' total");
   return r;
 }
 
