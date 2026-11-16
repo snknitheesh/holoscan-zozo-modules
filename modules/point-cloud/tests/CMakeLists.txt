@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The module's full suite. Every test needs the SDK, CUDA and a GPU. The tests check
-# against the synthetic camera's host functions, so they must not contract either.
+# against the synthetic camera's host functions, so they must not contract either. The
+# real-data test also needs the local recordings: it runs when HOLOSCAN_TEST_DATA names
+# the folder that holds them, and is skipped otherwise, as in CI.
 add_library(point_cloud_test_flags INTERFACE)
 target_compile_options(
   point_cloud_test_flags
@@ -40,14 +42,23 @@ target_link_libraries(
   PRIVATE holoscan::point_cloud holoscan::testing point_cloud_test_flags
 )
 
+add_executable(point_cloud_real_data_test real_data_test.cpp)
+target_link_libraries(
+  point_cloud_real_data_test
+  PRIVATE holoscan::point_cloud point_cloud_test_flags
+)
+
 add_test(NAME point_cloud_deproject COMMAND point_cloud_deproject_test)
 add_test(NAME point_cloud_depth_to_point_cloud_op COMMAND point_cloud_depth_to_point_cloud_op_test)
 add_test(NAME point_cloud_project COMMAND point_cloud_project_test)
 add_test(NAME point_cloud_point_cloud_to_depth_op COMMAND point_cloud_point_cloud_to_depth_op_test)
+add_test(NAME point_cloud_real_data COMMAND point_cloud_real_data_test)
+set_tests_properties(point_cloud_real_data PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(
   point_cloud_deproject
   point_cloud_depth_to_point_cloud_op
   point_cloud_project
   point_cloud_point_cloud_to_depth_op
+  point_cloud_real_data
   PROPERTIES LABELS "point_cloud;gpu" TIMEOUT 600
 )

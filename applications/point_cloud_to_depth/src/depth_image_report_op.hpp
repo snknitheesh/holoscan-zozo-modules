@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // DepthImageReportOp: the application's sink. Counts filled pixels and their
-// depth range, checks that frame ids run 1, 2, 3, ... without a gap, checks
-// every pixel (and color) against the synthetic camera's ground truth when the
-// input is synthetic, optionally writes the images as PGM and PPM files, and
-// asks the run to complete after its expected frames.
+// depth range, checks that frame ids run without a gap from the first image
+// to the last frame (clouds before the first camera info give no image),
+// checks every pixel (and color) against the synthetic camera's ground truth
+// when the input is synthetic, optionally writes the images as PGM and PPM
+// files, and asks the run to complete at the last frame's image.
 
 #pragma once
 
@@ -37,6 +38,9 @@ using holoscan::point_cloud::SceneTruth;
 // that it makes progress.
 struct DepthReport {
   std::atomic<std::uint32_t> frames{};
+  // The frame id of the first image: the clouds before it came before the
+  // first camera info.
+  std::uint64_t first_frame_id{};
   std::uint64_t pixels{};
   std::uint64_t filled_pixels{};
   float min_depth_m{};
@@ -51,7 +55,20 @@ struct DepthReport {
   double max_error_m{};
 
   [[nodiscard]] bool passed() const noexcept {
-    return frame_gaps == 0 && (!verified || (wrong_depths == 0 && wrong_colors == 0));
+    return frames.load() != 0 && frame_gaps == 0 &&
+           (!verified || (wrong_depths == 0 && wrong_colors == 0));
+  }
+  // The clouds before the first image, which came before the first camera
+  // info; 0 without an image.
+  [[nodiscard]] std::uint64_t before_camera_info() const noexcept {
+    return frames.load() == 0 ? 0U : first_frame_id - 1U;
+  }
+  // Whether the run accounts for all `expected` clouds: it passed, at most
+  // `max_before` clouds came before the first camera info, and every cloud
+  // from it on gave an image.
+  [[nodiscard]] bool complete(std::uint32_t expected, std::uint64_t max_before) const noexcept {
+    return passed() && before_camera_info() <= max_before &&
+           before_camera_info() + frames.load() == expected;
   }
 };
 
@@ -66,8 +83,8 @@ struct DepthImageTruth {
 struct DepthImageReportConfig {
   // Where the reporter adds what it sees; one report per run.
   std::shared_ptr<DepthReport> report;
-  // Frames after which the run completes, counted by each reporter on its
-  // own; 0 never completes.
+  // The frame id of the last frame, whose image completes the run; 0 never
+  // completes.
   std::uint32_t expected_frames{};
   // The depth images' format and, for uint16, meters per count.
   DepthFormat depth_format{DepthFormat::kFloat32};
@@ -77,8 +94,8 @@ struct DepthImageReportConfig {
   // Its format must be `depth_format`, and uint16 depth must be in whole
   // millimeters of a millimeter-depth scene (see SceneTruth).
   std::optional<DepthImageTruth> truth;
-  // Where to write depth_NNNNNN.pgm (millimeters) and color_NNNNNN.ppm; none
-  // when empty.
+  // Where to write depth_NNNNNN.pgm (millimeters) and color_NNNNNN.ppm,
+  // NNNNNN the frame from 0 (frame id 1); none when empty.
   std::filesystem::path image_dir;
 };
 
@@ -103,7 +120,8 @@ class DepthImageReportOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> process(
       holoscan::ExecutionContext& context);
   void measure(int width, int height);
-  [[nodiscard]] holoscan::expected<void, holoscan::Error> write_images(int width, int height,
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> write_images(std::uint64_t frame_id,
+                                                                       int width, int height,
                                                                        bool with_color);
 
   DepthImageReportConfig config_;
@@ -114,7 +132,7 @@ class DepthImageReportOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> rgb_;
   std::vector<std::uint16_t> millimeters_;
   std::uint64_t last_frame_id_{};
-  // Images this reporter has seen; it requests completion at expected_frames.
+  // Images this reporter has seen.
   std::uint32_t seen_{};
 };
 

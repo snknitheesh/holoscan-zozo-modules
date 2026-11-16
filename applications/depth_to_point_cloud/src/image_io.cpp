@@ -62,6 +62,7 @@ DepthImage read_pgm_depth(const std::filesystem::path& path) {
   }
   const std::size_t count = static_cast<std::size_t>(image.width) * image.height;
   const std::size_t sample_bytes = max_value > 255 ? 2 : 1;
+  image.one_byte_samples = sample_bytes == 1;
   std::vector<std::uint8_t> raw(count * sample_bytes);
   in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
   if (static_cast<std::size_t>(in.gcount()) != raw.size()) {

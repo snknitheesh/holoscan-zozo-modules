@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include <holoscan/core/domain/tensor.hpp>
@@ -21,11 +22,16 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 #include "image_io.hpp"
 
 namespace depth_to_point_cloud_app {
+
+// The synthetic camera's frame id, in the camera info it sends with every
+// frame and in the camera_info file written for it.
+inline constexpr std::string_view kSyntheticFrameId = "synthetic_camera";
 
 struct SyntheticSourceConfig {
   int width{640};
@@ -36,10 +42,15 @@ struct SyntheticSourceConfig {
   bool millimeters{false};
   // Also emit an aligned RGB8 image on `color`.
   bool color{false};
-  // Also emit each frame's intrinsics on `intrinsics`, varying by frame.
-  bool intrinsics{false};
+  // Also emit each frame's camera info on `camera_info`, with the frame's
+  // capture time and intrinsics that vary by frame.
+  bool camera_info{false};
   // Emit images in CUDA device memory instead of host memory.
   bool device_output{true};
+  // Send the first frame one period after the run starts, not when it
+  // starts: a camera info source that sends when the run starts, as
+  // CameraInfoSourceOp does, then goes first, and no frame comes before it.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -61,10 +72,10 @@ class SyntheticDepthSourceOp final : public holoscan::Operator<> {
 
   holoscan::Output<holoscan::schema::ImageT> depth;
   holoscan::Output<holoscan::schema::ImageT> color;
-  holoscan::Output<holoscan::Tensor> intrinsics;
+  holoscan::Output<holoscan::messages::schema::CameraInfoT> camera_info;
 
  private:
-  static constexpr std::uint32_t kSentIntrinsics = 1U;
+  static constexpr std::uint32_t kSentCameraInfo = 1U;
   static constexpr std::uint32_t kSentColor = 2U;
   static constexpr std::uint32_t kSentDepth = 4U;
 
@@ -73,6 +84,8 @@ class SyntheticDepthSourceOp final : public holoscan::Operator<> {
 
   SyntheticSourceConfig config_;
   std::uint32_t emitted_{};
+  // With delay_first_frame: whether the first tick has passed.
+  bool delayed_{};
   // The frame being sent: its capture time and which outputs are out.
   std::optional<holoscan::TimePoint> pending_capture_;
   std::uint32_t sent_{};
@@ -92,6 +105,9 @@ struct DepthFileSourceConfig {
   // Start over after the last file until `count` frames are out.
   bool loop{false};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
+  // Send the first frame one period after the run starts; see
+  // SyntheticSourceConfig::delay_first_frame.
+  bool delay_first_frame{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -117,6 +133,7 @@ class DepthFileSourceOp final : public holoscan::Operator<> {
   DepthFileSourceConfig config_;
   std::uint32_t total_{};
   std::uint32_t emitted_{};
+  bool delayed_{};
 };
 
 }  // namespace depth_to_point_cloud_app
