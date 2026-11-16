@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A project built against the installed holoscan-normals package: a source
-// sends organized clouds of the synthetic scene, with colors, in host memory;
-// NormalEstimationOp estimates their normals and PlaneSegmentationOp their
-// planes. A sink checks that the floor and the back wall are found where the
-// scene has them, and that every output came through.
+// sends organized PointCloud messages of the synthetic scene, with colors, in
+// host memory; NormalEstimationOp adds their normals and PlaneSegmentationOp
+// finds their planes. A sink checks that the floor and the back wall are
+// found where the scene has them, and that every output came through. The
+// graph is lossless and runs on one worker.
 
 #include <array>
 #include <chrono>
@@ -14,17 +15,17 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <span>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/run.hpp>
-#include <holoscan/core/tensor_contract.hpp>
-#include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/normals/normal_estimation_op.hpp>
 #include <holoscan/normals/plane_segmentation_op.hpp>
 #include <holoscan/normals/synthetic_scene.hpp>
@@ -32,6 +33,7 @@
 
 namespace {
 
+namespace hm = holoscan::messages;
 namespace hn = holoscan::normals;
 
 constexpr int kWidth = 160;
@@ -39,26 +41,21 @@ constexpr int kHeight = 120;
 constexpr std::uint32_t kFrames = 5;
 constexpr std::uint32_t kPlanes = 6;
 
-holoscan::TensorOutputSpec host_tensor(DLDataType dtype, std::uint64_t bytes) {
-  return holoscan::TensorOutputSpec{
-      .representation =
-          holoscan::TensorRepresentation{
-              .memory_kind = holoscan::MemoryKind::kHost,
-              .dtype = dtype,
-              .rank = 3U,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-          },
-      .bounds = holoscan::tensor_bounds(bytes),
-      .storage = holoscan::TensorOutputStorage::kRuntimePool,
-  };
+// Whether `error` says the consumers are still busy with earlier frames: an
+// emit refused before delivery, or every slot of the output's pool still held.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
 }
 
-// kFrames organized clouds of the scene with their colors, then idle.
+// kFrames organized clouds of the scene with their colors, then idle. A cloud
+// the consumers cannot take yet is sent again on the next tick.
 class CloudSourceOp final : public holoscan::Operator<> {
  public:
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.output(points, "points").produces_tensor(host_tensor(hn::kFloat32, kPixels * 12U));
-    spec.output(colors, "colors").produces_tensor(host_tensor(hn::kUInt8, kPixels * 3U));
+    hm::declare_point_cloud_output(
+        spec, point_cloud, "point_cloud",
+        {.max_points = kPixels, .colors = true, .memory_kind = holoscan::MemoryKind::kHost});
   }
 
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -78,51 +75,58 @@ class CloudSourceOp final : public holoscan::Operator<> {
     std::vector<float> truth;
     hn::synthetic_scene_cloud(hn::synthetic_scene(kWidth, kHeight, emitted_), xyz, rgb, surfaces,
                               truth);
-    const std::array<std::int64_t, 3> shape{kHeight, kWidth, 3};
-    auto points_loan =
-        points.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = hn::kFloat32});
-    auto colors_loan =
-        colors.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = hn::kUInt8});
-    if (!points_loan || !colors_loan) {
-      return holoscan::make_unexpected(!points_loan ? points_loan.error() : colors_loan.error());
+    // Both fields are allocated together, before anything is sent: a refusal
+    // leaves nothing half sent.
+    const hm::PointCloudShape shape = hm::organized_cloud(kHeight, kWidth);
+    auto loan =
+        hm::allocate_point_cloud(point_cloud, shape, {.colors = true}, context.cuda_stream());
+    if (!loan) {
+      return consumers_busy(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                          : holoscan::make_unexpected(std::move(loan).error());
     }
-    const auto fill = [](holoscan::TensorOutputLoan& loan, const void* data, std::size_t bytes) {
-      return loan.write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                            -> holoscan::expected<void, holoscan::Error> {
-        std::memcpy(writer.data_as<std::uint8_t>(), data, bytes);
-        return {};
-      });
+    const auto copy = [](const void* data, std::size_t bytes) {
+      return [data, bytes](const holoscan::TensorOutputWriteGuard& writer) {
+        std::memcpy(writer.data_as<void>(), data, bytes);
+      };
     };
-    if (auto filled = fill(*points_loan, xyz.data(), xyz.size() * sizeof(float)); !filled) {
+    if (auto filled = loan->write_host_and_commit(hm::PointCloudFields::points,
+                                                  copy(xyz.data(), xyz.size() * sizeof(float)));
+        !filled) {
       return filled;
     }
-    if (auto filled = fill(*colors_loan, rgb.data(), rgb.size()); !filled) {
+    if (auto filled =
+            loan->write_host_and_commit(hm::PointCloudFields::colors, copy(rgb.data(), rgb.size()));
+        !filled) {
       return filled;
     }
-    const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
-                                     .frame_id = emitted_ + 1U};
-    if (auto sent = points.emit(std::move(*points_loan), emit); !sent) {
-      return sent;
+    // A frame keeps its capture time until it is out.
+    if (!capture_) {
+      capture_ = context.activation_time();
     }
-    if (auto sent = colors.emit(std::move(*colors_loan), emit); !sent) {
-      return sent;
+    auto sent = hm::emit_point_cloud(
+        point_cloud, std::move(*loan), {.frame_id = "scene_optical"}, shape, -1,
+        holoscan::EmitOptions{.capture_time = *capture_, .frame_id = emitted_ + 1U});
+    if (!sent) {
+      return consumers_busy(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
     }
+    capture_.reset();
     ++emitted_;
     return {};
   }
 
-  holoscan::Output<holoscan::Tensor> points;
-  holoscan::Output<holoscan::Tensor> colors;
+  holoscan::Output<hm::schema::PointCloudT> point_cloud;
 
  private:
   static constexpr std::uint64_t kPixels = std::uint64_t{kWidth} * kHeight;
   std::uint32_t emitted_{};
+  std::optional<holoscan::TimePoint> capture_;
 };
 
 struct Tally {
   std::uint32_t frames{};
   std::uint32_t missed_planes{};
   std::uint32_t frame_gaps{};
+  std::uint32_t without_colors{};
 };
 
 // Checks each frame's planes; takes every other output, which must be connected.
@@ -131,7 +135,8 @@ class CheckOp final : public holoscan::Operator<> {
   explicit CheckOp(std::shared_ptr<Tally> tally) : tally_(std::move(tally)) {}
 
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.input(colors, "colors").queue_depth(2U);
+    // Two slots per input: one frame in compute() while the next arrives.
+    spec.input(point_cloud, "point_cloud").queue_depth(2U);
     spec.input(curvature, "curvature").queue_depth(2U);
     spec.input(labels, "labels").queue_depth(2U);
     spec.input(coefficients, "coefficients").queue_depth(2U);
@@ -144,9 +149,10 @@ class CheckOp final : public holoscan::Operator<> {
     holoscan::Contract result;
     result.trigger(
         holoscan::OnAligned{.ports = holoscan::PortList{std::vector<holoscan::PortRef>{
-                                colors, curvature, labels, coefficients, centroids, inliers}},
+                                point_cloud, curvature, labels, coefficients, centroids, inliers}},
                             .window = 0ns});
-    for (const auto* port : {&colors, &curvature, &labels, &coefficients, &centroids, &inliers}) {
+    result.input(point_cloud, holoscan::Exact{});
+    for (const auto* port : {&curvature, &labels, &coefficients, &centroids, &inliers}) {
       result.input(*port, holoscan::Exact{});
     }
     return result;
@@ -154,8 +160,12 @@ class CheckOp final : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
+    auto cloud = point_cloud.receive();
+    if (!cloud) {
+      return holoscan::make_unexpected(cloud.error());
+    }
     auto coefficient_sample = coefficients.receive();
-    for (auto* port : {&colors, &curvature, &labels, &centroids, &inliers}) {
+    for (auto* port : {&curvature, &labels, &centroids, &inliers}) {
       if (auto sample = port->receive(); !sample) {
         return holoscan::make_unexpected(sample.error());
       }
@@ -163,6 +173,7 @@ class CheckOp final : public holoscan::Operator<> {
     if (!coefficient_sample) {
       return holoscan::make_unexpected(coefficient_sample.error());
     }
+    tally_->without_colors += hm::is_present(cloud->data.colors) ? 0U : 1U;
     std::array<float, 4 * kPlanes> got{};
     if (auto copied =
             coefficient_sample->data.copy_to_host(got.data(), sizeof(got), context.cuda_stream());
@@ -190,7 +201,7 @@ class CheckOp final : public holoscan::Operator<> {
     return {};
   }
 
-  holoscan::Input<holoscan::Tensor> colors;
+  holoscan::Input<hm::schema::PointCloudT> point_cloud;
   holoscan::Input<holoscan::Tensor> curvature;
   holoscan::Input<holoscan::Tensor> labels;
   holoscan::Input<holoscan::Tensor> coefficients;
@@ -208,7 +219,7 @@ int main() {
   auto source = graph.op<CloudSourceOp>("source");
   constexpr std::uint32_t kPoints = std::uint32_t{kWidth} * kHeight;
   auto normals = graph.op<hn::NormalEstimationOp>(
-      "normals", hn::NormalEstimationConfig{.color = true, .max_points = kPoints});
+      "normals", hn::NormalEstimationConfig{.colors = true, .max_points = kPoints});
   hn::PlaneSegmentationConfig planes{.max_points = kPoints};
   planes.planes.max_planes = kPlanes;
   planes.planes.min_inliers = 200;
@@ -217,16 +228,17 @@ int main() {
   auto check = graph.op<CheckOp>("check", tally);
 
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
-  graph.add_flow(source->points, normals->points, lossless);
-  graph.add_flow(source->colors, normals->colors, lossless);
-  graph.add_flow(normals->filtered_points, segmenter->points, lossless);
-  graph.add_flow(normals->normals, segmenter->normals, lossless);
-  graph.add_flow(normals->filtered_colors, check->colors, lossless);
+  graph.add_flow(source->point_cloud, normals->point_cloud, lossless);
+  graph.add_flow(normals->point_cloud_with_normals, segmenter->point_cloud, lossless);
+  graph.add_flow(normals->point_cloud_with_normals, check->point_cloud, lossless);
   graph.add_flow(normals->curvature, check->curvature, lossless);
   graph.add_flow(segmenter->labels, check->labels, lossless);
   graph.add_flow(segmenter->plane_coefficients, check->coefficients, lossless);
   graph.add_flow(segmenter->plane_centroids, check->centroids, lossless);
   graph.add_flow(segmenter->plane_inliers, check->inliers, lossless);
+  // A lossless graph on one worker: across workers a stage that falls behind
+  // refuses its producer's emit, which fails the run.
+  graph.partition("normals_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // Every output of both operators is in device memory, on GPU 0.
@@ -235,26 +247,34 @@ int main() {
     options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
         .operator_path = op, .output_port = port, .device = holoscan::DeviceId{0}});
   };
-  for (const char* port : {"filtered_points", "filtered_colors", "normals", "curvature"}) {
+  for (const char* port : {"point_cloud_with_normals", "curvature"}) {
     on_gpu("normals", port);
   }
   for (const char* port : {"labels", "plane_coefficients", "plane_centroids", "plane_inliers"}) {
     on_gpu("planes", port);
   }
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
+  // Warnings on an accepted plan, as well as the reasons for a rejected one.
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
+  }
   if (!plan.ok()) {
-    std::cerr << plan.json() << '\n';
+    return 1;
+  }
+  const std::size_t workers = plan.execution_lanes().size();
+  if (workers != 1U) {
+    std::cerr << "normals_consumer: the graph runs on " << workers << " workers, not one\n";
     return 1;
   }
   if (const int status = holoscan::run(plan); status != 0) {
     std::cerr << "normals_consumer: run failed with " << status << '\n';
     return 1;
   }
-  const bool passed =
-      tally->frames == kFrames && tally->missed_planes == 0 && tally->frame_gaps == 0;
-  std::cout << "normals_consumer: frames=" << tally->frames
+  const bool passed = tally->frames == kFrames && tally->missed_planes == 0 &&
+                      tally->frame_gaps == 0 && tally->without_colors == 0;
+  std::cout << "normals_consumer: workers=" << workers << " frames=" << tally->frames
             << " missed_planes=" << tally->missed_planes << " frame_gaps=" << tally->frame_gaps
-            << '\n'
+            << " without_colors=" << tally->without_colors << '\n'
             << "normals_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 1;
 }

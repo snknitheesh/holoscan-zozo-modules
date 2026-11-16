@@ -45,6 +45,11 @@ if(HOLOSCAN_NORMALS_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The point cloud and camera info messages: in this build when the repository root added
+# holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::normals: the two operators, their CUDA kernels, the views and the synthetic scene.
 add_library(
@@ -57,6 +62,7 @@ add_library(
   src/normals.cu
   src/plane_segmentation_op.cpp
   src/planes.cu
+  src/synthetic_camera_info.cpp
   src/synthetic_scene.cu
 )
 add_library(holoscan::normals ALIAS holoscan_normals)
@@ -69,7 +75,9 @@ set_source_files_properties(
   src/synthetic_scene.cu
   PROPERTIES COMPILE_OPTIONS --fmad=false
 )
-# Nor does the library's host code contract, whatever the compiler's default.
+# Nor does the library's host code contract, whatever the compiler's default. This is not
+# passed on to consumers: host code of theirs that checks the synthetic scene's host functions
+# against the GPU bit for bit must use -ffp-contract=off itself (see README.md).
 target_compile_options(
   holoscan_normals
   PRIVATE
@@ -84,7 +92,13 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_normals PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+# The public headers use the SDK core, the messages and the CUDA runtime; Sensor I/O and NVTX
+# (header-only) only the sources.
+target_link_libraries(
+  holoscan_normals
+  PUBLIC holoscan::core holoscan::messages CUDA::cudart
+  PRIVATE holoscan::sensor_io CUDA::nvtx3
+)
 set_target_properties(
   holoscan_normals
   PROPERTIES

@@ -4,10 +4,8 @@
 #include "holoscan/normals/plane_segmentation_op.hpp"
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,26 +14,6 @@
 #include <holoscan/normals/normals.hpp>
 
 namespace holoscan::normals {
-namespace {
-
-using std::chrono_literals::operator""ns;
-
-holoscan::TensorOutputSpec planes_output(DLDataType dtype, std::uint32_t rank,
-                                         std::uint64_t bytes) {
-  return holoscan::TensorOutputSpec{
-      .representation =
-          holoscan::TensorRepresentation{
-              .memory_kind = holoscan::MemoryKind::kCudaDevice,
-              .dtype = dtype,
-              .rank = rank,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-          },
-      .bounds = holoscan::tensor_bounds(bytes),
-      .storage = holoscan::TensorOutputStorage::kRuntimePool,
-  };
-}
-
-}  // namespace
 
 void validate_config(const PlaneSegmentationConfig& config) {
   const char* what = nullptr;
@@ -58,24 +36,21 @@ PlaneSegmentationOp::~PlaneSegmentationOp() = default;
 
 void PlaneSegmentationOp::setup(holoscan::OperatorSpec& spec) {
   const std::uint64_t planes = config_.planes.max_planes;
-  spec.input(points, "points").queue_depth(2U);
-  spec.input(normals, "normals").queue_depth(2U);
+  // Two slots: one cloud in compute() while the next one arrives, so that the
+  // producer does not wait for this operator to take the previous cloud.
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
   spec.output(labels, "labels").produces_tensor(device_output(kUInt8, config_.max_points));
   spec.output(plane_coefficients, "plane_coefficients")
-      .produces_tensor(planes_output(kFloat32, 2U, planes * 4U * sizeof(float)));
+      .produces_tensor(device_output(kFloat32, planes * 4U * sizeof(float)));
   spec.output(plane_centroids, "plane_centroids")
-      .produces_tensor(planes_output(kFloat32, 2U, planes * 3U * sizeof(float)));
+      .produces_tensor(device_output(kFloat32, planes * 3U * sizeof(float)));
   spec.output(plane_inliers, "plane_inliers")
-      .produces_tensor(planes_output(kUInt32, 1U, planes * sizeof(std::uint32_t)));
+      .produces_tensor(device_output(kUInt32, planes * sizeof(std::uint32_t)));
 }
 
 holoscan::Contract PlaneSegmentationOp::contract() const {
   holoscan::Contract result;
-  // A cloud and its normals carry the same capture time.
-  result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, normals}}, .window = 0ns});
-  result.input(points, holoscan::Exact{});
-  result.input(normals, holoscan::Exact{});
+  result.trigger(holoscan::OnEach{point_cloud});
   return result;
 }
 
@@ -86,14 +61,13 @@ void PlaneSegmentationOp::stop() {
 
 holoscan::expected<void, holoscan::Error> PlaneSegmentationOp::compute(
     holoscan::ExecutionContext& context) {
-  auto cloud = receive_cloud(points, context);
+  auto cloud = receive_cloud(point_cloud, "point_cloud", context);
   if (!cloud) {
     return holoscan::make_unexpected(std::move(cloud).error());
   }
-  std::optional<holoscan::Sample<holoscan::Tensor>> normals_sample;
-  auto received = receive_matching(normals, "normals", kFloat32, *cloud, normals_sample, 0);
-  if (!received) {
-    return holoscan::make_unexpected(std::move(received).error());
+  if (!cloud->has_normals) {
+    return holoscan::make_unexpected(
+        invalid("the cloud carries no normals; send it through NormalEstimationOp first"));
   }
   const auto planes = static_cast<std::int64_t>(config_.planes.max_planes);
   const std::vector<std::int64_t> label_shape = cloud->point_shape();
@@ -123,9 +97,8 @@ holoscan::expected<void, holoscan::Error> PlaneSegmentationOp::compute(
                              .coefficients = out_coefficients.data<float>(),
                              .centroids = out_centroids.data<float>(),
                              .inliers = out_inliers.data<std::uint32_t>()};
-  if (const cudaError_t status =
-          segmenter_->segment(cloud->xyz, static_cast<const float*>(*received), cloud->count,
-                              config_.planes, outputs, cloud->stream);
+  if (const cudaError_t status = segmenter_->segment(cloud->xyz, cloud->normals, cloud->count,
+                                                     config_.planes, outputs, cloud->stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("plane segmentation", status));
   }

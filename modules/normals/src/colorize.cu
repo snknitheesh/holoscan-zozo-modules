@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -34,33 +35,33 @@ __device__ inline std::uint8_t channel(float value) {
   return static_cast<std::uint8_t>(fminf(fmaxf(scaled + 0.5F, 0.0F), 255.0F));
 }
 
+// Both kernels step rows by the grid's height, which the hardware limits to
+// 65535 blocks.
 __global__ void normals_kernel(const float* __restrict__ normals, int width, int height,
                                std::uint8_t* __restrict__ rgb, std::size_t row_stride) {
   const int u = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-  if (u >= width || v >= height) {
-    return;
+  for (int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y); u < width && v < height;
+       v += static_cast<int>(gridDim.y * blockDim.y)) {
+    const std::size_t i = static_cast<std::size_t>(v) * width + u;
+    std::uint8_t* out = rgb + static_cast<std::size_t>(v) * row_stride + 3U * u;
+    const float x = normals[3 * i];
+    const float y = normals[3 * i + 1];
+    const float z = normals[3 * i + 2];
+    const bool valid = isfinite(x) && isfinite(y) && isfinite(z);
+    out[0] = valid ? channel(x) : 0U;
+    out[1] = valid ? channel(y) : 0U;
+    out[2] = valid ? channel(z) : 0U;
   }
-  const std::size_t i = static_cast<std::size_t>(v) * width + u;
-  std::uint8_t* out = rgb + static_cast<std::size_t>(v) * row_stride + 3U * u;
-  const float x = normals[3 * i];
-  const float y = normals[3 * i + 1];
-  const float z = normals[3 * i + 2];
-  const bool valid = isfinite(x) && isfinite(y) && isfinite(z);
-  out[0] = valid ? channel(x) : 0U;
-  out[1] = valid ? channel(y) : 0U;
-  out[2] = valid ? channel(z) : 0U;
 }
 
 __global__ void labels_kernel(const std::uint8_t* __restrict__ labels, int width, int height,
                               std::uint8_t* __restrict__ rgb, std::size_t row_stride) {
   const int u = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-  if (u >= width || v >= height) {
-    return;
+  for (int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y); u < width && v < height;
+       v += static_cast<int>(gridDim.y * blockDim.y)) {
+    palette(labels[static_cast<std::size_t>(v) * width + u],
+            rgb + static_cast<std::size_t>(v) * row_stride + 3U * u);
   }
-  palette(labels[static_cast<std::size_t>(v) * width + u],
-          rgb + static_cast<std::size_t>(v) * row_stride + 3U * u);
 }
 
 bool usable(const void* in, int width, int height, const std::uint8_t* rgb,
@@ -81,7 +82,7 @@ cudaError_t colorize_normals(const float* normals, int width, int height, std::u
   }
   const dim3 block(32, 8);
   const dim3 grid((static_cast<unsigned int>(width) + 31U) / 32U,
-                  (static_cast<unsigned int>(height) + 7U) / 8U);
+                  std::min((static_cast<unsigned int>(height) + 7U) / 8U, 65535U));
   normals_kernel<<<grid, block, 0, stream>>>(normals, width, height, rgb, row_stride);
   return cudaGetLastError();
 }
@@ -96,7 +97,7 @@ cudaError_t colorize_labels(const std::uint8_t* labels, int width, int height, s
   }
   const dim3 block(32, 8);
   const dim3 grid((static_cast<unsigned int>(width) + 31U) / 32U,
-                  (static_cast<unsigned int>(height) + 7U) / 8U);
+                  std::min((static_cast<unsigned int>(height) + 7U) / 8U, 65535U));
   labels_kernel<<<grid, block, 0, stream>>>(labels, width, height, rgb, row_stride);
   return cudaGetLastError();
 }

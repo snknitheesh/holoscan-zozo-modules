@@ -8,6 +8,7 @@
 #include "compact.cuh"
 #include "device_buffer.hpp"
 #include "kernel_common.cuh"
+#include "nvtx_range.hpp"
 
 namespace holoscan::normals::detail {
 namespace {
@@ -16,20 +17,29 @@ __device__ inline bool has_normal(const float* normals, std::uint32_t i) {
   return isfinite(normals[3 * i]);
 }
 
-__global__ void keep_kernel(const float* __restrict__ xyz, const std::uint8_t* __restrict__ rgb,
+template <typename T>
+__device__ inline T missing();
+template <>
+__device__ inline float missing<float>() {
+  return nan_float();
+}
+template <>
+__device__ inline std::uint8_t missing<std::uint8_t>() {
+  return 0U;
+}
+
+template <typename T>
+__global__ void keep_kernel(const T* __restrict__ in, int channels,
                             const float* __restrict__ normals, std::uint32_t count,
-                            float* __restrict__ out_xyz, std::uint8_t* __restrict__ out_rgb) {
+                            T* __restrict__ out) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) {
     return;
   }
   const bool keep = has_normal(normals, i);
-  const float nan = nan_float();
-  for (int c = 0; c < 3; ++c) {
-    out_xyz[3 * i + c] = keep ? xyz[3 * i + c] : nan;
-    if (out_rgb != nullptr) {
-      out_rgb[3 * i + c] = keep ? rgb[3 * i + c] : 0U;
-    }
+  const std::size_t at = static_cast<std::size_t>(i) * static_cast<std::size_t>(channels);
+  for (int c = 0; c < channels; ++c) {
+    out[at + c] = keep ? in[at + c] : missing<T>();
   }
 }
 
@@ -47,40 +57,44 @@ __global__ void total_kernel(const std::uint32_t* __restrict__ flags,
   *total = count == 0U ? 0U : offsets[count - 1U] + flags[count - 1U];
 }
 
+template <typename T>
 __global__ void pack_kernel(const std::uint32_t* __restrict__ flags,
                             const std::uint32_t* __restrict__ offsets, std::uint32_t count,
-                            const float* __restrict__ xyz, const std::uint8_t* __restrict__ rgb,
-                            const float* __restrict__ normals, const float* __restrict__ curvature,
-                            float* __restrict__ out_xyz, std::uint8_t* __restrict__ out_rgb,
-                            float* __restrict__ out_normals, float* __restrict__ out_curvature) {
+                            const T* __restrict__ in, int channels, T* __restrict__ out) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count || flags[i] == 0U) {
     return;
   }
-  const std::uint32_t at = offsets[i];
-  for (int c = 0; c < 3; ++c) {
-    out_xyz[3 * at + c] = xyz[3 * i + c];
-    out_normals[3 * at + c] = normals[3 * i + c];
-    if (out_rgb != nullptr) {
-      out_rgb[3 * at + c] = rgb[3 * i + c];
-    }
+  const std::size_t from = static_cast<std::size_t>(i) * static_cast<std::size_t>(channels);
+  const std::size_t to = static_cast<std::size_t>(offsets[i]) * static_cast<std::size_t>(channels);
+  for (int c = 0; c < channels; ++c) {
+    out[to + c] = in[from + c];
   }
-  out_curvature[at] = curvature[i];
+}
+
+template <typename T>
+cudaError_t keep(const T* in, int channels, const float* normals, std::uint32_t count, T* out,
+                 cudaStream_t stream) {
+  if (count == 0U) {
+    return cudaSuccess;
+  }
+  if (in == nullptr || normals == nullptr || out == nullptr || channels < 1) {
+    return cudaErrorInvalidValue;
+  }
+  keep_kernel<T><<<blocks_for(count), kBlock, 0, stream>>>(in, channels, normals, count, out);
+  return cudaGetLastError();
 }
 
 }  // namespace
 
-cudaError_t keep_with_normals(const float* xyz, const std::uint8_t* rgb, const float* normals,
-                              std::uint32_t count, float* out_xyz, std::uint8_t* out_rgb,
-                              cudaStream_t stream) {
-  if (count == 0U) {
-    return cudaSuccess;
-  }
-  if ((rgb == nullptr) != (out_rgb == nullptr)) {
-    return cudaErrorInvalidValue;
-  }
-  keep_kernel<<<blocks_for(count), kBlock, 0, stream>>>(xyz, rgb, normals, count, out_xyz, out_rgb);
-  return cudaGetLastError();
+cudaError_t keep_with_normals(const float* in, int channels, const float* normals,
+                              std::uint32_t count, float* out, cudaStream_t stream) {
+  return keep(in, channels, normals, count, out, stream);
+}
+
+cudaError_t keep_with_normals(const std::uint8_t* in, int channels, const float* normals,
+                              std::uint32_t count, std::uint8_t* out, cudaStream_t stream) {
+  return keep(in, channels, normals, count, out, stream);
 }
 
 struct Compactor::Impl {
@@ -89,12 +103,26 @@ struct Compactor::Impl {
   DeviceBuffer total;
   DeviceBuffer temp;
   std::uint32_t count{};
+
+  template <typename T>
+  cudaError_t pack(const T* in, int channels, T* out, cudaStream_t stream) const {
+    if (count == 0U) {
+      return cudaSuccess;
+    }
+    if (in == nullptr || out == nullptr || channels < 1) {
+      return cudaErrorInvalidValue;
+    }
+    pack_kernel<T><<<blocks_for(count), kBlock, 0, stream>>>(
+        flags.as<std::uint32_t>(), offsets.as<std::uint32_t>(), count, in, channels, out);
+    return cudaGetLastError();
+  }
 };
 
 Compactor::Compactor() : impl_(std::make_unique<Impl>()) {}
 Compactor::~Compactor() = default;
 
 cudaError_t Compactor::count(const float* normals, std::uint32_t count, cudaStream_t stream) {
+  const NvtxRange range("holoscan_normals: compaction count");
   Impl& s = *impl_;
   const std::size_t n = count == 0U ? 1U : count;
   for (DeviceBuffer* buffer : {&s.flags, &s.offsets}) {
@@ -125,20 +153,13 @@ const std::uint32_t* Compactor::device_count() const noexcept {
   return impl_->total.as<std::uint32_t>();
 }
 
-cudaError_t Compactor::write(const float* xyz, const std::uint8_t* rgb, const float* normals,
-                             const float* curvature, float* out_xyz, std::uint8_t* out_rgb,
-                             float* out_normals, float* out_curvature, cudaStream_t stream) {
-  const std::uint32_t count = impl_->count;
-  if (count == 0U) {
-    return cudaSuccess;
-  }
-  if ((rgb == nullptr) != (out_rgb == nullptr)) {
-    return cudaErrorInvalidValue;
-  }
-  pack_kernel<<<blocks_for(count), kBlock, 0, stream>>>(
-      impl_->flags.as<std::uint32_t>(), impl_->offsets.as<std::uint32_t>(), count, xyz, rgb,
-      normals, curvature, out_xyz, out_rgb, out_normals, out_curvature);
-  return cudaGetLastError();
+cudaError_t Compactor::pack(const float* in, int channels, float* out, cudaStream_t stream) {
+  return impl_->pack(in, channels, out, stream);
+}
+
+cudaError_t Compactor::pack(const std::uint8_t* in, int channels, std::uint8_t* out,
+                            cudaStream_t stream) {
+  return impl_->pack(in, channels, out, stream);
 }
 
 }  // namespace holoscan::normals::detail

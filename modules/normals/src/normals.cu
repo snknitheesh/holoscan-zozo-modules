@@ -28,6 +28,7 @@
 
 #include "device_buffer.hpp"
 #include "kernel_common.cuh"
+#include "nvtx_range.hpp"
 
 namespace holoscan::normals {
 namespace {
@@ -123,13 +124,8 @@ struct WindowArgs {
   float3 view;
 };
 
-__global__ void window_kernel(const float* __restrict__ xyz, WindowArgs a,
-                              float* __restrict__ normals, float* __restrict__ curvature) {
-  const int u = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-  if (u >= a.width || v >= a.height) {
-    return;
-  }
+__device__ void window_point(const float* __restrict__ xyz, const WindowArgs& a, int u, int v,
+                             float* __restrict__ normals, float* __restrict__ curvature) {
   const auto i = static_cast<std::uint32_t>(v) * static_cast<std::uint32_t>(a.width) +
                  static_cast<std::uint32_t>(u);
   const float px = xyz[3 * i];
@@ -168,6 +164,19 @@ __global__ void window_kernel(const float* __restrict__ xyz, WindowArgs a,
     }
   }
   finish(m, a.min_neighbors, px, py, pz, a.view, i, normals, curvature);
+}
+
+// Rows step by the grid's height, which the hardware limits to 65535 blocks.
+__global__ void window_kernel(const float* __restrict__ xyz, WindowArgs a,
+                              float* __restrict__ normals, float* __restrict__ curvature) {
+  const int u = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (u >= a.width) {
+    return;
+  }
+  for (int v = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y); v < a.height;
+       v += static_cast<int>(gridDim.y * blockDim.y)) {
+    window_point(xyz, a, u, v, normals, curvature);
+  }
 }
 
 // ---- The grid ---------------------------------------------------------------------------------
@@ -403,6 +412,18 @@ bool valid_params(const NormalParams& params, const char** what) {
   if (params.min_neighbors < 3U || params.min_neighbors > window * window) {
     return fail("min_neighbors must be 3..961");
   }
+  // A search that cannot find min_neighbors would give every point NaN.
+  const bool window_possible =
+      params.search == NeighborSearch::kAuto || params.search == NeighborSearch::kWindow;
+  const bool knn_possible =
+      params.search == NeighborSearch::kAuto || params.search == NeighborSearch::kKnn;
+  const auto side = static_cast<std::uint32_t>(2 * params.window_radius + 1);
+  if (window_possible && params.min_neighbors > side * side) {
+    return fail("min_neighbors must be at most the window's (2 * window_radius + 1)^2 pixels");
+  }
+  if (knn_possible && params.min_neighbors > params.k) {
+    return fail("min_neighbors must be at most k");
+  }
   if (!std::isfinite(params.viewpoint[0]) || !std::isfinite(params.viewpoint[1]) ||
       !std::isfinite(params.viewpoint[2])) {
     return fail("viewpoint must be finite");
@@ -447,16 +468,20 @@ cudaError_t NormalEstimator::estimate(const float* xyz, std::uint32_t count, int
   const float3 view = make_float3(params.viewpoint[0], params.viewpoint[1], params.viewpoint[2]);
 
   if (search == NeighborSearch::kWindow) {
+    const detail::NvtxRange range("holoscan_normals: normals, window");
     const WindowArgs args{
         width, height, params.window_radius, params.depth_change_factor, params.min_neighbors,
         view};
     const dim3 block(32, 8);
     const dim3 grid((static_cast<unsigned int>(width) + 31U) / 32U,
-                    (static_cast<unsigned int>(height) + 7U) / 8U);
+                    std::min((static_cast<unsigned int>(height) + 7U) / 8U, 65535U));
     window_kernel<<<grid, block, 0, stream>>>(xyz, args, normals, curvature);
     return cudaGetLastError();
   }
 
+  const detail::NvtxRange range(search == NeighborSearch::kKnn
+                                    ? "holoscan_normals: normals, k-nearest"
+                                    : "holoscan_normals: normals, radius");
   Impl& s = *impl_;
   const std::size_t n = count;
   for (auto [buffer, bytes] :
@@ -478,7 +503,7 @@ cudaError_t NormalEstimator::estimate(const float* xyz, std::uint32_t count, int
   if (const cudaError_t status =
           detail::sort_pairs(s.keys.as<std::uint64_t>(), s.sorted_keys.as<std::uint64_t>(),
                              s.indices.as<std::uint32_t>(), s.sorted_indices.as<std::uint32_t>(),
-                             count, detail::kKeyBits, s.temp, stream);
+                             count, detail::kSortBits, s.temp, stream);
       status != cudaSuccess) {
     return status;
   }

@@ -7,7 +7,8 @@
 // (median and 95th percentile of the angle error, orientation) on organized
 // and shuffled unorganized clouds; the curvature on planes and on the sphere;
 // the GPU against the CPU reference on small clouds; determinism; empty,
-// all-invalid, single-point and degenerate clouds; and rejected settings.
+// all-invalid, single-point and degenerate clouds; scratch that grows with
+// the clouds; and rejected settings.
 
 #include <cuda_runtime_api.h>
 
@@ -26,6 +27,7 @@
 #include <holoscan/normals/normals.hpp>
 #include <holoscan/normals/synthetic_scene.hpp>
 
+#include "device_buffer.hpp"
 #include "reference.hpp"
 #include "scene_support.hpp"
 #include "test_support.hpp"
@@ -354,6 +356,44 @@ void check_determinism() {
   }
 }
 
+// Scratch grows by at least half, keeps its buffer for any smaller request,
+// and replaces it without waiting the first time.
+void check_scratch_growth() {
+  cudaStream_t stream{};
+  VERIFY(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+  detail::DeviceBuffer buffer;
+  VERIFY(buffer.reserve(1000, stream) == cudaSuccess);
+  VERIFY(buffer.bytes() == 1000);
+  VERIFY(buffer.reserve(1001, stream) == cudaSuccess);
+  VERIFY_MSG(buffer.bytes() == 1500, "grows by half: " + std::to_string(buffer.bytes()));
+  const void* grown = buffer.as<void>();
+  VERIFY(buffer.reserve(1400, stream) == cudaSuccess);
+  VERIFY(buffer.reserve(1500, stream) == cudaSuccess);
+  VERIFY_MSG(buffer.as<void>() == grown && buffer.bytes() == 1500, "no reallocation within it");
+  VERIFY(buffer.reserve(5000, stream) == cudaSuccess);
+  VERIFY_MSG(buffer.bytes() == 5000, "a larger request is taken whole");
+  VERIFY(cudaStreamDestroy(stream) == cudaSuccess);
+
+  // An estimator whose clouds grow frame by frame gives what a fresh one gives.
+  const SceneCloud cloud = test::scene_cloud(320, 240, 0);
+  NormalEstimator growing;
+  for (const NeighborSearch search : {NeighborSearch::kKnn, NeighborSearch::kRadius}) {
+    NormalParams params;
+    params.search = search;
+    params.radius = 0.1F;
+    for (const std::size_t points : {std::size_t{4000}, std::size_t{4100}, std::size_t{9000},
+                                     std::size_t{20000}, std::size_t{76800}}) {
+      const std::vector<float> part(cloud.xyz.begin(),
+                                    cloud.xyz.begin() + static_cast<std::ptrdiff_t>(3 * points));
+      const auto n = static_cast<int>(points);
+      const test::Estimate got = test::estimate(growing, part, n, 1, params);
+      const test::Estimate fresh = test::estimate(part, n, 1, params);
+      VERIFY_MSG(same_bits(got.normals, fresh.normals) && same_bits(got.curvature, fresh.curvature),
+                 "a growing cloud of " + std::to_string(points) + " points");
+    }
+  }
+}
+
 void check_edge_cases() {
   NormalParams window;
   NormalParams knn;
@@ -435,6 +475,33 @@ void check_edge_cases() {
   bad = NormalParams{};
   bad.viewpoint[1] = NAN;
   rejects(bad, "viewpoint");
+  // A search that cannot find min_neighbors: k nearest, or a window, smaller.
+  bad = NormalParams{};
+  bad.search = NeighborSearch::kKnn;
+  bad.k = 4;
+  rejects(bad, "min_neighbors must be at most k");
+  bad.search = NeighborSearch::kAuto;
+  rejects(bad, "min_neighbors must be at most k");
+  bad = NormalParams{};
+  bad.search = NeighborSearch::kWindow;
+  bad.window_radius = 1;
+  bad.min_neighbors = 10;
+  rejects(bad, "min_neighbors must be at most the window");
+  // The radius search has no such bound, nor a k-nearest search with a
+  // smaller window, nor a window search with a smaller k.
+  NormalParams fine;
+  fine.search = NeighborSearch::kRadius;
+  fine.k = 4;
+  fine.window_radius = 1;
+  fine.min_neighbors = 10;
+  VERIFY(valid_params(fine));
+  fine.search = NeighborSearch::kKnn;
+  fine.k = 10;
+  VERIFY(valid_params(fine));
+  fine.search = NeighborSearch::kWindow;
+  fine.window_radius = 2;
+  fine.k = 4;
+  VERIFY(valid_params(fine));
 }
 
 }  // namespace
@@ -450,6 +517,7 @@ int main() {
       TestCase{"curvature", hn::check_curvature},
       TestCase{"CPU reference", hn::check_cpu_reference},
       TestCase{"determinism", hn::check_determinism},
+      TestCase{"scratch growth", hn::check_scratch_growth},
       TestCase{"edge cases and settings", hn::check_edge_cases},
   });
 }

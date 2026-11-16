@@ -14,8 +14,6 @@ add_executable(normals_consumer main.cpp)
 target_link_libraries(normals_consumer PRIVATE holoscan::normals)
 set_target_properties(normals_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# The exit status decides: 0 only when every frame passed, on one worker.
 add_test(NAME normals_installed_consumer COMMAND normals_consumer)
-set_tests_properties(
-  normals_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "normals_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(normals_installed_consumer PROPERTIES TIMEOUT 300)

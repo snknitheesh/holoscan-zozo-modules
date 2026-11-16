@@ -39,6 +39,9 @@ inline constexpr std::int32_t kCellRange = std::int32_t{1} << 20;
 inline constexpr std::uint64_t kNoCell = ~std::uint64_t{0};
 inline constexpr int kCellBits = 21;
 inline constexpr int kKeyBits = 3 * kCellBits;
+// The sorts take all 64 bits, so that kNoCell, the only key with the top bit
+// set, sorts after every cell, the last one of the range included.
+inline constexpr int kSortBits = 64;
 
 // The cell index of coordinate `value` in cells of `size`, or false when it is
 // out of range (or not finite).

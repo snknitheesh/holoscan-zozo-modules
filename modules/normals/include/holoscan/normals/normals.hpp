@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Surface normals and curvature on the GPU, without a Holoscan graph. A cloud
-// is `count` packed float32 x, y, z triples in device memory, the layout of
-// holoscan-point-cloud's clouds; an organized cloud is `height` rows of
-// `width` points. A point is invalid when any coordinate is not finite
+// is `count` packed float32 x, y, z triples in device memory, the points of a
+// PointCloud message of holoscan-messages; an organized cloud is `height` rows
+// of `width` points. A point is invalid when any coordinate is not finite
 // (DepthToPointCloudOp writes NaN).
 //
 // Each valid point's neighborhood is gathered, its covariance computed about
@@ -19,10 +19,12 @@
 // nearest) found in a uniform grid sorted on the GPU, for any cloud.
 //
 // The results are deterministic: the same input gives the same bits on every
-// run. NormalEstimator keeps its device scratch between calls, grown as
-// needed, and is for one stream at a time. All work is ordered on the given
-// stream; nothing waits for it, except that growing a scratch buffer first
-// waits for the stream to finish with the old one.
+// run. NormalEstimator keeps its device scratch between calls, grown by at
+// least half when a cloud is larger than any before, and is for one stream at
+// a time. All work is ordered on the given stream; nothing waits for it,
+// except that replacing a scratch buffer with a larger one first waits for
+// the stream to finish with the old one (the first allocation waits for
+// nothing).
 
 #pragma once
 
@@ -47,9 +49,14 @@ enum class NeighborSearch : std::uint8_t {
   // range from the viewpoint differs from the point's by at most
   // depth_change_factor * range per pixel of distance. Organized clouds only.
   kWindow,
-  // Every point within `radius`.
+  // Every point within `radius`. Each point visits every point in the 27
+  // grid cells of side `radius` around it, with no cap: the work per point
+  // grows with the points within about two radii, so a dense, near cloud (or
+  // one with many points in one place) costs far more than a far one.
   kRadius,
-  // The k nearest points within `radius`.
+  // The k nearest points within `radius`. Its cells are a quarter of the
+  // radius, and it stops once no unvisited point can be nearer than the k it
+  // has, so its work grows much less with the density.
   kKnn,
 };
 
@@ -67,7 +74,8 @@ struct NormalParams {
   // kKnn: neighbors, the point itself included, 3..kMaxNeighbors.
   std::uint32_t k{24};
   // Fewer neighbors than this, the point itself included, give no normal;
-  // 3..(2 * kMaxWindowRadius + 1)^2.
+  // 3..(2 * kMaxWindowRadius + 1)^2, and no more than the window's pixels
+  // (kWindow, kAuto) or k (kKnn, kAuto), which could never find them.
   std::uint32_t min_neighbors{5};
   // Normals point toward this point, in the cloud's frame: the camera at its
   // origin for a camera's cloud.

@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Times normal estimation (each search) and plane segmentation on clouds of
-// the synthetic scene, as the operators run them in the kKeep layout. Prints
-// a Markdown table of the mean and the 95th percentile over the iterations,
-// in milliseconds of GPU time on one stream.
+// Times the kernels of normal estimation (each search) and plane
+// segmentation on clouds of the synthetic scene, as the operators launch them
+// in the kKeep layout: GPU time on one stream between two events, without the
+// operators' receive, allocation and emit, and without host time. Prints the
+// GPU, its driver and the CUDA runtime, then a Markdown table of the mean and
+// the 95th percentile over the iterations, in milliseconds. The near rows
+// shrink the cloud to a quarter of its distances, 16 times the points per
+// area of surface, where the radius search visits many more points.
 //
 //   normals_benchmark [--iterations N] [--size WxH]...
 
@@ -71,6 +75,20 @@ Timing time_it(const std::function<void()>& step, int iterations, cudaStream_t s
   return timing;
 }
 
+void print_versions() {
+  int device = 0;
+  int driver = 0;
+  int runtime = 0;
+  cudaDeviceProp properties{};
+  check(cudaGetDevice(&device), "cudaGetDevice");
+  check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
+  check(cudaDriverGetVersion(&driver), "cudaDriverGetVersion");
+  check(cudaRuntimeGetVersion(&runtime), "cudaRuntimeGetVersion");
+  std::printf("GPU %s (sm_%d%d), CUDA driver API %d.%d, CUDA runtime %d.%d\n\n", properties.name,
+              properties.major, properties.minor, driver / 1000, (driver % 1000) / 10,
+              runtime / 1000, (runtime % 1000) / 10);
+}
+
 void run(int width, int height, int iterations) {
   const hn::SyntheticScene scene = hn::synthetic_scene(width, height, 0);
   const auto n = static_cast<std::uint32_t>(width) * static_cast<std::uint32_t>(height);
@@ -89,12 +107,24 @@ void run(int width, int height, int iterations) {
   check(cudaMalloc(&planes, 7U * hn::kMaxPlanes * sizeof(float)), "cudaMalloc");
   check(cudaMalloc(&inliers, hn::kMaxPlanes * sizeof(std::uint32_t)), "cudaMalloc");
   check(hn::render_synthetic_scene(scene, nullptr, nullptr, xyz, stream), "render");
+  // The same cloud at a quarter of its distances.
+  float* near = nullptr;
+  check(cudaMalloc(&near, 12U * n), "cudaMalloc");
+  {
+    std::vector<float> host(3U * n);
+    check(cudaMemcpyAsync(host.data(), xyz, 12U * n, cudaMemcpyDeviceToHost, stream), "copy");
+    check(cudaStreamSynchronize(stream), "copy");
+    for (float& value : host) {
+      value *= 0.25F;
+    }
+    check(cudaMemcpy(near, host.data(), 12U * n, cudaMemcpyHostToDevice), "copy");
+  }
 
   hn::NormalEstimator estimator;
   hn::PlaneSegmenter segmenter;
-  const auto normals_step = [&](hn::NormalParams params) {
-    return [&, params] {
-      check(estimator.estimate(xyz, n, width, height, params, normals, curvature, stream),
+  const auto normals_step = [&](hn::NormalParams params, const float* cloud) {
+    return [&, params, cloud] {
+      check(estimator.estimate(cloud, n, width, height, params, normals, curvature, stream),
             "estimate");
     };
   };
@@ -115,10 +145,12 @@ void run(int width, int height, int iterations) {
   };
 
   std::vector<std::pair<std::string, std::function<void()>>> steps{
-      {"NormalEstimationOp (window 7x7)", normals_step(window3)},
-      {"NormalEstimationOp (window 11x11)", normals_step(window5)},
-      {"NormalEstimationOp (k-nearest 24, 10 cm)", normals_step(knn)},
-      {"NormalEstimationOp (radius 4 cm)", normals_step(radius)},
+      {"Normals (window 7x7)", normals_step(window3, xyz)},
+      {"Normals (window 11x11)", normals_step(window5, xyz)},
+      {"Normals (k-nearest 24, 10 cm)", normals_step(knn, xyz)},
+      {"Normals (radius 4 cm)", normals_step(radius, xyz)},
+      {"Normals (k-nearest 24, 10 cm), near", normals_step(knn, near)},
+      {"Normals (radius 4 cm), near", normals_step(radius, near)},
   };
   std::printf("| %dx%d | mean ms | p95 ms |\n| --- | --- | --- |\n", width, height);
   for (const auto& [name, step] : steps) {
@@ -126,12 +158,12 @@ void run(int width, int height, int iterations) {
     std::printf("| %s | %.3f | %.3f |\n", name.c_str(), t.mean, t.p95);
   }
   // The planes of the window normals.
-  normals_step(window3)();
+  normals_step(window3, xyz)();
   const Timing t = time_it(planes_step, iterations, stream);
-  std::printf("| PlaneSegmentationOp (8 planes, 256 hypotheses) | %.3f | %.3f |\n", t.mean, t.p95);
+  std::printf("| Planes (8 planes, 256 hypotheses) | %.3f | %.3f |\n", t.mean, t.p95);
   const Timing both = time_it(
       [&] {
-        normals_step(window3)();
+        normals_step(window3, xyz)();
         planes_step();
       },
       iterations, stream);
@@ -139,6 +171,7 @@ void run(int width, int height, int iterations) {
   std::fflush(stdout);
 
   cudaFree(xyz);
+  cudaFree(near);
   cudaFree(normals);
   cudaFree(curvature);
   cudaFree(labels);
@@ -179,6 +212,7 @@ int main(int argc, char** argv) try {
   if (sizes.empty()) {
     sizes = {{640, 480}, {1280, 720}};
   }
+  print_versions();
   for (const auto& [width, height] : sizes) {
     run(width, height, iterations);
   }

@@ -5,9 +5,9 @@
 // normal agreement on the GPU, and which plane each point is on. See
 // planes.hpp for the method and cloud_op.hpp for the cloud.
 //
-//   points              (input) float32 [N, 3] or [H, W, 3].
-//   normals             (input) float32 of the points' shape, as
-//                       NormalEstimationOp emits them; a point with a
+//   point_cloud         (input) a PointCloud of float32 [N, 3] or [H, W, 3]
+//                       points that carries normals, as NormalEstimationOp's
+//                       point_cloud_with_normals does; a point with a
 //                       non-finite normal is on no plane.
 //   labels              uint8, one per point ([H, W] or [N]): plane k is
 //                       k + 1; kLabelNoPlane (0) on none, kLabelInvalid (255)
@@ -19,10 +19,13 @@
 //   plane_inliers       uint32 [max_planes], each plane's inliers; 0 past the
 //                       planes found.
 //
-// The operator runs once per cloud when the normals with exactly the same
-// capture time have arrived. Every output is in device memory and carries the
-// cloud's capture time and frame id; they go out in the order above. Nothing
-// waits for the GPU.
+// Every output is in device memory and carries the cloud's capture time and
+// frame id; they go out in the order above. With input in device memory and
+// once its scratch has reached the clouds' size, nothing waits for the GPU;
+// host input is copied to the GPU every frame (see README.md, "Waits and
+// copies").
+//
+// The operator is configured only by its constructor's PlaneSegmentationConfig.
 
 #pragma once
 
@@ -35,6 +38,7 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/normals/cloud_op.hpp>
 #include <holoscan/normals/planes.hpp>
 
@@ -62,8 +66,7 @@ class PlaneSegmentationOp final : public CloudOp {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  holoscan::Input<holoscan::Tensor> points;
-  holoscan::Input<holoscan::Tensor> normals;
+  holoscan::Input<holoscan::messages::schema::PointCloudT> point_cloud;
   holoscan::Output<holoscan::Tensor> labels;
   holoscan::Output<holoscan::Tensor> plane_coefficients;
   holoscan::Output<holoscan::Tensor> plane_centroids;

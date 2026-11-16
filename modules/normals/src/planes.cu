@@ -27,6 +27,7 @@
 
 #include "device_buffer.hpp"
 #include "kernel_common.cuh"
+#include "nvtx_range.hpp"
 
 namespace holoscan::normals {
 namespace {
@@ -590,6 +591,7 @@ cudaError_t PlaneSegmenter::segment(const float* xyz, const float* normals, std:
       (count != 0U && (xyz == nullptr || normals == nullptr || outputs.labels == nullptr))) {
     return cudaErrorInvalidValue;
   }
+  const detail::NvtxRange range("holoscan_normals: planes");
   Impl& s = *impl_;
   const std::size_t n = std::max<std::size_t>(count, 1U);
   const std::uint32_t iterations = params.iterations;

@@ -18,8 +18,11 @@
 // min_inliers ends the search. With merge_coplanar, planes that agree within
 // merge_angle_deg and merge_distance are then merged, and refit.
 //
-// Everything is decided on the GPU, so the host never waits; floating-point
-// sums are in double, reduced in a fixed order.
+// Everything is decided on the GPU, so the host does not wait for a
+// decision; floating-point sums are in double, reduced in a fixed order.
+// PlaneSegmenter keeps its device scratch between calls, grown by at least
+// half when a cloud is larger than any before; growing replaces a buffer
+// only after waiting for the stream to finish with it.
 
 #pragma once
 

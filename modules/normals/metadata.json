@@ -4,7 +4,7 @@
     "name": "holoscan-normals",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Surface normals and planes of point clouds on the GPU, in holoscan-point-cloud's layout: per-point normals oriented toward a viewpoint and curvature by PCA of each point's neighborhood (an image window for organized clouds, a GPU grid k-nearest or radius search for any cloud), and multi-plane segmentation by RANSAC with normal agreement, plane after plane, with each plane's coefficients, centroid and inlier count and a per-point label image, optionally merging coplanar planes.",
+    "description": "Surface normals and planes of point clouds on the GPU, on the PointCloud message of holoscan-messages: per-point normals oriented toward a viewpoint and curvature by PCA of each point's neighborhood (an image window for organized clouds, a GPU grid k-nearest or radius search for any cloud), carried on the cloud with its colors and intensities, and multi-plane segmentation by RANSAC with normal agreement, plane after plane, with each plane's coefficients, centroid and inlier count and a per-point label image, optionally merging coplanar planes.",
     "authors": [
       {
         "name": "zozo",
@@ -50,11 +50,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-normals",
       "install_commands": [
-        "sudo apt install ./holoscan-normals_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-normals_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

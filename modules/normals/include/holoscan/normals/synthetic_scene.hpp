@@ -20,7 +20,10 @@
 #include <cmath>
 #include <cstdint>
 #include <numbers>
+#include <string>
 #include <vector>
+
+#include <holoscan/messages/camera_info.hpp>
 
 #if defined(__CUDACC__)
 #define HOLOSCAN_NORMALS_HOST_DEVICE __host__ __device__
@@ -101,6 +104,13 @@ inline SyntheticScene synthetic_scene(int width, int height, std::uint32_t frame
   scene.frame = frame;
   return scene;
 }
+
+// The CameraInfo of `scene`'s camera, as DepthToPointCloudOp takes it:
+// undistorted (no distortion model), the scene's size and intrinsics (its
+// floats, exactly, as doubles), and `frame_id`. Write it with the messages
+// module's write_camera_info_yaml() for CameraInfoSourceOp to read.
+[[nodiscard]] holoscan::messages::CameraInfo synthetic_camera_info(
+    const SyntheticScene& scene, std::string frame_id = "synthetic_camera");
 
 struct ScenePixel {
   // Camera z in meters, as a depth camera reports it; 0 without depth.
