@@ -3,18 +3,13 @@
 //
 // SceneSourceOp: frames of holoscan-clustering's synthetic scene as a depth
 // camera sends them: float32 depth in meters, 0 where there is none, in
-// device memory, a fixed number on a clock, then idle.
-//
-// EuclideanClusterOp cannot send a refused output again, so a full queue must
-// never meet it: with `finished`, the source keeps one frame in flight,
-// sending the next only once the last consumer has counted the previous one.
+// device memory, a fixed number on a clock, then idle. A full queue or pool
+// is backpressure: the same frame goes again on the next tick.
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <memory>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -31,8 +26,6 @@ struct SceneSourceConfig {
   int height{480};
   std::uint32_t count{100};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
-  // Frames the last consumer has finished; none sends on every tick.
-  std::shared_ptr<const std::atomic<std::uint32_t>> finished;
 };
 
 // @throws std::invalid_argument naming the first unusable field.

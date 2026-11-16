@@ -3,22 +3,28 @@
 //
 // Clustering: a synthetic depth camera over objects on a removed ground,
 // deprojected by holoscan-point-cloud's DepthToPointCloudOp and split into
-// objects on the GPU by holoscan-clustering's EuclideanClusterOp. A reporter
-// checks every frame against the scene's truth, and with a display the
-// clusters are drawn in their colors, with their boxes, in HoloViz.
+// objects on the GPU by holoscan-clustering's EuclideanClusterOp. The camera's
+// calibration is a ROS camera_info file, written for the run and sent by
+// holoscan-messages' CameraInfoSourceOp. A reporter checks every frame
+// against the scene's truth, and with a display the clusters are drawn in
+// their colors, with their boxes, in HoloViz.
 
-#include <atomic>
+#include <stdlib.h>
+
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -33,6 +39,10 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #if CLUSTERING_ENABLE_VISUALIZATION
@@ -49,9 +59,12 @@ namespace {
 using std::chrono_literals::operator""ms;
 namespace app = clustering_app;
 namespace hc = holoscan::clustering;
+namespace hm = holoscan::messages;
 namespace pc = holoscan::point_cloud;
 
 constexpr std::string_view kAppName = "clustering";
+// The synthetic camera's optical frame, the camera_info file's camera_name.
+constexpr std::string_view kCameraFrame = "scene_camera_optical";
 
 enum class DisplayMode { kAuto, kOn, kOff };
 
@@ -151,8 +164,64 @@ void usage(const char* argv0) {
          "  --display auto|true|false  Show the clusters in HoloViz (default: auto, on\n"
          "                           when a display is available)\n"
          "  --timeout-seconds N      Allowance beyond the expected run time (default: 120)\n"
-         "  --compile-only true|false  Build and check the graph without running it\n";
+         "  --compile-only true|false  Build and check the graph, print its workers and\n"
+         "                           exit without running it\n";
 }
+
+// The synthetic scene's camera, as its camera_info file describes it: an
+// undistorted pinhole of the scene's intrinsics.
+hm::CameraInfo scene_camera(const hc::SyntheticScene& scene, int width, int height) {
+  hm::CameraInfo camera;
+  camera.header.frame_id = std::string(kCameraFrame);
+  camera.width = static_cast<std::uint32_t>(width);
+  camera.height = static_cast<std::uint32_t>(height);
+  camera.state = hm::CameraState::kUndistorted;
+  camera.fx = scene.fx;
+  camera.fy = scene.fy;
+  camera.cx = scene.cx;
+  camera.cy = scene.cy;
+  camera.distortion_model = hm::DistortionModel::kNone;
+  return camera;
+}
+
+// The scene camera's camera_info file, written for CameraInfoSourceOp to read
+// (the calibration's one input), in a folder of its own that mkdtemp() names
+// unpredictably and makes private, so that nothing can be planted where the
+// file goes. Removed with everything in it with this object, on every path
+// out of the run.
+class CameraInfoFile {
+ public:
+  explicit CameraInfoFile(const hm::CameraInfo& camera) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(camera, path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~CameraInfoFile() { remove(); }
+  CameraInfoFile(const CameraInfoFile&) = delete;
+  CameraInfoFile& operator=(const CameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
 
 bool env_set(const char* name) {
   const char* value = std::getenv(name);
@@ -176,21 +245,22 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 
   const hc::SyntheticScene scene = hc::synthetic_scene(opts.width, opts.height, 0);
-  const pc::CameraIntrinsics intrinsics{scene.fx, scene.fy, scene.cx, scene.cy};
   const auto points =
       static_cast<std::uint32_t>(opts.width) * static_cast<std::uint32_t>(opts.height);
+  // CameraInfoSourceOp reads the file when it is made and again when the run
+  // starts, so it stays until execute() returns.
+  const CameraInfoFile camera_info_file(scene_camera(scene, opts.width, opts.height));
 
   holoscan::Graph graph{std::string(kAppName)};
-  auto finished = std::make_shared<std::atomic<std::uint32_t>>(0U);
   auto source = graph.op<app::SceneSourceOp>(
       "source", app::SceneSourceConfig{.width = opts.width,
                                        .height = opts.height,
                                        .count = opts.count,
-                                       .period = std::chrono::milliseconds(opts.period_ms),
-                                       .finished = finished});
+                                       .period = std::chrono::milliseconds(opts.period_ms)});
+  auto camera_info = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file.path()});
   auto deproject = graph.op<pc::DepthToPointCloudOp>(
-      "deproject", pc::DepthToPointCloudConfig{.intrinsics = intrinsics,
-                                               .depth_scale = 1.0F,
+      "deproject", pc::DepthToPointCloudConfig{.depth_scale = 1.0F,
                                                .depth_min = 0.1F,
                                                .depth_max = 10.0F,
                                                .max_width = opts.width,
@@ -207,16 +277,15 @@ int execute(const Options& opts, SignalDomain& signals) {
                                          .width = opts.width,
                                          .height = opts.height,
                                          .min_cluster_size = opts.min_size,
-                                         .expected_frames = opts.count,
-                                         .finished = finished});
+                                         .expected_frames = opts.count});
 
-  // Lossless edges: every frame is clustered and checked, in order. The
-  // source keeps one frame in flight, so no queue fills and no output is
-  // refused.
+  // Lossless edges: every frame is clustered and checked, in order.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->depth, deproject->depth, lossless);
-  graph.add_flow(deproject->point_cloud, cluster->points, lossless);
-  graph.add_flow(deproject->point_cloud, reporter->points, lossless);
+  graph.add_flow(camera_info->camera_info, deproject->camera_info,
+                 hm::latest_camera_info_connection());
+  graph.add_flow(deproject->point_cloud, cluster->point_cloud, lossless);
+  graph.add_flow(deproject->point_cloud, reporter->point_cloud, lossless);
   graph.add_flow(cluster->labels, reporter->labels, lossless);
   graph.add_flow(cluster->clusters, reporter->clusters, lossless);
 
@@ -235,12 +304,8 @@ int execute(const Options& opts, SignalDomain& signals) {
 #if CLUSTERING_ENABLE_VISUALIZATION
   if (display) {
     namespace viz = holoscan::visualization;
-    auto view = graph.op<app::ClusterViewOp>("view", app::ClusterViewConfig{.width = opts.width,
-                                                                            .height = opts.height,
-                                                                            .fx = scene.fx,
-                                                                            .fy = scene.fy,
-                                                                            .cx = scene.cx,
-                                                                            .cy = scene.cy});
+    auto view = graph.op<app::ClusterViewOp>(
+        "view", app::ClusterViewConfig{.max_width = opts.width, .max_height = opts.height});
     viz::LayerStack layers;
     layers.add_image_layer(
         "clusters", viz::ImageLayerDesc{.format = viz::ImageFormat::kR8G8B8Unorm,
@@ -256,11 +321,21 @@ int execute(const Options& opts, SignalDomain& signals) {
                                              .queue_depth = 1U};
     graph.add_flow(cluster->labels, view->labels, latest);
     graph.add_flow(cluster->clusters, view->clusters, latest);
+    graph.add_flow(camera_info->camera_info, view->camera_info,
+                   hm::latest_camera_info_connection());
     graph.add_flow(view->image, visualizer->image_layer_input(0), latest);
     on_gpu("view", "image");
   }
 #endif
 
+  // One worker for the whole graph: every frame must reach the reporter. With
+  // the camera info's source the graph has two sources, and the automatic
+  // partitioning would give the scene, the camera info, the clustering and
+  // the reporter workers of their own; a stage would then run while its
+  // consumer's queue or its own output pool is full and have what it sends
+  // refused, which fails the run. (The display shares the worker: it only
+  // ever keeps the newest frame.)
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   if (!plan.diagnostics().empty()) {
@@ -270,7 +345,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on: one per partition that runs operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -305,13 +381,20 @@ int execute(const Options& opts, SignalDomain& signals) {
     }
   }
 
+  // A stop request (SIGINT, SIGTERM) ends the run early; that is not a
+  // failure, but not a pass either.
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
+  // Frames before the first camera info give no cloud. CameraInfoSourceOp
+  // sends when the run starts, a period before the scene's first frame, so
+  // at most one frame, should the worker run it a period late, comes first.
+  constexpr std::uint32_t kAllowedBeforeCameraInfo = 1;
   const bool passed = !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
-                      report->frames == opts.count && report->passed();
+                      report->passed(opts.count, kAllowedBeforeCameraInfo);
   const app::ClusterReport& r = *report;
   std::cout << std::fixed << std::setprecision(4) << kAppName << ": frames=" << r.frames << '/'
-            << opts.count << " clusters_per_frame="
+            << opts.count << " before_camera_info=" << r.before_camera_info
+            << " clusters_per_frame="
             << (r.frames == 0 ? 0.0 : static_cast<double>(r.clusters) / r.frames)
             << " wrong_counts=" << r.wrong_counts << " min_rand_index=" << r.min_rand_index
             << " min_iou=" << r.min_iou << " max_centroid_error_m=" << r.max_centroid_error_m

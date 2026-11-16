@@ -2,15 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // ClusterReportOp: the demo's sink. For each frame it takes the organized
-// cloud, its labels and the cluster summaries, and checks them against the
-// synthetic scene's truth: the number of clusters, the adjusted Rand index of
-// the labels against the true objects, each object's cluster, its centroid
-// and its box, and that the summaries agree with the labels. It completes the
-// run after the expected frames.
+// point cloud, its labels and the cluster summaries, and checks them against
+// the synthetic scene's truth: the number of clusters, the adjusted Rand
+// index of the labels against the true objects, each object's cluster, its
+// centroid and its box, and that the summaries agree with the labels. It
+// completes the run after the last frame.
 
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -23,6 +22,7 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 
 namespace clustering_app {
 
@@ -35,6 +35,9 @@ inline constexpr double kMaxBoxErrorM = 0.03;
 // What one run saw. Written by the reporter during the run, read after it.
 struct ClusterReport {
   std::uint32_t frames{};
+  // Frames sent before the first camera info, which give no cloud: those
+  // before the first frame reported.
+  std::uint32_t before_camera_info{};
   std::uint32_t frame_gaps{};
   std::uint64_t clusters{};
   std::uint32_t wrong_counts{};
@@ -45,9 +48,14 @@ struct ClusterReport {
   double max_centroid_error_m{};
   double max_box_error_m{};
 
-  [[nodiscard]] bool passed() const {
-    return frames != 0 && frame_gaps == 0 && wrong_counts == 0 && wrong_objects == 0 &&
-           inconsistent == 0 && min_rand_index >= kMinRandIndex && clusters != 0;
+  // Every frame checked and right, the frames from the first camera info on
+  // all there. A frame with no object to find is right when it finds none:
+  // wrong_counts compares the clusters with the objects the truth has.
+  [[nodiscard]] bool passed(std::uint32_t expected_frames,
+                            std::uint32_t allowed_before_camera_info) const {
+    return frames != 0 && before_camera_info <= allowed_before_camera_info &&
+           frames + before_camera_info == expected_frames && frame_gaps == 0 && wrong_counts == 0 &&
+           wrong_objects == 0 && inconsistent == 0 && min_rand_index >= kMinRandIndex;
   }
 };
 
@@ -57,9 +65,9 @@ struct ClusterReportConfig {
   int height{};
   // The minimum cluster size the clusterer uses: smaller objects are noise.
   std::uint32_t min_cluster_size{};
+  // The frames sent, with frame ids 1..expected_frames: the run completes
+  // after the last.
   std::uint32_t expected_frames{};
-  // Counts the frames done, for the source that waits for them.
-  std::shared_ptr<std::atomic<std::uint32_t>> finished;
 };
 
 class ClusterReportOp final : public holoscan::Operator<> {
@@ -73,7 +81,7 @@ class ClusterReportOp final : public holoscan::Operator<> {
       holoscan::ExecutionContext& context) override;
 
   // The organized cloud, [H, W, 3].
-  holoscan::Input<holoscan::Tensor> points;
+  holoscan::Input<holoscan::messages::schema::PointCloudT> point_cloud;
   // Its labels, [H, W], and the clusters, [K, kSummaryFields].
   holoscan::Input<holoscan::Tensor> labels;
   holoscan::Input<holoscan::Tensor> clusters;

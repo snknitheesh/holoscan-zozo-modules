@@ -71,9 +71,6 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the reporter completes the run.
   }
-  if (config_.finished && config_.finished->load(std::memory_order_acquire) < emitted_) {
-    return {};  // The previous frame is still in flight.
-  }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     return holoscan::make_unexpected(holoscan::Error{
@@ -83,6 +80,9 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
       holoscan::clustering::synthetic_scene(config_.width, config_.height, emitted_);
   auto loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 2>{config_.height, config_.width}, .dtype = kFloat32});
+  if (!loan && loan.error().code == holoscan::ErrorCode::kResourceExhausted) {
+    return {};  // Every slot of the pool is still held downstream: retry on the next tick.
+  }
   if (!loan) {
     return holoscan::make_unexpected(std::move(loan).error());
   }

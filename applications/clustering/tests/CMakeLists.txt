@@ -24,8 +24,21 @@ clustering_app_test(clustering_app_image 0 "${_pass}"
 clustering_app_test(clustering_app_720p 0 "${_pass}"
   --count 5 --period-ms 20 --width 1280 --height 720 --display false
 )
-# The display graph compiles, without a display server.
-clustering_app_test(clustering_app_display_graph 0 "plan=OK" --display true --compile-only true)
+# The graph runs on one worker, with and without the display (a lossless chain; only the
+# plan's verdict is printed, so an accepted plan has no warnings). The display graph
+# compiles without a display server.
+clustering_app_test(clustering_app_one_worker 0 "^clustering: plan=OK workers=1\n*$"
+  --display false --compile-only true
+)
+clustering_app_test(clustering_app_display_graph 0 "^clustering: plan=OK workers=1\n*$"
+  --display true --compile-only true
+)
+# A scene whose every object is below the minimum size: the right answer is no cluster,
+# in every frame.
+clustering_app_test(clustering_app_no_clusters 0
+  "clusters_per_frame=0.0000 wrong_counts=0 .*wrong_objects=0 inconsistent=0.*verdict=PASS"
+  --count 5 --period-ms 10 --display false --min-size 100000
+)
 
 # Unusable arguments are usage errors.
 clustering_app_test(clustering_app_rejects_size 2 "^error: scene images" --width 10)

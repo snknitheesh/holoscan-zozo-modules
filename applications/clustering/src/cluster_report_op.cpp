@@ -65,7 +65,8 @@ ClusterReportOp::ClusterReportOp(ClusterReportConfig config) : config_(std::move
 }
 
 void ClusterReportOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(points, "points").queue_depth(2U);
+  // Two slots per input: one frame in compute() while the next one arrives.
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
   spec.input(labels, "labels").queue_depth(2U);
   spec.input(clusters, "clusters").queue_depth(2U);
 }
@@ -73,9 +74,9 @@ void ClusterReportOp::setup(holoscan::OperatorSpec& spec) {
 holoscan::Contract ClusterReportOp::contract() const {
   holoscan::Contract result;
   result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, labels, clusters}},
+      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{point_cloud, labels, clusters}},
       .window = 0ns});
-  result.input(points, holoscan::Exact{});
+  result.input(point_cloud, holoscan::Exact{});
   result.input(labels, holoscan::Exact{});
   result.input(clusters, holoscan::Exact{});
   return result;
@@ -83,7 +84,7 @@ holoscan::Contract ClusterReportOp::contract() const {
 
 holoscan::expected<void, holoscan::Error> ClusterReportOp::compute(
     holoscan::ExecutionContext& context) {
-  auto cloud = points.receive();
+  auto cloud = point_cloud.receive();
   auto label_sample = labels.receive();
   auto cluster_sample = clusters.receive();
   if (!cloud) {
@@ -95,9 +96,13 @@ holoscan::expected<void, holoscan::Error> ClusterReportOp::compute(
   if (!cluster_sample) {
     return holoscan::make_unexpected(std::move(cluster_sample).error());
   }
+  if (auto checked = holoscan::messages::check_point_cloud(cloud->data); !checked) {
+    return checked;
+  }
+  const holoscan::Tensor& points = *cloud->data.points;
   const int width = config_.width;
   const int height = config_.height;
-  const std::span<const std::int64_t> shape = cloud->data.shape_span();
+  const std::span<const std::int64_t> shape = points.shape_span();
   const std::span<const std::int64_t> label_shape = label_sample->data.shape_span();
   const std::span<const std::int64_t> summary_shape = cluster_sample->data.shape_span();
   if (shape.size() != 3 || shape[0] != height || shape[1] != width || shape[2] != 3 ||
@@ -112,7 +117,7 @@ holoscan::expected<void, holoscan::Error> ClusterReportOp::compute(
   labels_.resize(pixels);
   summaries_.resize(k);
   if (auto copied =
-          cloud->data.copy_to_host(xyz_.data(), xyz_.size() * sizeof(float), context.cuda_stream());
+          points.copy_to_host(xyz_.data(), xyz_.size() * sizeof(float), context.cuda_stream());
       !copied) {
     return copied;
   }
@@ -121,15 +126,23 @@ holoscan::expected<void, holoscan::Error> ClusterReportOp::compute(
       !copied) {
     return copied;
   }
-  if (auto copied = cluster_sample->data.copy_to_host(
-          summaries_.data(), k * sizeof(hc::ClusterSummary), context.cuda_stream());
-      !copied) {
-    return copied;
+  // No cluster, no summary to copy: an empty vector has no memory to copy into.
+  if (k != 0) {
+    if (auto copied = cluster_sample->data.copy_to_host(
+            summaries_.data(), k * sizeof(hc::ClusterSummary), context.cuda_stream());
+        !copied) {
+      return copied;
+    }
   }
 
   ClusterReport& report = *config_.report;
   const std::uint64_t frame_id = cloud->metadata.frame_id;
-  report.frame_gaps += frame_id != last_frame_id_ + 1U ? 1U : 0U;
+  if (last_frame_id_ == 0U) {
+    // The frames before the first cloud came before the first camera info.
+    report.before_camera_info = static_cast<std::uint32_t>(frame_id - 1U);
+  } else {
+    report.frame_gaps += frame_id != last_frame_id_ + 1U ? 1U : 0U;
+  }
   last_frame_id_ = frame_id;
   const hc::SyntheticScene scene =
       hc::synthetic_scene(width, height, static_cast<std::uint32_t>(frame_id - 1U));
@@ -247,10 +260,7 @@ holoscan::expected<void, holoscan::Error> ClusterReportOp::compute(
   }
 
   ++report.frames;
-  if (config_.finished) {
-    config_.finished->fetch_add(1U, std::memory_order_release);
-  }
-  if (!finished_ && report.frames >= config_.expected_frames) {
+  if (!finished_ && frame_id >= config_.expected_frames) {
     finished_ = true;
     context.request_completion();
   }
