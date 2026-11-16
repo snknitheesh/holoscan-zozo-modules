@@ -13,13 +13,14 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/point_cloud/synthetic_depth.hpp>
 
 namespace depth_to_point_cloud_app {
 namespace {
 
-using holoscan::point_cloud::CameraIntrinsics;
 using holoscan::point_cloud::render_synthetic;
+using holoscan::point_cloud::synthetic_camera_info;
 using holoscan::point_cloud::synthetic_frame;
 using holoscan::point_cloud::SyntheticFrame;
 
@@ -65,16 +66,26 @@ holoscan::schema::ImageT image_descriptor(int width, int height,
   return image;
 }
 
-// A consumer still busy with earlier frames makes an emit fail with
-// kBackpressured before anything is delivered; the source then sends the same
-// frame on its next tick instead of failing the run or skipping the frame.
+// Whether `error` says the consumers are still busy with earlier frames: an
+// emit fails with kBackpressured before anything is delivered, and an
+// allocation with kResourceExhausted while every slot of the output's pool is
+// still held, by frames the consumers have not finished with or by a frame
+// they refused (the SDK takes back a refused loan only once this source's GPU
+// work on it is done). A source that runs on a worker of its own can meet
+// both. It then sends the same frame on its next tick instead of failing the
+// run or skipping the frame.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
+
 holoscan::expected<void, holoscan::Error> retry_if_backpressured(
     holoscan::expected<void, holoscan::Error> emitted, std::uint32_t& sent) {
   if (emitted) {
     ++sent;
     return {};
   }
-  if (emitted.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (consumers_busy(emitted.error())) {
     return {};
   }
   return emitted;
@@ -112,10 +123,8 @@ void SyntheticDepthSourceOp::setup(holoscan::OperatorSpec& spec) {
         .produces_tensor(tensor_spec(memory, kUInt8, 3U, pixels * 3U))
         .payload_options(image_payload());
   }
-  if (config_.intrinsics) {
-    spec.output(intrinsics, "intrinsics")
-        .produces_tensor(
-            tensor_spec(holoscan::MemoryKind::kHost, kFloat32, 1U, 4U * sizeof(float)));
+  if (config_.camera_info) {
+    spec.output(camera_info, "camera_info");
   }
 }
 
@@ -127,6 +136,7 @@ holoscan::Contract SyntheticDepthSourceOp::contract() const {
 
 void SyntheticDepthSourceOp::start() {
   emitted_ = 0;
+  delayed_ = false;
   pending_capture_.reset();
   sent_ = 0U;
 }
@@ -150,6 +160,10 @@ holoscan::expected<void, holoscan::Error> SyntheticDepthSourceOp::compute(
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the consumers request completion.
   }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
+  }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     if (own_stream_ == nullptr) {
@@ -170,12 +184,13 @@ holoscan::expected<void, holoscan::Error> SyntheticDepthSourceOp::compute(
   // Frame ids count from 1; 0 means none.
   const holoscan::EmitOptions emit{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U};
   const SyntheticFrame frame =
-      synthetic_frame(config_.width, config_.height, emitted_, config_.intrinsics);
+      synthetic_frame(config_.width, config_.height, emitted_, config_.camera_info);
   const auto pixels = static_cast<std::size_t>(config_.width) * config_.height;
   const std::size_t depth_bytes = pixels * (config_.millimeters ? 2U : 4U);
   const std::size_t color_bytes = config_.color ? pixels * 3U : 0U;
 
-  // Sends one output; on backpressure the frame is retried on the next tick.
+  // Sends one output; while the consumers are busy the frame is retried on
+  // the next tick.
   bool blocked = false;
   const auto settle = [&](holoscan::expected<void, holoscan::Error> sent,
                           std::uint32_t bit) -> holoscan::expected<void, holoscan::Error> {
@@ -183,31 +198,19 @@ holoscan::expected<void, holoscan::Error> SyntheticDepthSourceOp::compute(
       sent_ |= bit;
       return {};
     }
-    if (sent.error().code == holoscan::ErrorCode::kBackpressured) {
+    if (consumers_busy(sent.error())) {
       blocked = true;
       return {};
     }
     return sent;
   };
 
-  if (config_.intrinsics && (sent_ & kSentIntrinsics) == 0U) {
-    auto loan = intrinsics.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 1>{4}, .dtype = kFloat32});
-    if (!loan) {
-      return settle(holoscan::make_unexpected(std::move(loan).error()), kSentIntrinsics);
-    }
-    const CameraIntrinsics& k = frame.intrinsics;
-    if (auto written =
-            loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                            -> holoscan::expected<void, holoscan::Error> {
-              const std::array<float, 4> values{k.fx, k.fy, k.cx, k.cy};
-              std::memcpy(writer.data_as<float>(), values.data(), sizeof(values));
-              return {};
-            });
-        !written) {
-      return written;
-    }
-    if (auto settled = settle(intrinsics.emit(std::move(*loan), emit), kSentIntrinsics);
+  if (config_.camera_info && (sent_ & kSentCameraInfo) == 0U) {
+    holoscan::messages::CameraInfo info =
+        synthetic_camera_info(frame, std::string(kSyntheticFrameId));
+    info.header.capture_timestamp_ns = pending_capture_->timestamp_ns;
+    if (auto settled =
+            settle(camera_info.emit(holoscan::messages::to_message(info), emit), kSentCameraInfo);
         !settled || blocked) {
       return settled;
     }
@@ -400,11 +403,18 @@ holoscan::Contract DepthFileSourceOp::contract() const {
   return result;
 }
 
-void DepthFileSourceOp::start() { emitted_ = 0; }
+void DepthFileSourceOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+}
 
 holoscan::expected<void, holoscan::Error> DepthFileSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= total_) {
+    return {};
+  }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
     return {};
   }
   const auto& path = config_.files[emitted_ % config_.files.size()];

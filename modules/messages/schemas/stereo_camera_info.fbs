@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+// A stereo pair's calibration in one message, so that both cameras and their
+// extrinsics always come from the same calibration. Compatible edits keep the
+// root name, the file identifier and the explicit field ids, and only append
+// fields.
+include "header.fbs";
+include "geometry.fbs";
+include "camera_info.fbs";
+
+namespace holoscan.messages.schema;
+
+// A point p in the left camera's frame is R * p + t in the right camera's,
+// with R row-major and t in metres.
+struct RigidTransform {
+  rotation: holoscan.schema.Matrix3d;
+  translation: holoscan.schema.Vector3d;
+}
+
+table StereoCameraInfo {
+  // capture_timestamp_ns: the time this calibration is for; frame_id: the
+  // left camera's optical frame.
+  header: holoscan.schema.Header (id: 0);
+  left: CameraInfo (id: 1);
+  right: CameraInfo (id: 2);
+  right_from_left: RigidTransform (id: 3);
+  // When both cameras are Rectified: the distance in metres of the right
+  // camera along +x of the rectified left frame (> 0), and
+  // cx_right - cx_left in pixels. A disparity d = x_left - x_right is then at
+  // depth fx * baseline / (d + doffs) metres. Both 0 for any other pair.
+  baseline: double (id: 4);
+  doffs: double (id: 5);
+}
+
+root_type StereoCameraInfo;
+file_identifier "HMSC";

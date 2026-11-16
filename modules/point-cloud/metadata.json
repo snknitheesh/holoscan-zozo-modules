@@ -2,9 +2,9 @@
   "$schema": "urn:holoscan:module:v2",
   "module": {
     "name": "holoscan-point-cloud",
-    "version": "1.1.0",
+    "version": "2.0.0",
     "support_level": "community",
-    "description": "Point clouds on the GPU in both directions: depth images (uint16 or float32, with optional aligned color and per-frame intrinsics) deprojected into organized, optionally colored XYZ point clouds, and point clouds projected through extrinsics and pinhole intrinsics into z-buffered depth images (float32 or uint16) with optional color.",
+    "description": "Point clouds on the GPU in both directions, on the messages of holoscan-messages: depth images (uint16 or float32, with optional aligned color) and the depth camera's CameraInfo deprojected into organized, optionally colored PointCloud messages, and PointCloud messages projected through extrinsics into the pinhole camera a CameraInfo describes, as z-buffered depth images (float32 or uint16) with optional color.",
     "authors": [
       {
         "name": "zozo",
@@ -50,11 +50,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-point-cloud",
       "install_commands": [
-        "sudo apt install ./holoscan-point-cloud_1.1.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-point-cloud_2.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {
