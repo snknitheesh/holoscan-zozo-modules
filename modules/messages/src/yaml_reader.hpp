@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// A reader for the part of YAML that camera_info files use, so that reading
-// them needs no YAML library (the Holoscan SDK ships none): block mappings and
-// sequences by indentation, flow sequences and mappings (also over several
-// lines), plain and quoted scalars, comments, a `%YAML` directive and one
-// `---` document. Anything else (anchors, aliases, tags, block scalars, a
-// second document, tabs in indentation, a key given twice) is refused with
-// its line number, never misread.
+// A reader for the part of YAML that camera_info files use, so that the
+// module's SDK-free part, which builds and is tested without the Holoscan SDK
+// (whose YAML reader, holoscan/config/io.hpp, it therefore cannot use), needs
+// no YAML library: block mappings and sequences by indentation, flow
+// sequences and mappings (also over several lines), plain and quoted scalars,
+// comments, a `%YAML` directive, one `---` document and a leading UTF-8 byte
+// order mark. Anything else (anchors, aliases, tags, block scalars, a second
+// document, tabs in indentation, a key given twice) is refused with its line
+// number, never misread.
 
 #pragma once
 

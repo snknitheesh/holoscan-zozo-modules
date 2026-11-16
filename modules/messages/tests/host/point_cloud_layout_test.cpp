@@ -99,6 +99,11 @@ void test_refused() {
       base, [](PointCloudLayout& l) { l.valid_count = 21; },
       "point_cloud.valid_count must be -1 or 0..20, not 21"));
   VERIFY(refused(base, [](PointCloudLayout& l) { l.valid_count = -2; }, "point_cloud.valid_count"));
+  // More values than an int64 counts: refused, and counted as no points.
+  PointCloudLayout huge = organized(false);
+  huge.points.shape = {std::int64_t{1} << 40, std::int64_t{1} << 40, 3};
+  VERIFY(point_count(huge) == 0);
+  VERIFY(test::refuses([&] { validate(huge); }, "point_cloud.points must be float32 [H, W, 3]"));
 }
 
 }  // namespace

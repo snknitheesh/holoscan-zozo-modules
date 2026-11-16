@@ -53,6 +53,7 @@ void check_8bit() {
       read_pgm_depth(write_file("8bit.pgm", "P5\n3 2\n255\n", {0, 1, 2, 127, 128, 255}));
   VERIFY(image.width == 3 && image.height == 2);
   VERIFY((image.pixels == std::vector<std::uint16_t>{0, 1, 2, 127, 128, 255}));
+  VERIFY(image.one_byte_samples);
 }
 
 void check_16bit_big_endian() {
@@ -61,6 +62,7 @@ void check_16bit_big_endian() {
       write_file("16bit.pgm", "P5\n3 1\n65535\n", {0x01, 0x02, 0xFF, 0x00, 0x00, 0xFF}));
   VERIFY(image.width == 3 && image.height == 1);
   VERIFY((image.pixels == std::vector<std::uint16_t>{258, 65280, 255}));
+  VERIFY(!image.one_byte_samples);
   // A maxval above 255 means two bytes per sample, whatever its value.
   const DepthImage small =
       read_pgm_depth(write_file("16bit_small.pgm", "P5\n2 1\n256\n", {0x01, 0x00, 0x00, 0x07}));

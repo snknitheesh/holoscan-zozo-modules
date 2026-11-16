@@ -19,8 +19,8 @@ namespace holoscan::messages {
 // `height` (> 0) with `model`'s distortion (kRaw; kNone gives kUndistorted
 // cameras), slightly different intrinsics, the right camera 0.12 m to the
 // right of the left one and turned by about a degree, and the rectifications
-// that turn both into one frame with the right camera on its -x axis. Frame
-// ids "left" and "right"; the pair's is "left".
+// that turn both into one frame in which the right camera lies along +x of
+// the left one. Frame ids "left" and "right"; the pair's is "left".
 [[nodiscard]] StereoCameraInfo synthetic_stereo_camera_info(DistortionModel model,
                                                             std::uint32_t width = 1280,
                                                             std::uint32_t height = 720);
