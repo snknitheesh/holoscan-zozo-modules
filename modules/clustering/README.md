@@ -8,8 +8,9 @@ point with its cluster and summarizes each cluster with its point count, centroi
 and, optionally, an oriented box. The [Clustering demo](../../applications/clustering/) runs it end
 to end.
 
-It takes clouds in [holoscan-point-cloud](../point-cloud/)'s layout, so `DepthToPointCloudOp`
-connects straight in, but it does not depend on that module.
+It takes and sends the `PointCloud` message of [holoscan-messages](../messages/), so
+holoscan-point-cloud's `DepthToPointCloudOp`, or any other producer of that message, connects
+straight in.
 
 | | |
 | --- | --- |
@@ -18,7 +19,8 @@ connects straight in, but it does not depend on that module.
 | Headers | `<holoscan/clustering/...>` |
 | C++ namespace | `holoscan::clustering` |
 | Debian package | `holoscan-clustering` |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Module dependencies | [holoscan-messages](../messages/) 1.x |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## `EuclideanClusterOp`
 
@@ -34,18 +36,18 @@ breadth-first search with the same distances.
 
 | Port | Type | |
 | --- | --- | --- |
-| `points` (input) | `holoscan::Tensor` | float32 `[N, 3]`, or organized `[H, W, 3]`; in host, pinned or device memory |
-| `colors` (input, with `color`) | `holoscan::Tensor` | uint8 RGB of the points' shape |
+| `point_cloud` (input) | `messages::schema::PointCloudT` | Points float32 `[N, 3]`, or organized `[H, W, 3]`, with optional colors, normals and intensities; in host, pinned host or device memory |
 | `labels` (output) | `holoscan::Tensor` | int32 cluster id per point, -1 for noise and invalid points: `[N]` or `[H, W]` with `OutputLayout::kKeep`; `[M]` with `kDense` |
 | `clusters` (output) | `holoscan::Tensor` | float32 `[K, 26]`: one `ClusterSummary` per cluster, by id |
-| `clustered_points` (output, with `emit_points`) | `holoscan::Tensor` | float32: the input's shape with unclustered points NaN (`kKeep`), or `[M, 3]` packed by cluster (`kDense`) |
-| `clustered_colors` (output, with `color`) | `holoscan::Tensor` | uint8 RGB of the clustered points' shape, black where a point is not clustered |
+| `clustered_point_cloud` (output, with `emit_points`) | `messages::schema::PointCloudT` | The input's shape with unclustered points NaN (`kKeep`), or an unorganized cloud of the `M` clustered points, packed by cluster (`kDense`); the input's colors, normals and intensities that `fields` names, when the input has them |
 
-All outputs are in device memory and carry the cloud's capture time and frame id; they go out in
-the order of the table. With `kDense`, the clustered points come grouped by cluster in id order,
-in input order within one, so cluster `k`'s rows start at the sum of the point counts of the
-clusters before it. The optional ports exist only when configured; with colors, the operator runs
-once per cloud when the colors with exactly the same capture time have arrived.
+The operator runs once per cloud. All outputs are in device memory and carry the cloud's capture
+time and frame id, and the clustered cloud its header; they go out in the order of the table. With
+`kDense`, the clustered points come grouped by cluster in id order, in input order within one, so
+cluster `k`'s points start at the sum of the point counts of the clusters before it, and the cloud's
+`valid_count` is `M`; with `kKeep` it is -1 (not counted). Where a point is not clustered, `kKeep`
+gives it NaN coordinates, normal and intensity and a black color. The optional output exists only
+when configured.
 
 A row of `clusters` (`ClusterSummary` in `<holoscan/clustering/clustering.hpp>`):
 
@@ -72,22 +74,36 @@ equal, such as a sphere, has a valid but arbitrary oriented box.
 | `clustering.connectivity` | `Connectivity::kEuclidean` | `kEuclidean`, any two points within the tolerance; or `kImage`, organized clouds only, the points within the tolerance among a pixel's neighbors |
 | `clustering.image_window` | `2` | `kImage`: the neighborhood's radius in pixels, 1..8 (a 5x5 window by default) |
 | `oriented_boxes` | `false` | Fill the summaries' oriented boxes, at the cost of one more pass over the points |
-| `emit_points` | `false` | Declare the `clustered_points` output |
-| `color` | `false` | Declare the `colors` input and `clustered_colors` output; needs `emit_points` |
+| `emit_points` | `false` | Declare the `clustered_point_cloud` output |
+| `fields` | none | The optional fields (`colors`, `normals`, `intensity`) the clustered cloud carries when the input has them; they size its pools. Needs `emit_points` |
 | `layout` | `OutputLayout::kKeep` | Per-point outputs in the input's shape, or packed by cluster (`kDense`) |
 | `max_points` | `1920 * 1080` | Largest cloud accepted, up to 2^24 points; it sizes the outputs |
 
-Inputs must be packed, and points in device memory aligned to 4 bytes and on the operator's GPU.
-The operator rejects another element type or shape, colors that do not match the points, a cloud
-above `max_points`, and `kImage` with an unorganized cloud, with an error that says so. Clouds in
-host memory are copied to the GPU through a staging buffer that grows with the largest cloud seen.
+The operator checks each cloud with the messages module's `check_point_cloud()` (every tensor
+there, packed, of the right shapes and element types, its fields in the points' memory), and
+rejects points in device memory not aligned to 4 bytes or on another GPU, a cloud above
+`max_points`, and `kImage` with an unorganized cloud, with an error that says so. Clouds in host
+memory are copied to the GPU through staging buffers that grow with the largest cloud seen; the
+operator logs that once.
 
-The number of clusters is known only once the GPU has found them, so the operator waits for its GPU
-work once per frame for the summaries' shape, once more with `kEuclidean` for the size of the grid,
-and once more with `kDense` for the number of clustered points. A refused output cannot be sent
-again, as its loan is gone: it fails the frame with an error that names the port. Connect a
-consumer that only displays the results with `QueuePolicy::kDropOldest`, so that it never pushes
-back.
+A refused output cannot be sent again, as its loan is gone: it fails the frame with an error that
+names the port. Keep a lossless chain on one worker (see the messages module's
+[README](../messages/README.md#run-a-graph-on-one-worker)), and connect a consumer that only
+displays the results with `QueuePolicy::kDropOldest` and depth 1, so that it never pushes back.
+The input's two slots (`queue_depth(2)`, one cloud in `compute()` while the next arrives) are the
+operator's default; an edge's `ConnectionOptions::queue_depth` replaces them.
+
+### CPU waits and copies per frame
+
+| Where | Waits | Copies |
+| --- | --- | --- |
+| `EuclideanClusterOp`, device input | 1: the number of clusters, which shapes the summaries, read with the number of their points | 1 device-to-device: the labels from the clusterer's scratch into the output (`kKeep`) |
+| ... with `kDense` | None more, unless more components pass the size filter than `max_clusters` keeps: then 1 more, for the points of those kept | None more |
+| ... with host or pinned host input | 1 more for pageable host memory: the host waits for the producer before copying | 1 host-to-device per field read (points, and colors, normals and intensities when carried) |
+| The [demo](../../applications/clustering/)'s reporter | 3: one per copy | 3 device-to-host: the cloud, the labels and the summaries (none for the summaries when there is no cluster) |
+
+Scratch memory grows in stream order (`cudaMallocAsync` on the operator's stream, from its GPU's
+memory pool, by at least half each time), so a growing cloud costs no wait either.
 
 ### How it works
 
@@ -115,10 +131,10 @@ points is linked exactly when the CPU reference links it.
 
 ### Which connectivity
 
-`kEuclidean` is the default: it is exact for any cloud, organized or not, and on a desktop GPU it
+`kEuclidean` is the default: it is exact for any cloud, organized or not, and on an RTX 5090 it
 costs about as much as `kImage` (and less on the wall, where every `kImage` link contends for one
-root). `kImage` skips the sort and the grid, and on the Orin it is 2 to 3 times faster on the
-demo's scene, so it is the choice for organized clouds on a Jetson when milliseconds count. It
+root). `kImage` skips the sort and the grid, and on the Jetson Orin it is 2 to 3 times faster on
+the demo's scene, so it is the choice for organized clouds on a Jetson when milliseconds count. It
 links only points that are close in the image as well as in space, though: across an occlusion
 edge, or where a grazing surface is sampled sparsely, two points within the tolerance but more than
 `image_window` pixels apart stay apart. On the demo's scene the two agree to an adjusted Rand index
@@ -141,6 +157,10 @@ search with the same distances:
 - The synthetic depth camera at 640x480 and 1280x720 (the demo's scene): 8 clusters, the true
   objects but the one below the minimum size, adjusted Rand index above 0.997 in both
   connectivities.
+
+On the local recordings (`clustering_real_data`, depth images of a static indoor scene with real
+noise, holes and flying pixels, at 848x480 and 1280x720): labels equal to the CPU reference's in
+both connectivities.
 
 ## Timings
 
@@ -173,7 +193,7 @@ The x86 GPU was shared with other work during the runs.
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
-find_package(holoscan-clustering 1.0 REQUIRED CONFIG)
+find_package(holoscan-clustering 1.0 REQUIRED CONFIG)  # finds holoscan-messages too
 target_link_libraries(my_app PRIVATE holoscan::clustering)
 ```
 
@@ -187,9 +207,9 @@ auto cluster = graph.op<hc::EuclideanClusterOp>(
                    .clustering = {.tolerance = 0.025F, .min_cluster_size = 100},
                    .oriented_boxes = true,
                    .max_points = 640 * 480});
-graph.add_flow(deproject->point_cloud, cluster->points);   // after ground removal
-graph.add_flow(cluster->labels, consumer->labels);        // int32 [H, W]
-graph.add_flow(cluster->clusters, consumer->clusters);    // float32 [K, 26]
+graph.add_flow(deproject->point_cloud, cluster->point_cloud);  // after ground removal
+graph.add_flow(cluster->labels, consumer->labels);            // int32 [H, W]
+graph.add_flow(cluster->clusters, consumer->clusters);        // float32 [K, 26]
 ```
 
 The outputs are in device memory, so bind their GPU when compiling:
@@ -213,15 +233,19 @@ compiled with `-ffp-contract=off`.
 
 - Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13 with CUB and libcu++ from
   its toolkit, CMake 4.0 or later and a C++20 compiler.
+- [holoscan-messages](../messages/) 1.x, installed, or added before this module by the repository
+  root's build.
 
-The module downloads nothing and needs no models or data.
+The module downloads nothing and needs no models or data. Its real-data test reads the local
+recordings when `HOLOSCAN_TEST_DATA` names them.
 
 ## Build, test and install
 
 From the repository root, in the repository's CI image or with the requirements above:
 
 ```bash
-cmake -S modules/clustering -B build/clustering -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S modules/clustering -B build/clustering -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DCMAKE_PREFIX_PATH="$PWD/install"   # where holoscan-messages is installed
 cmake --build build/clustering
 ctest --test-dir build/clustering --output-on-failure
 cmake --install build/clustering --prefix "$PWD/install"
@@ -234,18 +258,21 @@ build/clustering/tests/clustering_benchmark   # the timings above
 | `HOLOSCAN_CLUSTERING_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
-The tests, all on data made at test time:
+The tests, on data made at test time but for `clustering_real_data`:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `clustering_clusterer` | GPU | The clusterer against the truth and the CPU reference: boxes and spheres on a removed ground, touching and nearly touching, of a range of sizes, with jitter and noise, near the origin and far from it; random clouds and lattices on the tolerance; organized clouds in both connectivities and the synthetic depth camera at 640x480 and 1280x720; every output against the labels, summaries against a CPU sum, oriented boxes against a rotated box; the size limits and `max_clusters`; determinism across runs, instances, streams and scratch reuse; empty, all-invalid, all-noise, single-point, million-point and out-of-range clouds; rejected settings; and the drawing |
-| `clustering_operator` | GPU | `EuclideanClusterOp` through the SDK's operator test harness: organized and unorganized clouds in host and device memory, both layouts, both connectivities, with and without points, colors and oriented boxes, every output against the CPU reference, the capture time and frame id of every output, an empty cloud, a cloud above `max_points`, `kImage` with an unorganized cloud, and the rejection of unusable settings |
+| `clustering_operator` | GPU | `EuclideanClusterOp` through the SDK's operator test harness, on `PointCloud` messages: organized and unorganized clouds in host and device memory, both layouts, both connectivities, with and without the clustered cloud, its colors, normals and intensities (carried only when configured and present) and oriented boxes, every output against the CPU reference, the capture time, frame id and header of every output, an empty cloud, a cloud without any cluster, a cloud above `max_points`, a malformed cloud, `kImage` with an unorganized cloud, and the rejection of unusable settings; through a graph on one worker, clouds from a producer's host, pinned host and device pools |
 | `clustering_benchmark` | GPU | Runs the benchmark briefly, to keep it working |
+| `clustering_real_data` | GPU, `HOLOSCAN_TEST_DATA` | The local recordings' first two depth images per clip, deprojected through their `depth.yaml`, clustered by the operator in both connectivities: labels equal to the CPU reference's, summaries consistent with them. Skipped without `HOLOSCAN_TEST_DATA` |
+| `clustering_clusterer_memcheck`, `_racecheck`, `_initcheck`, `_synccheck` | GPU, `compute-sanitizer` | `clustering_clusterer` under each compute-sanitizer tool (memcheck with a leak check), failing on any report; label `sanitizer` |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a small graph that clusters synthetic clouds with colors from host memory,
-packed by cluster with oriented boxes, and checks the number of clusters against the truth and
-that the labels and summaries agree. Build it with the install prefix on `CMAKE_PREFIX_PATH` and
+installed package: a small graph on one worker (which it checks) that clusters synthetic
+`PointCloud` messages with colors from host memory, packed by cluster with oriented boxes, and
+checks the number of clusters against the truth and that the labels, summaries and clustered cloud
+agree. Build it with the install prefix on `CMAKE_PREFIX_PATH` and
 run `ctest` there.
 
 ## Debian package
@@ -259,10 +286,12 @@ holoscan --project-root modules/clustering package holoscan-clustering --languag
 
 `--language cpp` selects the module rather than its package entry, which has the same name. This
 builds for every major GPU architecture and writes `holoscan-clustering_1.0.0_<arch>.deb` to the
-current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
-`apt install ./holoscan-clustering_1.0.0_<arch>.deb` needs NVIDIA's CUDA repository.
+current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)` and
+`holoscan-messages` 1.x, so `apt install ./holoscan-messages_1.0.0_<arch>.deb
+./holoscan-clustering_1.0.0_<arch>.deb` needs NVIDIA's CUDA repository.
 
 ## Licenses
 
-Apache-2.0. CUB and libcu++ (NVIDIA CCCL, Apache-2.0 with LLVM exceptions) come header-only from
-the CUDA Toolkit. See [NOTICE](NOTICE).
+Apache-2.0. From NVIDIA CCCL, header-only from the CUDA Toolkit and compiled into the library: CUB
+(BSD-3-Clause; its copyright, conditions and disclaimer are in the NOTICE, which the Debian package
+installs) and libcu++ (Apache-2.0 with LLVM exceptions). See [NOTICE](NOTICE).

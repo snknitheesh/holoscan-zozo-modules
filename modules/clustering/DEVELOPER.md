@@ -30,19 +30,29 @@ unchanged.
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-clustering/holoscan-clustering-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-clustering)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-clustering`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB and libcu++ from the CUDA Toolkit (header-only) |
-| Module dependencies | None: it reads holoscan-point-cloud's cloud layout, which is documented, without linking it |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
-| Test labels | `clustering` and `gpu` on all |
+| Debian package | `holoscan-clustering`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0), (<< 2)` |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB (BSD-3-Clause) and libcu++ (Apache-2.0 with LLVM exceptions) from the CUDA Toolkit, header-only and compiled into the library |
+| Module dependencies | holoscan-messages 1.x (`module.dependencies`), linked `PUBLIC`: the operator's ports carry its `PointCloud`; the package config finds it with `find_dependency()` |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
+| Test labels | `clustering` and `gpu` on all; `sanitizer` on the compute-sanitizer runs |
 
 ## Conventions
 
 - Code lives in `holoscan::clustering`. The clusterer (`clustering.hpp`), the drawing and the
-  synthetic scene are public and need no Holoscan graph; the operator is thin: `CloudOp` receives,
-  checks and stages the cloud and emits device tensors, and `EuclideanClusterOp` runs the clusterer
-  in between. A new operator that takes a cloud derives from `CloudOp`. Helpers stay private in
-  `src/`.
+  synthetic scene are public and need no Holoscan graph; the operator is thin: `CloudOp` receives
+  the `PointCloud` message, checks it with `check_point_cloud()` and stages host input on the GPU,
+  and emits device tensors, and `EuclideanClusterOp` runs the clusterer in between and sends the
+  clustered cloud with the messages module's `allocate_point_cloud()` / `emit_point_cloud()`. A new
+  operator that takes a cloud derives from `CloudOp`. Helpers stay private in `src/`.
+- Point clouds travel only as holoscan-messages' `PointCloud`, its optional fields carried through:
+  an operator reads the fields its outputs carry (`CloudSettings::fields`) and sends every field it
+  has, so colors, normals and intensities are not lost. Input and output ports have different
+  names (`point_cloud`, `clustered_point_cloud`).
+- The clusterer waits for the GPU once per frame (the number of clusters kept, read with the number
+  of their points). A kernel over the graph's nodes is launched for the number of points, an upper
+  bound, and reads the real number from the GPU, rather than the host waiting for it; keep new
+  kernels that way. Scratch grows in stream order (`DeviceBuffer`, `cudaMallocAsync`), never with
+  a host wait.
 - Public headers carry only SDK, CUDA runtime and standard types; CUB and libcu++ stay in `src/`.
 - Every result is deterministic. The union-find gives the same components whatever the order of its
   links, as a root is always its component's lowest node; sorts are stable; integer counts may use
@@ -59,5 +69,9 @@ unchanged.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
   gone; it fails the frame, with an error that names the port.
+- A lossless graph (a test's, the installed consumer's, the demo's) runs on one worker
+  (`graph.partition(...).include_all()`) and checks it: a stage on another worker can have what it
+  sends refused, which fails the run (the messages module's README says why).
 - A new clustering option needs a case in `clustering_clusterer` against the CPU reference or the
-  truth; a new port or behavior of the operator, a case in `clustering_operator`.
+  truth; a new port or behavior of the operator, a case in `clustering_operator`. Run
+  `ctest -L sanitizer` after changing a kernel.
