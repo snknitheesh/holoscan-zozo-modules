@@ -20,6 +20,7 @@
 #include <cub/device/device_run_length_encode.cuh>  // NOLINT(build/include_order)
 #include <cub/device/device_scan.cuh>               // NOLINT(build/include_order)
 #include <cub/device/device_select.cuh>             // NOLINT(build/include_order)
+#include <nvtx3/nvtx3.hpp>                          // NOLINT(build/include_order)
 
 #include "holoscan/icp/registration.hpp"
 #include "normal_equations.hpp"
@@ -389,8 +390,8 @@ struct AssociateParams {
   GridView grids[kMaxLevels];
   float max_distance2[kMaxLevels]{};
   const LoopState* state{};
-  // The distance level to use; -1 for the state's. With one, the pass runs
-  // even when the iterations have finished: the final evaluation.
+  // The distance level to use; -1 for the state's. With one, the pass is the
+  // final evaluation: it runs only once the iterations have finished.
   int level{-1};
   bool point_to_plane{};
   RobustKernel kernel{RobustKernel::kNone};
@@ -452,8 +453,10 @@ __global__ void associate_kernel(AssociateParams params, float* partials) {
   __shared__ typename Reduce::TempStorage storage;
   __shared__ DeviceTransform transform;
   const LoopState& state = *params.state;
-  if (params.level < 0 && state.finished != 0) {
-    return;  // Done: the rest of the batch does nothing.
+  // An iteration pass does nothing once the iterations have finished (the
+  // rest of the batch); the final evaluation, nothing until they have.
+  if ((params.level < 0) == (state.finished != 0)) {
+    return;
   }
   const int level = params.level < 0 ? state.level : params.level;
   if (threadIdx.x == 0) {
@@ -509,11 +512,12 @@ __global__ void associate_kernel(AssociateParams params, float* partials) {
 }
 
 // Sums the blocks' partials in block order, in double: one thread per sum.
-// Does nothing once the iterations have finished, unless `final`.
+// As its association pass, an iteration's sum does nothing once the
+// iterations have finished, and the `final` one nothing until they have.
 __global__ void total_kernel(const float* partials, int blocks, const LoopState* state, bool final,
                              double* totals) {
   const int k = threadIdx.x;
-  if (k >= kSums || (!final && state->finished != 0)) return;
+  if (k >= kSums || final != (state->finished != 0)) return;
   double sum = 0.0;
   for (int b = 0; b < blocks; ++b) sum += partials[b * kSums + k];
   totals[k] = sum;
@@ -751,6 +755,7 @@ struct IcpRegistration::Impl {
   // Drops non-finite points and, with a voxel size, keeps one point of each
   // voxel. Nothing waits for the GPU.
   cudaError_t prepare(const float* points, std::uint32_t count, Cloud& cloud, cudaStream_t stream) {
+    const nvtx3::scoped_range range{"icp/prepare"};
     cloud.capacity = count;
     const std::size_t n = std::max<std::uint32_t>(count, 1U);
     ICP_TRY(cloud.points.reserve(n * sizeof(float3), stream));
@@ -787,6 +792,7 @@ struct IcpRegistration::Impl {
   // Builds the target's grid for every distance and, for point-to-plane, its
   // normals. Nothing waits for the GPU.
   cudaError_t index_target(cudaStream_t stream) {
+    const nvtx3::scoped_range range{"icp/index_target"};
     for (int level = 0; level < levels; ++level) {
       ICP_TRY(build_grid(target, distances[level] * kCellMargin, grids[level], stream));
     }
@@ -810,9 +816,9 @@ struct IcpRegistration::Impl {
     return cudaGetLastError();
   }
 
-  // Queues one association pass and its sum into `totals`: at the state's
-  // distance (`level` -1), skipped once the iterations have finished, or at
-  // `level` regardless.
+  // Queues one association pass and its sum into `totals`: an iteration's,
+  // at the state's distance (`level` -1), skipped once the iterations have
+  // finished; or the final evaluation's, at `level`, skipped until they have.
   cudaError_t queue_pass(int level, cudaStream_t stream) {
     const int blocks =
         static_cast<int>(std::min<std::uint32_t>(blocks_for(source.capacity), kMaxReduceBlocks));
@@ -839,8 +845,11 @@ struct IcpRegistration::Impl {
 
   // Runs the iterations from `initial` and the final evaluation, leaving the
   // state, the final sums and both clouds' point counts in `mirror`. The host
-  // waits for the GPU once per batch of iterations, and once at the end.
+  // waits for the GPU once per batch of iterations: each batch ends with the
+  // final evaluation, which runs on the GPU only once the iterations have
+  // finished, and one copy of everything the host reads.
   cudaError_t iterate(const Matrix4& initial, cudaStream_t stream) {
+    const nvtx3::scoped_range range{"icp/iterate"};
     const int blocks =
         static_cast<int>(std::min<std::uint32_t>(blocks_for(source.capacity), kMaxReduceBlocks));
     ICP_TRY(partials.reserve(static_cast<std::size_t>(std::max(blocks, 1)) * kSums * sizeof(float),
@@ -863,13 +872,25 @@ struct IcpRegistration::Impl {
                           .rotation_epsilon = options.rotation_epsilon,
                           .max_iterations = options.max_iterations,
                           .finest = levels - 1};
+    // The counts the host reads, queued after the batch.
+    const auto read_back = [&]() -> cudaError_t {
+      ICP_TRY(cudaMemcpyAsync(&mirror->state, state.data, sizeof(LoopState), cudaMemcpyDeviceToHost,
+                              stream));
+      ICP_TRY(cudaMemcpyAsync(mirror->totals, totals.data, kSums * sizeof(double),
+                              cudaMemcpyDeviceToHost, stream));
+      ICP_TRY(cudaMemcpyAsync(&mirror->source_count, source.count.data, sizeof(std::uint32_t),
+                              cudaMemcpyDeviceToHost, stream));
+      ICP_TRY(cudaMemcpyAsync(&mirror->target_count, target.count.data, sizeof(std::uint32_t),
+                              cudaMemcpyDeviceToHost, stream));
+      return cudaStreamSynchronize(stream);
+    };
     // Each pass either updates the transform or moves to a finer distance,
     // so this many passes always finish. The first batch is as long as the
-    // last registration took, the rest are short; passes past the end do
-    // nothing.
+    // last registration took (at least 4, at most the budget), the rest are
+    // short; passes past the end do nothing.
     const int budget = options.max_iterations + levels;
     int queued = 0;
-    int batch = std::clamp(last_passes + 1, 4, budget);
+    int batch = std::min(std::max(last_passes + 1, 4), budget);
     if (source.capacity != 0U) {
       while (queued < budget) {
         batch = std::min(batch, budget - queued);
@@ -879,22 +900,20 @@ struct IcpRegistration::Impl {
           ICP_TRY(cudaGetLastError());
         }
         queued += batch;
-        ICP_TRY(cudaMemcpyAsync(&mirror->state, state.data, sizeof(LoopState),
-                                cudaMemcpyDeviceToHost, stream));
-        ICP_TRY(cudaStreamSynchronize(stream));
+        // The fitness and error at the final transform, at the finest
+        // distance, when this batch finished the iterations.
+        ICP_TRY(queue_pass(levels - 1, stream));
+        ICP_TRY(read_back());
         if (mirror->state.finished != 0) break;
         batch = 8;
       }
       last_passes = mirror->state.iterations + mirror->state.level + 1;
-      // The fitness and error at the final transform, at the finest distance.
-      ICP_TRY(queue_pass(levels - 1, stream));
-      ICP_TRY(cudaMemcpyAsync(mirror->totals, totals.data, kSums * sizeof(double),
-                              cudaMemcpyDeviceToHost, stream));
-    } else {
-      std::fill(std::begin(mirror->totals), std::end(mirror->totals), 0.0);
-      mirror->state.status = static_cast<int>(IcpStatus::kTooFewCorrespondences);
-      mirror->state.finished = 1;
+      // The budget always finishes them (see above); this guards that.
+      return mirror->state.finished != 0 ? cudaSuccess : cudaErrorUnknown;
     }
+    std::fill(std::begin(mirror->totals), std::end(mirror->totals), 0.0);
+    mirror->state.status = static_cast<int>(IcpStatus::kTooFewCorrespondences);
+    mirror->state.finished = 1;
     ICP_TRY(cudaMemcpyAsync(&mirror->source_count, source.count.data, sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost, stream));
     ICP_TRY(cudaMemcpyAsync(&mirror->target_count, target.count.data, sizeof(std::uint32_t),
@@ -1055,6 +1074,20 @@ cudaError_t launch_transform_points(const float* in, float* out, std::uint64_t c
     return cudaErrorInvalidValue;
   }
   transform_kernel<<<blocks_for(count), kBlock, 0, stream>>>(in, out, count, to_device(transform));
+  return cudaGetLastError();
+}
+
+cudaError_t launch_rotate_vectors(const float* in, float* out, std::uint64_t count,
+                                  const Matrix4& transform, cudaStream_t stream) {
+  if (count == 0U) {
+    return cudaSuccess;
+  }
+  if (in == nullptr || out == nullptr || !is_rigid_shaped(transform)) {
+    return cudaErrorInvalidValue;
+  }
+  DeviceTransform rotation = to_device(transform);
+  for (float& t : rotation.t) t = 0.0F;
+  transform_kernel<<<blocks_for(count), kBlock, 0, stream>>>(in, out, count, rotation);
   return cudaGetLastError();
 }
 

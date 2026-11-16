@@ -6,6 +6,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <string>
+#include <utility>
 
 #include "holoscan/icp/synthetic_scene.hpp"
 
@@ -13,6 +15,16 @@ namespace holoscan::icp {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+
+// The camera as the kernels take it; pixel centers are at integer coordinates.
+struct PinholeCamera {
+  int width{};
+  int height{};
+  float fx{};
+  float fy{};
+  float cx{};
+  float cy{};
+};
 
 struct RenderParams {
   SyntheticScene scene;
@@ -143,9 +155,21 @@ __global__ void cloud_kernel(RenderParams p, float* points) {
   }
 }
 
-bool valid(const PinholeCamera& k) {
-  return k.width > 0 && k.height > 0 && k.width <= 16384 && k.height <= 16384 &&
-         std::isfinite(k.fx) && k.fx > 0.0F && std::isfinite(k.fy) && k.fy > 0.0F &&
+// The pinhole camera of `info`, when the kernels can render it: an
+// undistorted or rectified camera (no distortion coefficient other than 0)
+// without skew, of at most 16384 pixels a side, with positive focal lengths.
+bool pinhole_of(const holoscan::messages::CameraInfo& info, PinholeCamera& k) {
+  for (const double coefficient : info.coefficients) {
+    if (coefficient != 0.0) return false;
+  }
+  if (info.skew != 0.0 || info.width == 0U || info.height == 0U || info.width > 16384U ||
+      info.height > 16384U) {
+    return false;
+  }
+  k = PinholeCamera{static_cast<int>(info.width), static_cast<int>(info.height),
+                    static_cast<float>(info.fx),  static_cast<float>(info.fy),
+                    static_cast<float>(info.cx),  static_cast<float>(info.cy)};
+  return std::isfinite(k.fx) && k.fx > 0.0F && std::isfinite(k.fy) && k.fy > 0.0F &&
          std::isfinite(k.cx) && std::isfinite(k.cy);
 }
 
@@ -179,14 +203,21 @@ SceneSphere sphere(float x, float y, float z, float radius) {
 
 }  // namespace
 
-PinholeCamera synthetic_camera(int width, int height) {
+holoscan::messages::CameraInfo synthetic_camera_info(int width, int height, std::string frame_id) {
+  // The intrinsics are floats, as the kernels use them, so that a camera_info
+  // file of this camera reads back to the same camera.
   const float focal = 0.8F * static_cast<float>(width);
-  return PinholeCamera{width,
-                       height,
-                       focal,
-                       focal,
-                       static_cast<float>(width - 1) / 2.0F,
-                       static_cast<float>(height - 1) / 2.0F};
+  holoscan::messages::CameraInfo info;
+  info.header.frame_id = std::move(frame_id);
+  info.width = static_cast<std::uint32_t>(width);
+  info.height = static_cast<std::uint32_t>(height);
+  info.state = holoscan::messages::CameraState::kUndistorted;
+  info.fx = focal;
+  info.fy = focal;
+  info.cx = static_cast<float>(width - 1) / 2.0F;
+  info.cy = static_cast<float>(height - 1) / 2.0F;
+  info.distortion_model = holoscan::messages::DistortionModel::kNone;
+  return info;
 }
 
 SyntheticScene synthetic_scene(SceneKind kind) {
@@ -233,9 +264,10 @@ SyntheticScene synthetic_scene(SceneKind kind) {
 }
 
 cudaError_t render_scene_depth(const SyntheticScene& scene, const Matrix4& world_from_camera,
-                               const PinholeCamera& camera, float max_depth,
+                               const holoscan::messages::CameraInfo& camera_info, float max_depth,
                                const DepthNoise& noise, float* depth, cudaStream_t stream) {
-  if (depth == nullptr || !valid(camera) || !(max_depth > 0.0F) ||
+  PinholeCamera camera;
+  if (depth == nullptr || !pinhole_of(camera_info, camera) || !(max_depth > 0.0F) ||
       !is_rigid_shaped(world_from_camera)) {
     return cudaErrorInvalidValue;
   }
@@ -247,9 +279,10 @@ cudaError_t render_scene_depth(const SyntheticScene& scene, const Matrix4& world
 }
 
 cudaError_t render_scene_cloud(const SyntheticScene& scene, const Matrix4& world_from_camera,
-                               const PinholeCamera& camera, float max_depth,
+                               const holoscan::messages::CameraInfo& camera_info, float max_depth,
                                const DepthNoise& noise, float* points, cudaStream_t stream) {
-  if (points == nullptr || !valid(camera) || !(max_depth > 0.0F) ||
+  PinholeCamera camera;
+  if (points == nullptr || !pinhole_of(camera_info, camera) || !(max_depth > 0.0F) ||
       !is_rigid_shaped(world_from_camera)) {
     return cudaErrorInvalidValue;
   }

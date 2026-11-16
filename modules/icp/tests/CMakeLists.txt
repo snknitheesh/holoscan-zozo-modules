@@ -19,13 +19,18 @@ add_test(NAME icp_op COMMAND icp_op_test)
 set_tests_properties(icp_op PROPERTIES LABELS "icp;gpu" TIMEOUT 600)
 
 # Odometry's time per frame at three resolutions, which the run prints; it fails only if
-# frames fail to register.
+# frames fail to register. Labeled `benchmark` as well, so that `ctest -LE benchmark` leaves
+# them out: their times are only meaningful on a GPU no other work shares.
 add_executable(icp_benchmark icp_benchmark.cu)
 target_link_libraries(icp_benchmark PRIVATE holoscan::icp)
 
 add_test(NAME icp_benchmark COMMAND icp_benchmark)
 add_test(NAME icp_benchmark_coarse COMMAND icp_benchmark 150 0.03)
-set_tests_properties(icp_benchmark icp_benchmark_coarse PROPERTIES LABELS "icp;gpu" TIMEOUT 600)
+set_tests_properties(
+  icp_benchmark
+  icp_benchmark_coarse
+  PROPERTIES LABELS "icp;gpu;benchmark" TIMEOUT 600
+)
 
 # The SDK-free tests, which the hosted CI job also builds on their own.
 add_subdirectory(host)

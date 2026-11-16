@@ -3,8 +3,9 @@
 //
 // A project built against the installed holoscan-icp package: a source
 // renders clouds of the synthetic room along its camera path into device
-// memory, IcpOp tracks them as depth odometry, and a sink checks each pose
-// against the camera's true one.
+// memory and sends them as PointCloud messages, IcpOp tracks them as depth
+// odometry, and a sink checks each pose against the camera's true one. The
+// chain is lossless, so the graph runs on one worker.
 
 #include <cuda_runtime_api.h>
 
@@ -27,11 +28,14 @@
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/icp/icp_op.hpp>
 #include <holoscan/icp/synthetic_scene.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/time/realtime_clock.hpp>
+#include <holoscan/time/time_point.hpp>
 
 namespace {
 
 namespace icp = holoscan::icp;
+namespace hm = holoscan::messages;
 
 constexpr int kWidth = 320;
 constexpr int kHeight = 240;
@@ -44,18 +48,8 @@ constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 class CloudSourceOp final : public holoscan::Operator<> {
  public:
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.output(points, "points")
-        .produces_tensor(holoscan::TensorOutputSpec{
-            .representation =
-                holoscan::TensorRepresentation{
-                    .memory_kind = holoscan::MemoryKind::kCudaDevice,
-                    .dtype = kFloat32,
-                    .rank = 3U,
-                    .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-                },
-            .bounds = holoscan::tensor_bounds(std::uint64_t{kWidth} * kHeight * 3U * 4U),
-            .storage = holoscan::TensorOutputStorage::kRuntimePool,
-        });
+    hm::declare_point_cloud_output(spec, points, "points",
+                                   {.max_points = std::uint64_t{kWidth} * kHeight});
   }
 
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -69,43 +63,56 @@ class CloudSourceOp final : public holoscan::Operator<> {
     if (emitted_ >= kFrames) {
       return {};
     }
-    cudaStream_t stream = context.cuda_stream().get();
-    auto loan = points.allocate_tensor(holoscan::TensorLoanRequest{
-        .shape = std::array<std::int64_t, 3>{kHeight, kWidth, 3}, .dtype = kFloat32});
+    const hm::PointCloudShape shape = hm::organized_cloud(kHeight, kWidth);
+    auto loan = hm::allocate_point_cloud(points, shape, {}, context.cuda_stream());
     if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    auto writer = loan->write(stream);
-    if (!writer) {
-      return holoscan::make_unexpected(std::move(writer).error());
+      return consumers_busy(std::move(loan).error());
     }
     const icp::DepthNoise noise{.sigma = 0.0005F, .sigma_per_m2 = 0.0005F, .seed = emitted_};
-    if (const cudaError_t status = icp::render_scene_cloud(
-            icp::synthetic_scene(icp::SceneKind::kRoom), icp::synthetic_trajectory(emitted_, kPath),
-            icp::synthetic_camera(kWidth, kHeight), 8.0F, noise, writer->data_as<float>(), stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(
-          holoscan::Error{holoscan::ErrorCode::kFailure, cudaGetErrorString(status)});
+    if (auto written = loan->write_and_commit(
+            hm::PointCloudFields::points, context.cuda_stream(),
+            [&](const holoscan::TensorOutputWriteGuard& writer)
+                -> holoscan::expected<void, holoscan::Error> {
+              if (const cudaError_t status = icp::render_scene_cloud(
+                      icp::synthetic_scene(icp::SceneKind::kRoom),
+                      icp::synthetic_trajectory(emitted_, kPath),
+                      icp::synthetic_camera_info(kWidth, kHeight), 8.0F, noise,
+                      writer.data_as<float>(), context.cuda_stream().get());
+                  status != cudaSuccess) {
+                return holoscan::make_unexpected(
+                    holoscan::Error{holoscan::ErrorCode::kFailure, cudaGetErrorString(status)});
+              }
+              return {};
+            });
+        !written) {
+      return written;
     }
-    if (auto committed = std::move(*writer).commit(); !committed) {
-      return holoscan::make_unexpected(std::move(committed).error());
-    }
-    auto emitted = points.emit(std::move(*loan),
-                               holoscan::EmitOptions{.capture_time = context.activation_time(),
-                                                     .frame_id = emitted_ + 1U});
+    const holoscan::TimePoint capture = context.activation_time();
+    auto emitted = hm::emit_point_cloud(
+        points, std::move(*loan),
+        hm::Header{.frame_id = "synthetic_camera", .capture_timestamp_ns = capture.timestamp_ns},
+        shape, -1, holoscan::EmitOptions{.capture_time = capture, .frame_id = emitted_ + 1U});
     if (emitted) {
       ++emitted_;
       return {};
     }
-    // A busy consumer refuses the frame; render it again on the next tick.
-    return emitted.error().code == holoscan::ErrorCode::kBackpressured
-               ? holoscan::expected<void, holoscan::Error>{}
-               : emitted;
+    return consumers_busy(std::move(emitted).error());
   }
 
-  holoscan::Output<holoscan::Tensor> points;
+  holoscan::Output<hm::schema::PointCloudT> points;
 
  private:
+  // A consumer still busy with earlier clouds: the emit is refused
+  // (kBackpressured), or every slot of the pool is still held
+  // (kResourceExhausted). The same cloud is rendered again on the next tick.
+  static holoscan::expected<void, holoscan::Error> consumers_busy(holoscan::Error error) {
+    if (error.code == holoscan::ErrorCode::kBackpressured ||
+        error.code == holoscan::ErrorCode::kResourceExhausted) {
+      return {};
+    }
+    return holoscan::make_unexpected(std::move(error));
+  }
+
   std::uint32_t emitted_{};
 };
 
@@ -177,6 +184,9 @@ int main() {
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->points, odometry->source, lossless);
   graph.add_flow(odometry->pose, check->pose, lossless);
+  // A lossless chain on one worker: every operator of the graph, one at a
+  // time (see holoscan-messages' README).
+  graph.partition("icp_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // The clouds are in device memory, on GPU 0.
@@ -186,6 +196,12 @@ int main() {
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
     std::cerr << plan.json() << '\n';
+    return 1;
+  }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "icp_consumer: workers=" << workers << '\n';
+  if (workers != 1U) {
+    std::cerr << "icp_consumer: the graph should run on one worker\n";
     return 1;
   }
   if (const int status = holoscan::run(plan); status != 0) {

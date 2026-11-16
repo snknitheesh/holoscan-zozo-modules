@@ -4,7 +4,7 @@
     "name": "holoscan-icp",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Point-cloud registration on the GPU with iterative closest point: point-to-point and point-to-plane, with nearest neighbors in a sorted uniform grid, normals estimated on the GPU, CUB reductions, coarse-to-fine correspondence distances, voxel subsampling and Huber or Tukey weights. IcpOp aligns pairs of clouds, clouds to a stored map, or each cloud to the one before as depth odometry; the results are deterministic.",
+    "description": "Point-cloud registration on the GPU with iterative closest point: point-to-point and point-to-plane, with nearest neighbors in a sorted uniform grid, normals estimated on the GPU, CUB reductions, coarse-to-fine correspondence distances, voxel subsampling and Huber or Tukey weights. IcpOp takes and sends holoscan-messages' PointCloud messages and aligns pairs of clouds, clouds to a stored map, or each cloud to the one before as depth odometry; the results are deterministic.",
     "authors": [
       {
         "name": "zozo",
@@ -49,11 +49,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-icp",
       "install_commands": [
-        "sudo apt install ./holoscan-icp_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-icp_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

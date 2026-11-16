@@ -3,6 +3,8 @@
 
 #include "holoscan/icp/icp_op.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -10,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -20,10 +23,13 @@
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
 namespace holoscan::icp {
 namespace {
+
+namespace hm = holoscan::messages;
 
 using std::chrono_literals::operator""ns;
 
@@ -81,20 +87,11 @@ bool packed(const holoscan::Tensor& tensor) {
   return true;
 }
 
-// The point count of a [N, 3] or [H, W, 3] float32 cloud.
-holoscan::expected<std::uint64_t, holoscan::Error> point_count(const holoscan::Tensor& tensor,
-                                                               const char* name) {
-  const std::span<const std::int64_t> shape = tensor.shape_span();
-  if (!is_dtype(tensor.dtype(), kFloat32) || shape.size() < 2 || shape.size() > 3 ||
-      shape.back() != 3) {
-    return holoscan::make_unexpected(
-        invalid(std::string(name) + " must be float32 [N, 3] or [H, W, 3]"));
-  }
+// The points of a cloud that check_point_cloud() accepted: N, or H * W.
+std::uint64_t point_count(const holoscan::Tensor& points) {
+  const std::span<const std::int64_t> shape = points.shape_span();
   std::uint64_t count = 1;
   for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) {
-    if (shape[axis] < 0) {
-      return holoscan::make_unexpected(invalid(std::string(name) + " has a negative extent"));
-    }
     count *= static_cast<std::uint64_t>(shape[axis]);
   }
   return count;
@@ -187,19 +184,11 @@ void IcpOp::setup(holoscan::OperatorSpec& spec) {
     spec.output(pose, "pose").produces_tensor(host_tensor(2U, 16U * sizeof(double)));
   }
   if (config_.aligned_output) {
-    spec.output(aligned, "aligned")
-        .produces_tensor(holoscan::TensorOutputSpec{
-            .representation =
-                holoscan::TensorRepresentation{
-                    .memory_kind = holoscan::MemoryKind::kCudaDevice,
-                    .dtype = kFloat32,
-                    .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-                },
-            .bounds = holoscan::TensorBounds{.max_rank = 3U,
-                                             .max_byte_span = std::uint64_t{config_.max_points} *
-                                                              3U * sizeof(float)},
-            .storage = holoscan::TensorOutputStorage::kRuntimePool,
-        });
+    hm::declare_point_cloud_output(spec, aligned, "aligned",
+                                   {.max_points = config_.max_points,
+                                    .colors = config_.aligned_fields.colors,
+                                    .normals = config_.aligned_fields.normals,
+                                    .intensity = config_.aligned_fields.intensity});
   }
 }
 
@@ -226,7 +215,8 @@ holoscan::Contract IcpOp::contract() const {
     }
   }
   if (config_.mode == IcpMode::kMap) {
-    // The newest target, when there is one; otherwise the stored one.
+    // The newest target captured at or before the source, when there is one
+    // within map_max_age; otherwise the stored one.
     result.input(target, holoscan::LatestWithin{.max_age = config_.map_max_age});
     result.on_missing(target, holoscan::SafeDefault{});
   }
@@ -242,6 +232,8 @@ void IcpOp::start() {
   stored_target_time_.reset();
   stored_target_frame_ = 0;
   stored_target_data_ = nullptr;
+  target_frame_id_.clear();
+  staging_pending_ = false;
 }
 
 void IcpOp::stop() { release(); }
@@ -250,16 +242,24 @@ void IcpOp::release() noexcept {
   if (own_stream_ != nullptr) {
     cudaStreamSynchronize(own_stream_);
   }
-  // The registration's buffers are freed only after its work is done: every
-  // call returns with its stream synchronized.
+  // set_target() and promote_source_to_target() only queue work, which may
+  // still run on the runtime's stream when the run stops: cudaFree() waits
+  // for the device to finish it before freeing. compute() itself waits for
+  // its stream before it returns an error with work queued.
   registration_.reset();
   odometry_.reset();
-  for (Staging* staging : {&source_staging_, &target_staging_}) {
+  for (Staging* staging : {&source_staging_, &target_staging_, &colors_staging_, &normals_staging_,
+                           &intensity_staging_}) {
     if (staging->data != nullptr) {
       cudaFree(staging->data);
     }
     *staging = {};
   }
+  if (staging_free_ != nullptr) {
+    cudaEventDestroy(staging_free_);
+    staging_free_ = nullptr;
+  }
+  staging_pending_ = false;
   if (own_stream_ != nullptr) {
     cudaStreamDestroy(own_stream_);
     own_stream_ = nullptr;
@@ -284,15 +284,15 @@ holoscan::expected<cudaStream_t, holoscan::Error> IcpOp::stream_for(
   return own_stream_;
 }
 
-holoscan::expected<const float*, holoscan::Error> IcpOp::cloud_on_device(
-    const holoscan::Tensor& tensor, std::uint32_t count, Staging& staging, cudaStream_t stream) {
-  if (!packed(tensor)) {
-    return holoscan::make_unexpected(invalid("clouds must be packed"));
-  }
-  const std::size_t bytes = static_cast<std::size_t>(count) * 3U * sizeof(float);
+holoscan::expected<const void*, holoscan::Error> IcpOp::on_device(const holoscan::Tensor& tensor,
+                                                                  std::size_t bytes,
+                                                                  std::size_t alignment,
+                                                                  Staging& staging,
+                                                                  cudaStream_t stream) {
   if (on_gpu(tensor)) {
-    if (reinterpret_cast<std::uintptr_t>(tensor.data()) % sizeof(float) != 0U) {
-      return holoscan::make_unexpected(invalid("cloud data must be aligned to 4 bytes"));
+    if (reinterpret_cast<std::uintptr_t>(tensor.data()) % alignment != 0U) {
+      return holoscan::make_unexpected(
+          invalid("cloud data must be aligned to " + std::to_string(alignment) + " bytes"));
     }
     int device = 0;
     if (const cudaError_t status = cudaStreamGetDevice(stream, &device); status != cudaSuccess) {
@@ -301,17 +301,18 @@ holoscan::expected<const float*, holoscan::Error> IcpOp::cloud_on_device(
     if (tensor.device().device_type == kDLCUDA && tensor.device().device_id != device) {
       return holoscan::make_unexpected(invalid("a cloud is on another GPU than the operator"));
     }
-    // The runtime orders device input on its own stream only.
+    // The runtime orders device input on its own stream only; on the
+    // operator's own, the GPU waits for the input's producer.
     if (stream == own_stream_) {
-      if (auto ready = tensor.synchronize_for_host(); !ready) {
+      if (auto ready = tensor.synchronize_for_consumer_stream(stream); !ready) {
         return holoscan::make_unexpected(std::move(ready).error());
       }
     }
-    return static_cast<const float*>(tensor.data());
+    return static_cast<const void*>(tensor.data());
   }
-  // Host memory: wait for its producer, then copy it. Every registration
-  // synchronizes its stream before it returns, so the copy is done before
-  // compute() returns and the input is released.
+  // Host memory: wait for its producer, then copy it. The registration waits
+  // for the stream before it returns (see registration.hpp), so the copy is
+  // done before compute() returns and the input is released.
   if (auto ready = tensor.synchronize_for_host(); !ready) {
     return holoscan::make_unexpected(std::move(ready).error());
   }
@@ -321,7 +322,16 @@ holoscan::expected<const float*, holoscan::Error> IcpOp::cloud_on_device(
         "IcpOp: clouds arrive in host memory and are copied to the GPU; send them in device "
         "memory to avoid the copy");
   }
+  // The `aligned` kernels of the frame before may still read the staging
+  // buffers: the copy waits for them on the GPU.
+  if (staging_pending_) {
+    if (const cudaError_t status = cudaStreamWaitEvent(stream, staging_free_);
+        status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaStreamWaitEvent", status));
+    }
+  }
   if (staging.bytes < bytes) {
+    // Rare: only when a cloud is larger than every one before it.
     if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
     }
@@ -341,7 +351,157 @@ holoscan::expected<const float*, holoscan::Error> IcpOp::cloud_on_device(
       return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
     }
   }
-  return static_cast<const float*>(staging.data);
+  return static_cast<const void*>(staging.data);
+}
+
+holoscan::expected<IcpOp::DeviceCloud, holoscan::Error> IcpOp::cloud_on_device(
+    const hm::schema::PointCloudT& cloud, const char* name, bool fields, Staging& staging,
+    cudaStream_t stream) {
+  if (auto checked = hm::check_point_cloud(cloud); !checked) {
+    return holoscan::make_unexpected(
+        invalid(std::string(name) + ": " + std::move(checked).error().message));
+  }
+  const holoscan::Tensor& points = *cloud.points;
+  const std::uint64_t count = point_count(points);
+  if (count > config_.max_points) {
+    return holoscan::make_unexpected(invalid(std::string(name) + " has " + std::to_string(count) +
+                                             " points, more than the configured maximum of " +
+                                             std::to_string(config_.max_points)));
+  }
+  DeviceCloud out;
+  out.count = static_cast<std::uint32_t>(count);
+  out.staged = !on_gpu(points);
+  auto data = on_device(points, count * 3U * sizeof(float), sizeof(float), staging, stream);
+  if (!data) {
+    return holoscan::make_unexpected(std::move(data).error());
+  }
+  out.points = static_cast<const float*>(*data);
+  if (!fields) {
+    return out;
+  }
+  // The optional fields the aligned cloud carries; check_point_cloud() found
+  // them in the points' memory, of their shape and type.
+  const auto field =
+      [&](const std::shared_ptr<holoscan::Tensor>& tensor, bool allowed, const char* what,
+          std::size_t element_bytes, std::size_t alignment,
+          Staging& field_staging) -> holoscan::expected<const void*, holoscan::Error> {
+    if (!hm::is_present(tensor)) {
+      return static_cast<const void*>(nullptr);
+    }
+    if (!allowed) {
+      return holoscan::make_unexpected(invalid(std::string(name) + " carries " + what +
+                                               ", which aligned_fields leaves out of the "
+                                               "aligned output"));
+    }
+    return on_device(*tensor, count * element_bytes, alignment, field_staging, stream);
+  };
+  auto colors =
+      field(cloud.colors, config_.aligned_fields.colors, "colors", 3U, 1U, colors_staging_);
+  if (!colors) {
+    return holoscan::make_unexpected(std::move(colors).error());
+  }
+  auto normals = field(cloud.normals, config_.aligned_fields.normals, "normals", 3U * sizeof(float),
+                       sizeof(float), normals_staging_);
+  if (!normals) {
+    return holoscan::make_unexpected(std::move(normals).error());
+  }
+  auto intensity = field(cloud.intensity, config_.aligned_fields.intensity, "intensity",
+                         sizeof(float), sizeof(float), intensity_staging_);
+  if (!intensity) {
+    return holoscan::make_unexpected(std::move(intensity).error());
+  }
+  out.colors = *colors;
+  out.normals = static_cast<const float*>(*normals);
+  out.intensity = static_cast<const float*>(*intensity);
+  return out;
+}
+
+holoscan::expected<void, holoscan::Error> IcpOp::emit_aligned(
+    const hm::schema::PointCloudT& cloud, const DeviceCloud& in, const Matrix4& moved,
+    const std::string& frame_id, const holoscan::EmitOptions& emit, cudaStream_t stream) {
+  const std::span<const std::int64_t> shape = cloud.points->shape_span();
+  const hm::PointCloudShape cloud_shape =
+      cloud.organized ? hm::organized_cloud(shape[0], shape[1]) : hm::unorganized_cloud(shape[0]);
+  const hm::PointCloudContents contents{.colors = in.colors != nullptr,
+                                        .normals = in.normals != nullptr,
+                                        .intensity = in.intensity != nullptr};
+  auto loan = hm::allocate_point_cloud(aligned, cloud_shape, contents, stream);
+  if (!loan) {
+    return holoscan::make_unexpected(std::move(loan).error());
+  }
+  const auto kernel = [](const char* what,
+                         cudaError_t status) -> holoscan::expected<void, holoscan::Error> {
+    if (status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure(what, status));
+    }
+    return {};
+  };
+  if (auto written = loan->write_and_commit(
+          hm::PointCloudFields::points, stream,
+          [&](const holoscan::TensorOutputWriteGuard& out) {
+            return kernel(
+                "transform kernel",
+                launch_transform_points(in.points, out.data_as<float>(), in.count, moved, stream));
+          });
+      !written) {
+    return written;
+  }
+  if (in.normals != nullptr) {
+    if (auto written = loan->write_and_commit(
+            hm::PointCloudFields::normals, stream,
+            [&](const holoscan::TensorOutputWriteGuard& out) {
+              return kernel("rotate kernel", launch_rotate_vectors(in.normals, out.data_as<float>(),
+                                                                   in.count, moved, stream));
+            });
+        !written) {
+      return written;
+    }
+  }
+  // Colors and intensities do not change with the pose.
+  const auto copy = [&](const holoscan::TensorFieldSelector<hm::schema::PointCloudT>& field,
+                        const void* from, std::size_t bytes) {
+    return loan->write_and_commit(field, stream, [&](const holoscan::TensorOutputWriteGuard& out) {
+      return kernel(
+          "cudaMemcpyAsync",
+          bytes == 0U ? cudaSuccess
+                      : cudaMemcpyAsync(out.data(), from, bytes, cudaMemcpyDeviceToDevice, stream));
+    });
+  };
+  if (in.colors != nullptr) {
+    if (auto written = copy(hm::PointCloudFields::colors, in.colors, in.count * 3U); !written) {
+      return written;
+    }
+  }
+  if (in.intensity != nullptr) {
+    if (auto written =
+            copy(hm::PointCloudFields::intensity, in.intensity, in.count * sizeof(float));
+        !written) {
+      return written;
+    }
+  }
+  // The kernels read the staging buffers after compute() returns: the next
+  // copy into them waits for this event on the GPU.
+  if (in.staged) {
+    if (staging_free_ == nullptr) {
+      if (const cudaError_t status =
+              cudaEventCreateWithFlags(&staging_free_, cudaEventDisableTiming);
+          status != cudaSuccess) {
+        staging_free_ = nullptr;
+        return holoscan::make_unexpected(cuda_failure("cudaEventCreate", status));
+      }
+    }
+    if (const cudaError_t status = cudaEventRecord(staging_free_, stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaEventRecord", status));
+    }
+    staging_pending_ = true;
+  }
+  hm::Header header{.frame_id = frame_id};
+  if (cloud.header) {
+    header.capture_timestamp_ns = cloud.header->capture_timestamp_ns;
+    header.device_sequence = cloud.header->device_sequence;
+  }
+  return hm::emit_point_cloud(aligned, std::move(*loan), header, cloud_shape, cloud.valid_count,
+                              emit);
 }
 
 holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionContext& context) {
@@ -354,42 +514,48 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
     return holoscan::make_unexpected(std::move(stream_or).error());
   }
   cudaStream_t stream = *stream_or;
+  // An error after work was queued: wait for it first, so that nothing still
+  // reads an input or a buffer when the run stops.
+  const auto failed = [stream](holoscan::Error error) -> holoscan::expected<void, holoscan::Error> {
+    cudaStreamSynchronize(stream);
+    return holoscan::make_unexpected(std::move(error));
+  };
 
   // The source.
-  const holoscan::Tensor& source_tensor = source_sample->data;
-  auto source_count = point_count(source_tensor, "source");
-  if (!source_count) {
-    return holoscan::make_unexpected(std::move(source_count).error());
-  }
-  if (*source_count > config_.max_points) {
-    return holoscan::make_unexpected(invalid("source has " + std::to_string(*source_count) +
-                                             " points, more than the configured maximum of " +
-                                             std::to_string(config_.max_points)));
-  }
-  const auto count = static_cast<std::uint32_t>(*source_count);
-  auto source_points = cloud_on_device(source_tensor, count, source_staging_, stream);
+  const hm::schema::PointCloudT& source_cloud = source_sample->data;
+  auto source_points =
+      cloud_on_device(source_cloud, "source", config_.aligned_output, source_staging_, stream);
   if (!source_points) {
-    return holoscan::make_unexpected(std::move(source_points).error());
+    return failed(std::move(source_points).error());
   }
+  const std::uint32_t count = source_points->count;
+  const std::string source_frame_id =
+      source_cloud.header ? source_cloud.header->frame_id : std::string{};
 
   // The initial guess.
   std::optional<Matrix4> guess;
   if (config_.initial_guess_input) {
     auto sample = initial_guess.receive();
     if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
+      return failed(std::move(sample).error());
     }
     const holoscan::Tensor& tensor = sample->data;
     const std::span<const std::int64_t> shape = tensor.shape_span();
     const bool f32 = is_dtype(tensor.dtype(), kFloat32);
     if (!(f32 || is_dtype(tensor.dtype(), kFloat64)) || shape.size() != 2 || shape[0] != 4 ||
         shape[1] != 4 || !packed(tensor)) {
-      return holoscan::make_unexpected(invalid("initial_guess must be float32 or float64 [4, 4]"));
+      return failed(invalid("initial_guess must be float32 or float64 [4, 4]"));
+    }
+    if (on_gpu(tensor) && !logged_guess_copy_) {
+      logged_guess_copy_ = true;
+      HOLOSCAN_LOG_INFO(
+          "IcpOp: initial guesses arrive in device memory and are copied to the host, waiting "
+          "for the GPU, each frame; send them in host memory to avoid the copy");
     }
     std::array<std::byte, 16U * sizeof(double)> bytes{};
     const std::size_t size = 16U * (f32 ? sizeof(float) : sizeof(double));
     if (auto copied = tensor.copy_to_host(bytes.data(), size, stream); !copied) {
-      return holoscan::make_unexpected(std::move(copied).error());
+      return failed(std::move(copied).error());
     }
     Matrix4 m{};
     for (std::size_t i = 0; i < 16U; ++i) {
@@ -402,7 +568,7 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
       }
     }
     if (!rigid(m)) {
-      return holoscan::make_unexpected(invalid("initial_guess is not a rigid transform"));
+      return failed(invalid("initial_guess is not a rigid transform"));
     }
     guess = m;
   }
@@ -410,58 +576,57 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
   // The registration.
   IcpResult result;
   Matrix4 pose_out = identity_transform();
+  // The frame the aligned cloud is in: the target's.
+  std::string aligned_frame_id;
   if (config_.mode == IcpMode::kOdometry) {
     OdometryStep step;
     if (const cudaError_t status =
-            odometry_->track(*source_points, count, stream, step, guess ? &*guess : nullptr);
+            odometry_->track(source_points->points, count, stream, step, guess ? &*guess : nullptr);
         status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("odometry", status));
+      return failed(cuda_failure("odometry", status));
     }
     result = step.result;
     pose_out = step.pose;
+    aligned_frame_id = step.first ? source_frame_id : target_frame_id_;
+    target_frame_id_ = source_frame_id;
   } else {
     // The target: this source's own in kPairs; in kMap a new one when it
     // came, otherwise the stored one.
     if (config_.mode == IcpMode::kPairs || !target.is_missing()) {
       auto target_sample = target.receive();
       if (!target_sample) {
-        return holoscan::make_unexpected(std::move(target_sample).error());
+        return failed(std::move(target_sample).error());
       }
       const holoscan::SampleMetadata& metadata = target_sample->metadata;
-      const holoscan::Tensor& tensor = target_sample->data;
+      const hm::schema::PointCloudT& target_cloud = target_sample->data;
+      const void* target_data = target_cloud.points ? target_cloud.points->data() : nullptr;
       const bool stored =
           config_.mode == IcpMode::kMap && stored_target_time_ &&
           *stored_target_time_ == static_cast<std::uint64_t>(metadata.capture_timestamp_ns) &&
-          stored_target_frame_ == metadata.frame_id && stored_target_data_ == tensor.data();
+          stored_target_frame_ == metadata.frame_id && stored_target_data_ == target_data;
       if (!stored) {
-        auto target_count = point_count(tensor, "target");
-        if (!target_count) {
-          return holoscan::make_unexpected(std::move(target_count).error());
-        }
-        if (*target_count > config_.max_points) {
-          return holoscan::make_unexpected(invalid("target has " + std::to_string(*target_count) +
-                                                   " points, more than the configured maximum of " +
-                                                   std::to_string(config_.max_points)));
-        }
-        const auto n = static_cast<std::uint32_t>(*target_count);
-        auto target_points = cloud_on_device(tensor, n, target_staging_, stream);
+        auto target_points =
+            cloud_on_device(target_cloud, "target", false, target_staging_, stream);
         if (!target_points) {
-          return holoscan::make_unexpected(std::move(target_points).error());
+          return failed(std::move(target_points).error());
         }
-        if (const cudaError_t status = registration_->set_target(*target_points, n, stream);
+        if (const cudaError_t status =
+                registration_->set_target(target_points->points, target_points->count, stream);
             status != cudaSuccess) {
-          return holoscan::make_unexpected(cuda_failure("set_target", status));
+          return failed(cuda_failure("set_target", status));
         }
         stored_target_time_ = static_cast<std::uint64_t>(metadata.capture_timestamp_ns);
         stored_target_frame_ = metadata.frame_id;
-        stored_target_data_ = tensor.data();
+        stored_target_data_ = target_data;
+        target_frame_id_ = target_cloud.header ? target_cloud.header->frame_id : std::string{};
       }
     }
     if (const cudaError_t status = registration_->align(
-            *source_points, count, guess.value_or(identity_transform()), stream, result);
+            source_points->points, count, guess.value_or(identity_transform()), stream, result);
         status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("align", status));
+      return failed(cuda_failure("align", status));
     }
+    aligned_frame_id = target_frame_id_;
   }
 
   // The outputs, with the source's provenance.
@@ -498,36 +663,12 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
   values[kStatSourcePoints] = result.source_points;
   values[kStatTargetPoints] = result.target_points;
 
-  // The aligned cloud first: its kernel runs while the host emits the rest.
+  // The aligned cloud first: its kernels run while the host emits the rest.
   if (config_.aligned_output) {
-    const std::span<const std::int64_t> shape = source_tensor.shape_span();
-    auto loan = aligned.allocate_tensor(holoscan::TensorLoanRequest{
-        .shape = std::vector<std::int64_t>(shape.begin(), shape.end()), .dtype = kFloat32});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    auto writer = loan->write(stream);
-    if (!writer) {
-      return holoscan::make_unexpected(std::move(writer).error());
-    }
-    if (const cudaError_t status = launch_transform_points(*source_points, writer->data_as<float>(),
-                                                           count, result.transform, stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("transform kernel", status));
-    }
-    // The runtime knows nothing of the operator's own stream, and the next
-    // frame's copy into the staging buffer, which the kernel reads for host
-    // input, may go on another stream: finish before the output goes.
-    if (stream == own_stream_ || !on_gpu(source_tensor)) {
-      if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-        return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
-      }
-    }
-    if (auto committed = std::move(*writer).commit(); !committed) {
-      return holoscan::make_unexpected(std::move(committed).error());
-    }
-    if (auto sent = aligned.emit(std::move(*loan), emit); !sent) {
-      return sent;
+    if (auto sent = emit_aligned(source_cloud, *source_points, result.transform, aligned_frame_id,
+                                 emit, stream);
+        !sent) {
+      return failed(std::move(sent).error());
     }
   }
   if (config_.transform_output) {

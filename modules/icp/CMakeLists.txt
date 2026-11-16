@@ -45,6 +45,11 @@ if(HOLOSCAN_ICP_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The point cloud and camera info messages: in this build when the repository root added
+# holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::icp: IcpOp, the registration and odometry it runs, and the synthetic scenes.
 add_library(holoscan_icp src/icp_op.cpp src/odometry.cpp src/registration.cu src/synthetic_scene.cu)
@@ -57,7 +62,12 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_icp PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_icp
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+  # NVTX ranges for Nsight: header-only, and free when no profiler is attached.
+  PRIVATE CUDA::nvtx3
+)
 set_target_properties(
   holoscan_icp
   PROPERTIES

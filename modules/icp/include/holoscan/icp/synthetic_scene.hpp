@@ -6,7 +6,8 @@
 // with optional depth noise; and a smooth closed camera path through them.
 // With the camera's poses known, they give ground truth for registration and
 // odometry. For tests, benchmarks and demos; nothing here depends on the
-// Holoscan SDK.
+// Holoscan SDK. The camera is holoscan-messages' CameraInfo, the calibration
+// every operator of the collection takes.
 //
 // Frames: the world's axes are those of the camera at the identity pose, the
 // optical frame (x right, y down, z forward). A pose maps camera-frame points
@@ -17,24 +18,20 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <string>
 
 #include <holoscan/icp/rigid_transform.hpp>
+#include <holoscan/messages/camera_info.hpp>
 
 namespace holoscan::icp {
 
-// A pinhole camera; pixel centers are at integer coordinates.
-struct PinholeCamera {
-  int width{};
-  int height{};
-  float fx{};
-  float fy{};
-  float cx{};
-  float cy{};
-};
-
-// A camera of `width` x `height` pixels with a horizontal field of view of
-// about 64 degrees and square pixels, centered.
-[[nodiscard]] PinholeCamera synthetic_camera(int width, int height);
+// The synthetic depth camera: `width` x `height` pixels (1..16384 a side),
+// a horizontal field of view of about 64 degrees, square pixels, centered,
+// undistorted, with `frame_id`. Write it with holoscan-messages'
+// write_camera_info_yaml() for a graph's CameraInfoSourceOp; it reads back
+// as the same camera.
+[[nodiscard]] holoscan::messages::CameraInfo synthetic_camera_info(
+    int width, int height, std::string frame_id = "synthetic_camera");
 
 // The points x with normal . x = offset; both sides are solid.
 struct ScenePlane {
@@ -90,20 +87,22 @@ struct DepthNoise {
 
 // Renders the scene seen by `camera` at pose `world_from_camera` into a
 // packed width x height float32 depth image in meters, 0 where nothing lies
-// within `max_depth`; device memory, ordered on `stream`.
+// within `max_depth`; device memory, ordered on `stream`. The camera must be
+// undistorted or rectified (every distortion coefficient 0), without skew,
+// at most 16384 pixels a side: cudaErrorInvalidValue otherwise.
 [[nodiscard]] cudaError_t render_scene_depth(const SyntheticScene& scene,
                                              const Matrix4& world_from_camera,
-                                             const PinholeCamera& camera, float max_depth,
-                                             const DepthNoise& noise, float* depth,
+                                             const holoscan::messages::CameraInfo& camera,
+                                             float max_depth, const DepthNoise& noise, float* depth,
                                              cudaStream_t stream);
 
 // As render_scene_depth(), as an organized [height, width, 3] float32 point
 // cloud in the camera frame, NaN where there is no depth; device memory.
 [[nodiscard]] cudaError_t render_scene_cloud(const SyntheticScene& scene,
                                              const Matrix4& world_from_camera,
-                                             const PinholeCamera& camera, float max_depth,
-                                             const DepthNoise& noise, float* points,
-                                             cudaStream_t stream);
+                                             const holoscan::messages::CameraInfo& camera,
+                                             float max_depth, const DepthNoise& noise,
+                                             float* points, cudaStream_t stream);
 
 // Pose `frame` of `frames` on a smooth closed path through the room scene:
 // the camera sways sideways and up and down, moves forward and back, yaws,

@@ -122,8 +122,10 @@ struct IcpResult {
 // grid cells) of the origin; points beyond are ignored. Calls are ordered on
 // `stream`. set_target() and promote_source_to_target() only queue work;
 // align() returns when its result is on the host, having waited for the GPU
-// once per batch of iterations and once at the end: the iterations' solve
-// and convergence test run on the GPU, so they need no round trip each. One
+// once per batch of iterations (usually one batch): the iterations' solve,
+// convergence test and final evaluation run on the GPU, so they need no round
+// trip each. align() and target_points() wait for `stream`, so work queued
+// before them on it, such as a copy into `points`, is done when they return. One
 // instance is not thread-safe; its device memory grows to the largest clouds
 // it has seen and is freed when it is destroyed, and its buffers may be
 // reused only once its last call's work is done.
@@ -157,9 +159,8 @@ class IcpRegistration {
   [[nodiscard]] cudaError_t align(const float* points, std::uint32_t count, const Matrix4& initial,
                                   cudaStream_t stream, IcpResult& result);
 
-  struct Impl;
-
  private:
+  struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
@@ -208,5 +209,11 @@ class IcpOdometry {
 // are. Both are device memory.
 [[nodiscard]] cudaError_t launch_transform_points(const float* in, float* out, std::uint64_t count,
                                                   const Matrix4& transform, cudaStream_t stream);
+
+// Writes R * v for each of `count` packed float32 vectors from `in` to `out`
+// (which may be `in`), R the rotation of `transform`: normals moved with
+// their points. Non-finite vectors stay as they are. Both are device memory.
+[[nodiscard]] cudaError_t launch_rotate_vectors(const float* in, float* out, std::uint64_t count,
+                                                const Matrix4& transform, cudaStream_t stream);
 
 }  // namespace holoscan::icp

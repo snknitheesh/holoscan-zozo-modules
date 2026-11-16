@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// IcpOp on its own, through the SDK's operator test harness: pairs of clouds
-// from host and device memory, with and without an initial guess, their
-// transforms checked against the truth and the aligned cloud against the
-// transform; a stored target (kMap) used for later sources; odometry along a
-// camera path; a failed registration still reported; the capture time carried
-// to every output; and unusable inputs and configurations rejected.
+// IcpOp on its own, through the SDK's operator test harness: pairs of
+// PointCloud messages from host and device memory, with and without an
+// initial guess, their transforms checked against the truth and the aligned
+// cloud against the transform; colors, normals and intensities carried into
+// the aligned cloud; a stored target (kMap) used for later sources; odometry
+// along a camera path; a failed registration still reported; the capture time
+// carried to every output; and unusable inputs and configurations rejected.
 
 #include <cuda_runtime_api.h>
 
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -29,6 +31,7 @@
 #include <holoscan/icp/synthetic_scene.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 
 #include "cloud_support.hpp"
@@ -37,7 +40,9 @@
 namespace holoscan::icp {
 namespace {
 
+namespace hm = holoscan::messages;
 using std::chrono_literals::operator""ms;
+using CloudSnapshot = holoscan::testing::Snapshot<hm::schema::PointCloudT>;
 using test::degrees;
 using test::radians;
 
@@ -45,6 +50,10 @@ constexpr int kWidth = 160;
 constexpr int kHeight = 120;
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 constexpr DLDataType kFloat64{kDLFloat, 64U, 1U};
+constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
+// Captured clouds kept per output: the clouds' four tensors each, within the
+// SDK's limit on an output's buffers.
+constexpr std::size_t kCaptures = 16;
 constexpr DepthNoise kNoise{.sigma = 0.0005F, .sigma_per_m2 = 0.0005F, .seed = 1U};
 
 // A tensor of `shape` holding `size` bytes from `bytes`, in host or device memory.
@@ -75,6 +84,74 @@ holoscan::Tensor cloud_tensor(const Matrix4& pose, bool device, std::uint32_t se
   const std::vector<float> xyz =
       test::render(synthetic_scene(SceneKind::kRoom), pose, width, height, noise).to_host();
   return make({height, width, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), device);
+}
+
+// The empty [0] tensor of a field a cloud does not carry.
+holoscan::Tensor absent(DLDataType dtype, bool device) {
+  return make({0}, dtype, nullptr, 0, device);
+}
+
+// The optional fields of a cloud message, each present when given.
+struct Fields {
+  std::optional<holoscan::Tensor> colors;
+  std::optional<holoscan::Tensor> normals;
+  std::optional<holoscan::Tensor> intensity;
+};
+
+// A cloud message of `points` in `frame_id`, with `fields`; valid_count -1.
+hm::schema::PointCloudT cloud_message(holoscan::Tensor points, const std::string& frame_id,
+                                      Fields fields = {}) {
+  const bool device = points.device().device_type == kDLCUDA;
+  hm::schema::PointCloudT cloud;
+  cloud.header = std::make_shared<holoscan::schema::HeaderT>();
+  cloud.header->frame_id = frame_id;
+  cloud.organized = points.ndim() == 3;
+  cloud.valid_count = -1;
+  cloud.colors = std::make_shared<holoscan::Tensor>(fields.colors ? std::move(*fields.colors)
+                                                                  : absent(kUInt8, device));
+  cloud.normals = std::make_shared<holoscan::Tensor>(fields.normals ? std::move(*fields.normals)
+                                                                    : absent(kFloat32, device));
+  cloud.intensity = std::make_shared<holoscan::Tensor>(
+      fields.intensity ? std::move(*fields.intensity) : absent(kFloat32, device));
+  cloud.points = std::make_shared<holoscan::Tensor>(std::move(points));
+  return cloud;
+}
+
+// The organized cloud seen from `pose` as a message in `frame_id`.
+hm::schema::PointCloudT cloud_at(const Matrix4& pose, bool device, std::uint32_t seed,
+                                 const std::string& frame_id = "camera", int width = kWidth,
+                                 int height = kHeight) {
+  return cloud_message(cloud_tensor(pose, device, seed, width, height), frame_id);
+}
+
+// The values of one field of a captured cloud.
+template <typename T>
+std::vector<T> field(const CloudSnapshot& cloud,
+                     holoscan::TensorFieldSelector<hm::schema::PointCloudT> selector) {
+  const auto& tensor = cloud.tensor(selector);
+  std::vector<T> values(tensor.bytes().size() / sizeof(T));
+  std::memcpy(values.data(), tensor.bytes().data(), values.size() * sizeof(T));
+  return values;
+}
+
+// How many coordinates of `got` are not `m` applied to `in` (`translate`:
+// as points, else as directions), within 1e-5; non-finite ones must stay so.
+int wrong_moved(const std::vector<float>& in, const std::vector<float>& got, const Matrix4& m,
+                bool translate) {
+  if (in.size() != got.size()) return static_cast<int>(std::max(in.size(), got.size()));
+  int wrong = 0;
+  for (std::size_t i = 0; i + 2 < in.size(); i += 3) {
+    if (!std::isfinite(in[i]) || !std::isfinite(in[i + 1]) || !std::isfinite(in[i + 2])) {
+      wrong += std::isfinite(got[i]) && std::isfinite(got[i + 1]) && std::isfinite(got[i + 2]);
+      continue;
+    }
+    for (int row = 0; row < 3; ++row) {
+      const double expected = m[4 * row] * in[i] + m[4 * row + 1] * in[i + 1] +
+                              m[4 * row + 2] * in[i + 2] + (translate ? m[4 * row + 3] : 0.0);
+      wrong += std::fabs(got[i + row] - expected) > 1e-5 ? 1 : 0;
+    }
+  }
+  return wrong;
 }
 
 holoscan::Tensor matrix_tensor(const Matrix4& m, bool f32, bool device) {
@@ -147,9 +224,10 @@ void check_pairs(bool device, bool guess, bool aligned_output, bool f32_guess = 
   for (std::uint32_t frame = 0; frame < kFrames; ++frame) {
     const Matrix4 a = pair_target_pose(frame);
     const Matrix4 truth = pair_truth(frame);
-    holoscan::Tensor source = cloud_tensor(compose(a, truth), device, 2U * frame + 1U);
-    holoscan::Tensor target = cloud_tensor(a, device, 2U * frame);
-    sources.push_back(source);
+    holoscan::Tensor source_points = cloud_tensor(compose(a, truth), device, 2U * frame + 1U);
+    sources.push_back(source_points);
+    hm::schema::PointCloudT source = cloud_message(source_points, "source_camera");
+    hm::schema::PointCloudT target = cloud_at(a, device, 2U * frame, "target_camera");
     if (guess) {
       // A guess 2 degrees and 5 cm off.
       const Matrix4 rough =
@@ -173,7 +251,7 @@ void check_pairs(bool device, bool guess, bool aligned_output, bool f32_guess = 
   h.capture_snapshot<holoscan::Tensor>("stats");
   if (aligned_output) {
     h.output_device("aligned", holoscan::DeviceId{0});
-    h.capture_snapshot<holoscan::Tensor>("aligned");
+    h.capture_snapshot<hm::schema::PointCloudT>("aligned", kCaptures);
   }
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
@@ -197,31 +275,94 @@ void check_pairs(bool device, bool guess, bool aligned_output, bool f32_guess = 
     check_time(stats[frame], frame, "stats");
   }
   if (!aligned_output) return;
-  const auto aligned = result.snapshots<holoscan::Tensor>("aligned");
+  const auto aligned = result.snapshots<hm::schema::PointCloudT>("aligned");
   VERIFY(aligned.size() == kFrames);
   for (std::uint32_t frame = 0; frame < kFrames && frame < aligned.size(); ++frame) {
-    VERIFY(aligned[frame].shape() == (std::vector<std::int64_t>{kHeight, kWidth, 3}));
-    std::vector<float> got(static_cast<std::size_t>(kWidth) * kHeight * 3U);
-    std::vector<float> in(got.size());
-    if (aligned[frame].bytes().size() != got.size() * sizeof(float)) continue;
-    std::memcpy(got.data(), aligned[frame].bytes().data(), got.size() * sizeof(float));
-    VERIFY(sources[frame].copy_to_host(in.data(), in.size() * sizeof(float)).has_value());
-    const Matrix4 m = matrix(transforms[frame]);
-    int wrong = 0;
-    for (std::size_t i = 0; i < in.size(); i += 3) {
-      if (!std::isfinite(in[i])) {
-        wrong += std::isfinite(got[i]) ? 1 : 0;
-        continue;
-      }
-      for (int row = 0; row < 3; ++row) {
-        const double expected = m[4 * row] * in[i] + m[4 * row + 1] * in[i + 1] +
-                                m[4 * row + 2] * in[i + 2] + m[4 * row + 3];
-        wrong += std::fabs(got[i + row] - expected) > 1e-5 ? 1 : 0;
-      }
+    const CloudSnapshot& cloud = aligned[frame];
+    const hm::schema::PointCloudT metadata = cloud.metadata();
+    VERIFY(metadata.organized && metadata.valid_count == -1);
+    VERIFY_MSG(metadata.header != nullptr && metadata.header->frame_id == "target_camera",
+               "the aligned cloud is in the target's frame");
+    VERIFY(cloud.tensor(hm::PointCloudFields::points).shape() ==
+           (std::vector<std::int64_t>{kHeight, kWidth, 3}));
+    for (const auto absent_field : {hm::PointCloudFields::colors, hm::PointCloudFields::normals,
+                                    hm::PointCloudFields::intensity}) {
+      VERIFY(cloud.tensor(absent_field).shape() == std::vector<std::int64_t>{0});
     }
+    std::vector<float> in(static_cast<std::size_t>(kWidth) * kHeight * 3U);
+    VERIFY(sources[frame].copy_to_host(in.data(), in.size() * sizeof(float)).has_value());
+    const int wrong = wrong_moved(in, field<float>(cloud, hm::PointCloudFields::points),
+                                  matrix(transforms[frame]), true);
     VERIFY_MSG(wrong == 0, std::to_string(wrong) + " aligned coordinates differ");
-    check_time(aligned[frame], frame, "aligned");
+    check_time(cloud, frame, "aligned");
   }
+}
+
+// The aligned cloud carries the source's colors and intensities as they are
+// and its normals turned by the transform, from host or device memory, in an
+// unorganized cloud; the source's valid_count comes along.
+void check_aligned_fields(bool device) {
+  IcpConfig config = base_config(IcpMode::kPairs);
+  config.aligned_output = true;
+  config.transform_output = true;
+  config.stats_output = false;
+  auto h = holoscan::testing::create_operator_test<IcpOp>(config);
+  const Matrix4 truth = pair_truth(1);
+  std::vector<float> xyz =
+      test::render(synthetic_scene(SceneKind::kRoom), truth, kWidth, kHeight, kNoise).to_host();
+  const auto n = static_cast<std::int64_t>(xyz.size() / 3U);
+  std::vector<std::uint8_t> rgb(xyz.size());
+  std::vector<float> normals(xyz.size());
+  std::vector<float> intensity(static_cast<std::size_t>(n));
+  std::int64_t valid = 0;
+  for (std::int64_t i = 0; i < n; ++i) {
+    for (int c = 0; c < 3; ++c) rgb[3 * i + c] = static_cast<std::uint8_t>((i * 7 + c * 50) & 0xFF);
+    // A unit vector per point, and a non-finite one now and then.
+    const double angle = 0.001 * static_cast<double>(i);
+    normals[3 * i] = static_cast<float>(std::cos(angle));
+    normals[3 * i + 1] = static_cast<float>(std::sin(angle));
+    normals[3 * i + 2] = i % 97 == 0 ? std::numeric_limits<float>::quiet_NaN() : 0.0F;
+    intensity[i] = 0.5F * static_cast<float>(i % 300);
+    valid += std::isfinite(xyz[3 * i + 2]) ? 1 : 0;
+  }
+  hm::schema::PointCloudT source = cloud_message(
+      make({n, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), device), "source_camera",
+      Fields{
+          .colors = make({n, 3}, kUInt8, rgb.data(), rgb.size(), device),
+          .normals = make({n, 3}, kFloat32, normals.data(), normals.size() * sizeof(float), device),
+          .intensity =
+              make({n}, kFloat32, intensity.data(), intensity.size() * sizeof(float), device)});
+  source.valid_count = valid;
+  h.push_frame(holoscan::testing::frame_at(
+      capture_time(0), holoscan::testing::input("source", std::move(source)),
+      holoscan::testing::input("target", cloud_at(identity_transform(), device, 7U, "map"))));
+  if (device) {
+    h.input_source_device("source", holoscan::DeviceId{0});
+    h.input_source_device("target", holoscan::DeviceId{0});
+  }
+  h.output_device("aligned", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::Tensor>("transform");
+  h.capture_snapshot<hm::schema::PointCloudT>("aligned", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto transforms = result.snapshots<holoscan::Tensor>("transform");
+  const auto aligned = result.snapshots<hm::schema::PointCloudT>("aligned");
+  VERIFY(transforms.size() == 1U && aligned.size() == 1U);
+  if (transforms.size() != 1U || aligned.size() != 1U) return;
+  const Matrix4 m = matrix(transforms[0]);
+  const CloudSnapshot& cloud = aligned[0];
+  const hm::schema::PointCloudT metadata = cloud.metadata();
+  VERIFY(!metadata.organized && metadata.valid_count == valid);
+  VERIFY(metadata.header != nullptr && metadata.header->frame_id == "map");
+  VERIFY(wrong_moved(xyz, field<float>(cloud, hm::PointCloudFields::points), m, true) == 0);
+  VERIFY_MSG(
+      wrong_moved(normals, field<float>(cloud, hm::PointCloudFields::normals), m, false) == 0,
+      "the normals are turned with the points");
+  VERIFY_MSG(field<std::uint8_t>(cloud, hm::PointCloudFields::colors) == rgb,
+             "the colors are carried as they were");
+  VERIFY_MSG(field<float>(cloud, hm::PointCloudFields::intensity) == intensity,
+             "the intensities are carried as they were");
 }
 
 // kMap: one target, then sources from around it, each aligned to the stored
@@ -231,13 +372,13 @@ void check_map() {
   auto h = holoscan::testing::create_operator_test<IcpOp>(config);
   const Matrix4 map_pose = pair_target_pose(0);
   h.push_frame(holoscan::testing::frame_at(
-      capture_time(0), holoscan::testing::input("target", cloud_tensor(map_pose, true, 0U))));
+      capture_time(0), holoscan::testing::input("target", cloud_at(map_pose, true, 0U, "map"))));
   constexpr std::uint32_t kFrames = 3;
   for (std::uint32_t frame = 1; frame <= kFrames; ++frame) {
     h.push_frame(holoscan::testing::frame_at(
         capture_time(frame),
         holoscan::testing::input(
-            "source", cloud_tensor(compose(map_pose, pair_truth(frame - 1U)), true, 10U + frame))));
+            "source", cloud_at(compose(map_pose, pair_truth(frame - 1U)), true, 10U + frame))));
   }
   h.input_source_device("source", holoscan::DeviceId{0});
   h.input_source_device("target", holoscan::DeviceId{0});
@@ -273,11 +414,11 @@ void check_odometry() {
   auto h = holoscan::testing::create_operator_test<IcpOp>(config);
   constexpr std::uint32_t kFrames = 12;
   constexpr std::uint32_t kPath = 150;  // The path's length in frames; the test runs a part.
-  std::vector<holoscan::testing::TestSample<holoscan::Tensor>> samples;
+  std::vector<holoscan::testing::TestSample<hm::schema::PointCloudT>> samples;
   for (std::uint32_t frame = 0; frame < kFrames; ++frame) {
     samples.push_back(
-        holoscan::testing::sample_at(cloud_tensor(synthetic_trajectory(frame, kPath), false, frame,
-                                                  kOdometryWidth, kOdometryHeight),
+        holoscan::testing::sample_at(cloud_at(synthetic_trajectory(frame, kPath), false, frame,
+                                              "camera", kOdometryWidth, kOdometryHeight),
                                      capture_time(frame)));
   }
   h.push_samples("source", std::move(samples));
@@ -320,11 +461,12 @@ void check_failure_reported() {
   std::vector<float> xyz =
       test::render(synthetic_scene(SceneKind::kRoom), identity_transform(), kWidth, kHeight, kNoise)
           .to_host();
-  const holoscan::Tensor target =
-      make({kHeight, kWidth, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), false);
+  const hm::schema::PointCloudT target = cloud_message(
+      make({kHeight, kWidth, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), false), "map");
   for (std::size_t i = 2; i < xyz.size(); i += 3) xyz[i] += 20.0F;
-  const holoscan::Tensor source =
-      make({kHeight * kWidth, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), false);
+  const hm::schema::PointCloudT source = cloud_message(
+      make({kHeight * kWidth, 3}, kFloat32, xyz.data(), xyz.size() * sizeof(float), false),
+      "camera");
   h.push_frame(holoscan::testing::frame_at(capture_time(0),
                                            holoscan::testing::input("source", source),
                                            holoscan::testing::input("target", target)));
@@ -344,18 +486,24 @@ void check_failure_reported() {
 }
 
 // Runs the operator on one unusable input and checks the failure names `what`.
-void check_rejects(const IcpConfig& config, holoscan::Tensor source,
+void check_rejects(const IcpConfig& config, hm::schema::PointCloudT source,
                    std::optional<holoscan::Tensor> guess, const std::string& what) {
   auto h = holoscan::testing::create_operator_test<IcpOp>(config);
   const std::vector<float> xyz(12, 1.0F);
-  const holoscan::Tensor target = make({4, 3}, kFloat32, xyz.data(), 48, false);
+  hm::schema::PointCloudT target =
+      cloud_message(make({4, 3}, kFloat32, xyz.data(), 48, false), "map");
   if (guess) {
-    h.push_frame(holoscan::testing::frame_at(100ms, holoscan::testing::input("source", source),
-                                             holoscan::testing::input("target", target),
+    h.push_frame(holoscan::testing::frame_at(100ms,
+                                             holoscan::testing::input("source", std::move(source)),
+                                             holoscan::testing::input("target", std::move(target)),
                                              holoscan::testing::input("initial_guess", *guess)));
   } else {
-    h.push_frame(holoscan::testing::frame_at(100ms, holoscan::testing::input("source", source),
-                                             holoscan::testing::input("target", target)));
+    h.push_frame(
+        holoscan::testing::frame_at(100ms, holoscan::testing::input("source", std::move(source)),
+                                    holoscan::testing::input("target", std::move(target))));
+  }
+  if (config.aligned_output) {
+    h.output_device("aligned", holoscan::DeviceId{0});
   }
   const auto result = h.run();
   VERIFY_MSG(!result.ok(), what + " is rejected");
@@ -367,23 +515,37 @@ void check_rejected_inputs() {
   const IcpConfig config = base_config(IcpMode::kPairs);
   const std::vector<float> xyz(12, 1.0F);
   const std::vector<double> xyz64(12, 1.0);
-  const char* kShape = "source must be float32 [N, 3] or [H, W, 3]";
-  check_rejects(config, make({4, 3}, kFloat64, xyz64.data(), 96, false), {}, kShape);
-  check_rejects(config, make({3, 4}, kFloat32, xyz.data(), 48, false), {}, kShape);
-  check_rejects(config, make({12}, kFloat32, xyz.data(), 48, false), {}, kShape);
+  const char* kShape = "source: point_cloud.points must be float32";
+  check_rejects(config, cloud_message(make({4, 3}, kFloat64, xyz64.data(), 96, false), "camera"),
+                {}, kShape);
+  check_rejects(config, cloud_message(make({3, 4}, kFloat32, xyz.data(), 48, false), "camera"), {},
+                kShape);
+  check_rejects(config, cloud_message(make({12}, kFloat32, xyz.data(), 48, false), "camera"), {},
+                kShape);
   IcpConfig small = config;
   small.max_points = 3;
-  check_rejects(small, make({4, 3}, kFloat32, xyz.data(), 48, false), {},
+  check_rejects(small, cloud_message(make({4, 3}, kFloat32, xyz.data(), 48, false), "camera"), {},
                 "more than the configured maximum of 3");
+  // A field the aligned output was not declared with.
+  IcpConfig no_colors = config;
+  no_colors.aligned_output = true;
+  no_colors.aligned_fields.colors = false;
+  const std::vector<std::uint8_t> rgb(12, 9U);
+  check_rejects(no_colors,
+                cloud_message(make({4, 3}, kFloat32, xyz.data(), 48, false), "camera",
+                              Fields{.colors = make({4, 3}, kUInt8, rgb.data(), 12, false)}),
+                {}, "source carries colors, which aligned_fields leaves out");
   IcpConfig guessed = config;
   guessed.initial_guess_input = true;
-  const holoscan::Tensor points = make({4, 3}, kFloat32, xyz.data(), 48, false);
+  const auto points = [&] {
+    return cloud_message(make({4, 3}, kFloat32, xyz.data(), 48, false), "camera");
+  };
   const std::vector<double> nine(9, 0.0);
-  check_rejects(guessed, points, make({3, 3}, kFloat64, nine.data(), 72, false),
+  check_rejects(guessed, points(), make({3, 3}, kFloat64, nine.data(), 72, false),
                 "initial_guess must be float32 or float64 [4, 4]");
   Matrix4 scaled = identity_transform();
   scaled[0] = 2.0;
-  check_rejects(guessed, points, matrix_tensor(scaled, false, false),
+  check_rejects(guessed, points(), matrix_tensor(scaled, false, false),
                 "initial_guess is not a rigid transform");
 }
 
@@ -432,6 +594,10 @@ int main() {
        [] { icp::check_pairs(true, true, true, true); }},
       {"pairs with float64 initial guesses, host memory",
        [] { icp::check_pairs(false, true, false); }},
+      {"colors, normals and intensities in the aligned cloud, host memory",
+       [] { icp::check_aligned_fields(false); }},
+      {"colors, normals and intensities in the aligned cloud, device memory",
+       [] { icp::check_aligned_fields(true); }},
       {"stored target", icp::check_map},
       {"odometry from host memory", icp::check_odometry},
       {"a failed registration is reported", icp::check_failure_reported},

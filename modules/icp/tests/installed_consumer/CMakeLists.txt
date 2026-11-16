@@ -14,8 +14,9 @@ add_executable(icp_consumer main.cpp)
 target_link_libraries(icp_consumer PRIVATE holoscan::icp)
 set_target_properties(icp_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# Passes on its verdict, which needs every pose right and the graph on one worker.
 add_test(NAME icp_installed_consumer COMMAND icp_consumer)
 set_tests_properties(
   icp_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "icp_consumer: PASS" TIMEOUT 300
+  PROPERTIES PASS_REGULAR_EXPRESSION "icp_consumer: workers=1\n.*icp_consumer: PASS" TIMEOUT 300
 )

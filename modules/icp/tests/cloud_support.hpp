@@ -73,7 +73,7 @@ class DeviceCloud {
 inline DeviceCloud render(const SyntheticScene& scene, const Matrix4& pose, int width, int height,
                           const DepthNoise& noise = {}, cudaStream_t stream = nullptr) {
   DeviceCloud cloud(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-  cuda_check(render_scene_cloud(scene, pose, synthetic_camera(width, height), 8.0F, noise,
+  cuda_check(render_scene_cloud(scene, pose, synthetic_camera_info(width, height), 8.0F, noise,
                                 cloud.data(), stream),
              "render_scene_cloud");
   cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
