@@ -2,19 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Normals and Planes: a synthetic depth camera in a known room, deprojected
-// by holoscan-point-cloud's DepthToPointCloudOp; holoscan-normals'
-// NormalEstimationOp estimates every point's normal and curvature, and
-// PlaneSegmentationOp finds the planes and labels every pixel with its plane.
-// A reporter checks every frame against the room's truth, and with a display
-// HoloViz shows the normals color-mapped beside the plane labels.
+// by holoscan-point-cloud's DepthToPointCloudOp with the camera from a
+// camera_info file written at run time, which CameraInfoSourceOp reads;
+// holoscan-normals' NormalEstimationOp adds every point's normal to the cloud
+// and gives its curvature, and PlaneSegmentationOp finds the planes and labels
+// every pixel with its plane. A reporter checks every frame against the
+// room's truth, and with a display HoloViz shows the normals color-mapped
+// beside the plane labels. The whole graph runs on one worker.
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -22,7 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -34,6 +38,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/normals/normal_estimation_op.hpp>
 #include <holoscan/normals/plane_segmentation_op.hpp>
 #include <holoscan/normals/synthetic_scene.hpp>
@@ -50,12 +57,13 @@
 
 namespace {
 
-using std::chrono_literals::operator""ms;
 namespace app = normals_planes_app;
+namespace hm = holoscan::messages;
 namespace pc = holoscan::point_cloud;
 namespace hn = holoscan::normals;
 
 constexpr std::string_view kAppName = "normals_planes";
+constexpr std::string_view kCameraFrame = "synthetic_camera";
 
 enum class DisplayMode { kAuto, kOn, kOff, kOffscreen };
 
@@ -68,6 +76,8 @@ struct Options {
   hn::NeighborSearch search{hn::NeighborSearch::kWindow};
   bool merge{false};
   DisplayMode display{DisplayMode::kAuto};
+  // The largest cloud the operators take; 0 for the image's size.
+  std::uint32_t max_points{0};
   std::uint32_t timeout_seconds{120};
   bool compile_only{false};
   bool help{false};
@@ -133,6 +143,8 @@ Options parse_args(int argc, char** argv) {
       } else {
         throw std::invalid_argument("--display must be auto, true, false or offscreen");
       }
+    } else if (option == "--max-points") {
+      opts.max_points = parse_number<std::uint32_t>(value, option);
     } else if (option == "--timeout-seconds") {
       opts.timeout_seconds = parse_number<std::uint32_t>(value, option);
     } else if (option == "--compile-only") {
@@ -159,7 +171,11 @@ void usage(const char* argv0) {
                "  --display auto|true|false|offscreen\n"
                "                           Show normals and planes in HoloViz (default: auto, on\n"
                "                           when a display is available)\n"
-               "  --timeout-seconds N      Allowance beyond the expected run time (default: 120)\n"
+               "  --max-points N           Largest cloud the operators take, which sizes their\n"
+               "                           outputs; a larger one fails the run (default: the\n"
+               "                           image's size)\n"
+               "  --timeout-seconds N      Allowance beyond the expected run time, which is\n"
+               "                           2 x count x period (default: 120)\n"
                "  --compile-only true|false  Build and check the graph without running it\n";
 }
 
@@ -167,6 +183,45 @@ bool env_set(const char* name) {
   const char* value = std::getenv(name);
   return value != nullptr && *value != '\0';
 }
+
+// A camera_info file of the synthetic camera, written for CameraInfoSourceOp
+// to read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every path out of the run.
+class SyntheticCameraInfoFile {
+ public:
+  explicit SyntheticCameraInfoFile(const hn::SyntheticScene& scene) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(hn::synthetic_camera_info(scene, std::string(kCameraFrame)),
+                                 path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~SyntheticCameraInfoFile() { remove(); }
+  SyntheticCameraInfoFile(const SyntheticCameraInfoFile&) = delete;
+  SyntheticCameraInfoFile& operator=(const SyntheticCameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
@@ -188,10 +243,13 @@ int execute(const Options& opts, SignalDomain& signals) {
         "the display needs a display server; set DISPLAY or add --display false");
   }
 
-  const hn::SyntheticScene scene = hn::synthetic_scene(opts.width, opts.height, 0);
-  const pc::CameraIntrinsics intrinsics{scene.fx, scene.fy, scene.cx, scene.cy};
-  const auto points =
+  // The camera: from a camera_info file of the synthetic camera, written for
+  // this run. CameraInfoSourceOp reads it again when the run starts, so it
+  // stays until the run is over.
+  const SyntheticCameraInfoFile camera_file(hn::synthetic_scene(opts.width, opts.height, 0));
+  const auto pixels =
       static_cast<std::uint32_t>(opts.width) * static_cast<std::uint32_t>(opts.height);
+  const std::uint32_t points = opts.max_points != 0 ? opts.max_points : pixels;
 
   holoscan::Graph graph{std::string(kAppName)};
   auto finished = std::make_shared<std::atomic<std::uint32_t>>(0U);
@@ -200,10 +258,12 @@ int execute(const Options& opts, SignalDomain& signals) {
                                        .height = opts.height,
                                        .count = opts.count,
                                        .period = std::chrono::milliseconds(opts.period_ms),
-                                       .finished = finished});
+                                       .finished = finished,
+                                       .frame_id = std::string(kCameraFrame)});
+  auto camera = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_file.path()});
   auto deproject = graph.op<pc::DepthToPointCloudOp>(
-      "deproject", pc::DepthToPointCloudConfig{.intrinsics = intrinsics,
-                                               .depth_scale = 1.0F,
+      "deproject", pc::DepthToPointCloudConfig{.depth_scale = 1.0F,
                                                .depth_min = 0.1F,
                                                .depth_max = 10.0F,
                                                .max_width = opts.width,
@@ -216,7 +276,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   hn::PlaneSegmentationConfig plane_config{.max_points = points};
   plane_config.planes.merge_coplanar = opts.merge;
   // A plane needs a share of the image: 500 points at 640x480.
-  plane_config.planes.min_inliers = std::max(100U, points / 600U);
+  plane_config.planes.min_inliers = std::max(100U, pixels / 600U);
   auto planes = graph.op<hn::PlaneSegmentationOp>("planes", plane_config);
   auto report = std::make_shared<app::Report>();
   if (opts.search == hn::NeighborSearch::kKnn) {
@@ -233,13 +293,13 @@ int execute(const Options& opts, SignalDomain& signals) {
                                   .finished = finished});
 
   // Lossless edges: every frame is estimated, segmented and checked, in
-  // order. The source keeps one frame in flight, so no queue fills.
+  // order. The source keeps at most two frames in flight, so no queue fills.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->depth, deproject->depth, lossless);
-  graph.add_flow(deproject->point_cloud, normals->points, lossless);
-  graph.add_flow(normals->filtered_points, planes->points, lossless);
-  graph.add_flow(normals->normals, planes->normals, lossless);
-  graph.add_flow(normals->normals, reporter->normals, lossless);
+  graph.add_flow(camera->camera_info, deproject->camera_info, hm::latest_camera_info_connection());
+  graph.add_flow(deproject->point_cloud, normals->point_cloud, lossless);
+  graph.add_flow(normals->point_cloud_with_normals, planes->point_cloud, lossless);
+  graph.add_flow(normals->point_cloud_with_normals, reporter->point_cloud, lossless);
   graph.add_flow(normals->curvature, reporter->curvature, lossless);
   graph.add_flow(planes->labels, reporter->labels, lossless);
   graph.add_flow(planes->plane_coefficients, reporter->coefficients, lossless);
@@ -255,7 +315,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   };
   on_gpu("source", "depth");
   on_gpu("deproject", "point_cloud");
-  for (const char* port : {"filtered_points", "normals", "curvature"}) {
+  for (const char* port : {"point_cloud_with_normals", "curvature"}) {
     on_gpu("normals", port);
   }
   for (const char* port : {"labels", "plane_coefficients", "plane_centroids", "plane_inliers"}) {
@@ -286,20 +346,28 @@ int execute(const Options& opts, SignalDomain& signals) {
     // Best effort: the display keeps the newest frame and never holds back the pipeline.
     const holoscan::ConnectionOptions latest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
                                              .queue_depth = 1U};
-    graph.add_flow(normals->normals, view->normals, latest);
+    graph.add_flow(normals->point_cloud_with_normals, view->point_cloud, latest);
     graph.add_flow(planes->labels, view->labels, latest);
     graph.add_flow(view->image, visualizer->image_layer_input(0), latest);
     on_gpu("view", "image");
     if (offscreen) {
+      // The check only counts frames that show both views: it may skip some,
+      // and never holds HoloViz back.
       auto check = graph.op<app::RenderCheckOp>("render_check", rendered);
-      graph.add_flow(visualizer->output(), check->frame, lossless);
+      graph.add_flow(visualizer->output(), check->frame, latest);
       on_gpu("holoviz", "output");
     }
   }
 #endif
 
+  // One worker for the whole graph. The graph has two sources (the camera and
+  // its camera info) and forks and joins, so the automatic partitioning would
+  // give its parts workers of their own, and a part that ran ahead could find
+  // a lossless queue full, which fails the run.
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
+  // Warnings on an accepted plan, as well as the reasons for a rejected one.
   if (!plan.diagnostics().empty()) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
   }
@@ -307,22 +375,24 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
     return 0;
   }
   if (!signals) {
+    // Profilers, sanitizers and preloaded libraries can start a thread before
+    // main(); the SDK then refuses to take over SIGINT and SIGTERM.
     std::cerr << kAppName << ": warning: running without managed SIGINT/SIGTERM handling: "
-              << holoscan::runtime_error_message(signals.error())
-              << "; an interrupt ends the process without a report\n";
+              << holoscan::runtime_error_message(signals.error());
+    if (signals.error().code == holoscan::ErrorCode::kInvalidArgument) {
+      std::cerr << " (another thread was already running)";
+    }
+    std::cerr << "; an interrupt ends the process without a report\n";
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(opts.timeout_seconds) +
-                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const bool timed_out = session.is_running();
+  const bool timed_out =
+      !session.wait_for(std::chrono::seconds(opts.timeout_seconds) +
+                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms));
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
@@ -345,19 +415,25 @@ int execute(const Options& opts, SignalDomain& signals) {
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
   // Offscreen, HoloViz must have shown both views; it may skip frames, never all.
   const bool shown = !offscreen || rendered->showing != 0;
+  // The frames before the first camera info give no cloud: at most the first,
+  // as the source waits a tick before it, should the worker run the camera
+  // info that late.
   const bool passed = !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
-                      report->frames == opts.count && report->passed() && shown;
+                      report->passed(opts.count) && shown;
   const app::Report& r = *report;
   std::cout << std::fixed << std::setprecision(3) << kAppName << ": frames=" << r.frames << '/'
-            << opts.count << " normals: worst_median_deg=" << r.worst_median_deg
-            << " worst_p95_deg=" << r.worst_p95_deg << " flipped=" << r.flipped
-            << " planes_per_frame="
+            << opts.count << " before_camera_info=" << r.before_camera_info
+            << " normals: share=" << r.worst_normal_share
+            << " worst_median_deg=" << r.worst_median_deg << " worst_p95_deg=" << r.worst_p95_deg
+            << " flipped=" << r.flipped << " planes_per_frame="
             << (r.frames == 0 ? 0.0 : static_cast<double>(r.planes) / r.frames)
             << " planes: worst_angle_deg=" << r.worst_plane_angle_deg
             << " worst_offset_mm=" << 1000.0 * r.worst_plane_offset_m
-            << " worst_recall=" << r.worst_recall << " worst_precision=" << r.worst_precision
-            << " wrong_planes=" << r.wrong_planes << " flat_sphere=" << r.flat_sphere;
+            << " worst_centroid_mm=" << 1000.0 * r.worst_centroid_offset_m
+            << " wrong_inliers=" << r.wrong_inliers << " worst_recall=" << r.worst_recall
+            << " worst_precision=" << r.worst_precision << " wrong_planes=" << r.wrong_planes
+            << " flat_sphere=" << r.flat_sphere;
   if (r.frame_gaps != 0) {
     std::cout << " frame_gaps=" << r.frame_gaps;
   }

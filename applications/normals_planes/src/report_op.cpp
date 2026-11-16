@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/normals/planes.hpp>
 #include <holoscan/normals/synthetic_scene.hpp>
 
@@ -21,10 +22,16 @@ namespace normals_planes_app {
 namespace {
 
 using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
 namespace hn = holoscan::normals;
 
 holoscan::Error invalid(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "ReportOp: " + message};
+}
+
+holoscan::Error cuda_failure(const char* what, cudaError_t status) {
+  return holoscan::Error{holoscan::ErrorCode::kFailure,
+                         std::string("ReportOp: ") + what + ": " + cudaGetErrorString(status)};
 }
 
 double angle_deg(const float* a, const float* b) {
@@ -33,16 +40,68 @@ double angle_deg(const float* a, const float* b) {
   return std::acos(std::clamp(dot, -1.0, 1.0)) * 180.0 / std::numbers::pi;
 }
 
+// The q-quantile of `values`; callers check that there are some.
 double percentile(std::vector<double>& values, double q) {
-  if (values.empty()) {
-    return 0.0;
-  }
   const auto at = std::min(values.size() - 1, static_cast<std::size_t>(q * values.size()));
   std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(at), values.end());
   return values[at];
 }
 
+// Pinned host memory of `bytes`, freed with it.
+class Pinned {
+ public:
+  explicit Pinned(std::size_t bytes) : bytes_(bytes) {
+    if (const cudaError_t status = cudaMallocHost(&data_, std::max<std::size_t>(bytes, 1U));
+        status != cudaSuccess) {
+      throw std::runtime_error(std::string("ReportOp: cudaMallocHost: ") +
+                               cudaGetErrorString(status));
+    }
+  }
+  ~Pinned() { cudaFreeHost(data_); }
+  Pinned(const Pinned&) = delete;
+  Pinned& operator=(const Pinned&) = delete;
+
+  template <typename T>
+  [[nodiscard]] T* as() const noexcept {
+    return static_cast<T*>(data_);
+  }
+  [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+
+ private:
+  void* data_{};
+  std::size_t bytes_{};
+};
+
 }  // namespace
+
+struct ReportOp::HostCopies {
+  HostCopies(std::size_t pixels, std::size_t planes)
+      : normals(12U * pixels),
+        curvature(4U * pixels),
+        labels(pixels),
+        coefficients(16U * planes),
+        centroids(12U * planes),
+        inliers(4U * planes) {
+    if (const cudaError_t status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        status != cudaSuccess) {
+      throw std::runtime_error(std::string("ReportOp: cudaStreamCreate: ") +
+                               cudaGetErrorString(status));
+    }
+  }
+  ~HostCopies() { cudaStreamDestroy(stream); }
+  HostCopies(const HostCopies&) = delete;
+  HostCopies& operator=(const HostCopies&) = delete;
+
+  Pinned normals;
+  Pinned curvature;
+  Pinned labels;
+  Pinned coefficients;
+  Pinned centroids;
+  Pinned inliers;
+  // The copies' own stream: an operator without device outputs may get none
+  // from the runtime.
+  cudaStream_t stream{};
+};
 
 ReportOp::ReportOp(ReportConfig config) : config_(std::move(config)) {
   if (!config_.report) {
@@ -50,8 +109,12 @@ ReportOp::ReportOp(ReportConfig config) : config_(std::move(config)) {
   }
 }
 
+ReportOp::~ReportOp() = default;
+
 void ReportOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(normals, "normals").queue_depth(2U);
+  // Two slots per input: the frame being checked, and the next one's outputs,
+  // which arrive one by one while it is.
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
   spec.input(curvature, "curvature").queue_depth(2U);
   spec.input(labels, "labels").queue_depth(2U);
   spec.input(coefficients, "coefficients").queue_depth(2U);
@@ -63,52 +126,87 @@ holoscan::Contract ReportOp::contract() const {
   holoscan::Contract result;
   result.trigger(
       holoscan::OnAligned{.ports = holoscan::PortList{std::vector<holoscan::PortRef>{
-                              normals, curvature, labels, coefficients, centroids, inliers}},
+                              point_cloud, curvature, labels, coefficients, centroids, inliers}},
                           .window = 0ns});
-  for (const auto* port : {&normals, &curvature, &labels, &coefficients, &centroids, &inliers}) {
+  result.input(point_cloud, holoscan::Exact{});
+  for (const auto* port : {&curvature, &labels, &coefficients, &centroids, &inliers}) {
     result.input(*port, holoscan::Exact{});
   }
   return result;
 }
 
+void ReportOp::start() {
+  copies_ = std::make_unique<HostCopies>(
+      static_cast<std::size_t>(config_.width) * static_cast<std::size_t>(config_.height),
+      config_.max_planes);
+  last_frame_id_ = 0;
+  finished_ = false;
+}
+
+void ReportOp::stop() { copies_.reset(); }
+
 holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionContext& context) {
-  auto normal_sample = normals.receive();
+  auto cloud_sample = point_cloud.receive();
   auto curvature_sample = curvature.receive();
   auto label_sample = labels.receive();
   auto coefficient_sample = coefficients.receive();
   auto centroid_sample = centroids.receive();
   auto inlier_sample = inliers.receive();
-  for (const auto* failed : {&normal_sample, &curvature_sample, &label_sample, &coefficient_sample,
-                             &centroid_sample, &inlier_sample}) {
+  if (!cloud_sample) {
+    return holoscan::make_unexpected(cloud_sample.error());
+  }
+  for (const auto* failed :
+       {&curvature_sample, &label_sample, &coefficient_sample, &centroid_sample, &inlier_sample}) {
     if (!*failed) {
       return holoscan::make_unexpected(failed->error());
     }
   }
   const int width = config_.width;
   const int height = config_.height;
-  const std::span<const std::int64_t> shape = normal_sample->data.shape_span();
+  const hm::schema::PointCloudT& cloud = cloud_sample->data;
+  if (auto checked = hm::check_point_cloud(cloud); !checked) {
+    return holoscan::make_unexpected(invalid(checked.error().message));
+  }
+  if (!hm::is_present(cloud.normals)) {
+    return holoscan::make_unexpected(invalid("the cloud carries no normals"));
+  }
+  const std::span<const std::int64_t> shape = cloud.normals->shape_span();
   if (shape.size() != 3 || shape[0] != height || shape[1] != width || shape[2] != 3) {
     return holoscan::make_unexpected(invalid("expected organized [H, W, 3] normals"));
   }
   const std::size_t pixels = static_cast<std::size_t>(width) * height;
   const std::size_t planes = config_.max_planes;
-  normals_.resize(3 * pixels);
-  curvature_.resize(pixels);
-  labels_.resize(pixels);
-  std::vector<float> got(4 * planes);
-  const auto stream = context.cuda_stream();
-  for (auto copied : {normal_sample->data.copy_to_host(normals_.data(), 12 * pixels, stream),
-                      curvature_sample->data.copy_to_host(curvature_.data(), 4 * pixels, stream),
-                      label_sample->data.copy_to_host(labels_.data(), pixels, stream),
-                      coefficient_sample->data.copy_to_host(got.data(), 16 * planes, stream)}) {
-    if (!copied) {
+
+  // Every copy is queued, then the host waits once.
+  HostCopies& host = *copies_;
+  const std::pair<const holoscan::Tensor*, const Pinned*> copies[] = {
+      {cloud.normals.get(), &host.normals},      {&curvature_sample->data, &host.curvature},
+      {&label_sample->data, &host.labels},       {&coefficient_sample->data, &host.coefficients},
+      {&centroid_sample->data, &host.centroids}, {&inlier_sample->data, &host.inliers}};
+  for (const auto& [tensor, to] : copies) {
+    if (auto copied = tensor->copy_to_host_async(to->as<void>(), to->bytes(), host.stream);
+        !copied) {
       return copied;
     }
   }
+  if (const cudaError_t status = cudaStreamSynchronize(host.stream); status != cudaSuccess) {
+    return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+  }
+  const float* normals = host.normals.as<float>();
+  const float* curvature_values = host.curvature.as<float>();
+  const std::uint8_t* label_values = host.labels.as<std::uint8_t>();
+  const float* got = host.coefficients.as<float>();
+  const float* centroid_values = host.centroids.as<float>();
+  const std::uint32_t* inlier_values = host.inliers.as<std::uint32_t>();
 
   Report& report = *config_.report;
-  const std::uint64_t frame_id = normal_sample->metadata.frame_id;
-  report.frame_gaps += frame_id != last_frame_id_ + 1U ? 1U : 0U;
+  const std::uint64_t frame_id = cloud_sample->metadata.frame_id;
+  if (last_frame_id_ == 0) {
+    // Frames before the first cloud came before the first camera info.
+    report.before_camera_info = static_cast<std::uint32_t>(frame_id - 1U);
+  } else {
+    report.frame_gaps += frame_id != last_frame_id_ + 1U ? 1U : 0U;
+  }
   last_frame_id_ = frame_id;
   const hn::SyntheticScene scene =
       hn::synthetic_scene(width, height, static_cast<std::uint32_t>(frame_id - 1U));
@@ -119,8 +217,11 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     }
   }
 
-  // The normals on the inside of each surface, and the curvature there.
+  // The normals: how many of the room's points got one, their angle error on
+  // the inside of each surface, and the curvature there.
   const int r = config_.window_radius;
+  std::size_t shown = 0;
+  std::size_t with_normal = 0;
   std::vector<double> angles;
   std::vector<double> flat;
   std::vector<double> sphere;
@@ -128,9 +229,14 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     for (int u = 0; u < width; ++u) {
       const std::size_t i = static_cast<std::size_t>(v) * width + u;
       const std::uint8_t surface = truth[i].surface;
-      if (surface == hn::kSurfaceNone || !std::isfinite(normals_[3 * i])) {
+      if (surface == hn::kSurfaceNone) {
         continue;
       }
+      ++shown;
+      if (!std::isfinite(normals[3 * i])) {
+        continue;
+      }
+      ++with_normal;
       bool alone = true;
       for (int dv = -r; dv <= r && alone; ++dv) {
         for (int du = -r; du <= r && alone; ++du) {
@@ -146,16 +252,23 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
       if (!alone) {
         continue;
       }
-      const double angle = angle_deg(normals_.data() + 3 * i, truth[i].normal);
+      const double angle = angle_deg(normals + 3 * i, truth[i].normal);
       report.flipped += angle > 90.0 ? 1U : 0U;
       angles.push_back(angle);
       float plane[4];
-      (hn::synthetic_surface_plane(scene, surface, plane) ? flat : sphere).push_back(curvature_[i]);
+      (hn::synthetic_surface_plane(scene, surface, plane) ? flat : sphere)
+          .push_back(curvature_values[i]);
     }
   }
-  report.worst_median_deg = std::max(report.worst_median_deg, percentile(angles, 0.5));
-  report.worst_p95_deg = std::max(report.worst_p95_deg, percentile(angles, 0.95));
-  report.flat_sphere += percentile(sphere, 0.5) > percentile(flat, 0.5) ? 0U : 1U;
+  const double share = shown == 0 ? 0.0 : static_cast<double>(with_normal) / shown;
+  report.worst_normal_share = std::min(report.worst_normal_share, share);
+  // Without normals to measure, a frame fails rather than passing on nothing.
+  report.worst_median_deg =
+      std::max(report.worst_median_deg, angles.empty() ? 180.0 : percentile(angles, 0.5));
+  report.worst_p95_deg =
+      std::max(report.worst_p95_deg, angles.empty() ? 180.0 : percentile(angles, 0.95));
+  report.flat_sphere +=
+      !sphere.empty() && !flat.empty() && percentile(sphere, 0.5) > percentile(flat, 0.5) ? 0U : 1U;
 
   // The large planes among those found.
   std::uint32_t found = 0;
@@ -163,6 +276,17 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     ++found;
   }
   report.planes += found;
+  // Each plane's inliers are the points with its label.
+  std::vector<std::size_t> labeled(planes + 1U, 0U);
+  for (std::size_t i = 0; i < pixels; ++i) {
+    if (label_values[i] != hn::kLabelNoPlane && label_values[i] <= planes) {
+      ++labeled[label_values[i]];
+    }
+  }
+  for (std::uint32_t k = 0; k < planes; ++k) {
+    const std::size_t want = k < found ? labeled[k + 1U] : 0U;
+    report.wrong_inliers += inlier_values[k] == want ? 0U : 1U;
+  }
   for (const std::uint8_t surface :
        {hn::kSurfaceFloor, hn::kSurfaceBackWall, hn::kSurfaceSideWall, hn::kSurfaceTableTop}) {
     float want[4];
@@ -171,7 +295,7 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     double best_angle = 180.0;
     double best_offset = 1e30;
     for (std::uint32_t k = 0; k < found; ++k) {
-      const double angle = angle_deg(got.data() + 4 * k, want);
+      const double angle = angle_deg(got + 4 * k, want);
       const double offset = std::fabs(got[4 * k + 3] - want[3]);
       if (angle < 5.0 && offset < best_offset) {
         best = static_cast<int>(k);
@@ -179,33 +303,43 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
         best_offset = offset;
       }
     }
+    // The centroid of the plane's inliers lies on the true plane.
+    double centroid_offset = 1e9;
+    if (best >= 0) {
+      const float* c = centroid_values + 3 * best;
+      centroid_offset =
+          std::fabs(static_cast<double>(want[0]) * c[0] + static_cast<double>(want[1]) * c[1] +
+                    static_cast<double>(want[2]) * c[2] + want[3]);
+    }
     std::size_t on_surface = 0;
-    std::size_t labeled = 0;
     std::size_t both = 0;
     const auto label = static_cast<std::uint8_t>(best + 1);
     for (std::size_t i = 0; i < pixels && best >= 0; ++i) {
       on_surface += truth[i].surface == surface ? 1U : 0U;
-      labeled += labels_[i] == label ? 1U : 0U;
-      both += truth[i].surface == surface && labels_[i] == label ? 1U : 0U;
+      both += truth[i].surface == surface && label_values[i] == label ? 1U : 0U;
     }
+    const std::size_t with_label = best >= 0 ? labeled[label] : 0U;
     const double recall = on_surface == 0 ? 0.0 : static_cast<double>(both) / on_surface;
-    const double precision = labeled == 0 ? 0.0 : static_cast<double>(both) / labeled;
+    const double precision = with_label == 0 ? 0.0 : static_cast<double>(both) / with_label;
     if (best < 0 || best_angle > kMaxPlaneAngleDeg || best_offset > kMaxPlaneOffsetM ||
-        recall < kMinRecall || precision < kMinPrecision) {
+        centroid_offset > kMaxPlaneOffsetM || recall < kMinRecall || precision < kMinPrecision) {
       ++report.wrong_planes;
     }
     report.worst_plane_angle_deg = std::max(report.worst_plane_angle_deg, best_angle);
     report.worst_plane_offset_m =
         std::max(report.worst_plane_offset_m, best < 0 ? 1e9 : best_offset);
+    report.worst_centroid_offset_m = std::max(report.worst_centroid_offset_m, centroid_offset);
     report.worst_recall = std::min(report.worst_recall, recall);
     report.worst_precision = std::min(report.worst_precision, precision);
   }
 
-  ++report.frames;
-  if (config_.finished) {
-    config_.finished->fetch_add(1U, std::memory_order_release);
+  if (report.frames++ == 0) {
+    HOLOSCAN_LOG_INFO("ReportOp: the first frame is checked");
   }
-  if (!finished_ && report.frames >= config_.expected_frames) {
+  if (config_.finished) {
+    config_.finished->store(static_cast<std::uint32_t>(frame_id), std::memory_order_release);
+  }
+  if (!finished_ && frame_id >= config_.expected_frames) {
     finished_ = true;
     context.request_completion();
   }

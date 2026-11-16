@@ -4,6 +4,8 @@
 #include "scene_source_op.hpp"
 
 #include <array>
+#include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,13 +40,23 @@ holoscan::PayloadOptions image_payload() {
   };
 }
 
-holoscan::schema::ImageT descriptor(int width, int height,
-                                    holoscan::schema::ImageEncoding encoding) {
+holoscan::schema::ImageT descriptor(int width, int height, holoscan::schema::ImageEncoding encoding,
+                                    const std::string& frame_id, std::int64_t capture_ns) {
   holoscan::schema::ImageT image;
   image.width = width;
   image.height = height;
   image.encoding = encoding;
+  image.header = std::make_shared<holoscan::schema::HeaderT>();
+  image.header->frame_id = frame_id;
+  image.header->capture_timestamp_ns = capture_ns;
   return image;
+}
+
+// Whether `error` says the consumers are still busy with earlier frames: an
+// emit refused before delivery, or every slot of the output's pool still held.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
 }
 
 holoscan::Error cuda_failure(const char* what, cudaError_t status) {
@@ -81,30 +93,45 @@ holoscan::Contract SceneSourceOp::contract() const {
   return result;
 }
 
-void SceneSourceOp::start() { emitted_ = 0; }
+void SceneSourceOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+  capture_.reset();
+}
 
 holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the reporter completes the run.
   }
-  if (config_.finished && config_.finished->load(std::memory_order_acquire) < emitted_) {
-    return {};  // The previous frame is still in flight.
+  if (!delayed_) {
+    delayed_ = true;
+    return {};  // A tick for the camera info to come first.
+  }
+  // Frames 1 and 2 go out without waiting, then frame k + 1 once frame k - 1
+  // is finished: a frame before the camera info, which never finishes, holds
+  // nothing back, as the reporter marks it finished with the next one.
+  if (config_.finished && emitted_ >= 2U &&
+      config_.finished->load(std::memory_order_acquire) + 1U < emitted_) {
+    return {};
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     return holoscan::make_unexpected(holoscan::Error{
         holoscan::ErrorCode::kFailure, "SceneSourceOp: the runtime gave no CUDA stream"});
   }
+  if (!capture_) {
+    capture_ = context.activation_time();
+  }
   // Frame ids count from 1; 0 means none.
-  const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
-                                   .frame_id = emitted_ + 1U};
+  const holoscan::EmitOptions emit{.capture_time = *capture_, .frame_id = emitted_ + 1U};
   const holoscan::normals::SyntheticScene scene =
       holoscan::normals::synthetic_scene(config_.width, config_.height, emitted_);
   auto loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 2>{config_.height, config_.width}, .dtype = kFloat32});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    return consumers_busy(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                        : holoscan::make_unexpected(std::move(loan).error());
   }
   auto writer = loan->write(stream);
   if (!writer) {
@@ -120,13 +147,14 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
   }
   auto sent = depth.emit_tensor(
       std::move(*loan),
-      descriptor(config_.width, config_.height, holoscan::schema::ImageEncoding_MONO32F), emit);
-  if (!sent && sent.error().code == holoscan::ErrorCode::kBackpressured) {
-    return {};  // A consumer still busy refused it before delivery: send it on the next tick.
-  }
+      descriptor(config_.width, config_.height, holoscan::schema::ImageEncoding_MONO32F,
+                 config_.frame_id, capture_->timestamp_ns),
+      emit);
   if (!sent) {
-    return sent;
+    // Refused before delivery: the same frame goes again on the next tick.
+    return consumers_busy(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
   }
+  capture_.reset();
   ++emitted_;
   return {};
 }

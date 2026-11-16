@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# The Normals and Planes demo, built against the INSTALLED holoscan-point-cloud and
-# holoscan-normals packages, as any other project would use them: put the modules' install
-# prefix on CMAKE_PREFIX_PATH.
+# The Normals and Planes demo, built against the INSTALLED holoscan-messages,
+# holoscan-point-cloud and holoscan-normals packages, as any other project would use them: put
+# the modules' install prefix on CMAKE_PREFIX_PATH.
 cmake_minimum_required(VERSION 4.0)
 project(normals_planes LANGUAGES CXX)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -16,7 +16,8 @@ if(NORMALS_PLANES_ENABLE_VISUALIZATION)
   list(APPEND _holoscan_components visualization)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
-find_package(holoscan-point-cloud 1.1 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+find_package(holoscan-point-cloud 2.0 REQUIRED CONFIG)
 find_package(holoscan-normals 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
@@ -33,7 +34,7 @@ target_compile_features(normals_planes_app_ops PUBLIC cxx_std_20)
 target_include_directories(normals_planes_app_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   normals_planes_app_ops
-  PUBLIC holoscan::normals holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::normals holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 # The reporter evaluates the scene as the GPU renders it: without contracting.
 target_compile_options(normals_planes_app_ops PUBLIC -ffp-contract=off)
