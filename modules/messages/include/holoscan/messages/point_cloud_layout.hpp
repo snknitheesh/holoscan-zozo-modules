@@ -47,7 +47,8 @@ struct PointCloudLayout {
 // [0]; there is nothing in it either way.)
 [[nodiscard]] bool is_present(const TensorLayout& field) noexcept;
 
-// N, or H * W; 0 for points that are not a cloud's.
+// N, or H * W; 0 for points that are not a cloud's, or more than an int64
+// counts (which validate() refuses).
 [[nodiscard]] std::int64_t point_count(const PointCloudLayout& layout) noexcept;
 
 // Throws std::invalid_argument naming the first field that breaks the rules

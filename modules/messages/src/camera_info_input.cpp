@@ -20,8 +20,8 @@ std::optional<holoscan::Error> selection_error(holoscan::SelectionReason reason)
   switch (reason) {
     case holoscan::SelectionReason::kCaptureTimeAbsent:
       return holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
-                             "camera info without a capture time cannot be matched to frames; "
-                             "send it with EmitOptions::capture_time"};
+                             "a frame or its camera info has no capture time, so they cannot "
+                             "be matched; send both with EmitOptions::capture_time"};
     case holoscan::SelectionReason::kClockIncomparable:
     case holoscan::SelectionReason::kConversionUnavailable:
       return holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
