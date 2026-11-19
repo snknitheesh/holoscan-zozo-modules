@@ -1,0 +1,167 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+//
+// Device helpers shared by the filters: point validity, copying and removing a
+// point with its fields, grid cell keys, launch sizes, and the CUB scans and
+// sorts with their scratch.
+
+#pragma once
+
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
+#include <cstdint>
+
+#include <cub/device/device_radix_sort.cuh>  // NOLINT(build/include_order): CUB
+#include <cub/device/device_scan.cuh>        // NOLINT(build/include_order): CUB
+#include <holoscan/pcl_filters/filters.hpp>
+
+#include "device_buffer.hpp"
+
+namespace holoscan::pcl_filters::detail {
+
+inline constexpr int kBlock = 256;
+
+inline unsigned int blocks_for(std::uint32_t count) { return (count + kBlock - 1U) / kBlock; }
+
+__device__ inline bool valid_point(float x, float y, float z) {
+  return isfinite(x) && isfinite(y) && isfinite(z);
+}
+
+// Whether `in` has points and every field that `out` has, which `out` needs
+// points for.
+inline bool fields_match(const CloudFields& in, const CloudOutput& out) {
+  return in.xyz != nullptr && out.xyz != nullptr && (out.rgb == nullptr || in.rgb != nullptr) &&
+         (out.normals == nullptr || in.normals != nullptr) &&
+         (out.intensity == nullptr || in.intensity != nullptr);
+}
+
+__device__ inline float quiet_nan() { return __int_as_float(0x7FC00000); }
+
+// Point `from` of `in`, with every field `out` has, as point `to` of `out`.
+__device__ inline void copy_point(const CloudFields& in, std::uint32_t from, const CloudOutput& out,
+                                  std::uint32_t to) {
+  for (int axis = 0; axis < 3; ++axis) {
+    out.xyz[3 * to + axis] = in.xyz[3 * from + axis];
+  }
+  if (out.rgb != nullptr) {
+    for (int channel = 0; channel < 3; ++channel) {
+      out.rgb[3 * to + channel] = in.rgb[3 * from + channel];
+    }
+  }
+  if (out.normals != nullptr) {
+    for (int axis = 0; axis < 3; ++axis) {
+      out.normals[3 * to + axis] = in.normals[3 * from + axis];
+    }
+  }
+  if (out.intensity != nullptr) {
+    out.intensity[to] = in.intensity[from];
+  }
+}
+
+// Point `at` of `out` removed: NaN, black, a NaN normal and a NaN intensity.
+__device__ inline void remove_point(const CloudOutput& out, std::uint32_t at) {
+  const float nan = quiet_nan();
+  for (int axis = 0; axis < 3; ++axis) {
+    out.xyz[3 * at + axis] = nan;
+  }
+  if (out.rgb != nullptr) {
+    for (int channel = 0; channel < 3; ++channel) {
+      out.rgb[3 * at + channel] = 0U;
+    }
+  }
+  if (out.normals != nullptr) {
+    for (int axis = 0; axis < 3; ++axis) {
+      out.normals[3 * at + axis] = nan;
+    }
+  }
+  if (out.intensity != nullptr) {
+    out.intensity[at] = nan;
+  }
+}
+
+// A grid cell key: the cell's (x, y, z) index, each biased by
+// kVoxelIndexRange into 21 bits, x in the highest. Keys sort like the indices.
+// kNoCell sets the 64th bit too, which no cell's key does, so it sorts after
+// every cell, the last one on every axis (all 63 key bits set) included.
+inline constexpr std::uint64_t kNoCell = ~std::uint64_t{0};
+inline constexpr int kCellBits = 21;
+
+// The cell index of coordinate `value` in cells of `size`, or false when it is
+// out of range (or not finite).
+__device__ inline bool cell_index(float value, float size, int& index) {
+  const float cell = floorf(value / size);
+  if (!(cell >= -static_cast<float>(kVoxelIndexRange) &&
+        cell < static_cast<float>(kVoxelIndexRange))) {
+    return false;
+  }
+  index = static_cast<int>(cell);
+  return true;
+}
+
+__device__ inline std::uint64_t cell_key(int ix, int iy, int iz) {
+  return (static_cast<std::uint64_t>(ix + kVoxelIndexRange) << (2 * kCellBits)) |
+         (static_cast<std::uint64_t>(iy + kVoxelIndexRange) << kCellBits) |
+         static_cast<std::uint64_t>(iz + kVoxelIndexRange);
+}
+
+__device__ inline bool in_range(int index) {
+  return index >= -kVoxelIndexRange && index < kVoxelIndexRange;
+}
+
+// The key of the cell of point p, or kNoCell for an invalid or far point.
+__device__ inline std::uint64_t point_cell(float x, float y, float z, float size) {
+  int ix = 0;
+  int iy = 0;
+  int iz = 0;
+  if (!valid_point(x, y, z) || !cell_index(x, size, ix) || !cell_index(y, size, iy) ||
+      !cell_index(z, size, iz)) {
+    return kNoCell;
+  }
+  return cell_key(ix, iy, iz);
+}
+
+// Exclusive prefix sum of `count` values, with CUB's scratch in `temp`.
+inline cudaError_t exclusive_sum(const std::uint32_t* in, std::uint32_t* out, std::uint32_t count,
+                                 DeviceBuffer& temp, cudaStream_t stream) {
+  std::size_t bytes = 0;
+  if (const cudaError_t status =
+          cub::DeviceScan::ExclusiveSum(nullptr, bytes, in, out, static_cast<int>(count), stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status = temp.reserve(bytes, stream); status != cudaSuccess) {
+    return status;
+  }
+  return cub::DeviceScan::ExclusiveSum(temp.as<void>(), bytes, in, out, static_cast<int>(count),
+                                       stream);
+}
+
+// Sorts (key, value) pairs by the whole key, stably.
+inline cudaError_t sort_pairs(const std::uint64_t* keys_in, std::uint64_t* keys_out,
+                              const std::uint32_t* values_in, std::uint32_t* values_out,
+                              std::uint32_t count, DeviceBuffer& temp, cudaStream_t stream) {
+  constexpr int bits = 64;
+  std::size_t bytes = 0;
+  if (const cudaError_t status =
+          cub::DeviceRadixSort::SortPairs(nullptr, bytes, keys_in, keys_out, values_in, values_out,
+                                          static_cast<int>(count), 0, bits, stream);
+      status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status = temp.reserve(bytes, stream); status != cudaSuccess) {
+    return status;
+  }
+  return cub::DeviceRadixSort::SortPairs(temp.as<void>(), bytes, keys_in, keys_out, values_in,
+                                         values_out, static_cast<int>(count), 0, bits, stream);
+}
+
+// SplitMix64: the deterministic random numbers of RANSAC.
+__device__ inline std::uint64_t mix64(std::uint64_t value) {
+  value += 0x9E3779B97F4A7C15ULL;
+  value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+  return value ^ (value >> 31);
+}
+
+}  // namespace holoscan::pcl_filters::detail
