@@ -35,7 +35,7 @@ namespace isp_demo {
 
 struct Report {
   std::uint32_t frames{};
-  std::uint32_t frame_gaps{};  // Frames that arrived out of order or not at all.
+  std::uint32_t frame_gaps{};      // Frames that arrived out of order or not at all.
   std::uint32_t bad_histograms{};  // Frames whose histograms differ from their image's.
   double worst_psnr{99.0};
   double psnr_sum{};

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "frame_check.hpp"
 
@@ -45,8 +46,7 @@ bool on_gpu(const holoscan::Tensor& tensor) {
 FrameCheckResult check_frame_host(const isp::SyntheticRawScene& scene,
                                   const std::vector<float>& lut,
                                   const std::vector<std::uint8_t>& rgb,
-                                  const std::vector<std::uint32_t>& histogram,
-                                  const float* stats) {
+                                  const std::vector<std::uint32_t>& histogram, const float* stats) {
   FrameCheckResult result{};
   std::vector<std::uint32_t> rebuilt(kHistogramEntries, 0U);
   const int lut_size = static_cast<int>(lut.size());
@@ -57,7 +57,7 @@ FrameCheckResult check_frame_host(const isp::SyntheticRawScene& scene,
       const std::uint8_t* pixel = rgb.data() + (static_cast<std::size_t>(y) * scene.width + x) * 3U;
       for (int k = 0; k < 3; ++k) {
         const int d = static_cast<int>(pixel[k]) - truth[k];
-        result.squared_error += static_cast<unsigned long long>(d * d);
+        result.squared_error += static_cast<ErrorSum>(d * d);
       }
       ++rebuilt[isp::kHistogramLuma * isp::kHistogramBins + luma_bin(pixel[0], pixel[1], pixel[2])];
       ++rebuilt[isp::kHistogramRed * isp::kHistogramBins + pixel[0]];
@@ -113,8 +113,7 @@ void CheckOp::start() {
     check(cudaMalloc(&device_result_, sizeof(FrameCheckResult)), "cudaMalloc");
     check(cudaMallocHost(&host_result_, sizeof(FrameCheckResult)), "cudaMallocHost");
     // A copy from pageable memory may return before it has landed: wait for it.
-    check(cudaMemcpy(device_lut_, lut_.data(), lut_.size() * sizeof(float),
-                     cudaMemcpyHostToDevice),
+    check(cudaMemcpy(device_lut_, lut_.data(), lut_.size() * sizeof(float), cudaMemcpyHostToDevice),
           "cudaMemcpy");
     check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   } catch (const std::exception& error) {
@@ -182,18 +181,17 @@ holoscan::expected<void, holoscan::Error> CheckOp::compute(holoscan::ExecutionCo
       return holoscan::make_unexpected(
           holoscan::Error{holoscan::ErrorCode::kFailure, "CheckOp: the runtime gave no stream"});
     }
-    if (const cudaError_t status = check_frame_cuda(
-            scene, device_lut_, static_cast<int>(lut_.size()),
-            static_cast<const std::uint8_t*>(pixels.data()),
-            static_cast<const std::uint32_t*>(bins->data.data()),
-            static_cast<const float*>(values->data.data()), device_bins_,
-            static_cast<FrameCheckResult*>(device_result_), stream);
+    if (const cudaError_t status =
+            check_frame_cuda(scene, device_lut_, static_cast<int>(lut_.size()),
+                             static_cast<const std::uint8_t*>(pixels.data()),
+                             static_cast<const std::uint32_t*>(bins->data.data()),
+                             static_cast<const float*>(values->data.data()), device_bins_,
+                             static_cast<FrameCheckResult*>(device_result_), stream);
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("check", status));
     }
-    if (const cudaError_t status = cudaMemcpyAsync(host_result_, device_result_,
-                                                   sizeof(FrameCheckResult),
-                                                   cudaMemcpyDeviceToHost, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            host_result_, device_result_, sizeof(FrameCheckResult), cudaMemcpyDeviceToHost, stream);
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
     }
@@ -214,8 +212,8 @@ holoscan::expected<void, holoscan::Error> CheckOp::compute(holoscan::ExecutionCo
       return copied;
     }
     counts_.resize(kHistogramEntries);
-    if (auto copied = bins->data.copy_to_host(counts_.data(), counts_.size() * 4U,
-                                              context.cuda_stream());
+    if (auto copied =
+            bins->data.copy_to_host(counts_.data(), counts_.size() * 4U, context.cuda_stream());
         !copied) {
       return copied;
     }

@@ -24,7 +24,10 @@ target_link_libraries(isp_benchmark PRIVATE holoscan::isp)
 
 add_test(NAME isp_pipeline COMMAND isp_pipeline_test)
 add_test(NAME isp_op COMMAND isp_op_test)
-add_test(NAME isp_benchmark COMMAND isp_benchmark --iterations 3 --cpu true --cpu-iterations 1)
+add_test(
+  NAME isp_benchmark
+  COMMAND isp_benchmark --iterations 3 --cpu true --cpu-iterations 1
+)
 set_tests_properties(isp_op isp_pipeline PROPERTIES LABELS "isp;gpu" TIMEOUT 900)
 set_tests_properties(isp_benchmark PROPERTIES LABELS "isp;gpu;benchmark" TIMEOUT 900)
 

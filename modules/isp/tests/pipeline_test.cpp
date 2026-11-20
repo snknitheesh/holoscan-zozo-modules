@@ -245,9 +245,8 @@ void histograms_count_pixels() {
       IspPipeline pipeline(backend, params);
       const Result r = run(pipeline, frame, format);
       const int channels = output_channels(format);
-      std::vector<std::uint32_t> rebuilt(static_cast<std::size_t>(kHistogramChannels) *
-                                             kHistogramBins,
-                                         0U);
+      std::vector<std::uint32_t> rebuilt(
+          static_cast<std::size_t>(kHistogramChannels) * kHistogramBins, 0U);
       for (std::size_t i = 0; i + 2 < r.image.size(); i += static_cast<std::size_t>(channels)) {
         const int red = r.image[i];
         const int green = r.image[i + 1];
@@ -283,7 +282,8 @@ void two_streams() {
   }
   IspPipeline cpu(Backend::kCpu, params);
   std::vector<Result> expected;
-  for (const test::RawFrame& frame : frames) expected.push_back(run(cpu, frame, OutputFormat::kRgb8));
+  for (const test::RawFrame& frame : frames)
+    expected.push_back(run(cpu, frame, OutputFormat::kRgb8));
 
   const std::size_t image_bytes = static_cast<std::size_t>(config.width) * config.height * 3U;
   const std::size_t histogram_bytes = sizeof(std::uint32_t) * kHistogramChannels * kHistogramBins;
@@ -308,9 +308,9 @@ void two_streams() {
     std::vector<void*> statistics;
     for (const test::RawFrame& frame : frames) {
       raws.push_back(device_buffer(frame.bytes.size()));
-      test::cuda_check(cudaMemcpy(raws.back(), frame.bytes.data(), frame.bytes.size(),
-                                  cudaMemcpyHostToDevice),
-                       "cudaMemcpy");
+      test::cuda_check(
+          cudaMemcpy(raws.back(), frame.bytes.data(), frame.bytes.size(), cudaMemcpyHostToDevice),
+          "cudaMemcpy");
       images.push_back(device_buffer(image_bytes));
       histograms.push_back(device_buffer(histogram_bytes));
       statistics.push_back(device_buffer(stats_bytes));
@@ -319,12 +319,12 @@ void two_streams() {
     for (int f = 0; f < kFrames; ++f) {
       RawImageView view = frames[f].view();
       view.data = raws[f];
-      gpu.process(view,
-                  RgbImageView{images[f], static_cast<std::size_t>(config.width) * 3U,
-                               OutputFormat::kRgb8},
-                  StatsOutput{static_cast<std::uint32_t*>(histograms[f]),
-                              static_cast<float*>(statistics[f])},
-                  {}, streams[f % 2]);
+      gpu.process(
+          view,
+          RgbImageView{images[f], static_cast<std::size_t>(config.width) * 3U, OutputFormat::kRgb8},
+          StatsOutput{static_cast<std::uint32_t*>(histograms[f]),
+                      static_cast<float*>(statistics[f])},
+          {}, streams[f % 2]);
     }
     test::cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     for (int f = 0; f < kFrames; ++f) {
@@ -334,9 +334,9 @@ void two_streams() {
       got.stats.resize(stats::kStatsSize);
       test::cuda_check(cudaMemcpy(got.image.data(), images[f], image_bytes, cudaMemcpyDeviceToHost),
                        "cudaMemcpy");
-      test::cuda_check(cudaMemcpy(got.histogram.data(), histograms[f], histogram_bytes,
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy");
+      test::cuda_check(
+          cudaMemcpy(got.histogram.data(), histograms[f], histogram_bytes, cudaMemcpyDeviceToHost),
+          "cudaMemcpy");
       test::cuda_check(
           cudaMemcpy(got.stats.data(), statistics[f], stats_bytes, cudaMemcpyDeviceToHost),
           "cudaMemcpy");
@@ -759,8 +759,7 @@ int main() {
                holoscan::isp::synthetic_render_matches},
       TestCase{"the histograms count the output's own pixels",
                holoscan::isp::histograms_count_pixels},
-      TestCase{"frames on two streams in turn run in call order",
-               holoscan::isp::two_streams},
+      TestCase{"frames on two streams in turn run in call order", holoscan::isp::two_streams},
       TestCase{"padded rows", holoscan::isp::padded_rows},
       TestCase{"auto white balance recovers the camera's gains", holoscan::isp::auto_white_balance},
       TestCase{"white balance smoothing", holoscan::isp::white_balance_smoothing},

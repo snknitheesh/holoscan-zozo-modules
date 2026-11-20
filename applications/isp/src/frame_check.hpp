@@ -26,12 +26,17 @@
 
 namespace isp_demo {
 
-inline constexpr int kHistogramEntries =
-    holoscan::isp::kHistogramChannels * holoscan::isp::kHistogramBins;
+// Every bin of every histogram row.
+inline constexpr int kHistogramEntries = 4 * 256;
+static_assert(kHistogramEntries ==
+              holoscan::isp::kHistogramChannels * holoscan::isp::kHistogramBins);
+
+// The type of CUDA's 64-bit atomicAdd.
+using ErrorSum = unsigned long long;  // NOLINT(runtime/int)
 
 struct FrameCheckResult {
   // Sum over every pixel and channel of (code - truth code)^2.
-  unsigned long long squared_error;
+  ErrorSum squared_error;
   // Histogram bins that differ from the counts of the image's own pixels.
   unsigned int histogram_mismatches;
   unsigned int reserved;
@@ -47,8 +52,8 @@ ISP_DEMO_HD inline float tone(const float* lut, int size, float v) {
 }
 
 // The 8-bit code an ideal ISP outputs at (x, y), per channel.
-ISP_DEMO_HD inline void truth_codes(const holoscan::isp::SyntheticRawScene& scene,
-                                    const float* lut, int lut_size, int x, int y, int codes[3]) {
+ISP_DEMO_HD inline void truth_codes(const holoscan::isp::SyntheticRawScene& scene, const float* lut,
+                                    int lut_size, int x, int y, int codes[3]) {
   float linear[3];
   holoscan::isp::synthetic_truth(scene, x, y, linear);
   for (int k = 0; k < 3; ++k) {
@@ -64,9 +69,8 @@ ISP_DEMO_HD inline int luma_bin(int r, int g, int b) {
 // Queues the check of one RGB8 frame (rows packed) on `stream`, everything in
 // device memory: `scratch` holds kHistogramEntries uint32, `result` is written.
 cudaError_t check_frame_cuda(const holoscan::isp::SyntheticRawScene& scene, const float* lut,
-                             int lut_size, const std::uint8_t* rgb,
-                             const std::uint32_t* histogram, const float* stats,
-                             std::uint32_t* scratch, FrameCheckResult* result,
+                             int lut_size, const std::uint8_t* rgb, const std::uint32_t* histogram,
+                             const float* stats, std::uint32_t* scratch, FrameCheckResult* result,
                              cudaStream_t stream);
 
 }  // namespace isp_demo

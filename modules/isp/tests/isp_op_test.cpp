@@ -404,13 +404,13 @@ int main() {
   using holoscan::isp::Backend;
   using holoscan::isp::OutputFormat;
   using holoscan::isp::RawFormat;
-  using holoscan::isp::test::TestCase;
   using holoscan::isp::test::Memory;
+  using holoscan::isp::test::TestCase;
   return holoscan::isp::test::run({
       TestCase{"cuda: 12-bit BAYER_GRBG from device memory, RGB8, statistics",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kDevice, RawFormat::kUint16,
-                                            12, OutputFormat::kRgb8, true);
+                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kDevice, RawFormat::kUint16, 12,
+                                            OutputFormat::kRgb8, true);
                }},
       TestCase{"cuda: 8-bit BAYER_BGGR from pinned host memory, RGBA8",
                [] {
@@ -419,16 +419,16 @@ int main() {
                }},
       TestCase{"cuda: 12-bit BAYER_GRBG from pageable host memory, RGB8, statistics",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kPageable,
-                                            RawFormat::kUint16, 12, OutputFormat::kRgb8, true);
+                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kPageable, RawFormat::kUint16,
+                                            12, OutputFormat::kRgb8, true);
                }},
       TestCase{"cuda: MONO16 [H, W, 1] with a configured pattern, RGB16", holoscan::isp::mono16},
       TestCase{"cuda: packed RAW10 from device memory, RGB32F, statistics",
                holoscan::isp::packed_raw10},
       TestCase{"cpu: 12-bit BAYER_GRBG from device memory, statistics in host memory",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCpu, Memory::kDevice, RawFormat::kUint16,
-                                            12, OutputFormat::kRgb8, true);
+                 holoscan::isp::bayer_input(Backend::kCpu, Memory::kDevice, RawFormat::kUint16, 12,
+                                            OutputFormat::kRgb8, true);
                }},
       TestCase{"cpu: 16-bit from pageable host memory, RGB16",
                [] {
