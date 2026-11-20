@@ -102,9 +102,9 @@ DepthImage read_pgm16(const fs::path& path) {
 
 holoscan::TensorOutputSpec host_spec(DLDataType dtype, std::uint64_t bytes) {
   return holoscan::TensorOutputSpec{
-      .representation = holoscan::TensorRepresentation{.memory_kind = holoscan::MemoryKind::kHost,
-                                                       .dtype = dtype,
-                                                       .rank = 2U},
+      .representation =
+          holoscan::TensorRepresentation{
+              .memory_kind = holoscan::MemoryKind::kHost, .dtype = dtype, .rank = 2U},
       .bounds = holoscan::tensor_bounds(bytes),
       .storage = holoscan::TensorOutputStorage::kRuntimePool};
 }
@@ -140,8 +140,8 @@ class ImageSourceOp final : public holoscan::Operator<> {
     const DepthImage& image = (*images_)[next_];
     auto depth_loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
         .shape = std::array<std::int64_t, 2>{image.height, image.width}, .dtype = kUInt16});
-    auto pose_loan = pose.allocate_tensor(holoscan::TensorLoanRequest{
-        .shape = std::array<std::int64_t, 2>{4, 4}, .dtype = kFloat32});
+    auto pose_loan = pose.allocate_tensor(
+        holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 2>{4, 4}, .dtype = kFloat32});
     for (const auto* loan : {&depth_loan, &pose_loan}) {
       if (!*loan) {
         return loan->error().code == holoscan::ErrorCode::kResourceExhausted
@@ -221,10 +221,16 @@ class CheckOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
     auto depth_sample = depth.receive();
-    if (!depth_sample) return holoscan::make_unexpected(std::move(depth_sample).error());
+    if (!depth_sample) {
+      return holoscan::make_unexpected(std::move(depth_sample).error());
+    }
     auto cloud_sample = cloud.receive();
-    if (!cloud_sample) return holoscan::make_unexpected(std::move(cloud_sample).error());
-    if (auto checked = hm::check_point_cloud(cloud_sample->data); !checked) return checked;
+    if (!cloud_sample) {
+      return holoscan::make_unexpected(std::move(cloud_sample).error());
+    }
+    if (auto checked = hm::check_point_cloud(cloud_sample->data); !checked) {
+      return checked;
+    }
     const holoscan::Tensor& image = *depth_sample->data.data;
     const std::size_t pixels = static_cast<std::size_t>(image.size());
     std::vector<float> values(pixels);
@@ -430,14 +436,14 @@ void check_clip(const fs::path& clip, std::size_t number) {
   const double agree = hits == 0 ? 0.0 : static_cast<double>(close) / hits;
   std::cout << name << ": " << width << "x" << height << " images=" << images->size()
             << " raycasts=" << tally->raycasts << " volume=" << volume_config.dims[0] << "x"
-            << volume_config.dims[1] << "x" << volume_config.dims[2]
-            << " voxel=" << voxel << " surfaces=" << expected << " coverage=" << coverage
-            << " within_2_voxels=" << agree << '\n';
+            << volume_config.dims[1] << "x" << volume_config.dims[2] << " voxel=" << voxel
+            << " surfaces=" << expected << " coverage=" << coverage << " within_2_voxels=" << agree
+            << '\n';
   VERIFY_MSG(expected > valid.size() / 2U, name + ": surfaces inside the volume");
-  VERIFY_MSG(coverage > 0.8, name + ": the ray cast sees the surfaces: " +
-                                  std::to_string(coverage));
-  VERIFY_MSG(agree > 0.95, name + ": the ray cast is within two voxels of the input: " +
-                               std::to_string(agree));
+  VERIFY_MSG(coverage > 0.8,
+             name + ": the ray cast sees the surfaces: " + std::to_string(coverage));
+  VERIFY_MSG(agree > 0.95,
+             name + ": the ray cast is within two voxels of the input: " + std::to_string(agree));
 }
 
 }  // namespace
@@ -466,7 +472,8 @@ int main() {
   }
   std::vector<ht::test::TestCase> cases;
   for (std::size_t i = 0; i < clips.size(); ++i) {
-    cases.push_back({"clip " + std::to_string(i), [clip = clips[i], i] { ht::check_clip(clip, i); }});
+    cases.push_back(
+        {"clip " + std::to_string(i), [clip = clips[i], i] { ht::check_clip(clip, i); }});
   }
   cases.push_back({"a clip with depth was checked", [] { VERIFY(ht::g_checked.load() > 0); }});
   return ht::test::run(cases);
