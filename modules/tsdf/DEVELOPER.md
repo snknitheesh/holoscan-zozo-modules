@@ -7,11 +7,27 @@ tsdf/
 ├── CMakeLists.txt          Standalone project against an installed Holoscan SDK 5.0
 ├── metadata.json           Module metadata (urn:holoscan:module:v2)
 ├── NOTICE                  Third-party notices (CUB, the marching cubes table)
+├── README.md               What it does, how to use it, accuracy and performance
 ├── cmake/                  Package config template; the CLI template's Debian helper
 ├── include/holoscan/tsdf/  Installed public API
-├── src/                    Volume, mesh extractor, operators, CUDA kernels; private headers
+│   ├── tsdf_volume.hpp     The volume: integrate, ray cast, reset, PLY
+│   ├── marching_cubes.hpp  MeshExtractor
+│   ├── tsdf_integrate_op.hpp, tsdf_mesh_op.hpp   The operators
+│   ├── volume_op.hpp       detail::VolumeOp, their base (not a stable API)
+│   ├── views.hpp           Depth and ray-cast pictures for display
+│   └── synthetic_scene.hpp The synthetic scene, its camera and its truth
+├── src/                    Implementation and CUDA kernels; private headers
+│   ├── volume.cu, marching_cubes.cu, mc_tables.hpp, views.cu, synthetic_scene.cu
+│   ├── tsdf_integrate_op.cpp, tsdf_mesh_op.cpp, volume_op.cpp
+│   ├── pinhole_camera.*    CameraInfo to the kernels' intrinsics, refusing what they cannot model
+│   ├── host_input.*        Holding host input until its copy is done (as holoscan-point-cloud's)
+│   ├── device_buffer.hpp   Growing device scratch
+│   └── ply.*, synthetic_camera_info.cpp
 ├── pkg/holoscan-tsdf/      Debian packaging, entered when PKG_holoscan_tsdf is ON
 └── tests/
+    ├── volume_test.cpp, operators_test.cpp, real_data_test.cpp, benchmark.cpp
+    ├── reference.hpp       The CPU reference of the integration and the marching cubes
+    ├── scene_support.hpp, test_support.hpp
     └── installed_consumer/ Uses the installed package
 ```
 
@@ -30,10 +46,10 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-tsdf/holoscan-tsdf-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-tsdf)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-tsdf`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
-| Test labels | `tsdf` and `gpu` on all |
+| Debian package | `holoscan-tsdf`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0), holoscan-messages (<< 2)` |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), holoscan-messages 1.x (found, or the in-tree target when the repository root added it first; a PUBLIC dependency), the CUDA runtime, CUB from the CCCL on the include path (header-only) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin with JetPack 7.2) |
+| Test labels | `tsdf` and `gpu` on all; `benchmark` on `tsdf_benchmark` |
 
 ## Design
 
@@ -41,13 +57,14 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
 addressing, no allocation while running, a memory use known before the first frame, and every
 kernel a plain loop over voxels or pixels, so the results are deterministic and a CPU reference can
 repeat them. It suits what a robot reconstructs most: a bounded workspace. Voxel-block hashing
-(as in VoxelHashing or nvblox) would cover unbounded scenes in less memory, but needs a GPU hash
+would cover unbounded scenes in less memory, but needs a GPU hash
 table, block allocation and recycling, streaming between host and device, and a mesh whose size and
 order depend on insertion order; it does not stay simple, so the module leaves it out. A 512^3 volume
-(1 GiB, 2 mm voxels over a meter) is the practical top for Orin-class memory.
+(1 GiB, 2 mm voxels over a meter) is the practical top for Jetson Orin's memory.
 
 **Projective distance, constant weight.** Each voxel takes the depth at its nearest pixel and the
-distance along the camera's z axis, as KinectFusion does: cheap and exact at the zero crossing.
+distance along the camera's z axis, as projective TSDF fusion does: cheap and exact at the zero
+crossing.
 Each image adds weight 1, up to the cap; a depth-dependent weight would favor near views but needs
 a noise model per camera, so it is left to a later version.
 
@@ -56,7 +73,18 @@ let the ray cast and the mesh run at their own rate and let another project inte
 from its own operators. `TsdfVolume` orders every operation on the GPU with one CUDA event: each
 waits for the previous one, whatever the stream, and records itself. A mutex makes the wait and
 record atomic with the launches; nothing waits on the host. `TsdfIntegrateOp` uses the runtime's
-stream, or its own when the runtime gives none (every input in host memory).
+stream, or its own when the runtime gives none (every input in host memory); on its own stream it
+waits for the work that reads an input in place before compute() returns, as the runtime orders
+an input's release only after its own streams.
+
+**The collection's messages.** The camera comes as `CameraInfo` on a mandatory input with
+holoscan-messages' `camera_info_contract()` and `LatestCameraInfo`, so that a calibration has one
+source, a camera_info file read by `CameraInfoSourceOp` (or whatever produced the images, such as
+a rectifier or a downscaling disparity operator), and is never copied into a config. The ray cast
+goes out as an organized `PointCloud`. The mesh has no message in holoscan-messages: it stays this
+module's tensors, documented as such; a mesh message there would be its own change, and moving the
+outputs to it a 2.0.0 of this module. Poses are plain `[4, 4]` tensors, as the SDK has no pose
+message either.
 
 **Marching cubes in prefix sums.** A voxel is the first corner of one cube and the first voxel of
 three edges. Pass 1 classifies every voxel (does its cube give triangles; which of its edges carry a
@@ -68,14 +96,16 @@ by binary search of the owner list, which is in voxel order. Nothing depends on 
 mesh is the same on every run and the CPU reference (`tests/reference.hpp`) matches it bit for bit.
 The outputs have a fixed capacity and the counts stay on the GPU, so the operator never waits; a
 mesh beyond the capacity is not written at all (rather than cut), and the counts say what it needs.
+The scratch is allocated by `MeshExtractor::prepare()`, which `TsdfMeshOp` calls in `start()`.
 The scratch is 9 bytes per vertex and per triangle of capacity plus 32 bytes per 256 voxels; no
 array the size of the volume.
 
 ## Conventions
 
 - Code lives in `holoscan::tsdf`. `TsdfVolume`, `MeshExtractor`, the views and the synthetic scene
-  are public and need no Holoscan graph; the operators are thin: `VolumeOp` finds the stream,
-  checks poses, stages host input and emits outputs, and each operator calls the volume in between.
+  are public and need no Holoscan graph; the operators are thin: `detail::VolumeOp` finds the
+  stream, checks poses, stages host input and emits outputs, and each operator calls the volume in
+  between. Errors name the operator's class and its instance's path.
 - Public headers carry only SDK, CUDA runtime and standard types; CUB stays in `src/`.
 - Every result is deterministic: each voxel and pixel is written by one thread, and the mesh is
   placed by prefix sums. A new kernel must keep that.
@@ -83,9 +113,10 @@ array the size of the volume.
   `marching_cubes.cu` and `synthetic_scene.cu` are compiled with `--fmad=false`, and the library's
   and the tests' host code with `-ffp-contract=off`. The CPU reference follows the integration and
   the marching cubes step by step; a change to their arithmetic must change it too.
-- The marching cubes table (`src/mc_tables.hpp`) is Paul Bourke's, in the public domain. Its corners
-  and edges are numbered as `c_corners` and `c_edges` in `marching_cubes.cu`; the tests check the
-  table's winding, and a closed sphere's mesh for watertightness.
+- The marching cubes table (`src/mc_tables.hpp`) is from "Polygonising a scalar field", in the
+  public domain. Its corners and edges are numbered as `c_corners` and `c_edges` in
+  `marching_cubes.cu`; the tests check the table's winding, and a closed sphere's mesh for
+  watertightness.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
   gone; it fails the frame, with an error that names the port.
