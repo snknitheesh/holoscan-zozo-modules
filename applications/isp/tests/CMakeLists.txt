@@ -38,7 +38,8 @@ isp_app_test(isp_app_16bit_sharpened 0 "verdict=PASS"
 )
 isp_app_test(isp_app_raw10 0 "verdict=PASS" ${_fast} --packing raw10 --pattern GBRG)
 isp_app_test(isp_app_raw12 0 "verdict=PASS" ${_fast} --packing raw12)
-isp_app_test(isp_app_1080p 0 "verdict=PASS" --count 5 --period-ms 20 --width 1920 --height 1080
+# At 1920x1080 the checker keeps up with a 10 ms camera.
+isp_app_test(isp_app_1080p 0 "verdict=PASS" --count 60 --period-ms 10 --width 1920 --height 1080
   --display false
 )
 isp_app_test(isp_app_cpu 0 "backend=cpu.*verdict=PASS"
@@ -53,8 +54,14 @@ isp_app_test(isp_app_white_patch 0 "verdict=PASS" ${_fast} --white-balance white
 isp_app_test(isp_app_offscreen 0 "showing=[1-9].*verdict=PASS"
   --count 10 --period-ms 30 --width 640 --height 480 --display offscreen
 )
-# The display graph compiles, without a display server.
-isp_app_test(isp_app_display_graph 0 "plan=OK" --display true --compile-only true)
+# Every graph compiles to one worker, the display graph without a display server.
+isp_app_test(isp_app_one_worker 0 "plan=OK workers=1" --display false --compile-only true)
+isp_app_test(isp_app_display_graph 0 "plan=OK workers=1" --display true --compile-only true)
+isp_app_test(isp_app_offscreen_graph 0 "plan=OK workers=1"
+  --display offscreen --compile-only true
+)
+# A run that misses its bound fails: no frame beats 99 dB.
+isp_app_test(isp_app_fails_below_bound 1 "verdict=FAIL" ${_fast} --min-psnr 99)
 
 # Unusable arguments are usage errors.
 isp_app_test(isp_app_rejects_size 2 "^error: synthetic frames" --width 8)

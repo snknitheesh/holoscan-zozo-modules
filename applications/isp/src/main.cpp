@@ -4,11 +4,11 @@
 // ISP: a synthetic raw camera (holoscan-isp's colour chart scene, moving,
 // mosaicked with known black levels, white balance and vignetting) feeds
 // holoscan-isp's IspOp, which turns each Bayer frame into RGB on the GPU. A
-// checker measures every frame's PSNR against the camera's truth, and with a
-// display HoloViz shows the raw mosaic beside the processed image.
+// checker measures every frame's PSNR against the camera's truth and its
+// histograms against its pixels, and with a display HoloViz shows the raw
+// mosaic beside the processed image. The whole graph runs on one worker.
 
 #include <algorithm>
-#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -267,22 +267,18 @@ int execute(const Options& opts, SignalDomain& signals) {
   isp_config.max_height = opts.height;
 
   holoscan::Graph graph{std::string(kAppName)};
-  auto finished = std::make_shared<std::atomic<std::uint32_t>>(0U);
   auto source = graph.op<app::RawSourceOp>(
       "source", app::RawSourceConfig{.camera = camera,
                                      .count = opts.count,
-                                     .period = std::chrono::milliseconds(opts.period_ms),
-                                     .finished = finished});
+                                     .period = std::chrono::milliseconds(opts.period_ms)});
   auto processor = graph.op<isp::IspOp>("isp", isp_config);
   auto report = std::make_shared<app::Report>();
   auto check = graph.op<app::CheckOp>("check", app::CheckConfig{.camera = camera,
                                                                 .params = isp_config.params,
                                                                 .expected_frames = opts.count,
-                                                                .report = report,
-                                                                .finished = finished});
+                                                                .report = report});
 
-  // Lossless edges: every frame is processed and checked, in order. The source
-  // keeps one frame in flight, so no queue fills.
+  // Lossless edges: every frame is processed and checked, in order.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->raw, processor->raw, lossless);
   graph.add_flow(processor->image, check->image, lossless);
@@ -341,6 +337,10 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 #endif
 
+  // Every operator on one worker: across workers a producer runs even while
+  // its consumer's lossless queue is full, and IspOp, which cannot send a
+  // refused output again, would fail the frame.
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   if (!plan.diagnostics().empty()) {
@@ -349,15 +349,21 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!plan.ok()) {
     return 1;
   }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    std::cout << kAppName << ": plan=OK workers=" << workers << '\n';
     return 0;
+  }
+  if (workers != 1U) {
+    std::cerr << kAppName << ": the graph compiled to " << workers << " workers, not 1\n";
+    return 1;
   }
   if (!signals) {
     std::cerr << kAppName << ": warning: running without managed SIGINT/SIGTERM handling: "
               << holoscan::runtime_error_message(signals.error())
               << "; an interrupt ends the process without a report\n";
   }
+  const auto started = std::chrono::steady_clock::now();
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(opts.timeout_seconds) +
@@ -371,6 +377,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     session.request_stop();
   }
   session.wait();
+  const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - started;
   const holoscan::RunTermination termination = session.termination();
   const bool sdk_reported = termination == holoscan::RunTermination::kFailed &&
                             holoscan::automatic_diagnostic_logging_enabled() &&
@@ -424,7 +431,9 @@ int execute(const Options& opts, SignalDomain& signals) {
             << " mean_psnr=" << (r.frames == 0 ? 0.0 : r.psnr_sum / r.frames)
             << " worst_psnr=" << r.worst_psnr << " (min " << min_psnr << ")" << std::setprecision(3)
             << " wb_gains=" << r.wb_gains[0] << ',' << r.wb_gains[1] << ',' << r.wb_gains[2]
-            << " mean_luma=" << r.mean_luma << " ae_error_ev=" << r.ae_error_ev;
+            << " mean_luma=" << r.mean_luma << " ae_error_ev=" << r.ae_error_ev
+            << std::setprecision(1) << " rate=" << (r.frames / std::max(elapsed.count(), 1e-9))
+            << " fps";
   if (r.frame_gaps != 0 || r.bad_histograms != 0) {
     std::cout << " frame_gaps=" << r.frame_gaps << " bad_histograms=" << r.bad_histograms;
   }

@@ -4,18 +4,14 @@
 // RawSourceOp: frames of holoscan-isp's synthetic raw camera as a MIPI CSI-2
 // or serial-link sensor delivers them: a Bayer mosaic in device memory, 8 to 16 bits per
 // sample or packed MIPI RAW10 / RAW12, with the exposure time and gain of the
-// capture; a fixed number on a clock, then idle.
-//
-// The ISP cannot send a refused output again, so a full queue must never meet
-// it: with `finished`, the source keeps one frame in flight, sending the next
-// only once the last consumer has counted the previous one.
+// capture; a fixed number on a clock, then idle. A frame refused for lack of
+// room (a full queue, or no free slot in its pool) is sent again on the next
+// tick.
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <memory>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -37,8 +33,6 @@ struct RawSourceConfig {
   holoscan::isp::SyntheticRawConfig camera;
   std::uint32_t count{100};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
-  // Frames the last consumer has finished; none sends on every tick.
-  std::shared_ptr<const std::atomic<std::uint32_t>> finished;
 };
 
 // @throws std::invalid_argument naming the first unusable field.

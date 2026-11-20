@@ -22,11 +22,12 @@ find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(holoscan-isp 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
-# The raw source, the checker, the view and the render check.
+# The raw source, the checker and its GPU check, the view and the render check.
 add_library(
   isp_demo_ops
   STATIC
   src/check_op.cpp
+  src/frame_check.cu
   src/raw_source_op.cpp
   src/render_check_op.cpp
   src/view_op.cu
@@ -37,12 +38,14 @@ target_link_libraries(
   isp_demo_ops
   PUBLIC holoscan::isp holoscan::core holoscan::sensor_io CUDA::cudart
 )
-# The checker evaluates the synthetic camera as the GPU renders it: without contracting.
+# The checker evaluates the synthetic camera as the module renders it: without contracting,
+# on the host and on the GPU.
 target_compile_options(
   isp_demo_ops
   PUBLIC
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false
+    -Xcompiler=-ffp-contract=off>
 )
 
 add_executable(isp src/main.cpp)

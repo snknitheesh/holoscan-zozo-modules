@@ -88,9 +88,6 @@ holoscan::expected<void, holoscan::Error> RawSourceOp::compute(
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the checker completes the run.
   }
-  if (config_.finished && config_.finished->load(std::memory_order_acquire) < emitted_) {
-    return {};  // The previous frame is still in flight.
-  }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     return holoscan::make_unexpected(holoscan::Error{
@@ -105,6 +102,9 @@ holoscan::expected<void, holoscan::Error> RawSourceOp::compute(
       height, packed(camera.format) ? static_cast<std::int64_t>(row_bytes) : width};
   auto loan = raw.allocate_tensor(
       holoscan::TensorLoanRequest{.shape = shape, .dtype = sample_type(camera.format)});
+  if (!loan && loan.error().code == holoscan::ErrorCode::kResourceExhausted) {
+    return {};  // Every slot of the pool is still held: send the frame on the next tick.
+  }
   if (!loan) {
     return holoscan::make_unexpected(std::move(loan).error());
   }
