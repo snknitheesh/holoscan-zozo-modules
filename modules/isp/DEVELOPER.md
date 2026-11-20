@@ -43,7 +43,7 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
 | Debian package | `holoscan-isp`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime |
 | Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
-| Test labels | `isp` and `gpu`; `isp` and `host` for the SDK-free ones |
+| Test labels | `isp` and `gpu`; also `benchmark` for `isp_benchmark` and `sanitizer` for the compute-sanitizer runs; `isp` and `host` for the SDK-free ones |
 
 ## Conventions
 
@@ -52,7 +52,7 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
   `src/isp_math.hpp`, and both backends call it in the same order: a stage that one backend
   computes differently breaks `isp_pipeline`'s CUDA-against-CPU case. The library is compiled
   without contracting (`--fmad=false`, `-ffp-contract=off`), and so are the tests and the demo's
-  checker, which evaluate the synthetic sensor on the host.
+  checker, which evaluate the synthetic sensor on the host and the GPU.
 - The kernel's tile reflects coordinates at the image's edges (`mirror()`, keeping the mosaic's
   phase), and demosaics the sharpening's border pixels at their virtual coordinates; the CPU
   backend does the same, so edges match too.
@@ -64,6 +64,13 @@ plain `cmake --install` produces a usable package. The Debian packaging keeps th
   `cudaMemcpy` from pageable memory, which may return before its data has landed while the frames'
   non-blocking streams would not wait for it.
 - An operator has an optional port only when configured: an emit into an unconnected output fails.
-  A refused emit cannot be retried, as the loan is gone; it fails the frame.
+  A refused emit cannot be retried, as the loan is gone; it fails the frame. So every lossless graph
+  in this module and its demo runs on one worker (`include_all()`), and a test pins `workers=1`.
+- `IspPipeline`'s frames share device scratch and the white balance state: each `process()` waits,
+  on the GPU, for the previous call's work (an event), whatever stream it is on.
+- Every CPU wait and raw-frame copy in `IspOp` is counted (`isp_op_statistics()`), and `isp_op`
+  pins the counts per input memory and backend: a new one must update the README's table.
+- The statistics vector only grows (`stats::kLayoutVersion`): append a new entry after the last,
+  raise `kLayoutVersion` and `kStatsSize`, and never move, remove or redefine one.
 - A new stage or setting needs a case in `isp_pipeline` against the truth or the arithmetic, and in
   the CUDA-against-CPU list; a new port or input form of the operator, a case in `isp_op`.

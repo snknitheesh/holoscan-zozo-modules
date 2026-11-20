@@ -60,9 +60,9 @@ parameters; `IspParams` holds them all, and `validate_params()` names the first 
 | Port | Type | |
 | --- | --- | --- |
 | `raw` (input) | `schema::ImageT` | `BAYER_RGGB`, `BAYER_BGGR`, `BAYER_GRBG`, `BAYER_GBRG`, or `MONO8` / `MONO16` with the pattern in the configuration; uint8 or uint16 `[H, W]` or `[H, W, 1]`, rows packed or padded; with `packing`, uint8 `[H, row bytes]` and the descriptor's `width`. In host or CUDA device memory |
-| `image` | `schema::ImageT` | `RGB8`, `RGBA8` (alpha 255), `RGB16` or `RGB32F` `[H, W, channels]`, packed; device memory for the cuda backend, host memory for cpu. The descriptor keeps the raw image's header, `exposure_time_ns` and `gain` |
+| `image` | `schema::ImageT` | `RGB8`, `RGBA8` (alpha 255), `RGB16` or `RGB32F` `[H, W, channels]`, packed; device memory for the cuda backend, host memory for cpu. The descriptor keeps the raw image's header, `roi_offset_x`, `roi_offset_y`, `exposure_time_ns` and `gain`; its `color_space` is `SRGB` with the `kSrgb` tone curve (the colour matrix is meant to map to sRGB primaries), else `UNSPECIFIED` |
 | `histogram` (with `stats`) | `holoscan::Tensor` | uint32 `[4, 256]`: the output's luma, red, green and blue, in 8-bit code values |
-| `stats` (with `stats`) | `holoscan::Tensor` | float32 `[12]`, below |
+| `stats` (with `stats`) | `holoscan::Tensor` | float32 `[12]`, layout version 1, below |
 
 Every output carries the raw frame's capture time and frame id. The operator runs once per raw
 frame (`OnEach`). The image is emitted before the statistics; an operator cannot send a refused
@@ -103,8 +103,9 @@ output again, so a refused emit fails the frame.
 ## Statistics
 
 The histograms count the output image's pixels by their 8-bit code values (16-bit and float outputs
-rounded to 8 bits): luma (Rec. 709 weights of the coded R, G, B), red, green, blue. Each row sums
-to the pixel count. The statistics vector (`stats::` indices in `isp_params.hpp`):
+rounded to 8 bits): luma (Rec. 709 weights of the coded R, G, B, `(2126 R + 7152 G + 722 B + 5000)
+/ 10000`), red, green, blue. Each row sums to the pixel count. The statistics vector (`stats::`
+indices in `isp_params.hpp`) has layout `stats::kLayoutVersion` (1):
 
 | Index | |
 | --- | --- |
@@ -119,6 +120,10 @@ to the pixel count. The statistics vector (`stats::` indices in `isp_params.hpp`
 `AutoExposureParams`: `target` 0.18, `damping` 0.5, `min_exposure_ns` 10 us, `max_exposure_ns`
 33 ms, `min_gain` 1, `max_gain` 16. The module only suggests: it never drives a camera.
 
+The layout only grows: a later 1.x release may append entries after `kSaturatedFraction`, and then
+raises `stats::kLayoutVersion` and `stats::kStatsSize`, but never moves, removes or redefines one. So
+read the indices above from a vector of at least `kStatsSize` entries and ignore any more.
+
 The sums behind the means are integers (units of 2^-20), and the histograms integer counts, so the
 statistics are the same on every run.
 
@@ -132,9 +137,24 @@ statistics are the same on every run.
 
 Both backends evaluate the same arithmetic (`src/isp_math.hpp`), compiled without fused
 multiply-adds, so they produce the same image, histograms and white balance gains bit for bit (the
-auto-exposure fields, which use `log2` and `exp2`, agree to 1e-5). When the raw images are not
-where the backend reads them, the operator copies each frame (host to device for cuda, device to
-host for cpu), and says so once in the log, with the bytes per frame and how to avoid the copy.
+auto-exposure fields, which use `log2` and `exp2`, agree to 1e-5). The outputs are borrowed from
+the runtime's pool and sent without a copy. When the raw images are not where the backend reads
+them, the operator copies each frame (host to device for cuda, device to host for cpu), and says so
+once in the log, with the bytes per frame and how to avoid the copy. How often the operator's
+thread waits (CPU waits) and copies a raw frame:
+
+| Raw images in | Backend | Copies per frame | CPU waits per frame |
+| --- | --- | --- | --- |
+| CUDA device memory | `kCuda` | 0 | 0: the work is queued on the operator's stream |
+| Pinned host memory | `kCuda` | 1, host to device on the operator's stream | 1: its tensor cannot keep the memory from reuse until the copy is done, so the operator waits for the copy |
+| Pageable host memory | `kCuda` | 1 | 2: for the producer, and for CUDA to stage the pageable copy |
+| CUDA device memory, rows packed | `kCpu` | 1, device to host | 1: the copy follows the producer's work and is waited for |
+| CUDA device memory, rows padded | `kCpu` | 1 | 2: for the producer, and for the copy |
+| Host memory | `kCpu` | 0 | 1: for the producer |
+
+The cuda backend's staging buffer for host input grows with the largest frame so far; growing it
+waits for the stream once. `isp_op_statistics()` counts the waits and copies of every `IspOp` in
+the process, for tests and profiling.
 
 Existing demosaics considered, and why the module does not use them:
 
@@ -144,9 +164,8 @@ Existing demosaics considered, and why the module does not use them:
   element type, and nothing before or after it. Black level, lens shading and white balance must
   come before the demosaic and the colour matrix and tone curve after it, so it would sit between
   two more full-frame passes and their buffers, and the CPU backend could not match it bit for bit.
-- **NPP's `nppiCFAToRGB`** itself (CUDA Toolkit), for the same reasons. On its own it takes
-  0.023 ms at 1920x1080 and 0.089 ms at 3840x2160 (16-bit, RTX 5090), more than this module's whole
-  fused bilinear pipeline (0.017 ms and 0.064 ms).
+- **NPP's `nppiCFAToRGB`** itself (CUDA Toolkit), for the same reasons: it is the demosaic alone,
+  bilinear only, with every other stage still a pass of its own.
 - **VPI 4.1** has no demosaic or ISP algorithm: its image formats describe Bayer data, but no
   algorithm (`ConvertImageFormat` included) takes it. Its `Histogram` and `ImageStats` could compute
   statistics on the PVA, but only of an image the GPU has produced, adding a second engine for
@@ -188,18 +207,36 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
     .operator_path = "isp", .output_port = "image", .device = holoscan::DeviceId{0}});
 ```
 
-A lossless (`kBlocking`) edge whose queue is full fails the frame. Keep the camera at most one
-frame ahead of the slowest consumer, as the demo's source does, or connect consumers that only need
-the newest frame, such as a display, with `QueuePolicy::kDropOldest` and depth 1.
+`IspOp` cannot send a refused output again: an emit into a full lossless (`kBlocking`) queue fails
+the frame. Across workers the SDK 5.0 runs a producer even while its consumer's lossless queue is
+full, so keep a lossless chain, one whose every frame must arrive, on one worker, as the demo and
+the installed consumer do (see the messages module's
+[one-worker guidance](../messages/README.md#run-a-graph-on-one-worker)):
+
+```cpp
+graph.partition("my_app").include_all();  // Every operator of the graph, on one worker.
+// After compile(): plan.scheduler_plan().worker_count == 1.
+```
+
+A source in front of it should treat a refused emit (`kBackpressured`) and a refused allocation
+(`kResourceExhausted`) as backpressure and send the frame again on its next tick. A live chain
+that may lose frames rather than wait is better left to the automatic partitioning, with consumers
+that only need the newest frame, such as a display, connected with `QueuePolicy::kDropOldest` and
+depth 1.
 
 Without a graph, `IspPipeline` in `<holoscan/isp/isp_pipeline.hpp>` runs the same pipeline on
-`RawImageView` and `RgbImageView` pointers and a CUDA stream (or host memory with `kCpu`).
+`RawImageView` and `RgbImageView` pointers and a CUDA stream (or host memory with `kCpu`). Its frames
+share scratch memory and the white balance state, so each call's GPU work waits, on the GPU, for
+the previous call's: calls may use different streams, and the frames run in call order.
 `<holoscan/isp/synthetic_raw.hpp>` is the synthetic raw sensor of the tests and the demo: a 24-patch
 colour chart, gray and hue ramps, bars, a slanted edge and a moving disc, softened by a two-pixel lens
 blur, seen through a colour matrix, white balance gains and vignetting, mosaicked, offset by black
 levels, quantized and packed as a sensor would, with `synthetic_truth()` giving what an ideal ISP
 outputs at every pixel, and `synthetic_isp_params()` the settings that undo the camera.
-`<holoscan/isp/synthetic_raw_cuda.hpp>` renders it on the GPU, bit for bit.
+`<holoscan/isp/synthetic_raw_cuda.hpp>` renders it on the GPU, bit for bit. The header's functions
+are inline and compiled in your code: to evaluate them on the host bit for bit as the module's GPU
+render does, compile that code with `-ffp-contract=off` (and CUDA code with `--fmad=false`), as the
+tests, the demo and the installed consumer do.
 
 ## Accuracy
 
@@ -288,15 +325,17 @@ The tests, all on raw frames made at test time:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| `isp_pipeline` | GPU | `IspPipeline`: PSNR and patch CIEDE2000 against the truth for every pattern, sample format (uint8, uint16 at 10, 12 and 16 bits, RAW10, RAW12) and demosaic method; CUDA against CPU bit for bit (sharpening, odd sizes, both auto white balances, four-channel lens shading, every tone curve and output format); the GPU render of the synthetic sensor against the host's; padded rows; white balance recovery and smoothing; the colour matrix; the tone curves; histogram sums, means and the exposure suggestion; determinism; 2x2 to odd sizes, saturation and black frames; rejected settings and views |
-| `isp_op` | GPU | `IspOp` through the SDK's operator test harness, against the CPU backend bit for bit: `BAYER_*` from device and host memory, `MONO16` with the configured pattern, packed RAW10, every output format, the statistics ports, the cpu backend from device memory, the auto backend; the capture time, frame id, header, exposure and gain of the outputs; unusable inputs and settings |
-| `isp_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
+| `isp_pipeline` | GPU | `IspPipeline`: PSNR and patch CIEDE2000 against the truth for every pattern, sample format (uint8, uint16 at 10, 12 and 16 bits, RAW10, RAW12) and demosaic method; CUDA against CPU bit for bit (sharpening, odd sizes, both auto white balances, four-channel lens shading, every tone curve and output format); the histograms against the output's own pixels on both backends; 1920x1080 frames queued on two streams in turn against the CPU backend; the GPU render of the synthetic sensor against the host's; padded rows; white balance recovery and smoothing; the colour matrix; the tone curves; histogram sums, means and the exposure suggestion; determinism; 2x2 to odd sizes, saturation and black frames; rejected settings and views |
+| `isp_pipeline_memcheck`, `_racecheck`, `_initcheck`, `_synccheck` | GPU, compute-sanitizer | `isp_pipeline` under each compute-sanitizer tool (memcheck with a leak check); labeled `sanitizer`, registered when compute-sanitizer is found |
+| `isp_op` | GPU | `IspOp` through the SDK's operator test harness, against the CPU backend bit for bit: `BAYER_*` from device, pinned and pageable host memory with the CPU waits and copies per frame of the table above, `MONO16` with the configured pattern, packed RAW10, every output format, the statistics ports, the cpu backend from device and pageable memory, the auto backend; the capture time, frame id, header, region offsets, exposure, gain and colour space of the outputs; unusable inputs and settings |
+| `isp_benchmark` | GPU | Runs the benchmark briefly, CUDA and CPU, so that it keeps working; labeled `benchmark` |
 | `isp_params`, `isp_cpu_reference` | Nothing | SDK-free (`tests/host/`, also run by the hosted CI job): names, validation, tone tables; the CPU backend's bilinear against an independent reference, Malvar-He-Cutler on gradients, packed formats, and the whole pipeline against the synthetic truth |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a graph from host-memory 12-bit frames of the synthetic sensor through `IspOp`,
-checking each image's PSNR and that the histograms count every pixel. Build it with the install
-prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
+installed package: a graph on one worker from host-memory 12-bit frames of the synthetic sensor
+through `IspOp`, checking each image's PSNR and that the histograms count every pixel; it fails
+unless the graph compiles to one worker. Build it with the install prefix on `CMAKE_PREFIX_PATH` and
+run `ctest` there.
 
 ## Debian package
 

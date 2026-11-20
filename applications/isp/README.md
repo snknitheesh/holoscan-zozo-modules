@@ -2,9 +2,9 @@
 
 The demo of `IspOp` from the [holoscan-isp](../../modules/isp/) module. A synthetic raw sensor,
 mosaicked with known black levels, white balance gains and vignetting, sends Bayer frames as a MIPI
-CSI-2 or serial-link camera would; `IspOp` turns them into RGB on the GPU; a checker measures every frame's PSNR
-against the sensor's truth and checks its histograms; and HoloViz shows the raw mosaic beside the
-processed image. It uses the installed module the way any other project would:
+CSI-2 or serial-link camera would; `IspOp` turns them into RGB on the GPU; a checker measures every
+frame's PSNR against the sensor's truth and checks its histograms against its pixels, on the GPU; and
+HoloViz shows the raw mosaic beside the processed image. It uses the installed module the way any other project would:
 `find_package(holoscan-isp)`.
 
 ```mermaid
@@ -67,20 +67,26 @@ so that the dark half shows), as the sensor delivers it, with the chequer of the
 visible; on the right the processed image. The sensor sees a colour chart, a gray ramp, a hue
 ramp, bars of 4 to 16 pixels, a slanted edge and a red disc; the chart and the disc move.
 
-The ISP cannot send a refused output again, so the source keeps one frame in flight: it renders the
-next frame only once the checker has counted the previous one, and no lossless queue ever fills.
-The display branch keeps only the newest frame (`QueuePolicy::kDropOldest`, depth 1), so it never
-holds the pipeline back.
+The whole graph runs on one worker (`graph.partition("isp").include_all()`; `--compile-only true`
+prints `workers=1`, and the demo refuses to run on more). The ISP cannot send a refused output
+again, and across workers a producer runs even while its consumer's lossless queue is full; on one
+worker the operators run one at a time, so the lossless edges to the checker never refuse a frame.
+The source sends a frame refused for lack of room again on its next tick. The display branch keeps
+only the newest frame (`QueuePolicy::kDropOldest`, depth 1), so it never holds the pipeline back.
 
 ## What it checks
 
 For each frame the checker compares the image with the sensor's truth through the same tone curve
-and requires its PSNR above `--min-psnr`, and that each histogram row counts every pixel. With
-`--white-balance gray-world --scene gray` or `--white-balance white-patch` (on the chart), the gains
-the ISP reports must be the sensor's within 2 %. It prints, for example (x86_64, the `ci` mode):
+and requires its PSNR above `--min-psnr`, and rebuilds the four histogram rows from the image's
+pixels and requires IspOp's to match them bin for bin. With the cuda backend it does this on the GPU
+and waits once per frame, for a small result (the error sum, the mismatched bins and the
+statistics); with the cpu backend, on the host. With `--white-balance gray-world --scene gray` or
+`--white-balance white-patch` (on the chart), the gains the ISP reports must be the sensor's within
+2 %. It prints the frames, the PSNR, the statistics and the rate it kept, for example (RTX 5090,
+the `ci` mode):
 
 ```text
-isp: frames=30/30 backend=cuda demosaic=malvar mean_psnr=30.16 worst_psnr=30.12 (min 28.00) wb_gains=1.900,1.000,1.600 mean_luma=0.275 ae_error_ev=-0.613
+isp: frames=30/30 backend=cuda demosaic=malvar mean_psnr=30.16 worst_psnr=30.12 (min 28.00) wb_gains=1.900,1.000,1.600 mean_luma=0.275 ae_error_ev=-0.613 rate=99.2 fps
 isp: verdict=PASS
 ```
 
@@ -90,11 +96,12 @@ brighter than the 0.18 target. A stop request (Ctrl+C) ends the run with `verdic
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest --test-dir build/isp_demo` runs the demo with each demosaic
-method, at 8, 12 and 16 bits, packed RAW10 and RAW12, every pattern, with sharpening, at 1920x1080,
-on the cpu backend, and with gray world and white patch white balance, all checked against the
-truth; renders both views offscreen in HoloViz and checks the frames (the raw half gray, the
-processed half in colour); compiles the window display graph without a display; and checks that
-unusable arguments are usage errors.
+method, at 8, 12 and 16 bits, packed RAW10 and RAW12, every pattern, with sharpening, at 1920x1080
+with a 10 ms sensor, on the cpu backend, and with gray world and white patch white balance, all
+checked against the truth; renders both views offscreen in HoloViz and checks the frames (the raw
+half gray, the processed half in colour); compiles the headless, window and offscreen graphs and
+requires one worker each; requires a run that misses its bound (`--min-psnr 99`) to exit 1 with
+`verdict=FAIL`; and checks that unusable arguments are usage errors.
 
 ## Licenses
 
