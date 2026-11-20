@@ -8,6 +8,7 @@
 // found where the scene has them, and that every output came through. The
 // graph is lossless and runs on one worker.
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
