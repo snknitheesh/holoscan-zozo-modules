@@ -12,8 +12,11 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+#include <cuda_runtime_api.h>
 
 #include "terrain_camera_op.hpp"
 
@@ -60,7 +63,22 @@ ReportOp::ReportOp(ReportConfig config)
   }
 }
 
+void ReportOp::start() {
+  const std::size_t cells = config_.geometry.cells();
+  if (host_ == nullptr && cudaMallocHost(&host_, cells * (5U * sizeof(float) + 1U)) != cudaSuccess) {
+    host_ = nullptr;
+  }
+}
+
+void ReportOp::stop() {
+  if (host_ != nullptr) {
+    cudaFreeHost(host_);
+    host_ = nullptr;
+  }
+}
+
 void ReportOp::setup(holoscan::OperatorSpec& spec) {
+  // Two slots per input: one map in compute() while the next one arrives.
   spec.input(elevation, "elevation").queue_depth(2U);
   spec.input(map_info, "map_info").queue_depth(2U);
   spec.input(cost, "cost").queue_depth(2U);
@@ -105,23 +123,38 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     return holoscan::make_unexpected(invalid("expected a [rows, cols] elevation"));
   }
   const std::size_t cells = static_cast<std::size_t>(rows) * cols;
-  elevation_.resize(cells);
-  cost_.resize(cells);
-  slope_.resize(cells);
-  step_.resize(cells);
-  roughness_.resize(cells);
-  unknown_.resize(cells);
-  std::array<double, hm::kMapInfoSize> info{};
-  const auto stream = context.cuda_stream();
-  for (auto copied : {elevation_sample->data.copy_to_host(elevation_.data(), 4 * cells, stream),
-                      cost_sample->data.copy_to_host(cost_.data(), 4 * cells, stream),
-                      slope_sample->data.copy_to_host(slope_.data(), 4 * cells, stream),
-                      step_sample->data.copy_to_host(step_.data(), 4 * cells, stream),
-                      roughness_sample->data.copy_to_host(roughness_.data(), 4 * cells, stream),
-                      unknown_sample->data.copy_to_host(unknown_.data(), cells, stream),
-                      info_sample->data.copy_to_host(info.data(), sizeof(info), stream)}) {
-    if (!copied) {
+  if (host_ == nullptr) {
+    return holoscan::make_unexpected(invalid("no pinned host memory for the layers"));
+  }
+  float* const heights = static_cast<float*>(host_);
+  float* const costs = heights + cells;
+  float* const slopes = costs + cells;
+  float* const step_heights = slopes + cells;
+  float* const roughnesses = step_heights + cells;
+  auto* const unknowns = reinterpret_cast<std::uint8_t*>(roughnesses + cells);
+  // The layers' copies go on the operator's stream, which waits for their
+  // producers; the host waits once, for all of them. (Without a stream each
+  // copy completes before it returns.) map_info is in host memory.
+  cudaStream_t stream = context.cuda_stream().get();
+  for (const auto& [tensor, destination, bytes] :
+       {std::tuple{&elevation_sample->data, static_cast<void*>(heights), 4 * cells},
+        std::tuple{&cost_sample->data, static_cast<void*>(costs), 4 * cells},
+        std::tuple{&slope_sample->data, static_cast<void*>(slopes), 4 * cells},
+        std::tuple{&step_sample->data, static_cast<void*>(step_heights), 4 * cells},
+        std::tuple{&roughness_sample->data, static_cast<void*>(roughnesses), 4 * cells},
+        std::tuple{&unknown_sample->data, static_cast<void*>(unknowns), cells}}) {
+    if (auto copied = tensor->copy_to_host_async(destination, bytes, stream); !copied) {
       return copied;
+    }
+  }
+  std::array<double, hm::kMapInfoSize> info{};
+  if (auto copied = info_sample->data.copy_to_host(info.data(), sizeof(info)); !copied) {
+    return copied;
+  }
+  if (stream != nullptr) {
+    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(
+          invalid(std::string("cudaStreamSynchronize: ") + cudaGetErrorString(status)));
     }
   }
 
@@ -173,11 +206,11 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
     for (int c = 0; c < cols; ++c) {
       const std::size_t i = static_cast<std::size_t>(r) * cols + c;
       const bool layers_agree =
-          (unknown_[i] != 0U) == std::isnan(cost_[i]) &&
-          (unknown_[i] != 0U || (slope_[i] >= 0.0F && step_[i] >= 0.0F && roughness_[i] >= 0.0F &&
-                                 cost_[i] >= 0.0F && cost_[i] <= 1.0F));
+          (unknowns[i] != 0U) == std::isnan(costs[i]) &&
+          (unknowns[i] != 0U || (slopes[i] >= 0.0F && step_heights[i] >= 0.0F && roughnesses[i] >= 0.0F &&
+                                 costs[i] >= 0.0F && costs[i] <= 1.0F));
       report.mask_wrong += layers_agree ? 0U : 1U;
-      const float e = elevation_[i];
+      const float e = heights[i];
       if (!std::isfinite(e)) {
         continue;
       }
@@ -189,27 +222,27 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
         errors.push_back(std::fabs(
             e - hm::terrain_height(terrain_, static_cast<float>(x), static_cast<float>(y))));
       }
-      const bool cost_known = std::isfinite(cost_[i]);
+      const bool cost_known = std::isfinite(costs[i]);
       const double truth_slope = hm::terrain_slope_deg(terrain_, x, y);
       if (cost_known && edge > 3.5 * res) {
         if (truth_slope > 0.0) {
-          slope_errors.push_back(std::fabs(slope_[i] - truth_slope));
+          slope_errors.push_back(std::fabs(slopes[i] - truth_slope));
         } else {
-          flat_costs.push_back(cost_[i]);
+          flat_costs.push_back(costs[i]);
         }
       }
       // A rise inside a cell is seen in full by the cells beside that cell.
       const int rise = stairs != nullptr ? rise_near(*stairs, x, y, 3.0 * res, 2.0 * res) : -1;
       if (cost_known && rise >= 0) {
         float& most = rise_steps[{r, rise}];
-        most = std::max(most, step_[i]);
+        most = std::max(most, step_heights[i]);
       }
       // The box's near rim, which faces the camera: both sides of it must be
       // lethal.
       if (cost_known && box != nullptr && std::fabs(x - box->x0) < res && y >= box->y0 + res &&
           y < box->y1 - res) {
         ++rim;
-        lethal += cost_[i] == 1.0F ? 1U : 0U;
+        lethal += costs[i] == 1.0F ? 1U : 0U;
       }
     }
   }

@@ -8,6 +8,9 @@
 // near each of the steps' rises in each row, the unknown mask and the other
 // layers, the box's near rim lethal, the free ground cheap, and the window where
 // the camera is. It completes the run after the expected frames.
+//
+// It copies the six layers into one pinned host block on its stream, and
+// the host waits for them once per map.
 
 #pragma once
 
@@ -88,6 +91,8 @@ class ReportOp final : public holoscan::Operator<> {
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  void start() override;
+  void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
@@ -102,12 +107,9 @@ class ReportOp final : public holoscan::Operator<> {
  private:
   ReportConfig config_;
   holoscan::height_map::Terrain terrain_;
-  std::vector<float> elevation_;
-  std::vector<float> cost_;
-  std::vector<float> slope_;
-  std::vector<float> step_;
-  std::vector<float> roughness_;
-  std::vector<std::uint8_t> unknown_;
+  // Pinned host memory for one map's layers: five float32 layers, then the
+  // uint8 unknown mask.
+  void* host_{};
   std::uint64_t last_frame_id_{};
   bool finished_{};
 };
