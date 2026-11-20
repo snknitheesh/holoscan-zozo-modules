@@ -17,7 +17,8 @@ namespace holoscan::height_map::detail {
 
 // Keeps `tensor`'s memory from reuse until the work queued on `stream` so far
 // is done: its allocator waits for the stream if it can, otherwise this
-// waits. For host memory that the operator copies to the GPU asynchronously.
+// waits, and logs once that it does. For host memory that the operator
+// copies to the GPU asynchronously.
 // An error names `op`, the operator that asked.
 [[nodiscard]] holoscan::expected<void, holoscan::Error> hold_until_done(
     const holoscan::Tensor& tensor, cudaStream_t stream, std::string_view op);

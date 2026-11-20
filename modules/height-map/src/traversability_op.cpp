@@ -46,6 +46,8 @@ void validate_config(const TraversabilityConfig& config) {
 struct TraversabilityOp::Impl {
   detail::DeviceBuffer staging;  // Host elevation, copied to the GPU.
   bool logged_host_copy{};
+  bool logged_host_wait{};
+  bool logged_info_wait{};
 };
 
 TraversabilityOp::TraversabilityOp(TraversabilityConfig config)
@@ -58,6 +60,8 @@ TraversabilityOp::~TraversabilityOp() = default;
 void TraversabilityOp::setup(holoscan::OperatorSpec& spec) {
   const std::uint64_t cells =
       static_cast<std::uint64_t>(config_.max_rows) * static_cast<std::uint64_t>(config_.max_cols);
+  // Two slots per input: one map in compute() while the next one arrives, so
+  // that a producer one frame ahead is not refused.
   spec.input(elevation, "elevation").queue_depth(2U);
   spec.input(map_info, "map_info").queue_depth(2U);
   const holoscan::TensorOutputSpec layer = layer_output(kFloat32, cells * sizeof(float));
@@ -101,6 +105,12 @@ holoscan::expected<void, holoscan::Error> TraversabilityOp::compute(
     return holoscan::make_unexpected(std::move(stream_or).error());
   }
   cudaStream_t stream = *stream_or;
+  if (on_gpu(info_sample->data) && !impl_->logged_info_wait) {
+    impl_->logged_info_wait = true;
+    HOLOSCAN_LOG_INFO(
+        "TraversabilityOp: map_info arrives in device memory and is copied to the host, waiting "
+        "for the GPU every map; send it in host memory, as HeightMapOp does, to avoid the wait");
+  }
   auto geometry = read_map_info(info_sample->data, stream);
   if (!geometry) {
     return holoscan::make_unexpected(invalid(geometry.error().message));
@@ -128,10 +138,19 @@ holoscan::expected<void, holoscan::Error> TraversabilityOp::compute(
   if (tensor.device().device_type == kDLCUDA && tensor.device().device_id != device) {
     return holoscan::make_unexpected(invalid("elevation is on another GPU than the operator"));
   }
+  if (on_gpu(tensor) && reinterpret_cast<std::uintptr_t>(tensor.data()) % sizeof(float) != 0U) {
+    return holoscan::make_unexpected(invalid("elevation data must be aligned to 4 bytes"));
+  }
   const std::size_t cells = geometry->cells();
   const float* heights = static_cast<const float*>(tensor.data());
   if (!on_gpu(tensor)) {
     if (tensor.device().device_type == kDLCPU) {
+      if (!impl_->logged_host_wait) {
+        impl_->logged_host_wait = true;
+        HOLOSCAN_LOG_INFO(
+            "TraversabilityOp: elevation arrives in pageable host memory; the host waits for its "
+            "producer before copying each one");
+      }
       if (auto ready = tensor.synchronize_for_host(); !ready) {
         return holoscan::make_unexpected(std::move(ready).error());
       }
