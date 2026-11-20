@@ -115,6 +115,13 @@ compiles to one worker (without a display server); stops a run with SIGTERM and 
 and that the camera_info file's folder is gone; and checks that unusable arguments are usage
 errors.
 
+`height_map_app_real_data` maps the local recordings: with `HOLOSCAN_TEST_DATA` naming the folder
+that holds `stereo-camera/<clip>/` (each with `depth.yaml` and 16-bit PGM depth images), it sends
+each clip's first ten depth images through `CameraInfoSourceOp`, `DepthToPointCloudOp` and
+`HeightMapOp` on one worker, checks every map against `HeightMapper` run directly on the same
+cloud, bit for bit, and that the static scene's fused map settles. Without the variable it is
+skipped, as in CI.
+
 ## Licenses
 
 Apache-2.0, like the modules it uses. See their NOTICE files.

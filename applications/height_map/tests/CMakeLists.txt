@@ -77,5 +77,17 @@ height_map_app_test(height_map_app_rejects_map 2 "^error: --map-cells" --map-cel
 height_map_app_test(height_map_app_rejects_elevation 2 "^error: --elevation" --elevation median)
 height_map_app_test(height_map_app_rejects_option 2 "^error: unknown option" --frames 3)
 
+# The local recordings: each clip's depth images with its depth.yaml, through
+# CameraInfoSourceOp, DepthToPointCloudOp and HeightMapOp, every map against HeightMapper run
+# directly. Skipped (exit 77) unless HOLOSCAN_TEST_DATA names the folder that holds them, as
+# in CI. A test of the demo's folder, as the module does not depend on holoscan-point-cloud.
+add_executable(height_map_real_data_test real_data_test.cpp)
+target_link_libraries(
+  height_map_real_data_test
+  PRIVATE holoscan::height_map holoscan::messages holoscan::point_cloud CUDA::cudart
+)
+add_test(NAME height_map_app_real_data COMMAND height_map_real_data_test)
+set_tests_properties(height_map_app_real_data PROPERTIES SKIP_RETURN_CODE 77)
+
 get_property(_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_tests} PROPERTIES LABELS "height_map_app;gpu" TIMEOUT 300)
