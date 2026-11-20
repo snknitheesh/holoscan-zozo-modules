@@ -3,11 +3,12 @@
 //
 // IspOp through the SDK's operator test harness, every output checked bit for
 // bit against IspPipeline's CPU backend run on the same raw frames: BAYER_*
-// input in device and host memory; MONO16 with the configured pattern;
-// packed RAW10; every output format; the
-// histogram and statistics ports; the cpu and auto backends; the capture
-// time, frame id, header, exposure and gain carried to the outputs; and
-// unusable inputs and settings rejected.
+// input in device, pinned and pageable host memory, with the CPU waits and
+// copies per frame of each; MONO16 with the configured
+// pattern; packed RAW10; every output format; the histogram and statistics
+// ports; the cpu and auto backends; the capture time, frame id, header, region
+// offsets, exposure, gain and colour space of the outputs; and unusable inputs
+// and settings rejected.
 
 #include <cuda_runtime_api.h>
 
@@ -34,6 +35,7 @@ namespace holoscan::isp {
 namespace {
 
 using test::make;
+using test::Memory;
 using test::throws;
 using ImageSnapshot = holoscan::testing::Snapshot<holoscan::schema::ImageT>;
 using TensorSnapshot = holoscan::testing::Snapshot<holoscan::Tensor>;
@@ -44,6 +46,8 @@ constexpr int kWidth = 96;
 constexpr int kHeight = 64;
 constexpr std::int64_t kExposureNs = 8'000'000;
 constexpr float kGain = 2.0F;
+constexpr std::int32_t kRoiX = 64;
+constexpr std::int32_t kRoiY = 32;
 
 std::chrono::nanoseconds capture_time(std::uint32_t frame) {
   return std::chrono::milliseconds(100 * (frame + 1));
@@ -76,6 +80,8 @@ holoscan::schema::ImageT raw_image(holoscan::Tensor tensor, int width, int heigh
   image.header->frame_id = "camera";
   image.exposure_time_ns = kExposureNs;
   image.gain = kGain;
+  image.roi_offset_x = kRoiX;
+  image.roi_offset_y = kRoiY;
   return image;
 }
 
@@ -115,7 +121,12 @@ std::vector<unsigned char> bytes_of(const Snapshot& tensor) {
 
 // Checks the image, histogram and statistics of every frame against `expected`.
 void check_outputs(const holoscan::testing::TestResult& result,
-                   const std::vector<test::Result>& expected, OutputFormat format, bool stats) {
+                   const std::vector<test::Result>& expected, const IspOpConfig& config) {
+  const OutputFormat format = config.output_format;
+  const bool stats = config.stats;
+  const holoscan::schema::ColorSpace color_space = config.params.tone_curve == ToneCurve::kSrgb
+                                                       ? holoscan::schema::ColorSpace_SRGB
+                                                       : holoscan::schema::ColorSpace_UNSPECIFIED;
   const auto images = result.snapshots<holoscan::schema::ImageT>("image");
   VERIFY_MSG(images.size() == expected.size(), std::to_string(images.size()) + " images");
   for (std::size_t i = 0; i < images.size() && i < expected.size(); ++i) {
@@ -128,6 +139,8 @@ void check_outputs(const holoscan::testing::TestResult& result,
     // The camera's header and capture settings, and the sample's capture time and frame id.
     VERIFY(descriptor.header && descriptor.header->frame_id == "camera");
     VERIFY(descriptor.exposure_time_ns == kExposureNs && descriptor.gain == kGain);
+    VERIFY(descriptor.roi_offset_x == kRoiX && descriptor.roi_offset_y == kRoiY);
+    VERIFY(descriptor.color_space == color_space);
     const holoscan::SampleMetadata& metadata = images[i].sample_metadata();
     VERIFY(metadata.capture_timestamp_ns == capture_time(static_cast<std::uint32_t>(i)).count());
     VERIFY(metadata.frame_id == 7U + i);
@@ -198,23 +211,52 @@ void run_and_check(const IspOpConfig& config, const std::vector<test::RawFrame>&
   const auto result = h.run();
   VERIFY_MSG(result.ok(), what + ": " + result.describe_failure());
   if (!result.ok()) return;
-  check_outputs(result, reference(config.params, frames, config.output_format),
-                config.output_format, config.stats);
+  check_outputs(result, reference(config.params, frames, config.output_format), config);
 }
 
-// Synthetic frames as uint16 or uint8 tensors, in device or pageable host memory.
-void bayer_input(Backend backend, bool device, RawFormat format, int bits, OutputFormat output,
+// CPU waits and copies per frame, as the README's table gives them.
+struct Cost {
+  std::uint64_t waits{};
+  std::uint64_t copies{};
+};
+
+Cost expected_cost(Backend backend, Memory memory) {
+  if (backend == Backend::kCuda) {
+    switch (memory) {
+      case Memory::kDevice:
+        return {0, 0};
+      case Memory::kPinned:
+        return {1, 1};  // Its tensor cannot hold the memory until the copy is done.
+      case Memory::kPageable:
+        return {2, 1};
+    }
+  }
+  return memory == Memory::kDevice ? Cost{1, 1} : Cost{1, 0};
+}
+
+std::string memory_name(Memory memory) {
+  return memory == Memory::kDevice   ? "device"
+         : memory == Memory::kPinned ? "pinned host"
+                                     : "pageable host";
+}
+
+// Synthetic frames as uint16 or uint8 tensors in `memory`; checks the outputs
+// and the CPU waits and copies per frame. (The operator test harness stages
+// only contiguous tensors, so padded rows are not covered here.)
+void bayer_input(Backend backend, Memory memory, RawFormat format, int bits, OutputFormat output,
                  bool stats) {
+  constexpr std::uint32_t kFrames = 3;
   const BayerPattern pattern =
       format == RawFormat::kUint8 ? BayerPattern::kBGGR : BayerPattern::kGRBG;
+  const bool device = memory == Memory::kDevice;
   std::vector<test::RawFrame> frames;
   std::vector<Input> inputs;
-  for (std::uint32_t f = 0; f < 3; ++f) {
+  for (std::uint32_t f = 0; f < kFrames; ++f) {
     frames.push_back(test::render(camera(pattern, format, bits, f)));
     const test::RawFrame& frame = frames.back();
     const bool u8 = format == RawFormat::kUint8;
     inputs.push_back(Input{raw_image(make({kHeight, kWidth}, u8 ? kUInt8 : kUInt16,
-                                          frame.bytes.data(), frame.bytes.size(), device),
+                                          frame.bytes.data(), frame.bytes.size(), memory),
                                      kWidth, kHeight, bayer(pattern), bits),
                            device});
   }
@@ -227,8 +269,20 @@ void bayer_input(Backend backend, bool device, RawFormat format, int bits, Outpu
   config.stats = stats;
   config.max_width = 128;
   config.max_height = 128;
-  run_and_check(config, frames, std::move(inputs),
-                std::string(backend_name(backend)) + (device ? " device" : " host"));
+  const std::string what =
+      std::string(backend_name(backend)) + " from " + memory_name(memory) + " memory";
+  const IspOpStatistics before = isp_op_statistics();
+  run_and_check(config, frames, std::move(inputs), what);
+  const IspOpStatistics after = isp_op_statistics();
+  const Cost cost = expected_cost(backend, memory);
+  VERIFY_MSG(after.host_waits - before.host_waits == kFrames * cost.waits,
+             what + ": " + std::to_string(after.host_waits - before.host_waits) +
+                 " CPU waits for " + std::to_string(kFrames) + " frames, expected " +
+                 std::to_string(kFrames * cost.waits));
+  VERIFY_MSG(after.copies - before.copies == kFrames * cost.copies,
+             what + ": " + std::to_string(after.copies - before.copies) + " copies for " +
+                 std::to_string(kFrames) + " frames, expected " +
+                 std::to_string(kFrames * cost.copies));
 }
 
 // MONO16 with the pattern configured and 10 significant bits, on the GPU.
@@ -264,6 +318,7 @@ void packed_raw10() {
   IspOpConfig config;
   config.params = synthetic_isp_params(frames[0].config, 9);
   config.params.demosaic = DemosaicMethod::kBilinear;
+  config.params.tone_curve = ToneCurve::kLinear;  // Its colour space is then unspecified.
   config.packing = Packing::kMipiRaw10;
   config.output_format = OutputFormat::kRgb32f;
   config.stats = true;
@@ -350,29 +405,35 @@ int main() {
   using holoscan::isp::OutputFormat;
   using holoscan::isp::RawFormat;
   using holoscan::isp::test::TestCase;
+  using holoscan::isp::test::Memory;
   return holoscan::isp::test::run({
       TestCase{"cuda: 12-bit BAYER_GRBG from device memory, RGB8, statistics",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCuda, true, RawFormat::kUint16, 12,
-                                            OutputFormat::kRgb8, true);
+                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kDevice, RawFormat::kUint16,
+                                            12, OutputFormat::kRgb8, true);
                }},
-      TestCase{"cuda: 8-bit BAYER_BGGR from pageable host memory, RGBA8",
+      TestCase{"cuda: 8-bit BAYER_BGGR from pinned host memory, RGBA8",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCuda, false, RawFormat::kUint8, 8,
+                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kPinned, RawFormat::kUint8, 8,
                                             OutputFormat::kRgba8, false);
+               }},
+      TestCase{"cuda: 12-bit BAYER_GRBG from pageable host memory, RGB8, statistics",
+               [] {
+                 holoscan::isp::bayer_input(Backend::kCuda, Memory::kPageable,
+                                            RawFormat::kUint16, 12, OutputFormat::kRgb8, true);
                }},
       TestCase{"cuda: MONO16 [H, W, 1] with a configured pattern, RGB16", holoscan::isp::mono16},
       TestCase{"cuda: packed RAW10 from device memory, RGB32F, statistics",
                holoscan::isp::packed_raw10},
       TestCase{"cpu: 12-bit BAYER_GRBG from device memory, statistics in host memory",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCpu, true, RawFormat::kUint16, 12,
-                                            OutputFormat::kRgb8, true);
+                 holoscan::isp::bayer_input(Backend::kCpu, Memory::kDevice, RawFormat::kUint16,
+                                            12, OutputFormat::kRgb8, true);
                }},
-      TestCase{"cpu: 16-bit from host memory, RGB16",
+      TestCase{"cpu: 16-bit from pageable host memory, RGB16",
                [] {
-                 holoscan::isp::bayer_input(Backend::kCpu, false, RawFormat::kUint16, 16,
-                                            OutputFormat::kRgb16, false);
+                 holoscan::isp::bayer_input(Backend::kCpu, Memory::kPageable, RawFormat::kUint16,
+                                            16, OutputFormat::kRgb16, false);
                }},
       TestCase{"auto picks cuda where there is a GPU", holoscan::isp::auto_backend},
       TestCase{"unusable inputs and settings are rejected", holoscan::isp::rejects},

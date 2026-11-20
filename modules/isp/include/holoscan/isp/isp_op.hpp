@@ -12,8 +12,6 @@
 
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -59,6 +57,19 @@ struct IspOpConfig {
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const IspOpConfig& config);
 
+// What the IspOps of this process have cost their threads so far, for tests
+// and profiling (README, "CPU waits and copies per frame").
+struct IspOpStatistics {
+  // Waits of the operator's thread: for a host input's producer, for CUDA to
+  // stage a copy from pageable host memory, for a copy to the host, for a
+  // pinned input whose tensor cannot hold its memory until the copy is done,
+  // and before the staging buffer grows.
+  std::uint64_t host_waits{};
+  // Raw frames copied between host and device memory.
+  std::uint64_t copies{};
+};
+[[nodiscard]] IspOpStatistics isp_op_statistics() noexcept;
+
 class IspOp final : public holoscan::Operator<> {
  public:
   // Resolves Backend::kAuto.
@@ -84,11 +95,13 @@ class IspOp final : public holoscan::Operator<> {
   holoscan::Input<holoscan::schema::ImageT> raw;
   // RGB8, RGBA8, RGB16 or RGB32F [H, W, channels], packed: in device memory
   // for the cuda backend, host memory for cpu. The descriptor keeps the raw
-  // image's header, exposure time and gain; the sample its capture time and frame id.
+  // image's header, region offsets, exposure time and gain; its colour space is
+  // SRGB with the sRGB tone curve, else unspecified. The sample keeps its
+  // capture time and frame id.
   holoscan::Output<holoscan::schema::ImageT> image;
   // With `stats`: uint32 [kHistogramChannels, kHistogramBins].
   holoscan::Output<holoscan::Tensor> histogram;
-  // With `stats`: float32 [stats::kStatsSize].
+  // With `stats`: float32 [stats::kStatsSize], layout stats::kLayoutVersion.
   holoscan::Output<holoscan::Tensor> stats;
 
  private:

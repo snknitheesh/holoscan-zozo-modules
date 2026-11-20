@@ -4,6 +4,7 @@
 #include "holoscan/isp/isp_op.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -29,6 +30,12 @@ constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 constexpr DLDataType kUInt16{kDLUInt, 16U, 1U};
 constexpr DLDataType kUInt32{kDLUInt, 32U, 1U};
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
+
+std::atomic<std::uint64_t> g_host_waits{0};
+std::atomic<std::uint64_t> g_copies{0};
+
+void count_host_wait() noexcept { g_host_waits.fetch_add(1, std::memory_order_relaxed); }
+void count_copy() noexcept { g_copies.fetch_add(1, std::memory_order_relaxed); }
 
 holoscan::Error invalid(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "IspOp: " + message};
@@ -107,10 +114,12 @@ bool on_gpu(const holoscan::Tensor& tensor) {
   return device.device_type == kDLCUDA || device.device_type == kDLCUDAManaged;
 }
 
-// A raw frame: its view (data still where the tensor is), and the bytes its rows span.
+// A raw frame: its view (data still where the tensor is), the bytes its rows
+// span, and whether its rows follow each other with no padding.
 struct RawFrame {
   RawImageView view;
   std::size_t span{};
+  bool contiguous{};
 };
 
 holoscan::expected<RawFrame, holoscan::Error> describe(const holoscan::schema::ImageT& image,
@@ -207,6 +216,7 @@ holoscan::expected<RawFrame, holoscan::Error> describe(const holoscan::schema::I
     return holoscan::make_unexpected(invalid("raw rows overlap"));
   }
   view.pitch = static_cast<std::size_t>(pitch);
+  frame.contiguous = pitch == row_bytes;
   if (view.format == RawFormat::kUint16 &&
       (reinterpret_cast<std::uintptr_t>(view.data) % 2U != 0U || view.pitch % 2U != 0U)) {
     return holoscan::make_unexpected(invalid("uint16 raw data must be aligned to 2 bytes"));
@@ -240,13 +250,24 @@ holoscan::expected<void, holoscan::Error> hold_until_done(const holoscan::Tensor
   if (handle.set_deallocation_stream(stream)) {
     return {};
   }
+  count_host_wait();
   if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
   }
   return {};
 }
 
+holoscan::schema::ColorSpace output_color_space(const IspParams& params) {
+  return params.tone_curve == ToneCurve::kSrgb ? holoscan::schema::ColorSpace_SRGB
+                                               : holoscan::schema::ColorSpace_UNSPECIFIED;
+}
+
 }  // namespace
+
+IspOpStatistics isp_op_statistics() noexcept {
+  return IspOpStatistics{.host_waits = g_host_waits.load(std::memory_order_relaxed),
+                         .copies = g_copies.load(std::memory_order_relaxed)};
+}
 
 void validate_config(const IspOpConfig& config) {
   validate_params(config.params);
@@ -277,13 +298,19 @@ struct IspOp::State {
   void release() noexcept {
     pipeline.reset();
     if (copy_stream != nullptr) {
-      cudaStreamSynchronize(copy_stream);
-      cudaStreamDestroy(copy_stream);
+      if (const cudaError_t status = cudaStreamSynchronize(copy_stream); status != cudaSuccess) {
+        HOLOSCAN_LOG_WARN("IspOp: cudaStreamSynchronize: {}", cudaGetErrorString(status));
+      }
+      if (const cudaError_t status = cudaStreamDestroy(copy_stream); status != cudaSuccess) {
+        HOLOSCAN_LOG_WARN("IspOp: cudaStreamDestroy: {}", cudaGetErrorString(status));
+      }
       copy_stream = nullptr;
     }
     // cudaFree waits for the work on the runtime's streams that may still read it.
     if (staging != nullptr) {
-      cudaFree(staging);
+      if (const cudaError_t status = cudaFree(staging); status != cudaSuccess) {
+        HOLOSCAN_LOG_WARN("IspOp: cudaFree of the staging buffer: {}", cudaGetErrorString(status));
+      }
     }
     staging = nullptr;
     staging_bytes = 0;
@@ -377,15 +404,25 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
       if (tensor.device().device_type == kDLCPU) {
         // The runtime orders device and stream-ready pinned memory on our
         // stream; plain host memory it does not, so wait for its producer.
+        count_host_wait();
         if (auto ready = tensor.synchronize_for_host(); !ready) {
           return holoscan::make_unexpected(std::move(ready).error());
         }
       }
       if (state.staging_bytes < frame->span) {
-        cudaStreamSynchronize(stream);  // The old buffer may still be read.
-        cudaFree(state.staging);
-        state.staging = nullptr;
-        state.staging_bytes = 0;
+        if (state.staging != nullptr) {
+          // The old buffer may still be read by work queued on the stream.
+          count_host_wait();
+          if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+            return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+          }
+          const cudaError_t freed = cudaFree(state.staging);
+          state.staging = nullptr;
+          state.staging_bytes = 0;
+          if (freed != cudaSuccess) {
+            return holoscan::make_unexpected(cuda_failure("cudaFree", freed));
+          }
+        }
         if (const cudaError_t status = cudaMalloc(&state.staging, frame->span);
             status != cudaSuccess) {
           state.staging = nullptr;
@@ -398,9 +435,12 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
           status != cudaSuccess) {
         return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
       }
+      count_copy();
       // A producer must not reuse pinned memory while the copy still reads it;
       // pageable memory is staged by the time cudaMemcpyAsync returns.
-      if (tensor.device().device_type == kDLCUDAHost) {
+      if (tensor.device().device_type == kDLCPU) {
+        count_host_wait();
+      } else {
         if (auto held = hold_until_done(tensor, stream); !held) {
           return holoscan::make_unexpected(std::move(held).error());
         }
@@ -411,7 +451,24 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
       }
       frame->view.data = state.staging;
     }
+  } else if (on_gpu(tensor) && frame->contiguous) {
+    // One wait: the copy follows the producer's work on the stream, and returns once done.
+    state.host_copy.resize(frame->view.pitch * static_cast<std::size_t>(frame->view.height));
+    count_host_wait();
+    if (auto copied = tensor.copy_to_host(state.host_copy.data(), state.host_copy.size(), stream);
+        !copied) {
+      return holoscan::make_unexpected(std::move(copied).error());
+    }
+    count_copy();
+    if (!state.copy_logged) {
+      state.copy_logged = true;
+      log_copy(backend_, false, state.host_copy.size());
+    }
+    frame->view.data = state.host_copy.data();
   } else if (on_gpu(tensor)) {
+    // Padded rows: copy_to_host() takes contiguous tensors only, so wait for
+    // the producer and copy the rows' span on a stream of our own.
+    count_host_wait();
     if (auto ready = tensor.synchronize_for_host(); !ready) {
       return holoscan::make_unexpected(std::move(ready).error());
     }
@@ -430,6 +487,8 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
     }
+    count_copy();
+    count_host_wait();
     if (const cudaError_t status = cudaStreamSynchronize(state.copy_stream);
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
@@ -439,8 +498,11 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
       log_copy(backend_, false, frame->span);
     }
     frame->view.data = state.host_copy.data();
-  } else if (auto ready = tensor.synchronize_for_host(); !ready) {
-    return holoscan::make_unexpected(std::move(ready).error());
+  } else {
+    count_host_wait();
+    if (auto ready = tensor.synchronize_for_host(); !ready) {
+      return holoscan::make_unexpected(std::move(ready).error());
+    }
   }
 
   // The outputs.
@@ -512,6 +574,9 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
   descriptor.width = width;
   descriptor.height = height;
   descriptor.encoding = output_encoding(config_.output_format);
+  descriptor.color_space = output_color_space(config_.params);
+  descriptor.roi_offset_x = input.roi_offset_x;
+  descriptor.roi_offset_y = input.roi_offset_y;
   if (input.header) {
     descriptor.header = std::make_shared<holoscan::schema::HeaderT>(*input.header);
   }
