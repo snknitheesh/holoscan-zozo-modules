@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <holoscan/denoise/denoiser.hpp>
@@ -65,25 +66,36 @@ struct Method {
 int main(int argc, char** argv) try {
   int iterations = 50;
   std::vector<int> heights{1080, 2160};
+  // A whole positive number, or a usage error.
+  const auto positive = [](std::string_view text, std::string_view option) {
+    int value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc() || end != text.data() + text.size() || value < 1) {
+      throw std::invalid_argument(std::string(option) + " needs a positive number, got '" +
+                                  std::string(text) + "'");
+    }
+    return value;
+  };
+  if (argc % 2 == 0) {
+    throw std::invalid_argument("options are --iterations N and --sizes H[,H...]");
+  }
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string_view option = argv[i];
     const std::string_view value = argv[i + 1];
     if (option == "--iterations") {
-      std::from_chars(value.data(), value.data() + value.size(), iterations);
+      iterations = positive(value, option);
     } else if (option == "--sizes") {
       heights.clear();
-      for (std::string_view rest = value; !rest.empty();) {
+      for (std::string_view rest = value;;) {
         const std::size_t comma = rest.find(',');
-        int h = 0;
-        std::from_chars(rest.data(), rest.data() + std::min(comma, rest.size()), h);
-        heights.push_back(h);
-        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        heights.push_back(positive(rest.substr(0, comma), option));
+        if (comma == std::string_view::npos) break;
+        rest = rest.substr(comma + 1);
       }
     } else {
       throw std::invalid_argument("unknown option " + std::string(option));
     }
   }
-  iterations = std::max(iterations, 1);
   const int warmup = std::min(iterations, 5);
 
   std::vector<Method> methods;
@@ -130,6 +142,8 @@ int main(int argc, char** argv) try {
         DeviceImage noisy(dn::PixelFormat::kRgb8, width, height);
         cuda_check(dn::render_noisy(scene, dn::NoiseModel{}, 0, noisy.view(), stream),
                    "render_noisy");
+        // The copies below run on the legacy stream, which does not wait for `stream`.
+        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
         DeviceImage in(format, width, height);
         if (format == dn::PixelFormat::kNv12) {
           in.upload(dn::test::rgb_to_nv12(noisy.download(), width, height));

@@ -436,6 +436,7 @@ void check_noise_estimate() {
   Denoiser denoiser(Backend::kCuda, params);
   DeviceImage in(PixelFormat::kRgb8, 32, 32);
   DeviceImage out(PixelFormat::kRgb8, 32, 32);
+  in.upload(std::vector<std::uint8_t>(static_cast<std::size_t>(32) * 32 * 3, 64));
   denoiser.process(in.view(), out.view(), nullptr);
   VERIFY(denoiser.noise_sigma(nullptr) == 5.5F);
 }
