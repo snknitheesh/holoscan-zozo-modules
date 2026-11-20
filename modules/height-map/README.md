@@ -120,7 +120,7 @@ frame. The outputs go out in the order above.
 | `elevation` | `ElevationMode::kFused` | `kMax`, `kMean` or `kFused` |
 | `min_height`, `max_height` | -inf, +inf | Points outside these map-frame heights are dropped |
 | `min_range`, `max_range` | 0, +inf | Points outside these distances from the sensor are dropped |
-| `noise_base`, `noise_quadratic` | 0.005, 0.002 | A point's height standard deviation, `noise_base + noise_quadratic * range^2` meters |
+| `noise_base`, `noise_quadratic` | 0.005, 0.002 | A point's height standard deviation, `noise_base + noise_quadratic * range^2` meters; `noise_base` positive, so that a point at the sensor has a finite weight |
 | `min_variance` | 1e-6 | Floor of a measurement's variance, m^2 |
 | `mahalanobis_gate` | 3 | `kFused`: standard deviations beyond which a measurement is not fused; 0 fuses all |
 | `rejection_variance` | 1e-4 | `kFused`: variance added for each lower measurement the gate drops, m^2 |
@@ -167,7 +167,9 @@ has arrived.
 | `slope_weight`, `step_weight`, `roughness_weight` | `0.5`, `0.25`, `0.25` | The cost's weights below the maxima |
 
 and `components` (`false`), `image` (`false`), `frame_id` (`"map"`), and `max_rows`, `max_cols`
-(`1024`: the largest map accepted).
+(`1024`: the largest map accepted). They size the outputs' pools: set them to the map's `rows` and
+`cols`, as the demo does; the defaults reserve room for a 1024 x 1024 map, 25 times a 200 x 200
+one.
 
 A mean or fused elevation mixes the points on a riser (a step's or a box's vertical face) into the
 cells next to it; a step window two cells wide on either side still reaches clear cells, which is
@@ -255,24 +257,27 @@ use `-ffp-contract=off`. Every result is the same on every run.
 
 A map update is `HeightMapper::update()` and `write_layers()` of the elevation and the variance, as
 `HeightMapOp` runs them, on a depth camera's cloud of the demo's course, the window following a
-sensor moving 1 cm a frame; mean milliseconds of GPU time over 200 runs (100 on the Jetson Orin);
-`height_map_benchmark` measures it. Both maps are 10 m square.
+sensor moving 1 cm a frame; `height_map_benchmark` measures it. The times are mean milliseconds of
+GPU time over 200 runs (100 on the Jetson Orin), between CUDA events on one stream: the kernels'
+time only, not the operators' host time. Both maps are 10 m square.
 
 | Step | Map | RTX 5090, 640x480 | RTX 5090, 1280x720 | Jetson Orin, 640x480 | Jetson Orin, 1280x720 |
 | --- | --- | --- | --- | --- | --- |
-| Map update (fused) | 200x200, 5 cm | 0.058 | 0.117 | 0.296 | 0.881 |
-| Map update (fused) | 500x500, 2 cm | 0.054 | 0.080 | 0.414 | 0.968 |
-| Map update (highest point) | 200x200 | 0.057 | 0.117 | 0.290 | 0.880 |
-| Map update (highest point) | 500x500 | 0.054 | 0.079 | 0.406 | 0.962 |
-| Traversability (5x5 plane fit) | 200x200 | 0.009 | 0.008 | 0.030 | 0.029 |
-| Traversability (5x5 plane fit) | 500x500 | 0.012 | 0.010 | 0.104 | 0.096 |
-| Elevation and cost images | 500x500 | 0.009 | 0.008 | 0.057 | 0.054 |
+| Map update (fused) | 200x200, 5 cm | 0.061 | 0.119 | 0.293 | 0.890 |
+| Map update (fused) | 500x500, 2 cm | 0.057 | 0.082 | 0.449 | 1.038 |
+| Map update (highest point) | 200x200 | 0.059 | 0.117 | 0.290 | 0.890 |
+| Map update (highest point) | 500x500 | 0.057 | 0.080 | 0.435 | 0.990 |
+| Traversability (5x5 plane fit) | 200x200 | 0.009 | 0.008 | 0.031 | 0.028 |
+| Traversability (5x5 plane fit) | 500x500 | 0.012 | 0.010 | 0.102 | 0.085 |
+| Elevation and cost images | 500x500 | 0.009 | 0.009 | 0.062 | 0.057 |
 
-The x86_64 machine has an RTX 5090; the Jetson Orin runs JetPack 7.2 in its highest power mode.
-The results, accuracy included, are the same on both. The update is the sort of the points by cell and one pass per
-cell; it grows with the points, and with the most crowded cell, whose points one thread sums, which
-is why 1280x720 into 5 cm cells costs more than into 2 cm cells. The traversability's time grows
-with the known cells.
+Measured on 2026-11-20 in the repository's CI image (CUDA 13.2.1, Holoscan SDK 5.0.0): the x86_64
+machine has an RTX 5090 with NVIDIA driver 595.99.02, shared with other work; the Jetson Orin runs
+JetPack 7.2 (driver 595.78) in its highest power mode. The results, accuracy included, are the same
+on both. The update is the sort of the points by cell and one pass per cell; it grows with the
+points, and with the most crowded cell, whose points one thread sums, which is why 1280x720 into
+5 cm cells costs more than into 2 cm cells. The traversability's time grows with the known cells.
+The host waits for none of it.
 
 ## Requirements
 
@@ -299,14 +304,19 @@ cmake --install build/height-map --prefix "$PWD/install"
 | `HOLOSCAN_HEIGHT_MAP_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
-The tests, all on synthetic clouds made at test time:
+The tests, all on synthetic data made at test time:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `height_map_mapper` | GPU | `HeightMapper`: flat ground, a ramp, steps, a box and a pit, with and without noise, per cell against the analytic heights; counts and unknown cells; height and range limits; the moving window; temporal fusion; clearing, ageing, variance growth and the gate (a box appearing, a pit appearing); the CPU reference, bit for bit; determinism with 750k points; a depth camera over the course; empty, all-NaN, infinite, out-of-grid and clipped clouds, a single point; rejected settings |
 | `height_map_traversability` | GPU | `compute_traversability()`: flat ground, ramps of known slopes (the cost rising with the slope), steps of known heights, a box and a pit, the unknown mask (holes, a lone cell, collinear cells), a mapped noisy ramp, the CPU reference, determinism; the color views; rejected settings |
 | `height_map_operators` | GPU | Both operators through the SDK's operator test harness: `PointCloud` messages, organized and unorganized, in device, pinned host and pageable host memory, a configured pose and poses as an input (float32 and float64, host and device), fixed and following windows, every output bit for bit against the kernels run directly; `map_info`; the images and their headers; capture time and frame number; an empty cloud, a cloud without a capture time, a cloud with no valid point; rejected inputs (wrong layouts, a cloud in another frame, too many points, unusable poses and map_info) and settings; the packing check |
-| `height_map_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
+| `height_map_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working (label `benchmark`) |
+| `height_map_params` | Nothing | The map's and the traversability's settings, each refusal naming its field; the grid's size; rigid and non-rigid transforms |
+
+The SDK-free tests are also a standalone project, [tests/host/](tests/host/), which the hosted CI job
+builds without the SDK. The test on the local recordings, through `DepthToPointCloudOp`, is the
+demo's `height_map_app_real_data`, as the module does not depend on holoscan-point-cloud.
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
 installed package: `PointCloud` messages in host memory of a box on flat ground with a moving pose,
