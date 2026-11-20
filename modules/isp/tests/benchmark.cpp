@@ -7,9 +7,10 @@
 // shading, gray-world white balance, sharpening, statistics). Mean GPU time
 // per frame, from CUDA events, after a warm-up.
 //
-//   isp_benchmark [--iterations N] [--cpu true]
+//   isp_benchmark [--iterations N] [--cpu true] [--cpu-iterations N]
 //
-// --cpu also times the CPU backend once per case.
+// --cpu also times the CPU backend: the mean of --cpu-iterations calls (default
+// 5) after one warm-up call, on a pipeline that has processed frames before.
 
 #include <cuda_runtime_api.h>
 
@@ -50,6 +51,7 @@ struct Case {
 
 int main(int argc, char** argv) try {
   int iterations = 100;
+  int cpu_iterations = 5;
   bool cpu = false;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string_view option{argv[i]};
@@ -60,8 +62,15 @@ int main(int argc, char** argv) try {
       if (error != std::errc() || iterations < 1) throw std::invalid_argument("--iterations N");
     } else if (option == "--cpu") {
       cpu = value == "true";
+    } else if (option == "--cpu-iterations") {
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), cpu_iterations);
+      if (error != std::errc() || cpu_iterations < 1) {
+        throw std::invalid_argument("--cpu-iterations N");
+      }
     } else {
-      throw std::invalid_argument("usage: isp_benchmark [--iterations N] [--cpu true]");
+      throw std::invalid_argument(
+          "usage: isp_benchmark [--iterations N] [--cpu true] [--cpu-iterations N]");
     }
   }
   cudaDeviceProp properties{};
@@ -140,15 +149,19 @@ int main(int argc, char** argv) try {
           std::vector<std::uint32_t> host_histogram(holoscan::isp::kHistogramChannels *
                                                     holoscan::isp::kHistogramBins);
           std::vector<float> host_stats(holoscan::isp::stats::kStatsSize);
+          const auto run_cpu = [&] {
+            reference.process(
+                holoscan::isp::synthetic_raw_view(config, host_raw.data(), pitch),
+                {host_out.data(), static_cast<std::size_t>(width) * 3U,
+                 holoscan::isp::OutputFormat::kRgb8},
+                {c.full ? host_histogram.data() : nullptr, c.full ? host_stats.data() : nullptr});
+          };
+          run_cpu();  // Warm-up: first touches of the buffers, the white balance's first frame.
           const auto start = std::chrono::steady_clock::now();
-          reference.process(
-              holoscan::isp::synthetic_raw_view(config, host_raw.data(), pitch),
-              {host_out.data(), static_cast<std::size_t>(width) * 3U,
-               holoscan::isp::OutputFormat::kRgb8},
-              {c.full ? host_histogram.data() : nullptr, c.full ? host_stats.data() : nullptr});
+          for (int i = 0; i < cpu_iterations; ++i) run_cpu();
           const std::chrono::duration<double, std::milli> elapsed =
               std::chrono::steady_clock::now() - start;
-          std::printf(" %9.1f", elapsed.count());
+          std::printf(" %9.1f", elapsed.count() / cpu_iterations);
         }
         std::printf("\n");
       }

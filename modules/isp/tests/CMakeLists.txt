@@ -24,8 +24,27 @@ target_link_libraries(isp_benchmark PRIVATE holoscan::isp)
 
 add_test(NAME isp_pipeline COMMAND isp_pipeline_test)
 add_test(NAME isp_op COMMAND isp_op_test)
-add_test(NAME isp_benchmark COMMAND isp_benchmark --iterations 3)
-set_tests_properties(isp_benchmark isp_op isp_pipeline PROPERTIES LABELS "isp;gpu" TIMEOUT 900)
+add_test(NAME isp_benchmark COMMAND isp_benchmark --iterations 3 --cpu true --cpu-iterations 1)
+set_tests_properties(isp_op isp_pipeline PROPERTIES LABELS "isp;gpu" TIMEOUT 900)
+set_tests_properties(isp_benchmark PROPERTIES LABELS "isp;gpu;benchmark" TIMEOUT 900)
+
+# The pipeline's whole test under compute-sanitizer: memcheck with a leak check, racecheck,
+# initcheck and synccheck, labeled "sanitizer" (ctest -L sanitizer, or -LE sanitizer to leave
+# them out). Any error the tool reports fails the test.
+find_program(ISP_COMPUTE_SANITIZER compute-sanitizer HINTS "${CUDAToolkit_BIN_DIR}")
+if(ISP_COMPUTE_SANITIZER)
+  foreach(_tool memcheck racecheck initcheck synccheck)
+    set(_options --tool ${_tool} --error-exitcode 1)
+    if(_tool STREQUAL "memcheck")
+      list(APPEND _options --leak-check full)
+    endif()
+    add_test(
+      NAME isp_pipeline_${_tool}
+      COMMAND "${ISP_COMPUTE_SANITIZER}" ${_options} $<TARGET_FILE:isp_pipeline_test>
+    )
+    set_tests_properties(isp_pipeline_${_tool} PROPERTIES LABELS "isp;gpu;sanitizer" TIMEOUT 1200)
+  endforeach()
+endif()
 
 # The SDK-free tests, which the hosted CI job also builds on their own.
 add_subdirectory(host)
