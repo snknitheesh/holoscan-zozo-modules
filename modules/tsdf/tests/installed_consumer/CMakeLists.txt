@@ -14,8 +14,7 @@ add_executable(tsdf_consumer main.cpp)
 target_link_libraries(tsdf_consumer PRIVATE holoscan::tsdf)
 set_target_properties(tsdf_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# Passes on exit status 0, which the consumer returns only when it prints PASS (a
+# PASS_REGULAR_EXPRESSION would ignore the exit status).
 add_test(NAME tsdf_installed_consumer COMMAND tsdf_consumer)
-set_tests_properties(
-  tsdf_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "tsdf_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(tsdf_installed_consumer PROPERTIES TIMEOUT 300)
