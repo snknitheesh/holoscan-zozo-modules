@@ -673,16 +673,18 @@ holoscan::expected<void, holoscan::Error> IcpOp::compute(holoscan::ExecutionCont
   }
   if (config_.transform_output) {
     if (auto sent = emit_host(transform, result.transform, kMatrixShape); !sent) {
-      return sent;
+      return failed(std::move(sent).error());
     }
   }
   if (config_.stats_output) {
     if (auto sent = emit_host(stats, values, kStatsShape); !sent) {
-      return sent;
+      return failed(std::move(sent).error());
     }
   }
   if (config_.mode == IcpMode::kOdometry && config_.pose_output) {
-    return emit_host(pose, pose_out, kMatrixShape);
+    if (auto sent = emit_host(pose, pose_out, kMatrixShape); !sent) {
+      return failed(std::move(sent).error());
+    }
   }
   return {};
 }
