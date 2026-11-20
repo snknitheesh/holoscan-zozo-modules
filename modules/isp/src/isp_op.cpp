@@ -257,11 +257,6 @@ holoscan::expected<void, holoscan::Error> hold_until_done(const holoscan::Tensor
   return {};
 }
 
-holoscan::schema::ColorSpace output_color_space(const IspParams& params) {
-  return params.tone_curve == ToneCurve::kSrgb ? holoscan::schema::ColorSpace_SRGB
-                                               : holoscan::schema::ColorSpace_UNSPECIFIED;
-}
-
 }  // namespace
 
 IspOpStatistics isp_op_statistics() noexcept {
@@ -574,7 +569,10 @@ holoscan::expected<void, holoscan::Error> IspOp::compute(holoscan::ExecutionCont
   descriptor.width = width;
   descriptor.height = height;
   descriptor.encoding = output_encoding(config_.output_format);
-  descriptor.color_space = output_color_space(config_.params);
+  // No colour space claim: HoloViz admits an SRGB-labelled frame only into a
+  // kSRGBNonlinear layer, which takes RGBA8 or BGRA8 alone, and an UNSPECIFIED
+  // one into any layer.
+  descriptor.color_space = holoscan::schema::ColorSpace_UNSPECIFIED;
   descriptor.roi_offset_x = input.roi_offset_x;
   descriptor.roi_offset_y = input.roi_offset_y;
   if (input.header) {

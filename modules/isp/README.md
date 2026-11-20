@@ -60,7 +60,7 @@ parameters; `IspParams` holds them all, and `validate_params()` names the first 
 | Port | Type | |
 | --- | --- | --- |
 | `raw` (input) | `schema::ImageT` | `BAYER_RGGB`, `BAYER_BGGR`, `BAYER_GRBG`, `BAYER_GBRG`, or `MONO8` / `MONO16` with the pattern in the configuration; uint8 or uint16 `[H, W]` or `[H, W, 1]`, rows packed or padded; with `packing`, uint8 `[H, row bytes]` and the descriptor's `width`. In host or CUDA device memory |
-| `image` | `schema::ImageT` | `RGB8`, `RGBA8` (alpha 255), `RGB16` or `RGB32F` `[H, W, channels]`, packed; device memory for the cuda backend, host memory for cpu. The descriptor keeps the raw image's header, `roi_offset_x`, `roi_offset_y`, `exposure_time_ns` and `gain`; its `color_space` is `SRGB` with the `kSrgb` tone curve (the colour matrix is meant to map to sRGB primaries), else `UNSPECIFIED` |
+| `image` | `schema::ImageT` | `RGB8`, `RGBA8` (alpha 255), `RGB16` or `RGB32F` `[H, W, channels]`, packed; device memory for the cuda backend, host memory for cpu. The descriptor keeps the raw image's header, `roi_offset_x`, `roi_offset_y`, `exposure_time_ns` and `gain`; its `color_space` is `UNSPECIFIED` with every tone curve, since HoloViz admits an `SRGB` frame only into an RGBA8 or BGRA8 layer |
 | `histogram` (with `stats`) | `holoscan::Tensor` | uint32 `[4, 256]`: the output's luma, red, green and blue, in 8-bit code values |
 | `stats` (with `stats`) | `holoscan::Tensor` | float32 `[12]`, layout version 1, below |
 

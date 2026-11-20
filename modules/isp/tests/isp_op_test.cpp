@@ -124,9 +124,6 @@ void check_outputs(const holoscan::testing::TestResult& result,
                    const std::vector<test::Result>& expected, const IspOpConfig& config) {
   const OutputFormat format = config.output_format;
   const bool stats = config.stats;
-  const holoscan::schema::ColorSpace color_space = config.params.tone_curve == ToneCurve::kSrgb
-                                                       ? holoscan::schema::ColorSpace_SRGB
-                                                       : holoscan::schema::ColorSpace_UNSPECIFIED;
   const auto images = result.snapshots<holoscan::schema::ImageT>("image");
   VERIFY_MSG(images.size() == expected.size(), std::to_string(images.size()) + " images");
   for (std::size_t i = 0; i < images.size() && i < expected.size(); ++i) {
@@ -140,7 +137,7 @@ void check_outputs(const holoscan::testing::TestResult& result,
     VERIFY(descriptor.header && descriptor.header->frame_id == "camera");
     VERIFY(descriptor.exposure_time_ns == kExposureNs && descriptor.gain == kGain);
     VERIFY(descriptor.roi_offset_x == kRoiX && descriptor.roi_offset_y == kRoiY);
-    VERIFY(descriptor.color_space == color_space);
+    VERIFY(descriptor.color_space == holoscan::schema::ColorSpace_UNSPECIFIED);
     const holoscan::SampleMetadata& metadata = images[i].sample_metadata();
     VERIFY(metadata.capture_timestamp_ns == capture_time(static_cast<std::uint32_t>(i)).count());
     VERIFY(metadata.frame_id == 7U + i);
@@ -318,7 +315,6 @@ void packed_raw10() {
   IspOpConfig config;
   config.params = synthetic_isp_params(frames[0].config, 9);
   config.params.demosaic = DemosaicMethod::kBilinear;
-  config.params.tone_curve = ToneCurve::kLinear;  // Its colour space is then unspecified.
   config.packing = Packing::kMipiRaw10;
   config.output_format = OutputFormat::kRgb32f;
   config.stats = true;

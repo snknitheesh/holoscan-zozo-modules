@@ -96,8 +96,8 @@ class IspOp final : public holoscan::Operator<> {
   // RGB8, RGBA8, RGB16 or RGB32F [H, W, channels], packed: in device memory
   // for the cuda backend, host memory for cpu. The descriptor keeps the raw
   // image's header, region offsets, exposure time and gain; its colour space is
-  // SRGB with the sRGB tone curve, else unspecified. The sample keeps its
-  // capture time and frame id.
+  // UNSPECIFIED, whatever the tone curve. The sample keeps its capture time and
+  // frame id.
   holoscan::Output<holoscan::schema::ImageT> image;
   // With `stats`: uint32 [kHistogramChannels, kHistogramBins].
   holoscan::Output<holoscan::Tensor> histogram;
