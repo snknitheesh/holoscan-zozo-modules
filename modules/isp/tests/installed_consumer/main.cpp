@@ -5,8 +5,8 @@
 // frames of the synthetic raw camera as 12-bit BAYER_RGGB in host memory,
 // IspOp turns them into RGB8 on the GPU, one sink checks every image against
 // the camera's truth (PSNR), another that each histogram row counts every pixel.
-// IspOp cannot send a refused output again, so the source keeps one frame in
-// flight: it sends the next once both sinks have counted the last.
+// The graph runs on one worker: IspOp cannot send a refused output again, and
+// across workers a producer runs even while its consumer's lossless queue is full.
 
 #include <algorithm>
 #include <array>
@@ -50,13 +50,10 @@ isp::SyntheticRawConfig camera(std::uint32_t frame) {
   return config;
 }
 
-// kFrames raw frames, uint16 in host memory, then idle; each once the sinks
-// have counted the one before (`counted` goes up by two per frame).
+// kFrames raw frames, uint16 in host memory, then idle. A frame refused for
+// lack of room is sent again on the next tick.
 class RawSourceOp final : public holoscan::Operator<> {
  public:
-  explicit RawSourceOp(std::shared_ptr<const std::atomic<std::uint32_t>> counted)
-      : counted_(std::move(counted)) {}
-
   void setup(holoscan::OperatorSpec& spec) override {
     spec.output(raw, "raw")
         .produces_tensor(holoscan::TensorOutputSpec{
@@ -83,11 +80,14 @@ class RawSourceOp final : public holoscan::Operator<> {
 
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override {
-    if (emitted_ >= kFrames || counted_->load(std::memory_order_acquire) < 2U * emitted_) {
+    if (emitted_ >= kFrames) {
       return {};
     }
     const std::array<std::int64_t, 2> shape{kHeight, kWidth};
     auto loan = raw.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt16});
+    if (!loan && loan.error().code == holoscan::ErrorCode::kResourceExhausted) {
+      return {};  // Every slot of the pool is still held.
+    }
     if (!loan) {
       return holoscan::make_unexpected(std::move(loan).error());
     }
@@ -121,12 +121,10 @@ class RawSourceOp final : public holoscan::Operator<> {
   holoscan::Output<holoscan::schema::ImageT> raw;
 
  private:
-  std::shared_ptr<const std::atomic<std::uint32_t>> counted_;
   std::uint32_t emitted_{};
 };
 
 struct Tally {
-  std::atomic<std::uint32_t> counted{};  // Frames counted by either sink.
   std::uint32_t frames{};
   double worst_psnr{99.0};
   std::uint32_t stats_frames{};
@@ -146,6 +144,7 @@ class ImageCheckOp final : public holoscan::Operator<> {
   ImageCheckOp(std::shared_ptr<Tally> tally, std::shared_ptr<std::atomic<int>> remaining)
       : tally_(std::move(tally)), remaining_(std::move(remaining)) {}
 
+  // Two slots: the frame being checked, and the next one IspOp sends meanwhile.
   void setup(holoscan::OperatorSpec& spec) override { spec.input(image, "image").queue_depth(2U); }
 
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -188,7 +187,6 @@ class ImageCheckOp final : public holoscan::Operator<> {
     }
     const double psnr = 10.0 * std::log10(255.0 * 255.0 * 3.0 * kWidth * kHeight / squared);
     tally_->worst_psnr = std::min(tally_->worst_psnr, psnr);
-    tally_->counted.fetch_add(1U, std::memory_order_release);
     if (++tally_->frames == kFrames) {
       finish(*remaining_, context);
     }
@@ -208,6 +206,7 @@ class HistogramCheckOp final : public holoscan::Operator<> {
   HistogramCheckOp(std::shared_ptr<Tally> tally, std::shared_ptr<std::atomic<int>> remaining)
       : tally_(std::move(tally)), remaining_(std::move(remaining)) {}
 
+  // Two slots, as ImageCheckOp's.
   void setup(holoscan::OperatorSpec& spec) override {
     spec.input(histogram, "histogram").queue_depth(2U);
   }
@@ -235,7 +234,6 @@ class HistogramCheckOp final : public holoscan::Operator<> {
       for (int b = 0; b < isp::kHistogramBins; ++b) sum += counts[row * isp::kHistogramBins + b];
       tally_->bad_histograms += sum == std::uint64_t{kWidth} * kHeight ? 0U : 1U;
     }
-    tally_->counted.fetch_add(1U, std::memory_order_release);
     if (++tally_->stats_frames == kFrames) {
       finish(*remaining_, context);
     }
@@ -252,6 +250,7 @@ class HistogramCheckOp final : public holoscan::Operator<> {
 // Takes the statistics vector and drops it: every output of IspOp must be connected.
 class DropOp final : public holoscan::Operator<> {
  public:
+  // Two slots, as ImageCheckOp's.
   void setup(holoscan::OperatorSpec& spec) override { spec.input(stats, "stats").queue_depth(2U); }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
@@ -272,8 +271,7 @@ class DropOp final : public holoscan::Operator<> {
 int main() {
   holoscan::Graph graph{"isp_consumer"};
   auto tally = std::make_shared<Tally>();
-  auto source = graph.op<RawSourceOp>(
-      "source", std::shared_ptr<const std::atomic<std::uint32_t>>(tally, &tally->counted));
+  auto source = graph.op<RawSourceOp>("source");
   isp::IspOpConfig config;
   config.params = isp::synthetic_isp_params(camera(0));
   config.stats = true;
@@ -289,6 +287,8 @@ int main() {
   graph.add_flow(processor->image, image_check->image, lossless);
   graph.add_flow(processor->histogram, histogram_check->histogram, lossless);
   graph.add_flow(processor->stats, drop->stats, lossless);
+  // Every operator on one worker, so that no lossless queue refuses a frame.
+  graph.partition("isp_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // IspOp's outputs are in device memory, on GPU 0.
@@ -302,7 +302,16 @@ int main() {
     std::cerr << plan.json() << '\n';
     return 1;
   }
-  if (const int status = holoscan::run(plan); status != 0) {
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "isp_consumer: workers=" << workers << '\n';
+  if (workers != 1U) {
+    std::cerr << "isp_consumer: FAIL: the graph compiled to " << workers << " workers, not 1\n";
+    return 1;
+  }
+  // The caller's signal handling: managed signals refuse to start once another
+  // thread runs, as under a debugger or compute-sanitizer.
+  if (const int status = holoscan::run(plan, holoscan::RunSignalPolicy::kCallerManaged);
+      status != 0) {
     std::cerr << "isp_consumer: run failed with " << status << '\n';
     return 1;
   }

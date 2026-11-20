@@ -16,8 +16,6 @@ set_target_properties(isp_consumer PROPERTIES CXX_EXTENSIONS OFF)
 # It evaluates the synthetic camera on the host, as the module does: without contracting.
 target_compile_options(isp_consumer PRIVATE -ffp-contract=off)
 
+# It exits 0 only on PASS, on one worker.
 add_test(NAME isp_installed_consumer COMMAND isp_consumer)
-set_tests_properties(
-  isp_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "isp_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(isp_installed_consumer PROPERTIES TIMEOUT 300)
