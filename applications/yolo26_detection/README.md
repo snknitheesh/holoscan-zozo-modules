@@ -164,7 +164,7 @@ without a window.
 
 ## Performance
 
-On an RTX 5090 (driver 595.91.07, shared with another process) with SDK 5.0.0, CUDA 13.2 and
+On an RTX 5090 (shared with another process) with SDK 5.0.0, CUDA 13.2 and
 TensorRT 10.16, for YOLO26n at 640 on the 640x480 COCO image, it takes a median of 1.27 ms from
 capture to detections on the host with the FP32 engine, and 0.96 ms with FP16, the source's JPEG
 decode included. The module's README breaks down the GPU work per frame, measured with Nsight
