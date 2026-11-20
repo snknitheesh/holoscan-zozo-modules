@@ -348,10 +348,11 @@ bool valid_params(const HeightMapParams& p, const char** what) {
   if (!(p.min_range >= 0.0F) || std::isnan(p.max_range) || !(p.min_range <= p.max_range)) {
     return fail("min_range must be 0..max_range");
   }
-  if (!(std::isfinite(p.noise_base) && p.noise_base >= 0.0F) ||
-      !(std::isfinite(p.noise_quadratic) && p.noise_quadratic >= 0.0F) ||
-      !(p.noise_base > 0.0F || p.noise_quadratic > 0.0F)) {
-    return fail("noise_base and noise_quadratic must be finite, not negative, not both 0");
+  // A point at the sensor has range 0: only noise_base keeps its standard
+  // deviation, and so its weight, finite.
+  if (!(std::isfinite(p.noise_base) && p.noise_base > 0.0F) ||
+      !(std::isfinite(p.noise_quadratic) && p.noise_quadratic >= 0.0F)) {
+    return fail("noise_base must be positive and noise_quadratic not negative, both finite");
   }
   if (!(std::isfinite(p.min_variance) && p.min_variance > 0.0F)) {
     return fail("min_variance must be positive");
@@ -545,6 +546,9 @@ cudaError_t HeightMapper::update(const float* xyz, std::uint32_t count,
     return status;
   }
   const auto invalid_key = static_cast<std::uint32_t>(cells);
+  // At most one run per cell, plus the dropped points': the scan of the run
+  // lengths need not go further.
+  const std::size_t most_runs = std::min<std::size_t>(count, cells + 1U);
   const int end_bit = key_bits(invalid_key);
   std::size_t sort_bytes = 0;
   std::size_t encode_bytes = 0;
@@ -561,9 +565,9 @@ cudaError_t HeightMapper::update(const float* xyz, std::uint32_t count,
       status != cudaSuccess) {
     return status;
   }
-  if (const cudaError_t status =
-          cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, s.run_counts.as<std::uint32_t>(),
-                                        s.run_offsets.as<std::uint32_t>(), count, stream);
+  if (const cudaError_t status = cub::DeviceScan::ExclusiveSum(
+          nullptr, scan_bytes, s.run_counts.as<std::uint32_t>(), s.run_offsets.as<std::uint32_t>(),
+          static_cast<std::int64_t>(most_runs), stream);
       status != cudaSuccess) {
     return status;
   }
@@ -605,6 +609,13 @@ cudaError_t HeightMapper::update(const float* xyz, std::uint32_t count,
       status != cudaSuccess) {
     return status;
   }
+  // The encoding writes only as many run lengths as there are runs; the scan
+  // reads most_runs of them, so the rest are zero rather than uninitialized.
+  if (const cudaError_t status = cudaMemsetAsync(s.run_counts.as<void>(), 0,
+                                                 most_runs * sizeof(std::uint32_t), stream);
+      status != cudaSuccess) {
+    return status;
+  }
   temp_bytes = s.temp.bytes();
   if (const cudaError_t status = cub::DeviceRunLengthEncode::Encode(
           s.temp.as<void>(), temp_bytes, s.sorted_keys.as<std::uint32_t>(),
@@ -616,14 +627,12 @@ cudaError_t HeightMapper::update(const float* xyz, std::uint32_t count,
   temp_bytes = s.temp.bytes();
   if (const cudaError_t status = cub::DeviceScan::ExclusiveSum(
           s.temp.as<void>(), temp_bytes, s.run_counts.as<std::uint32_t>(),
-          s.run_offsets.as<std::uint32_t>(), count, stream);
+          s.run_offsets.as<std::uint32_t>(), static_cast<std::int64_t>(most_runs), stream);
       status != cudaSuccess) {
     return status;
   }
 
-  // 4. The observations, and their fusion. At most one run per cell, plus
-  // the dropped points'.
-  const std::size_t most_runs = std::min<std::size_t>(count, cells + 1U);
+  // 4. The observations, and their fusion: one thread per possible run.
   const FuseParams fuse{.now = now,
                         .cells = invalid_key,
                         .min_variance = p.min_variance,

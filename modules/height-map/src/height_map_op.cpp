@@ -126,8 +126,8 @@ void HeightMapOp::start() {
 }
 
 void HeightMapOp::stop() {
-  // Frees the map and the scratch; cudaFree waits for the work on the
-  // runtime's streams that may still use them.
+  // Frees the map and the scratch, after the device's work that may still
+  // use them (DeviceBuffer waits for it).
   impl_ = std::make_unique<Impl>(config_.map);
 }
 

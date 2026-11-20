@@ -43,8 +43,10 @@
 // kernels are compiled without fused multiply-adds, so a host evaluation of
 // the same expressions (tests/reference.hpp) matches them bit for bit.
 // A mapper keeps its device state and scratch between calls and is for one
-// stream at a time; nothing waits for the stream, except that growing a
-// scratch buffer first waits for the stream to finish with the old one.
+// stream at a time; the host never waits for the stream: the state and the
+// scratch are allocated and grown in stream order (CUDA's stream-ordered
+// allocator; on a GPU without it, growing waits for the stream). Destroying
+// the mapper waits for the device.
 
 #pragma once
 
@@ -84,7 +86,8 @@ struct HeightMapParams {
   float min_range{0.0F};
   float max_range{std::numeric_limits<float>::infinity()};
   // A point's height standard deviation in meters:
-  // noise_base + noise_quadratic * range^2.
+  // noise_base + noise_quadratic * range^2; noise_base positive, so that a
+  // point at the sensor has a finite weight.
   float noise_base{0.005F};
   float noise_quadratic{0.002F};
   // Floor of a measurement's variance, m^2; positive.

@@ -625,6 +625,19 @@ void check_edge_cases() {
     VERIFY(std::count_if(layers.elevation.begin(), layers.elevation.end(),
                          [](float v) { return std::isfinite(v); }) == 1);
   }
+  // A point at the sensor itself, range 0, with the default range limits and
+  // the quadratic noise: noise_base alone gives its weight, a finite one.
+  {
+    HeightMapParams at_sensor = p;
+    at_sensor.noise_quadratic = 0.002F;
+    HeightMapper mapper(at_sensor);
+    update(mapper, {0.0F, 0.0F, 0.0F}, Transform{}, kSecond);
+    const HostLayers layers = read_layers(mapper);
+    const std::size_t i = 40 * 80 + 40;
+    VERIFY_MSG(layers.elevation[i] == 0.0F && std::isfinite(layers.variance[i]) &&
+                   layers.variance[i] > 0.0F,
+               "a point at the sensor: a finite elevation and variance");
+  }
 }
 
 void check_rejected_params() {
@@ -656,6 +669,10 @@ void check_rejected_params() {
   p = HeightMapParams{};
   p.noise_base = 0.0F;
   p.noise_quadratic = 0.0F;
+  rejects(p, "noise_base");
+  // Without noise_base, a point at the sensor would weigh 1 / 0.
+  p = HeightMapParams{};
+  p.noise_base = 0.0F;
   rejects(p, "noise_base");
   p = HeightMapParams{};
   p.max_age = -1.0F;
