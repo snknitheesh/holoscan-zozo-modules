@@ -234,6 +234,37 @@ void cuda_matches_cpu() {
   }
 }
 
+// Each histogram row counts the output's own 8-bit pixels: rebuilt here from
+// the RGB8 and RGBA8 images, independently of the module's arithmetic.
+void histograms_count_pixels() {
+  for (const Backend backend : {Backend::kCuda, Backend::kCpu}) {
+    for (const OutputFormat format : {OutputFormat::kRgb8, OutputFormat::kRgba8}) {
+      const test::RawFrame frame = test::render(camera(BayerPattern::kGBRG, kFormats[2], 201, 117));
+      IspParams params = synthetic_isp_params(frame.config, 9);
+      params.sharpen = 0.5F;
+      IspPipeline pipeline(backend, params);
+      const Result r = run(pipeline, frame, format);
+      const int channels = output_channels(format);
+      std::vector<std::uint32_t> rebuilt(static_cast<std::size_t>(kHistogramChannels) *
+                                             kHistogramBins,
+                                         0U);
+      for (std::size_t i = 0; i + 2 < r.image.size(); i += static_cast<std::size_t>(channels)) {
+        const int red = r.image[i];
+        const int green = r.image[i + 1];
+        const int blue = r.image[i + 2];
+        ++rebuilt[kHistogramLuma * kHistogramBins +
+                  (2126 * red + 7152 * green + 722 * blue + 5000) / 10000];
+        ++rebuilt[kHistogramRed * kHistogramBins + red];
+        ++rebuilt[kHistogramGreen * kHistogramBins + green];
+        ++rebuilt[kHistogramBlue * kHistogramBins + blue];
+      }
+      VERIFY_MSG(r.histogram == rebuilt, std::string(backend_name(backend)) + " " +
+                                             (channels == 4 ? "RGBA8" : "RGB8") +
+                                             ": the histograms are not the image's");
+    }
+  }
+}
+
 // Frames queued on two streams in turn, never waited for in between, come out
 // as the CPU backend's in call order: each frame's GPU work waits for the
 // previous frame's, which shares the scratch and the white balance state.
@@ -726,6 +757,8 @@ int main() {
                holoscan::isp::cuda_matches_cpu},
       TestCase{"the synthetic camera renders the same on the GPU",
                holoscan::isp::synthetic_render_matches},
+      TestCase{"the histograms count the output's own pixels",
+               holoscan::isp::histograms_count_pixels},
       TestCase{"frames on two streams in turn run in call order",
                holoscan::isp::two_streams},
       TestCase{"padded rows", holoscan::isp::padded_rows},
