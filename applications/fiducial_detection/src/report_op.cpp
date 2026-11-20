@@ -23,6 +23,7 @@ ReportOp::ReportOp(ReportConfig config) : config_(std::move(config)) {
 }
 
 void ReportOp::setup(holoscan::OperatorSpec& spec) {
+  // As the detectors' inputs: the message being counted and the next.
   spec.input(detections, "detections").queue_depth(2U);
 }
 
@@ -45,7 +46,27 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
   report.corners += message.board ? message.board->corners.size() : 0U;
   report.dropped += static_cast<std::uint64_t>(std::max(message.dropped, 0));
   report.truncated_frames += message.truncated ? 1U : 0U;
-  report.detect_ms.push_back(message.detect_time_us / 1000.0F);
+  if (report.frames > 1) report.detect_ms.push_back(message.detect_time_us / 1000.0F);
+  report.host_waits += message.host_waits;
+  report.copied_bytes += message.copied_bytes;
+  if (config_.keep_results) {
+    FrameResult& result = report.results.emplace_back();
+    result.device_sequence = message.device_sequence;
+    for (const auto& marker : message.markers) {
+      std::array<float, 8> corners{};
+      for (int c = 0; c < 4; ++c) {
+        corners[2 * c] = marker.corners()->Get(c)->x();
+        corners[2 * c + 1] = marker.corners()->Get(c)->y();
+      }
+      result.markers.emplace_back(marker.id(), corners);
+    }
+    if (message.board) {
+      for (const auto& corner : message.board->corners) {
+        result.corners.emplace_back(corner.id(),
+                                    std::array<float, 2>{corner.image().x(), corner.image().y()});
+      }
+    }
+  }
   if (config_.truth) {
     auto verified = verify(message);
     if (!verified) return verified;
@@ -93,7 +114,12 @@ holoscan::expected<void, holoscan::Error> ReportOp::verify(
     const fd::TruthCounts counts = fd::match_markers(scene, found, [&](const fd::MarkerMatch& m) {
       bool misplaced = false;
       for (const double e : m.corner_errors) misplaced = corner_error(e) || misplaced;
-      if (m.found.pose) misplaced = pose_error(*m.found.pose, m.truth.pose) || misplaced;
+      // The scenes' camera is known, so every marker found must have its pose.
+      if (m.found.pose) {
+        misplaced = pose_error(*m.found.pose, m.truth.pose) || misplaced;
+      } else {
+        ++report.without_pose;
+      }
       report.misplaced += misplaced ? 1U : 0U;
     });
     report.expected += scene.markers.size();
@@ -106,7 +132,7 @@ holoscan::expected<void, holoscan::Error> ReportOp::verify(
   report.expected += truth.size();
   if (!view) {
     report.missed += truth.size();
-    ++report.frames_without_pose;
+    ++report.without_pose;
     return {};
   }
   std::size_t matched = 0;
@@ -128,7 +154,7 @@ holoscan::expected<void, holoscan::Error> ReportOp::verify(
   if (view->pose) {
     report.misplaced += pose_error(*view->pose, scene.board->pose) ? 1U : 0U;
   } else {
-    ++report.frames_without_pose;
+    ++report.without_pose;
   }
   return {};
 }

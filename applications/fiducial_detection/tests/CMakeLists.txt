@@ -34,6 +34,13 @@ fiducial_app_test(fiducial_app_legacy_board 0 "charuco backend=cpu .*verdict=PAS
   --board-dictionary DICT_5X5_100 --legacy-pattern true --count 10 --period-ms 10 --display false
 )
 
+# The lossless graphs run on one worker, as the demo lays them out: the camera info is a second
+# source and the frames fan out to every detector, which the automatic partitioning would split
+# onto a worker each.
+fiducial_app_test(fiducial_app_one_worker 0 "^fiducial_detection: plan=OK workers=1\n*$"
+  --scene both --backend all,auto --display false --compile-only true
+)
+
 # Invalid input fails fast with a usage error (exit status 2) instead of starting a run.
 fiducial_app_test(fiducial_app_rejects_unknown_backend 2 "^error: " --backend vpi --display false)
 fiducial_app_test(fiducial_app_rejects_unknown_dictionary 2 "^error: unknown dictionary"
@@ -46,21 +53,47 @@ fiducial_app_test(fiducial_app_rejects_missing_camera 2 "^error: cannot open cam
   --source camera --device /dev/no-such-camera --display false
 )
 
+fiducial_app_test(fiducial_app_rejects_camera_info_for_scenes 2
+  "^error: --camera-info does not apply to synthetic scenes" --camera-info camera.yaml
+  --display false
+)
+fiducial_app_test(fiducial_app_rejects_missing_recording 2 "^error: .*index.csv"
+  --recording "${CMAKE_CURRENT_BINARY_DIR}/no_such_recording" --display false
+)
+
 # A run whose detections fail the ground-truth check: with a smallest marker size above the
 # scene's markers, none is found. It exits 1.
 fiducial_app_test(fiducial_app_failed_run 1 "missed=18 .*verdict=FAIL"
   --scene aruco --min-marker-px 400 --count 3 --period-ms 10 --display false
 )
 
-# A stop request ends the run early with its own verdict. (A shell starts background jobs
-# with SIGINT ignored, so the test sends SIGTERM.)
+# Real frames: every local recording in $HOLOSCAN_TEST_DATA/stereo-camera/ with a color camera
+# (rgb.yaml). They show no marker or board, so every backend must find none (no false
+# positives) and agree with the others frame by frame. Skipped (77) when the variable is unset;
+# failed when it is set but names no such recording.
+set(_none_found "aruco backend=cpu frames=[0-9]+/[0-9]+ markers=0 ")
+string(APPEND _none_found ".*aruco backend=cuda frames=[0-9]+/[0-9]+ markers=0 ")
+string(APPEND _none_found ".*charuco backend=cpu frames=[0-9]+/[0-9]+ markers=0 corners=0 ")
+string(APPEND _none_found ".*charuco backend=cuda frames=[0-9]+/[0-9]+ markers=0 corners=0 ")
+string(APPEND _none_found ".*aruco backends_agree=yes.*charuco backends_agree=yes.*verdict=PASS")
+add_test(
+  NAME fiducial_app_recordings
+  COMMAND
+    sh -c
+    "if [ -z \"$HOLOSCAN_TEST_DATA\" ]; then echo 'HOLOSCAN_TEST_DATA is not set; skipping'; exit 77; fi; n=0; for c in \"$HOLOSCAN_TEST_DATA\"/stereo-camera/*/rgb.yaml; do [ -f \"$c\" ] || continue; n=$((n+1)); \"$0\" -DEXPECT_EXIT=0 \"-DEXPECT_OUTPUT=$3\" -P \"$1\" -- \"$2\" --recording \"$(dirname \"$c\")\" --scene both --backend cpu,cuda --period-ms 10 --display false || exit 1; done; [ $n -gt 0 ] || { echo \"no recordings with rgb.yaml in $HOLOSCAN_TEST_DATA/stereo-camera\"; exit 1; }"
+    ${CMAKE_COMMAND} "${_run_and_match}" $<TARGET_FILE:fiducial_detection> "${_none_found}"
+)
+set_tests_properties(fiducial_app_recordings PROPERTIES SKIP_RETURN_CODE 77)
+
+# A stop request ends the run early with its own verdict, sent once the run has started (its
+# "running" line), however long the start takes.
 add_test(
   NAME fiducial_app_stopped
   COMMAND
     ${CMAKE_COMMAND} -DEXPECT_EXIT=1 "-DEXPECT_OUTPUT=frames=[0-9]+/1000 .*verdict=STOPPED" -P
-    "${_run_and_match}" -- sh -c
-    "\"$1\" --scene aruco --count 1000 --period-ms 10 --display false & sleep 3 && kill -TERM $! && wait $!"
-    sh $<TARGET_FILE:fiducial_detection>
+    "${_run_and_match}" -- sh "${CMAKE_CURRENT_SOURCE_DIR}/stop_when_running.sh"
+    "${CMAKE_CURRENT_BINARY_DIR}/fiducial_app_stopped.log" $<TARGET_FILE:fiducial_detection> --scene
+    aruco --count 1000 --period-ms 10 --display false
 )
 
 # Another thread running before main(), as under a profiler or a sanitizer: the run goes ahead

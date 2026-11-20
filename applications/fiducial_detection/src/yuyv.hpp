@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// YUYV 4:2:2 (the usual webcam format) to packed RGB8. Header-only and free of
-// any SDK, so its test runs anywhere.
+// YUYV 4:2:2 (the usual webcam format) to packed RGB8, for the camera source.
+// Header-only and free of any SDK.
 
 #pragma once
 

@@ -1,17 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// ReportOp: the demo's sink. Counts markers, chessboard corners and latencies, checks synthetic
-// frames against their ground truth, and requests completion once every reporter has seen its
-// expected frames.
+// ReportOp: the demo's sink. Counts markers, chessboard corners, latencies, CPU waits and
+// copies, checks synthetic frames against their ground truth, keeps each frame's results for
+// comparing backends, and requests completion once every reporter has seen its expected frames.
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <holoscan/core/errors.hpp>
@@ -26,6 +28,16 @@
 
 namespace fiducial_app {
 
+// What one frame's detections were: by the source's frame number, each marker's id and
+// corners and each chessboard corner's id and position, as the message carries them.
+struct FrameResult {
+  std::uint64_t device_sequence{};
+  std::vector<std::pair<int, std::array<float, 8>>> markers;
+  std::vector<std::pair<int, std::array<float, 2>>> corners;
+
+  friend bool operator==(const FrameResult&, const FrameResult&) = default;
+};
+
 // One detector's results. Written by its reporter during the run, read after it has stopped.
 struct Report {
   std::string backend;
@@ -34,14 +46,19 @@ struct Report {
   std::uint64_t corners{};  // Chessboard corners.
   std::uint64_t dropped{};
   std::uint32_t truncated_frames{};
-  std::vector<float> detect_ms;
+  std::vector<float> detect_ms;  // Every frame's but the first, which warms the detector up.
+  std::uint64_t host_waits{};    // Summed over the frames.
+  std::uint64_t copied_bytes{};
+  std::vector<FrameResult> results;  // With ReportConfig::keep_results.
   // Ground-truth checks, for synthetic frames.
   bool verified{};
   std::uint64_t expected{};  // Markers, or chessboard corners.
   std::uint64_t missed{};
   std::uint64_t extra{};      // Markers of no scene marker, or corners of no corner in view.
   std::uint64_t misplaced{};  // Found, but off by more than the limits below.
-  std::uint32_t frames_without_pose{};  // Boards whose pose was not found.
+  // Markers found without a pose, or boards whose pose was not found, though the camera is
+  // known: misses.
+  std::uint32_t without_pose{};
   double max_corner_px{};
   double sum_corner_px{};
   std::uint64_t measured_corners{};
@@ -49,7 +66,7 @@ struct Report {
   double max_rotation_deg{};
 
   [[nodiscard]] bool passed() const noexcept {
-    return !verified || (missed == 0 && extra == 0 && misplaced == 0 && frames_without_pose == 0);
+    return !verified || (missed == 0 && extra == 0 && misplaced == 0 && without_pose == 0);
   }
 };
 
@@ -69,6 +86,8 @@ struct ReportConfig {
   std::optional<SceneKind> truth;
   int width{};
   int height{};
+  // Keep every frame's results, to compare backends.
+  bool keep_results{};
 };
 
 class ReportOp final : public holoscan::Operator<> {
