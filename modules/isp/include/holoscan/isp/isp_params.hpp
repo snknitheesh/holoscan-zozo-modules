@@ -170,8 +170,13 @@ inline constexpr int kHistogramRed = 1;
 inline constexpr int kHistogramGreen = 2;
 inline constexpr int kHistogramBlue = 3;
 
-// The float32 statistics vector, kStatsSize entries.
+// The float32 statistics vector, kStatsSize entries, in layout kLayoutVersion.
+// The layout only grows: a later release of this major version may append
+// entries after the last one, and then raises kLayoutVersion and kStatsSize,
+// but never moves, removes or redefines an entry. A consumer reads the indices
+// below from a vector of at least kStatsSize entries, and ignores the rest.
 namespace stats {
+inline constexpr int kLayoutVersion = 1;
 inline constexpr int kMeanR = 0;  // Mean linear red, 0..1, before the tone curve.
 inline constexpr int kMeanG = 1;
 inline constexpr int kMeanB = 2;
