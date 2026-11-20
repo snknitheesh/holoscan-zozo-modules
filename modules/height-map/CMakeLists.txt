@@ -45,6 +45,11 @@ if(HOLOSCAN_HEIGHT_MAP_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The point cloud message HeightMapOp takes: in this build when the repository root added
+# holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::height_map: the two operators, their CUDA kernels, the views and the synthetic
 # terrain.
@@ -85,7 +90,10 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_height_map PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_height_map
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
 set_target_properties(
   holoscan_height_map
   PROPERTIES

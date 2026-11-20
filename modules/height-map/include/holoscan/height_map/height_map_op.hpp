@@ -5,14 +5,15 @@
 // map frame or following the sensor. See height_mapper.hpp for the method,
 // grid.hpp for the grid and grid_op.hpp for the outputs.
 //
-//   points             (input) float32 [N, 3] or organized [H, W, 3], packed,
-//                      in host, pinned or device memory on the operator's
-//                      GPU, in the sensor frame; a point with a non-finite
-//                      coordinate is invalid (holoscan-point-cloud's layout).
+//   point_cloud        (input) holoscan-messages' PointCloud: points float32
+//                      [N, 3] or organized [H, W, 3], packed, in host, pinned
+//                      or device memory on the operator's GPU, in the sensor
+//                      frame (header.frame_id); a point with a non-finite
+//                      coordinate is invalid. Its other fields are not used.
 //   pose               (input, with `pose_input`) float32 or float64 [4, 4],
 //                      row-major, host or device memory: the rigid transform
-//                      from the cloud's frame into the map frame, with the
-//                      cloud's capture time.
+//                      from the cloud's frame into the map frame, with exactly
+//                      the cloud's capture time (one pose per cloud).
 //   elevation          float32 [rows, cols], meters, NaN where unknown.
 //   variance           (outputs.variance) float32 [rows, cols], m^2.
 //   count              (outputs.count) float32 [rows, cols], the points of the
@@ -29,11 +30,19 @@
 //                      `frame_id` and the capture time.
 //
 // The operator runs once per cloud; with `pose_input`, when the pose with
-// exactly the same capture time has arrived. The map's time is the cloud's
-// capture time, or the activation time when it has none. Every output carries
-// the cloud's capture time and frame id; the layers are in device memory and
-// nothing waits for the GPU. Each output exists only when configured, and
-// every output that exists must be connected.
+// exactly the same capture time has arrived (a pose with no cloud of its
+// capture time is dropped, so a localization that runs at its own rate must
+// send the pose of each cloud's capture time). The map's time is the cloud's
+// capture time, or the activation time when it has none; every output
+// carries that time and the cloud's frame number. A cloud in another clock
+// domain than the first one's fails the run. The layers are in device memory.
+// The host waits for the GPU only to read a pose sent in device memory, and
+// for a host cloud's producer (see the README); each of those logs once.
+// Each output exists only when configured, and every output that exists must
+// be connected.
+//
+// Configuration is fixed at construction; there are no parameters to set
+// later, and no Python bindings.
 
 #pragma once
 
@@ -49,6 +58,7 @@
 #include <holoscan/core/temporal_contract.hpp>
 #include <holoscan/height_map/grid_op.hpp>
 #include <holoscan/height_map/height_mapper.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace holoscan::height_map {
@@ -70,13 +80,16 @@ struct HeightMapConfig {
   Transform sensor_pose;
   // The map frame's name, for the image header.
   std::string frame_id{"map"};
+  // The frame the clouds must be in (their header's frame_id); empty takes
+  // any. A cloud in another frame fails the run.
+  std::string cloud_frame_id;
   HeightMapOutputs outputs;
   // The elevation image's color range in meters; with image_low >=
   // image_high, each map's own.
   float image_low{0.0F};
   float image_high{0.0F};
   // Largest cloud accepted, 1..kMaxPointsLimit points; a larger one fails the
-  // frame. The default fits 1920x1080.
+  // run. The default fits 1920x1080.
   std::uint32_t max_points{1920U * 1080U};
 };
 
@@ -96,7 +109,7 @@ class HeightMapOp final : public GridOp {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  holoscan::Input<holoscan::Tensor> points;
+  holoscan::Input<holoscan::messages::schema::PointCloudT> point_cloud;
   holoscan::Input<holoscan::Tensor> pose;
   holoscan::Output<holoscan::Tensor> elevation;
   holoscan::Output<holoscan::Tensor> variance;

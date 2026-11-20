@@ -4,7 +4,7 @@
     "name": "holoscan-height-map",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "2.5D elevation maps of point clouds on the GPU, in holoscan-point-cloud's layout: a fixed-size grid, fixed in the map frame or following the sensor's pose cell by cell, with per-cell elevation (highest, mean, or a variance-weighted Kalman estimate integrated over time), variance, point count, lowest and highest point and time since update, height and range limits and a clearing and decay policy; and traversability from the elevation: slope and roughness from a local plane fit, step height, a 0 to 1 cost and an unknown mask; with color images of the elevation and cost for HoloViz.",
+    "description": "2.5D elevation maps of holoscan-messages' PointCloud messages on the GPU: a fixed-size grid, fixed in the map frame or following the sensor's pose cell by cell, with per-cell elevation (highest, mean, or a variance-weighted Kalman estimate integrated over time), variance, point count, lowest and highest point and time since update, height and range limits and a clearing and decay policy; and traversability from the elevation: slope and roughness from a local plane fit, step height, a 0 to 1 cost and an unknown mask; with color images of the elevation and cost for HoloViz.",
     "authors": [
       {
         "name": "zozo",
@@ -51,7 +51,11 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-height-map",
       "install_commands": [

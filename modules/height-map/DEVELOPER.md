@@ -31,10 +31,22 @@ hold a hyphen, so the headers, namespace and target say `height_map`.
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-height-map/holoscan-height-map-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-height-map)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-height-map`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
+| Debian package | `holoscan-height-map`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0, << 2)` |
+| Module dependencies | holoscan-messages 1.x (`module.dependencies`), whose `PointCloud` `HeightMapOp` takes; in the same build when the repository root adds it first, else installed |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
 | Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7.2, Jetson Orin with JetPack 7.2) |
-| Test labels | `height_map` and `gpu` on all |
+| Test labels | `height_map` on all; `gpu` on the suite's, `host` on the SDK-free ones, `benchmark` on the benchmark |
+
+## API and ABI
+
+The API is the installed headers' public types and functions: the two operators, their
+configuration structs (passed to the constructor, fixed for the operator's life; there are no
+parameters to set later, and no Python bindings) and ports, the kernels, the views and the synthetic
+terrain. `GridOp` is not: only the module's operators can derive from it. The library's soname is its
+major version (`libholoscan_height_map.so.1`), and the CMake package matches `SameMajorVersion`: a
+change that breaks the API or the ABI (a removed or renamed port, a field added to a configuration
+struct, a changed signature) takes the next major version. The library exports every symbol, as the
+collection's other modules do.
 
 ## Conventions
 
@@ -58,7 +70,8 @@ hold a hyphen, so the headers, namespace and target say `height_map`.
   them too.
 - An operator has an optional port only when configured: an unconnected input is never satisfied,
   and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
-  gone; it fails the frame, with an error that names the port.
+  gone; like any error `compute()` returns, it ends the run (`RunTermination::kFailed`), with an
+  error that names the port.
 - A new mapper or traversability option needs a case in `height_map_mapper` or
   `height_map_traversability` against a reference or the truth; a new port or behavior of an
   operator, a case in `height_map_operators`.

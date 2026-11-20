@@ -20,6 +20,7 @@
 #include <holoscan/height_map/views.hpp>
 #include <holoscan/logger/logger.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
+#include <holoscan/time/time_point.hpp>
 
 #include "device_buffer.hpp"
 #include "host_input.hpp"
@@ -58,7 +59,10 @@ struct HeightMapOp::Impl {
   detail::DeviceBuffer staging;  // Host clouds, copied to the GPU.
   detail::DeviceBuffer range;    // The image's automatic color range.
   bool logged_host_copy{};
+  bool logged_host_wait{};
   bool logged_pose_copy{};
+  // The clock domain of the first map's time; every later one must share it.
+  holoscan::ClockId clock{};
 };
 
 HeightMapOp::HeightMapOp(HeightMapConfig config)
@@ -71,11 +75,13 @@ HeightMapOp::~HeightMapOp() = default;
 
 void HeightMapOp::setup(holoscan::OperatorSpec& spec) {
   const std::uint64_t cells = config_.map.geometry.cells();
-  // Two slots per input: one cloud in compute() while the next one arrives.
-  spec.input(points, "points").queue_depth(2U);
+  // Two slots per input: one cloud in compute() while the next one arrives,
+  // so that a producer one frame ahead is not refused.
+  spec.input(point_cloud, "point_cloud").queue_depth(2U);
   // Optional ports exist only when configured: an unconnected input would
   // never be satisfied, and an emit into an unconnected output fails.
   if (config_.pose_input) {
+    // As many as the clouds: the pose and its cloud are taken together.
     spec.input(pose, "pose").queue_depth(2U);
   }
   const holoscan::TensorOutputSpec layer = layer_output(kFloat32, cells * sizeof(float));
@@ -102,18 +108,22 @@ void HeightMapOp::setup(holoscan::OperatorSpec& spec) {
 holoscan::Contract HeightMapOp::contract() const {
   holoscan::Contract result;
   if (!config_.pose_input) {
-    result.trigger(holoscan::OnEach{points});
+    result.trigger(holoscan::OnEach{point_cloud});
     return result;
   }
   // A cloud and its pose carry the same capture time.
   result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{points, pose}}, .window = 0ns});
-  result.input(points, holoscan::Exact{});
+      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{point_cloud, pose}},
+      .window = 0ns});
+  result.input(point_cloud, holoscan::Exact{});
   result.input(pose, holoscan::Exact{});
   return result;
 }
 
-void HeightMapOp::start() { impl_->mapper.reset(); }
+void HeightMapOp::start() {
+  impl_->mapper.reset();
+  impl_->clock = {};
+}
 
 void HeightMapOp::stop() {
   // Frees the map and the scratch; cudaFree waits for the work on the
@@ -123,7 +133,7 @@ void HeightMapOp::stop() {
 
 holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
     holoscan::ExecutionContext& context) {
-  auto sample = points.receive();
+  auto sample = point_cloud.receive();
   if (!sample) {
     return holoscan::make_unexpected(std::move(sample).error());
   }
@@ -137,18 +147,23 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
     return holoscan::make_unexpected(cuda_failure("cudaStreamGetDevice", status));
   }
 
-  // The cloud.
-  const holoscan::Tensor& tensor = sample->data;
-  const std::span<const std::int64_t> shape = tensor.shape_span();
-  if (!is_dtype(tensor.dtype(), kFloat32) || (shape.size() != 2 && shape.size() != 3) ||
-      shape.back() != 3) {
-    return holoscan::make_unexpected(invalid("points must be float32 [N, 3] or [H, W, 3]"));
+  // The cloud: the message's layout (its tensors present, packed, of one
+  // shape and in one memory), then what the kernels need of its points.
+  const holoscan::messages::schema::PointCloudT& cloud = sample->data;
+  if (auto checked = holoscan::messages::check_point_cloud(cloud); !checked) {
+    return holoscan::make_unexpected(invalid(checked.error().message));
   }
+  if (!config_.cloud_frame_id.empty()) {
+    const std::string frame = cloud.header ? cloud.header->frame_id : std::string();
+    if (frame != config_.cloud_frame_id) {
+      return holoscan::make_unexpected(invalid("the cloud is in frame '" + frame + "', not '" +
+                                               config_.cloud_frame_id + "'"));
+    }
+  }
+  const holoscan::Tensor& tensor = *cloud.points;
+  const std::span<const std::int64_t> shape = tensor.shape_span();
   std::uint64_t n = 1;
   for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) {
-    if (shape[axis] < 0) {
-      return holoscan::make_unexpected(invalid("points have a negative extent"));
-    }
     // Saturates instead of wrapping, so that a huge shape cannot pass for a small one.
     const auto extent = static_cast<std::uint64_t>(shape[axis]);
     n = extent != 0 && n > std::numeric_limits<std::uint64_t>::max() / extent
@@ -169,6 +184,10 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
   if (tensor.device().device_type == kDLCUDA && tensor.device().device_id != device) {
     return holoscan::make_unexpected(invalid("points are on another GPU than the operator"));
   }
+  // A producer that counted no valid point: nothing to bin, the map still ages.
+  if (cloud.valid_count == 0) {
+    n = 0;
+  }
   const auto point_count = static_cast<std::uint32_t>(n);
   const std::size_t bytes = std::size_t{point_count} * 3U * sizeof(float);
   const float* xyz = static_cast<const float*>(tensor.data());
@@ -177,6 +196,12 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
     // the operator's stream before compute(); plain host memory it does not,
     // so the host waits for its producer here.
     if (tensor.device().device_type == kDLCPU) {
+      if (!impl_->logged_host_wait) {
+        impl_->logged_host_wait = true;
+        HOLOSCAN_LOG_INFO(
+            "HeightMapOp: clouds arrive in pageable host memory; the host waits for their "
+            "producer before copying each one");
+      }
       if (auto ready = tensor.synchronize_for_host(); !ready) {
         return holoscan::make_unexpected(std::move(ready).error());
       }
@@ -251,13 +276,28 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
     }
   }
 
-  // The map.
-  const holoscan::SampleMetadata& metadata = sample->metadata;
-  const std::int64_t stamp = metadata.source_clock_id.valid()
-                                 ? metadata.capture_timestamp_ns
-                                 : context.activation_time().timestamp_ns;
+  // The map's time: the cloud's capture time, or for a cloud without one the
+  // activation time, which the outputs then carry as their capture time, so
+  // that a consumer aligning them by capture time still can. Every map's
+  // time must be in the first one's clock domain, or the ageing would mix
+  // two time bases.
+  holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*sample);
+  if (!emit.capture_time) {
+    emit.capture_time = context.activation_time();
+  }
+  const holoscan::TimePoint map_time = *emit.capture_time;
+  if (!map_time.valid()) {
+    return holoscan::make_unexpected(invalid("the cloud has no capture time, nor the activation"));
+  }
+  if (!impl_->clock.valid()) {
+    impl_->clock = map_time.clock_id;
+  } else if (map_time.clock_id != impl_->clock) {
+    return holoscan::make_unexpected(
+        invalid("the cloud's time is in another clock domain than the first cloud's (a cloud "
+                "without a capture time among clouds with one?)"));
+  }
   if (const cudaError_t status =
-          impl_->mapper.update(xyz, point_count, sensor_to_map, stamp, stream);
+          impl_->mapper.update(xyz, point_count, sensor_to_map, map_time.timestamp_ns, stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("map update", status));
   }
@@ -314,7 +354,6 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
     }
   }
 
-  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*sample);
   if (auto sent = send(out_elevation, elevation, "elevation", emit); !sent) {
     return sent;
   }

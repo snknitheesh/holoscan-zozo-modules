@@ -6,8 +6,13 @@
 // `map_info` (float64 [kMapInfoSize] in host memory) and optionally a color
 // image for HoloViz, every one with the capture time and frame id of the
 // input it was made from. The base gets the operator's CUDA stream,
-// allocates, commits and emits the outputs; a refused emit fails the frame
-// with an error that names the port.
+// allocates, commits and emits the outputs; a refused emit, like any error
+// that compute() returns, ends the run (RunTermination::kFailed) with an
+// error that names the port.
+//
+// GridOp is the module's own base: only HeightMapOp and TraversabilityOp can
+// derive from it (its constructor is theirs alone), so its protected helpers
+// are not part of the module's API and may change in any release.
 
 #pragma once
 
@@ -42,11 +47,19 @@ inline constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 [[nodiscard]] holoscan::expected<MapGeometry, holoscan::Error> read_map_info(
     const holoscan::Tensor& tensor, cudaStream_t stream);
 
+class HeightMapOp;
+class TraversabilityOp;
+
 class GridOp : public holoscan::Operator<> {
  public:
   ~GridOp() override = default;
   GridOp(const GridOp&) = delete;
   GridOp& operator=(const GridOp&) = delete;
+
+ private:
+  friend class HeightMapOp;
+  friend class TraversabilityOp;
+  explicit GridOp(std::string name) : name_(std::move(name)) {}
 
  protected:
   // A device output being written: allocate() makes it, send() emits it.
@@ -59,8 +72,6 @@ class GridOp : public holoscan::Operator<> {
       return writer ? writer->data_as<T>() : nullptr;
     }
   };
-
-  explicit GridOp(std::string name) : name_(std::move(name)) {}
 
   // The stream the runtime gives the operator for its device outputs.
   [[nodiscard]] holoscan::expected<cudaStream_t, holoscan::Error> stream_of(

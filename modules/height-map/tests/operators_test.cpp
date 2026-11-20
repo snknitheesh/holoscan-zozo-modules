@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The two operators through the SDK's operator test harness, on clouds of the
-// synthetic terrain made at test time: organized and unorganized clouds in
-// host and device memory, with a configured pose and with poses as an input
-// (float32 and float64, host and device), fixed and following windows, every
-// output checked bit for bit against HeightMapper and
-// compute_traversability() run directly; map_info; the images and their
-// headers; the capture time and frame id carried to every output; an empty
-// cloud; and the rejection of unusable inputs and settings.
+// synthetic terrain made at test time, sent as holoscan-messages' PointCloud:
+// organized and unorganized clouds in device, pinned host and pageable host
+// memory, with a configured pose and with poses as an input (float32 and
+// float64, host and device), fixed and following windows, every output
+// checked bit for bit against HeightMapper and compute_traversability() run
+// directly; map_info; the images and their headers; the capture time and
+// frame id carried to every output; an empty cloud, a cloud without a capture
+// time (the outputs then carry the activation time) and a cloud whose
+// producer counted no valid point; and the rejection of unusable inputs (a
+// cloud that is not packed or is in the wrong frame among them) and settings.
 
 #include <cuda_runtime_api.h>
 
@@ -31,9 +34,12 @@
 #include <holoscan/height_map/traversability_op.hpp>
 #include <holoscan/height_map/views.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
+#include <holoscan/messages/conversion.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 
+#include "tensor_checks.hpp"
 #include "terrain_support.hpp"
 #include "test_support.hpp"
 
@@ -42,16 +48,20 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 namespace ht = holoscan::testing;
+namespace msg = holoscan::messages;
+using holoscan::MemoryStorageType;
 
 constexpr std::size_t kCaptures = 8;
+constexpr const char* kSensorFrame = "sensor_optical";
 
-// A tensor of `shape` holding `size` bytes from `bytes`, in host or device memory.
+// A tensor of `shape` holding `size` bytes from `bytes`, in `memory`: device,
+// pinned host (kHost) or pageable host (kSystem) memory; `byte_strides` when
+// given.
 holoscan::Tensor make(const std::vector<std::int64_t>& shape, DLDataType dtype, const void* bytes,
-                      std::size_t size, bool device) {
-  auto tensor = holoscan::make_tensor(
-      shape, dtype, std::nullopt,
-      device ? holoscan::MemoryStorageType::kDevice : holoscan::MemoryStorageType::kHost,
-      std::make_shared<holoscan::UnboundedAllocator>());
+                      std::size_t size, MemoryStorageType memory,
+                      std::optional<std::vector<std::int64_t>> byte_strides = std::nullopt) {
+  auto tensor = holoscan::make_tensor(shape, dtype, byte_strides, memory,
+                                      std::make_shared<holoscan::UnboundedAllocator>());
   if (!tensor) {
     throw std::runtime_error(tensor.error().message);
   }
@@ -63,6 +73,35 @@ holoscan::Tensor make(const std::vector<std::int64_t>& shape, DLDataType dtype, 
     throw std::runtime_error("cudaMemcpy failed");
   }
   return std::move(*tensor);
+}
+
+holoscan::Tensor make(const std::vector<std::int64_t>& shape, DLDataType dtype, const void* bytes,
+                      std::size_t size, bool device) {
+  return make(shape, dtype, bytes, size,
+              device ? MemoryStorageType::kDevice : MemoryStorageType::kHost);
+}
+
+// The PointCloud message of `points`, float32 [N, 3] or [H, W, 3], in frame
+// `frame`; its absent fields [0] in the same memory.
+msg::schema::PointCloudT cloud_message(holoscan::Tensor points, MemoryStorageType memory,
+                                       const std::string& frame = kSensorFrame,
+                                       std::int64_t valid_count = -1) {
+  msg::schema::PointCloudT message;
+  message.header =
+      std::make_shared<holoscan::schema::HeaderT>(msg::to_message(msg::Header{.frame_id = frame}));
+  message.organized = points.ndim() == 3;
+  message.points = std::make_shared<holoscan::Tensor>(std::move(points));
+  message.colors = std::make_shared<holoscan::Tensor>(make({0}, kUInt8, nullptr, 0, memory));
+  message.normals = std::make_shared<holoscan::Tensor>(make({0}, kFloat32, nullptr, 0, memory));
+  message.intensity = std::make_shared<holoscan::Tensor>(make({0}, kFloat32, nullptr, 0, memory));
+  message.valid_count = valid_count;
+  return message;
+}
+
+const char* memory_name(MemoryStorageType memory) {
+  return memory == MemoryStorageType::kDevice ? "device"
+         : memory == MemoryStorageType::kHost ? "pinned"
+                                              : "pageable";
 }
 
 std::chrono::nanoseconds capture_time(std::uint32_t frame) {
@@ -129,7 +168,9 @@ const std::vector<std::string> kLayerPorts{
 void check_height_map_op() {
   const std::vector<Frame> frames = course_frames(3);
   for (const MapMode mode : {MapMode::kFixed, MapMode::kFollow}) {
-    for (const bool device : {true, false}) {
+    for (const MemoryStorageType memory :
+         {MemoryStorageType::kDevice, MemoryStorageType::kHost, MemoryStorageType::kSystem}) {
+      const bool device = memory == MemoryStorageType::kDevice;
       for (const bool organized : {false, true}) {
         // 0: configured pose; 1: float64 host pose; 2: float32 device pose.
         for (const int pose_kind : {0, 1, 2}) {
@@ -139,7 +180,7 @@ void check_height_map_op() {
             config.sensor_pose = frames[0].pose;
           }
           const std::string name = std::string(mode == MapMode::kFixed ? "fixed" : "follow") +
-                                   (device ? " device" : " host") +
+                                   " " + memory_name(memory) +
                                    (organized ? " organized" : " unorganized") + " pose " +
                                    std::to_string(pose_kind);
           auto h = ht::create_operator_test<HeightMapOp>(config);
@@ -149,11 +190,19 @@ void check_height_map_op() {
             // Organized: one row of points.
             const std::vector<std::int64_t> shape =
                 organized ? std::vector<std::int64_t>{1, n, 3} : std::vector<std::int64_t>{n, 3};
-            holoscan::Tensor points = make(shape, kFloat32, xyz.data(), xyz.size() * 4, device);
+            holoscan::Tensor points = make(shape, kFloat32, xyz.data(), xyz.size() * 4, memory);
+            if (f == 0) {
+              // The memory each case means to test.
+              const DLDeviceType want = device                              ? kDLCUDA
+                                        : memory == MemoryStorageType::kHost ? kDLCUDAHost
+                                                                             : kDLCPU;
+              VERIFY_MSG(points.device().device_type == want, name + ": the cloud's memory");
+            }
+            msg::schema::PointCloudT cloud = cloud_message(std::move(points), memory);
             if (pose_kind == 0) {
-              auto sample = ht::sample_at(points, capture_time(f));
+              auto sample = ht::sample_at(std::move(cloud), capture_time(f));
               sample.metadata.frame_id = 7U + f;
-              h.push_samples("points", {std::move(sample)});
+              h.push_samples("point_cloud", {std::move(sample)});
               continue;
             }
             const Transform& p = frames[f].pose;
@@ -163,11 +212,11 @@ void check_height_map_op() {
             holoscan::Tensor matrix = pose_kind == 1
                                           ? make({4, 4}, kFloat64, m64.data(), 128, false)
                                           : make({4, 4}, kFloat32, m32.data(), 64, true);
-            h.push_frame(ht::frame_at(capture_time(f), ht::input("points", points),
+            h.push_frame(ht::frame_at(capture_time(f), ht::input("point_cloud", std::move(cloud)),
                                       ht::input("pose", matrix)));
           }
           if (device) {
-            h.input_source_device("points", holoscan::DeviceId{0});
+            h.input_source_device("point_cloud", holoscan::DeviceId{0});
           }
           if (pose_kind == 2) {
             h.input_source_device("pose", holoscan::DeviceId{0});
@@ -265,14 +314,18 @@ void check_height_map_op() {
   }
 }
 
-// Only the configured outputs exist; an empty cloud gives an unknown map.
+// Only the configured outputs exist; an empty cloud gives an unknown map. The
+// cloud has no capture time: the outputs carry the activation time instead,
+// so that a consumer aligning them by capture time still can.
 void check_minimal_outputs() {
   HeightMapConfig config;
   config.outputs = HeightMapOutputs{.variance = false};
   config.map.geometry = MapGeometry{.resolution = 0.1F, .rows = 10, .cols = 12};
+  config.cloud_frame_id = kSensorFrame;
   auto h = ht::create_operator_test<HeightMapOp>(config);
-  h.push("points", make({0, 3}, kFloat32, nullptr, 0, true));
-  h.input_source_device("points", holoscan::DeviceId{0});
+  h.push("point_cloud", cloud_message(make({0, 3}, kFloat32, nullptr, 0, true),
+                                      MemoryStorageType::kDevice));
+  h.input_source_device("point_cloud", holoscan::DeviceId{0});
   h.output_device("elevation", holoscan::DeviceId{0});
   h.capture_snapshot<holoscan::Tensor>("elevation", kCaptures);
   h.capture_snapshot<holoscan::Tensor>("map_info", kCaptures);
@@ -284,12 +337,44 @@ void check_minimal_outputs() {
   const auto elevation = result.snapshots<holoscan::Tensor>("elevation");
   VERIFY(elevation.size() == 1);
   if (!elevation.empty()) {
+    VERIFY_MSG(elevation[0].sample_metadata().source_clock_id.valid(),
+               "an unstamped cloud's map carries the activation time");
     const std::vector<float> values = floats(elevation[0]);
     VERIFY(values.size() == 120U &&
            std::all_of(values.begin(), values.end(), [](float v) { return std::isnan(v); }));
   }
   const auto info = result.snapshots<holoscan::Tensor>("map_info");
   VERIFY(info.size() == 1 && doubles(info[0]) == (std::vector<double>{-5.0, -5.0, 0.1F, 10, 12}));
+  if (!info.empty()) {
+    VERIFY(info[0].sample_metadata().source_clock_id.valid());
+  }
+}
+
+// A producer that counted no valid point: the map takes none of the points
+// it carries, and is unknown.
+void check_no_valid_points() {
+  HeightMapConfig config;
+  config.outputs = HeightMapOutputs{.variance = false};
+  config.map.geometry = MapGeometry{.resolution = 0.1F, .rows = 10, .cols = 12};
+  const std::vector<float> xyz(30, 0.0F);
+  auto h = ht::create_operator_test<HeightMapOp>(config);
+  h.push_at("point_cloud",
+            cloud_message(make({10, 3}, kFloat32, xyz.data(), xyz.size() * 4, true),
+                          MemoryStorageType::kDevice, kSensorFrame, 0),
+            100ms);
+  h.input_source_device("point_cloud", holoscan::DeviceId{0});
+  h.output_device("elevation", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::Tensor>("elevation", kCaptures);
+  h.capture_snapshot<holoscan::Tensor>("map_info", kCaptures);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), "no valid points: " + result.describe_failure());
+  const auto elevation = result.snapshots<holoscan::Tensor>("elevation");
+  VERIFY(elevation.size() == 1);
+  if (!elevation.empty()) {
+    const std::vector<float> values = floats(elevation[0]);
+    VERIFY_MSG(std::all_of(values.begin(), values.end(), [](float v) { return std::isnan(v); }),
+               "valid_count 0: every cell unknown");
+  }
 }
 
 void check_traversability_op() {
@@ -398,31 +483,76 @@ void check_rejects(const Config& config, const std::vector<std::string>& inputs,
              "failure names '" + what + "': " + result.describe_failure());
 }
 
+// The operators' packing check, which the harness cannot reach (it stages
+// only packed tensors; holoscan-messages' tests send a cloud with gaps
+// through a graph): any stride on an axis of extent 1, none elsewhere.
+void check_packed() {
+  const std::vector<float> values(12, 1.0F);
+  const auto device = MemoryStorageType::kDevice;
+  VERIFY(detail::packed(make({4, 3}, kFloat32, values.data(), 48, device)));
+  // Points 24 bytes apart, a gap of 12 after each: 36 bytes hold both.
+  VERIFY(!detail::packed(make({2, 3}, kFloat32, values.data(), 36, device,
+                              std::vector<std::int64_t>{24, 4})));
+  VERIFY(!detail::packed(make({3, 2}, kFloat32, values.data(), 24, device,
+                              std::vector<std::int64_t>{4, 12})));
+  // One row: its stride is never stepped along.
+  VERIFY(detail::packed(make({1, 4, 3}, kFloat32, values.data(), 48, device,
+                             std::vector<std::int64_t>{4096, 12, 4})));
+}
+
+// HeightMapOp refuses `cloud` (and `pose`, with `pose_input`), naming `what`.
+void check_map_rejects(const HeightMapConfig& config, msg::schema::PointCloudT cloud,
+                       std::optional<holoscan::Tensor> pose, const std::string& what) {
+  auto h = ht::create_operator_test<HeightMapOp>(config);
+  const bool device = cloud.points->device().device_type == kDLCUDA;
+  if (pose) {
+    h.push_frame(ht::frame_at(100ms, ht::input("point_cloud", std::move(cloud)),
+                              ht::input("pose", *pose)));
+  } else {
+    h.push_at("point_cloud", std::move(cloud), 100ms);
+  }
+  if (device) {
+    h.input_source_device("point_cloud", holoscan::DeviceId{0});
+  }
+  for (const char* output : {"elevation", "variance"}) {
+    h.output_device(output, holoscan::DeviceId{0});
+  }
+  const auto result = h.run();
+  VERIFY_MSG(!result.ok(), what + " is rejected");
+  VERIFY_MSG(result.describe_failure().find(what) != std::string::npos,
+             "failure names '" + what + "': " + result.describe_failure());
+}
+
 void check_rejected_inputs() {
   const std::vector<float> xyz(12, 1.0F);
   const std::vector<double> xyz64(12, 1.0);
-  const std::vector<std::string> map_outputs{"elevation", "variance"};
   const HeightMapConfig config;
-  const std::string shape = "points must be float32 [N, 3] or [H, W, 3]";
-  check_rejects<HeightMapOp>(config, {"points"}, {make({4, 3}, kFloat64, xyz64.data(), 96, false)},
-                             map_outputs, shape);
-  check_rejects<HeightMapOp>(config, {"points"}, {make({3, 4}, kFloat32, xyz.data(), 48, true)},
-                             map_outputs, shape);
+  const auto device = MemoryStorageType::kDevice;
+  const auto points = [&](const std::vector<std::int64_t>& shape) {
+    return make(shape, kFloat32, xyz.data(), 48, device);
+  };
+  const std::string shape = "point_cloud.points must be float32";
+  check_map_rejects(config,
+                    cloud_message(make({4, 3}, kFloat64, xyz64.data(), 96, device), device),
+                    std::nullopt, shape);
+  check_map_rejects(config, cloud_message(points({3, 4}), device), std::nullopt, shape);
   HeightMapConfig small = config;
   small.max_points = 3;
-  check_rejects<HeightMapOp>(small, {"points"}, {make({4, 3}, kFloat32, xyz.data(), 48, true)},
-                             map_outputs, "exceed the configured maximum of 3");
+  check_map_rejects(small, cloud_message(points({4, 3}), device), std::nullopt,
+                    "exceed the configured maximum of 3");
+  HeightMapConfig framed = config;
+  framed.cloud_frame_id = "lidar";
+  check_map_rejects(framed, cloud_message(points({4, 3}), device), std::nullopt,
+                    "the cloud is in frame '" + std::string(kSensorFrame) + "', not 'lidar'");
   HeightMapConfig posed = config;
   posed.pose_input = true;
   std::vector<double> sheared{1, 0.5, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-  check_rejects<HeightMapOp>(posed, {"points", "pose"},
-                             {make({4, 3}, kFloat32, xyz.data(), 48, true),
-                              make({4, 4}, kFloat64, sheared.data(), 128, false)},
-                             map_outputs, "pose is not a rigid transform");
-  check_rejects<HeightMapOp>(posed, {"points", "pose"},
-                             {make({4, 3}, kFloat32, xyz.data(), 48, true),
-                              make({3, 4}, kFloat64, sheared.data(), 96, false)},
-                             map_outputs, "pose must be float32 or float64 [4, 4]");
+  check_map_rejects(posed, cloud_message(points({4, 3}), device),
+                    make({4, 4}, kFloat64, sheared.data(), 128, false),
+                    "pose is not a rigid transform");
+  check_map_rejects(posed, cloud_message(points({4, 3}), device),
+                    make({3, 4}, kFloat64, sheared.data(), 96, false),
+                    "pose must be float32 or float64 [4, 4]");
 
   const std::vector<float> layer(12, 0.0F);
   const std::vector<double> info{0.0, 0.0, 0.1, 3.0, 4.0};
@@ -487,8 +617,10 @@ int main() {
   return holoscan::height_map::test::run({
       TestCase{"HeightMapOp", hm::check_height_map_op},
       TestCase{"HeightMapOp minimal outputs, empty cloud", hm::check_minimal_outputs},
+      TestCase{"HeightMapOp cloud without valid points", hm::check_no_valid_points},
       TestCase{"TraversabilityOp", hm::check_traversability_op},
       TestCase{"rejected inputs", hm::check_rejected_inputs},
+      TestCase{"packed tensors", hm::check_packed},
       TestCase{"rejected settings", hm::check_rejected_configs},
   });
 }

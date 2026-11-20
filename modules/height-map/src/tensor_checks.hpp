@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <span>
 
+#include <holoscan/core/domain/tensor.hpp>
+
 namespace holoscan::height_map::detail {
 
 inline bool is_dtype(const DLDataType& dtype, const DLDataType& expected) {

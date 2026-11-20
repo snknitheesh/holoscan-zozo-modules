@@ -11,9 +11,11 @@ obstacle stands, and where a robot can drive, from a depth camera's or a lidar's
 - `TraversabilityOp` turns the elevation into slope and roughness (a local plane fit), step height
   and a 0 to 1 cost, with an unknown mask.
 
-Both can emit color images of their layers for HoloViz. The
-[Height Map demo](../../applications/height_map/) runs both end to end after holoscan-point-cloud's
-`DepthToPointCloudOp`, on a synthetic depth camera driving over a course.
+Both can emit color images of their layers for HoloViz. The clouds are
+[holoscan-messages](../messages/)' `PointCloud` messages, so any producer of them connects directly,
+such as holoscan-point-cloud's `DepthToPointCloudOp`. The
+[Height Map demo](../../applications/height_map/) runs both end to end after it, on a synthetic
+depth camera driving over a course.
 
 | | |
 | --- | --- |
@@ -24,6 +26,9 @@ Both can emit color images of their layers for HoloViz. The
 | Debian package | `holoscan-height-map` |
 | Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7.2, Jetson Orin with JetPack 7.2) |
 
+Each operator takes its configuration struct in its constructor and keeps it for its life; there
+are no parameters to set later, and no Python bindings.
+
 ## The grid
 
 A map is `rows` x `cols` square cells of `resolution` meters in the map frame's x-y plane, z up.
@@ -33,25 +38,37 @@ Cell `(row, col)` covers x in `[origin_x + col * resolution, ... + resolution)` 
 `[rows, cols]`, row-major, NaN where the cell is unknown.
 
 With every map goes `map_info`, float64 `[5]` in host memory: `origin_x`, `origin_y`, `resolution`,
-`rows`, `cols` (`kInfoOriginX` .. `kInfoCols` in `grid.hpp`). The map's time is the sample's
-capture time, which every output carries with the cloud's frame id; the map frame's name is the
+`rows`, `cols` (`kInfoOriginX` .. `kInfoCols` in `grid.hpp`). The map's time is the cloud's
+capture time, which every output carries with the cloud's frame number; the map frame's name is the
 operators' `frame_id`, written with the capture time into the color images' headers.
 
 ## The cloud
 
-The operators take clouds in the layout of [holoscan-point-cloud](../point-cloud/):
-`DepthToPointCloudOp`'s `point_cloud` connects to `HeightMapOp` directly. The module does not depend
-on holoscan-point-cloud; the layout is the contract.
+`HeightMapOp` takes [holoscan-messages](../messages/)' `PointCloud` (`schema::PointCloudT`), as
+holoscan-point-cloud's `DepthToPointCloudOp` and holoscan-pcl-filters' operators send it, and checks
+each one with `check_point_cloud()`. It uses the points only; colors, normals and intensity may be
+there or not.
 
 | Port | Type | |
 | --- | --- | --- |
-| `points` (input) | `holoscan::Tensor` | float32 `[N, 3]`, or organized `[H, W, 3]`, packed; in host, pinned or device memory on the operator's GPU, in the sensor's frame. A point with a non-finite coordinate (NaN, as `DepthToPointCloudOp` writes) is invalid |
-| `pose` (input, with `pose_input`) | `holoscan::Tensor` | float32 or float64 `[4, 4]`, row-major, in host (preferred) or device memory: the rigid transform from the cloud's frame into the map frame, with the cloud's capture time |
+| `point_cloud` (input) | `holoscan::messages::schema::PointCloudT` | Points float32 `[N, 3]`, or organized `[H, W, 3]`, packed; in host, pinned or device memory on the operator's GPU, in the sensor's frame (`header.frame_id`, which must be `cloud_frame_id` when that is set). A point with a non-finite coordinate (NaN, as `DepthToPointCloudOp` writes) is invalid. A `valid_count` of 0 adds no point |
+| `pose` (input, with `pose_input`) | `holoscan::Tensor` | float32 or float64 `[4, 4]`, row-major, in host (preferred) or device memory: the rigid transform from the cloud's frame into the map frame, with exactly the cloud's capture time |
+
+With `pose_input`, each cloud is taken with the pose of the same capture time: send one pose per
+cloud, stamped with the cloud's capture time. A pose stream at its own rate (a localization at
+100 Hz beside a camera at 30 Hz) matches no cloud, its poses are dropped, and no map comes out;
+interpolate the pose at each cloud's capture time before the operator.
+
+A cloud without a capture time is mapped at the activation time, which its outputs then carry as
+their capture time, so that `TraversabilityOp` and other consumers can still align them. Every
+cloud's time must be in the first one's clock domain; one that is not (a cloud without a capture
+time after clouds with one) fails the run.
 
 Every layer is in device memory. An output that exists must be connected, and an optional port
 exists only when configured. Clouds in host memory are copied to the GPU through a staging buffer,
 and a pose in device memory is read back with a wait; each logs once. An operator cannot send a
-refused output again: a refused emit fails the frame, with an error that names the port.
+refused output again: a refused emit, like any other error in `compute()`, ends the run with
+`RunTermination::kFailed` and an error that names the port.
 
 ## Operators
 
@@ -91,9 +108,8 @@ Each cloud, on the GPU, without the host waiting:
 | `elevation_image` (`outputs.image`) | `holoscan::schema::ImageT` | RGB8 `[rows, cols, 3]`, the elevation in a rainbow from `image_low` (dark blue) to `image_high` (red) meters, or each map's own range when `image_low >= image_high`; unknown cells dark gray |
 
 The operator runs once per cloud; with `pose_input`, when the pose with exactly the same capture time
-has arrived. Without it, `sensor_pose` takes every cloud into the map frame. The map's time is the
-cloud's capture time, or the activation time when it has none. The outputs go out in the order
-above.
+has arrived (see [The cloud](#the-cloud)). Without it, `sensor_pose` takes every cloud into the map
+frame. The outputs go out in the order above.
 
 `HeightMapConfig::map` is a `HeightMapParams`:
 
@@ -113,9 +129,9 @@ above.
 | `variance_growth` | 0 | `kFused`: variance added per second, m^2/s |
 | `max_variance` | 0 | `kFused`: clear cells whose variance exceeds this, m^2; 0 never |
 
-and `pose_input` (`false`), `sensor_pose` (identity), `frame_id` (`"map"`), `outputs`, `image_low`
-and `image_high` (`0`, `0`: automatic) and `max_points` (`2073600`, 1920x1080: the largest cloud
-accepted).
+and `pose_input` (`false`), `sensor_pose` (identity), `frame_id` (`"map"`), `cloud_frame_id` (empty:
+any frame), `outputs`, `image_low` and `image_high` (`0`, `0`: automatic) and `max_points`
+(`2073600`, 1920x1080: the largest cloud accepted).
 
 ### `TraversabilityOp`
 
@@ -162,7 +178,7 @@ usually lethal by its slope before its height reaches `max_step`, unless `max_sl
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
-find_package(holoscan-height-map 1.0 REQUIRED CONFIG)
+find_package(holoscan-height-map 1.0 REQUIRED CONFIG)  # Finds holoscan-messages 1.x too.
 target_link_libraries(my_app PRIVATE holoscan::height_map)
 ```
 
@@ -176,13 +192,14 @@ hm::HeightMapConfig map;
 map.map.geometry = {.resolution = 0.04F, .rows = 200, .cols = 200, .origin_x = 0.0, .origin_y = 0.0};
 map.map.mode = hm::MapMode::kFollow;
 map.pose_input = true;
+map.cloud_frame_id = "camera_optical";
 map.max_points = 640 * 480;
 auto mapper = graph.op<hm::HeightMapOp>("height_map", map);
 auto traversability = graph.op<hm::TraversabilityOp>(
     "traversability", hm::TraversabilityConfig{.max_rows = 200, .max_cols = 200});
 
-graph.add_flow(deproject->point_cloud, mapper->points);  // DepthToPointCloudOp
-graph.add_flow(localization->pose, mapper->pose);        // float64 [4, 4], camera to map
+graph.add_flow(deproject->point_cloud, mapper->point_cloud);  // DepthToPointCloudOp
+graph.add_flow(localization->pose, mapper->pose);  // float64 [4, 4], camera to map, per cloud
 graph.add_flow(mapper->elevation, traversability->elevation);
 graph.add_flow(mapper->map_info, traversability->map_info);
 graph.add_flow(mapper->variance, planner->variance);
@@ -200,9 +217,11 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
     .operator_path = "height_map", .output_port = "elevation", .device = holoscan::DeviceId{0}});
 ```
 
-A lossless (`kBlocking`) edge whose queue is full fails the frame. Keep the producer at most one
-frame ahead of the slowest consumer, as the demo's camera does, or connect consumers that only need
-the newest map, such as HoloViz, with `QueuePolicy::kDropOldest`.
+A graph whose every map must arrive, with lossless (`kBlocking`) edges, runs on one worker:
+`graph.partition("my_app").include_all()`, as holoscan-messages' README explains in
+[Run a graph on one worker](../messages/README.md#run-a-graph-on-one-worker); the demo and the
+installed consumer check that their plan has one worker. Connect consumers that only need the newest
+map, such as HoloViz, with `QueuePolicy::kDropOldest` and depth 1.
 
 The kernels need no Holoscan graph: `HeightMapper` in `<holoscan/height_map/height_mapper.hpp>`
 and `compute_traversability()` in `<holoscan/height_map/traversability.hpp>` work on device
@@ -259,6 +278,7 @@ with the known cells.
 
 - Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13 (with its CUB), CMake 4.0
   or later and a C++20 compiler.
+- [holoscan-messages](../messages/) 1.x, installed or in the same build.
 
 The module downloads nothing and needs no models or data.
 
@@ -285,13 +305,14 @@ The tests, all on synthetic clouds made at test time:
 | --- | --- | --- |
 | `height_map_mapper` | GPU | `HeightMapper`: flat ground, a ramp, steps, a box and a pit, with and without noise, per cell against the analytic heights; counts and unknown cells; height and range limits; the moving window; temporal fusion; clearing, ageing, variance growth and the gate (a box appearing, a pit appearing); the CPU reference, bit for bit; determinism with 750k points; a depth camera over the course; empty, all-NaN, infinite, out-of-grid and clipped clouds, a single point; rejected settings |
 | `height_map_traversability` | GPU | `compute_traversability()`: flat ground, ramps of known slopes (the cost rising with the slope), steps of known heights, a box and a pit, the unknown mask (holes, a lone cell, collinear cells), a mapped noisy ramp, the CPU reference, determinism; the color views; rejected settings |
-| `height_map_operators` | GPU | Both operators through the SDK's operator test harness: organized and unorganized clouds in host and device memory, a configured pose and poses as an input (float32 and float64, host and device), fixed and following windows, every output bit for bit against the kernels run directly; `map_info`; the images and their headers; capture time and frame id; an empty cloud; rejected inputs and settings |
+| `height_map_operators` | GPU | Both operators through the SDK's operator test harness: `PointCloud` messages, organized and unorganized, in device, pinned host and pageable host memory, a configured pose and poses as an input (float32 and float64, host and device), fixed and following windows, every output bit for bit against the kernels run directly; `map_info`; the images and their headers; capture time and frame number; an empty cloud, a cloud without a capture time, a cloud with no valid point; rejected inputs (wrong layouts, a cloud in another frame, too many points, unusable poses and map_info) and settings; the packing check |
 | `height_map_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: host-memory clouds of a box on flat ground with a moving pose, through both
-operators, checking the box's height, its lethal rim, the free ground and the moving window. Build
-it with the install prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
+installed package: `PointCloud` messages in host memory of a box on flat ground with a moving pose,
+through both operators on one worker (it fails unless the plan has one), checking the box's height,
+its lethal rim, the free ground and the moving window. Build it with the install prefix on
+`CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
 
@@ -304,8 +325,9 @@ holoscan --project-root modules/height-map package holoscan-height-map --languag
 
 `--language cpp` selects the module rather than its package entry, which has the same name. This
 builds for every major GPU architecture and writes `holoscan-height-map_1.0.0_<arch>.deb` to the
-current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
-`apt install ./holoscan-height-map_1.0.0_<arch>.deb` needs NVIDIA's CUDA repository.
+current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)` and
+`holoscan-messages` 1.x, so `apt install ./holoscan-height-map_1.0.0_<arch>.deb` needs NVIDIA's
+CUDA repository and the holoscan-messages package.
 
 ## Licenses
 

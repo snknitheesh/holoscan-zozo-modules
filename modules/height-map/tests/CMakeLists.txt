@@ -21,6 +21,8 @@ target_link_libraries(
 )
 
 add_executable(height_map_operators_test operators_test.cpp)
+# The operators' private tensor checks.
+target_include_directories(height_map_operators_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(
   height_map_operators_test
   PRIVATE holoscan::height_map holoscan::testing height_map_test_flags
