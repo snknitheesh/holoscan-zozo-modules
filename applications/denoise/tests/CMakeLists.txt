@@ -46,6 +46,9 @@ denoise_app_test(denoise_app_1080p 0 "verdict=PASS"
 )
 if(holoscan-denoise_WITH_VPI)
   denoise_app_test(denoise_app_vpi 0 "backend=vpi.*verdict=PASS" ${_fast} --backend vpi)
+  denoise_app_test(denoise_app_vpi_scene_cut 0 "backend=vpi.*verdict=PASS"
+    ${_fast} --backend vpi --cut-frame 12
+  )
 endif()
 # The lossless graph runs on one worker, with no diagnostics.
 denoise_app_test(denoise_app_one_worker 0 "^denoise: plan=OK workers=1 diagnostics=0\n*$"
