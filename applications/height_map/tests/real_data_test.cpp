@@ -211,6 +211,7 @@ class CheckOp final : public holoscan::Operator<> {
   CheckOp(std::size_t frames, std::shared_ptr<Tally> tally)
       : frames_(frames), tally_(std::move(tally)), reference_(map_params()) {}
   void setup(holoscan::OperatorSpec& spec) override {
+    // Two slots per input: one map in compute() while the next one arrives.
     spec.input(point_cloud, "point_cloud").queue_depth(2U);
     spec.input(elevation, "elevation").queue_depth(2U);
     spec.input(map_info, "map_info").queue_depth(2U);

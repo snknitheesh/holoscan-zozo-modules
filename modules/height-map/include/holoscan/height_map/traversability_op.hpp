@@ -50,7 +50,8 @@ struct TraversabilityConfig {
   bool image{false};
   // The map frame's name, for the image header.
   std::string frame_id{"map"};
-  // The largest map accepted, rows and cols; it sizes the outputs.
+  // The largest map accepted, rows and cols; it sizes the outputs' pools, so
+  // set it to the map's size (the default reserves room for 1024 x 1024).
   int max_rows{1024};
   int max_cols{1024};
 };
