@@ -81,14 +81,7 @@ struct ReportOp::HostCopies {
         labels(pixels),
         coefficients(16U * planes),
         centroids(12U * planes),
-        inliers(4U * planes) {
-    if (const cudaError_t status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-        status != cudaSuccess) {
-      throw std::runtime_error(std::string("ReportOp: cudaStreamCreate: ") +
-                               cudaGetErrorString(status));
-    }
-  }
-  ~HostCopies() { cudaStreamDestroy(stream); }
+        inliers(4U * planes) {}
   HostCopies(const HostCopies&) = delete;
   HostCopies& operator=(const HostCopies&) = delete;
 
@@ -98,9 +91,6 @@ struct ReportOp::HostCopies {
   Pinned coefficients;
   Pinned centroids;
   Pinned inliers;
-  // The copies' own stream: an operator without device outputs may get none
-  // from the runtime.
-  cudaStream_t stream{};
 };
 
 ReportOp::ReportOp(ReportConfig config) : config_(std::move(config)) {
@@ -183,14 +173,24 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
       {cloud.normals.get(), &host.normals},      {&curvature_sample->data, &host.curvature},
       {&label_sample->data, &host.labels},       {&coefficient_sample->data, &host.coefficients},
       {&centroid_sample->data, &host.centroids}, {&inlier_sample->data, &host.inliers}};
+  // The copies go on the activation's stream, which the runtime owns: a stream
+  // given to copy_to_host_async() becomes the inputs' retirement boundary, and
+  // the runtime still records on it when it closes its pools after the
+  // operators are gone, so a stream of the operator's own would not live long
+  // enough. Without one, each copy waits for itself.
+  const cudaStream_t stream = context.cuda_stream().get();
   for (const auto& [tensor, to] : copies) {
-    if (auto copied = tensor->copy_to_host_async(to->as<void>(), to->bytes(), host.stream);
-        !copied) {
+    auto copied = stream != nullptr
+                      ? tensor->copy_to_host_async(to->as<void>(), to->bytes(), stream)
+                      : tensor->copy_to_host(to->as<void>(), to->bytes());
+    if (!copied) {
       return copied;
     }
   }
-  if (const cudaError_t status = cudaStreamSynchronize(host.stream); status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+  if (stream != nullptr) {
+    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+    }
   }
   const float* normals = host.normals.as<float>();
   const float* curvature_values = host.curvature.as<float>();
