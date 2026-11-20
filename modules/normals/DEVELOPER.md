@@ -26,23 +26,34 @@ hold a hyphen, so the headers, namespace and target say `normals`.
 | | |
 | --- | --- |
 | Build contexts | Top-level CMake project, or included by another project (`add_subdirectory()`, `FetchContent`, the repository root); it is not built inside the SDK tree |
-| Options | Top level: `BUILD_TESTING` (`OFF`), `BUILD_SHARED_LIBS` (`ON`). Included: `HOLOSCAN_PCL_FILTERS_BUILD_TESTING` (`OFF`), always shared, the includer's `BUILD_TESTING` and `BUILD_SHARED_LIBS` left alone. Both: `PKG_holoscan_normals` (`OFF`) |
+| Options | Top level: `BUILD_TESTING` (`OFF`), `BUILD_SHARED_LIBS` (`ON`). Included: `HOLOSCAN_NORMALS_BUILD_TESTING` (`OFF`), always shared, the includer's `BUILD_TESTING` and `BUILD_SHARED_LIBS` left alone. Both: `PKG_holoscan_normals` (`OFF`) |
 | Public targets | `holoscan::normals` (`libholoscan_normals.so.1`) |
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-normals/holoscan-normals-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-normals)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-normals`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
-| Test labels | `normals` and `gpu` on all |
+| Debian package | `holoscan-normals`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)`, `holoscan-messages` 1.x and `libcudart.so.13-dev` |
+| Module dependencies | holoscan-messages 1.0 (`holoscan::messages`, PUBLIC: the ports carry its `PointCloud`); linked when the including project defines it, else found installed |
+| External dependencies | Holoscan SDK 5.0 (`core` PUBLIC, `sensor_io` PRIVATE; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only, BSD-3-Clause, compiled in: see NOTICE) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
+| Test labels | `normals` and `gpu` on all; `benchmark` on `normals_benchmark` |
 
 ## Conventions
 
 - Code lives in `holoscan::normals`. The kernels (`normals.hpp`, `planes.hpp`, `views.hpp`) and the
-  synthetic scene are public and need no Holoscan graph; the operators are thin: `CloudOp` receives,
-  checks and stages the cloud and the tensors that go with it, and allocates, commits and emits the
+  synthetic scene are public and need no Holoscan graph; the operators are thin: `CloudOp` receives
+  a `PointCloud` message, checks it with holoscan-messages' `check_point_cloud()` and puts its
+  fields on the GPU, staging host ones (logged once), and allocates, commits and emits tensor
   outputs; each operator runs its kernels in between. Helpers shared by the kernels stay private in
   `src/`.
+- Clouds move as holoscan-messages' `PointCloud`, never as loose tensors: an input `point_cloud`,
+  an output under another name (`point_cloud_with_normals`), declared with
+  `declare_point_cloud_output()`, allocated with `allocate_point_cloud()` and sent with
+  `emit_point_cloud()` with the input's header. A cloud's fields are written one at a time
+  (`write_and_commit()`), each by its own kernel on the operator's stream. Results the message has
+  no field for (curvature, labels, plane tables) are tensor outputs of their own.
+- Device scratch (`DeviceBuffer`) grows by at least half; replacing a buffer waits for the stream,
+  the first allocation does not. Count any new host wait or copy per frame in the README's "Waits
+  and copies".
 - Public headers carry only SDK, CUDA runtime and standard types; CUB stays in `src/`.
 - Every result is deterministic: integer counts may use atomics, but floating-point sums are either
   one thread's, in a fixed order, or reduced in a fixed order (per-block trees over a fixed grid,
@@ -53,8 +64,11 @@ hold a hyphen, so the headers, namespace and target say `normals`.
   code with `-ffp-contract=off`. The plane CPU reference (`tests/reference.hpp`) follows the kernels
   step by step, including the order of the double sums; a change to the kernels' arithmetic or
   their reduction order must change it too.
-- An operator has an optional port only when configured: an unconnected input is never satisfied,
-  and an emit into an unconnected output fails. A refused emit cannot be retried, as the loan is
-  gone; it fails the frame, with an error that names the port.
+- Every port always exists: an unconnected input is never satisfied, and an emit into an
+  unconnected output fails. A refused emit cannot be retried, as the loan is gone; it fails the
+  frame, with an error that names the port. Graphs that use the operators losslessly (the tests',
+  the installed consumer's, the demo's) run on one worker, and pin that.
 - A new kernel option needs a case in `normals_normals` or `normals_planes` against a reference or
-  the truth; a new port or behavior of an operator, a case in `normals_operators`.
+  the truth; a new port or behavior of an operator, a case in `normals_operators`. Tests make
+  their own data; only `normals_real_data` reads the local recordings, and skips (77) without
+  `HOLOSCAN_TEST_DATA`.
