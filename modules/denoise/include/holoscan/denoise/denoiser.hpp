@@ -29,7 +29,9 @@ void check_available(Backend backend);
 
 class Denoiser {
  public:
-  // Resolves kAuto (probe_platform(), resolve_auto()). Device memory is
+  // Resolves kAuto (probe_platform(), resolve_auto()); probing VPI starts its
+  // threads, so in a process that runs a graph with a plain holoscan::run(plan),
+  // build it once the run has started (as DenoiseOp does). Device memory is
   // allocated on the first frame, and again when the size or format changes.
   // @throws std::invalid_argument if the settings are unusable or the backend
   //         is not compiled in or cannot run them.
@@ -41,7 +43,9 @@ class Denoiser {
 
   // kCuda or kVpi.
   [[nodiscard]] Backend backend() const noexcept;
-  // What runs it: "cuda", "vpi-vic" or "vpi-cuda".
+  // What runs it, a string literal: "cuda", "vpi-vic" or "vpi-cuda". The vpi
+  // backend may run frames too small for the VIC on CUDA, so this is what ran
+  // the latest frame (before the first, what is expected to run).
   [[nodiscard]] std::string_view engine() const noexcept;
   [[nodiscard]] const DenoiseParams& params() const noexcept;
 

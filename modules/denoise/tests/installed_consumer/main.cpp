@@ -268,8 +268,14 @@ int main() {
   auto tally = std::make_shared<Tally>();
   auto source = graph.op<SourceOp>(
       "source", std::shared_ptr<const std::atomic<std::uint32_t>>(tally, &tally->counted));
+  // The auto backend, under a plain holoscan::run(plan) below: building the
+  // graph must start no thread. With a spatial filter, auto runs cuda.
+  auto stats = std::make_shared<dn::DenoiseStats>();
   auto denoiser = graph.op<dn::DenoiseOp>(
-      "denoise", dn::DenoiseOpConfig{.max_width = kWidth, .max_height = kHeight});
+      "denoise", dn::DenoiseOpConfig{.backend = dn::Backend::kAuto,
+                                     .max_width = kWidth,
+                                     .max_height = kHeight,
+                                     .stats = stats});
   auto fusion = graph.op<dn::ExposureFusionOp>(
       "fusion", dn::ExposureFusionOpConfig{.max_width = kWidth, .max_height = kHeight});
   auto remaining = std::make_shared<std::atomic<int>>(2);
@@ -311,9 +317,10 @@ int main() {
     return 1;
   }
   const double gain = tally->last_psnr - tally->noisy_psnr;
-  const bool passed =
-      tally->denoised == kFrames && gain > 8.0 && tally->fused == kFrames && tally->bad_fused == 0;
-  std::cout << "denoise_consumer: denoised=" << tally->denoised << " gain_db=" << gain
+  const bool passed = tally->denoised == kFrames && gain > 8.0 && tally->fused == kFrames &&
+                      tally->bad_fused == 0 && stats->backend.load() == dn::Backend::kCuda;
+  std::cout << "denoise_consumer: backend=auto:" << dn::backend_name(stats->backend.load())
+            << " denoised=" << tally->denoised << " gain_db=" << gain
             << " fused=" << tally->fused << " bad_fused=" << tally->bad_fused << '\n'
             << "denoise_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 1;

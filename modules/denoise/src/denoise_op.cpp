@@ -54,10 +54,10 @@ struct DenoiseOp::State {
 };
 
 DenoiseOp::DenoiseOp(DenoiseOpConfig config)
-    : config_(std::move(config)), backend_(Backend::kCuda), state_(std::make_unique<State>()) {
+    : config_(std::move(config)), backend_(config_.backend), state_(std::make_unique<State>()) {
+  // Nothing is probed here: VPI starts threads, and the graph is built before
+  // the run admits the process.
   validate_config(config_);
-  backend_ = config_.backend == Backend::kAuto ? resolve_auto(probe_platform(), config_.params)
-                                               : config_.backend;
 }
 
 DenoiseOp::~DenoiseOp() = default;
@@ -77,13 +77,18 @@ holoscan::Contract DenoiseOp::contract() const {
 }
 
 void DenoiseOp::start() {
-  if (config_.backend == Backend::kAuto) {
-    HOLOSCAN_LOG_INFO("DenoiseOp: backend auto chose {}: {}", backend_name(backend_),
-                      auto_reason(probe_platform(), config_.params));
+  Backend backend = config_.backend;
+  if (backend == Backend::kAuto) {
+    const PlatformFacts facts = probe_platform();
+    backend = resolve_auto(facts, config_.params);
+    HOLOSCAN_LOG_INFO("DenoiseOp: backend auto chose {}: {}", backend_name(backend),
+                      auto_reason(facts, config_.params));
   }
+  backend_.store(backend);
+  if (config_.stats) config_.stats->backend.store(backend);
   state_->start_error.clear();
   try {
-    state_->denoiser = std::make_unique<Denoiser>(backend_, config_.params, config_.vpi);
+    state_->denoiser = std::make_unique<Denoiser>(backend, config_.params, config_.vpi);
   } catch (const std::exception& error) {
     // Reported by compute(), which can fail the frame.
     state_->start_error = error.what();
@@ -147,6 +152,11 @@ holoscan::expected<void, holoscan::Error> DenoiseOp::compute(holoscan::Execution
   }
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
+  }
+  if (config_.stats) {
+    // engine() is a string literal, so the pointer stays valid.
+    config_.stats->engine.store(state.denoiser->engine().data());
+    config_.stats->frames.fetch_add(1U);
   }
   return denoised.emit_tensor(std::move(*loan),
                               detail::image_descriptor(format, width, height, input),

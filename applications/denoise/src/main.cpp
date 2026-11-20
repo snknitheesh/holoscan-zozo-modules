@@ -223,8 +223,10 @@ void validate(Options& opts) {
   }
 }
 
-dn::DenoiseOpConfig denoise_config(const Options& opts) {
+dn::DenoiseOpConfig denoise_config(const Options& opts,
+                                   std::shared_ptr<dn::DenoiseStats> stats = nullptr) {
   dn::DenoiseOpConfig config;
+  config.stats = std::move(stats);
   config.backend = opts.backend;
   config.params.spatial = *opts.spatial;
   config.params.temporal = opts.temporal;
@@ -232,6 +234,27 @@ dn::DenoiseOpConfig denoise_config(const Options& opts) {
   config.max_width = opts.width;
   config.max_height = opts.height;
   return config;
+}
+
+// The engine DenoiseOp must run on a CI runner (HOLOSCAN_CI_PLATFORM): VPI's
+// TNR on the VIC on a Jetson, for the vpi backend and for auto with settings
+// it runs (temporal, no spatial filter), when the module has VPI; the cuda
+// backend on x86_64 for auto. Nothing to expect elsewhere.
+std::optional<std::string> expected_engine(const Options& opts) {
+  const char* platform = std::getenv("HOLOSCAN_CI_PLATFORM");
+  if (platform == nullptr) return std::nullopt;
+  const auto built = dn::available_backends();
+  const bool vpi_built = std::find(built.begin(), built.end(), dn::Backend::kVpi) != built.end();
+  const bool tnr_settings = opts.temporal && opts.spatial == dn::SpatialFilter::kNone;
+  if (opts.backend == dn::Backend::kCuda) return "cuda";
+  if (std::string_view(platform) == "jetson" && vpi_built) {
+    if (opts.backend == dn::Backend::kVpi || tnr_settings) return "vpi-vic";
+    return "cuda";
+  }
+  if (std::string_view(platform) == "x86_64") {
+    return opts.backend == dn::Backend::kVpi ? "vpi-cuda" : "cuda";
+  }
+  return std::nullopt;
 }
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
@@ -269,7 +292,8 @@ int execute(const Options& opts, SignalDomain& signals) {
                                        .count = opts.count,
                                        .period = std::chrono::milliseconds(opts.period_ms),
                                        .finished = finished});
-  auto denoiser = graph.op<dn::DenoiseOp>("denoise", denoise_config(opts));
+  auto stats = std::make_shared<dn::DenoiseStats>();
+  auto denoiser = graph.op<dn::DenoiseOp>("denoise", denoise_config(opts, stats));
   auto fusion = graph.op<dn::ExposureFusionOp>(
       "fusion", dn::ExposureFusionOpConfig{.max_width = opts.width, .max_height = opts.height});
   auto report = std::make_shared<app::Report>();
@@ -411,17 +435,19 @@ int execute(const Options& opts, SignalDomain& signals) {
 #else
   const bool shown = true;
 #endif
+  // What DenoiseOp ran, as it reports it; on a CI runner, what it must be.
+  const dn::Backend backend = stats->backend.load();
+  const std::string engine = stats->engine.load();
+  const std::optional<std::string> expected = expected_engine(opts);
+  const bool engine_ok = !expected || engine == *expected;
   const bool passed = workers == 1 && !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
                       r.frames == opts.count && r.frame_gaps == 0 && denoised_ok && trail_ok &&
-                      fused_ok && shown;
-  const dn::DenoiseOpConfig config = denoise_config(opts);
-  const dn::Backend backend = opts.backend == dn::Backend::kAuto
-                                  ? dn::resolve_auto(dn::probe_platform(), config.params)
-                                  : opts.backend;
+                      fused_ok && shown && engine_ok;
   std::cout << std::fixed << std::setprecision(2) << kAppName << ": frames=" << r.frames << '/'
             << opts.count << " backend=" << (opts.backend == dn::Backend::kAuto ? "auto:" : "")
-            << dn::backend_name(backend) << " spatial=" << dn::spatial_name(*opts.spatial)
+            << dn::backend_name(backend) << " engine=" << (engine.empty() ? "none" : engine)
+            << " spatial=" << dn::spatial_name(*opts.spatial)
             << " temporal=" << (opts.temporal ? "on" : "off") << " strength=" << opts.strength
             << " workers=" << workers << '\n'
             << kAppName << ": noisy_psnr=" << r.noisy_psnr_sum / checked
@@ -438,6 +464,11 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cout << " rendered=" << rendered->frames << " showing=" << rendered->showing;
   }
 #endif
+  if (expected) {
+    std::cout << '\n'
+              << kAppName << ": expected_engine=" << *expected << " ("
+              << std::getenv("HOLOSCAN_CI_PLATFORM") << ")";
+  }
   std::cout << '\n'
             << kAppName << ": verdict="
             << (passed    ? "PASS"

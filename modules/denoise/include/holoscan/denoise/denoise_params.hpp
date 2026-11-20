@@ -18,7 +18,7 @@ namespace holoscan::denoise {
 enum class Backend : std::uint8_t {
   kCuda,  // This module's CUDA kernels: any spatial filter, motion-adaptive temporal filter.
   kVpi,   // VPI 4's Temporal Noise Reduction, on the VIC where there is one, else on CUDA.
-  kAuto,  // One of the above, chosen once when the denoiser is built: see resolve_auto().
+  kAuto,  // One of the above, chosen once (a Denoiser when built, a DenoiseOp at start).
 };
 
 // The spatial filter, applied to each frame after the temporal filter (cuda backend).

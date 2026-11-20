@@ -294,16 +294,19 @@ void check_auto_backend() {
   const PlatformFacts facts = probe_platform();
   DenoiseParams tnr;
   tnr.spatial = SpatialFilter::kNone;
-  VERIFY(DenoiseOp(op_config(Backend::kAuto, tnr)).backend() == resolve_auto(facts, tnr));
-  VERIFY(DenoiseOp(op_config(Backend::kAuto, DenoiseParams{})).backend() == Backend::kCuda);
+  // Nothing is chosen until the operator starts.
+  VERIFY(DenoiseOp(op_config(Backend::kAuto, tnr)).backend() == Backend::kAuto);
+  VERIFY(DenoiseOp(op_config(Backend::kCuda, tnr)).backend() == Backend::kCuda);
   const char* platform = std::getenv("HOLOSCAN_CI_PLATFORM");
   if (platform != nullptr && std::string_view(platform) == "x86_64") {
     VERIFY_MSG(resolve_auto(facts, tnr) == Backend::kCuda, "auto is cuda on x86_64");
   }
   holoscan::set_log_level(holoscan::LogLevel::INFO);
   const auto frames = noisy_frames(PixelFormat::kRgb8, kWidth, kHeight, 2);
+  DenoiseOpConfig config = op_config(Backend::kAuto, tnr);
+  config.stats = std::make_shared<DenoiseStats>();
   const std::string output = capture_output([&] {
-    auto h = holoscan::testing::create_operator_test<DenoiseOp>(op_config(Backend::kAuto, tnr));
+    auto h = holoscan::testing::create_operator_test<DenoiseOp>(config);
     for (const auto& frame : frames) {
       h.push("image", image_of(frame, PixelFormat::kRgb8, kWidth, kHeight, true));
     }
@@ -315,6 +318,11 @@ void check_auto_backend() {
   });
   holoscan::set_log_level(holoscan::LogLevel::WARN);
   VERIFY_MSG(count_of(output, "backend auto chose") == 1, "the choice is logged once:\n" + output);
+  const Backend chosen = config.stats->backend.load();
+  const std::string engine = config.stats->engine.load();
+  VERIFY_MSG(chosen == resolve_auto(facts, tnr), "auto chose " + std::string(backend_name(chosen)));
+  VERIFY(config.stats->frames.load() == frames.size());
+  VERIFY_MSG(engine == (chosen == Backend::kVpi ? "vpi-vic" : "cuda"), "engine " + engine);
 }
 
 // One frame that must fail the run.

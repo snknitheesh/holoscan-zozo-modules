@@ -58,6 +58,7 @@ to the GPU, which is logged once with the bytes per frame.
 | `vpi.engine` | `VpiEngine::kAuto` | vpi backend: `kVic`, `kCuda`, or `kAuto` (the VIC where VPI runs TNR on it) |
 | `vpi.preset` | `VpiPreset::kIndoorLowLight` | vpi backend: VPI's TNR scene preset; on the tests' low-light scene indoor low light gains the most |
 | `max_width`, `max_height` | `3840`, `2160` | Largest image, which sizes the output |
+| `stats` | none | Optional `std::shared_ptr<DenoiseStats>`, filled in as the operator runs: the backend it runs (`kAuto` until it starts), the engine that ran the latest frame (`"cuda"`, `"vpi-vic"` or `"vpi-cuda"`) and the frames done. Read it, not the operator `graph.op()` returned: the graph runs the SDK's copy |
 
 `DenoiseParams`:
 
@@ -99,7 +100,7 @@ of their histories. RGBA8's alpha passes through.
 | --- | --- | --- | --- |
 | `kCuda` (default) | The GPU | Any | Deterministic: the same frames give the same bytes |
 | `kVpi` | VPI's TNR on the VIC (Jetson Orin, Thor) or CUDA (`vpi.engine`); with `kAuto`, frames under 64x16, which the VIC refuses, on CUDA | None of its own to configure: `spatial` must be `kNone` (TNR filters spatially itself) and `temporal` true | MONO8, RGB8 and RGBA8 are converted to full-range BT.601 NV12 and back on the GPU (chroma subsampled, as TNR needs), odd sizes padded by a pixel. The operator waits on the host for VPI each frame. A scene cut, found as on the cuda backend, restarts TNR |
-| `kAuto` | `kVpi` where VPI is built, its VIC runs TNR and `spatial` is `kNone` with `temporal`; `kCuda` otherwise. Chosen when the operator is built, logged at start | | On x86_64 always `kCuda`: VPI's TNR on CUDA gains less PSNR than the cuda backend and costs about as much |
+| `kAuto` | `kVpi` where VPI is built, its VIC runs TNR and `spatial` is `kNone` with `temporal`; `kCuda` otherwise. Chosen, and logged, when the operator starts: building the graph probes nothing, so a plain `holoscan::run(plan)`, which admits a process only while it has one thread, still starts | | On x86_64 always `kCuda`: VPI's TNR on CUDA gains less PSNR than the cuda backend and costs about as much |
 
 ## `ExposureFusionOp`
 
@@ -317,12 +318,14 @@ The tests, all on scenes rendered at test time:
 | `denoise_denoiser` | GPU | `Denoiser`: PSNR gain of every method and strength, strength 0 as the identity, temporal convergence, no ghosting behind a moving disc, the first frame, a scene cut and `reset()`, MONO8, RGBA8 and NV12, odd and 1x1 sizes, the noise estimate, determinism, rejected settings and views; with VPI, the same for the vpi backend and cuda against vpi |
 | `denoise_fusion` | GPU | `ExposureFusion` against the tone-mapped truth for RGB and gray brackets, 3 and 2 of them, against each single bracket; the weights; sizes from 1x1 and determinism; `ToneMapper` against its double-precision reference for each float and 16-bit layout, key, white and curve; rejections |
 | `denoise_operators` | GPU | `DenoiseOp` through the SDK's operator test harness, byte for byte against `Denoiser`: MONO8, RGB8, RGBA8 and NV12 from device and host memory, non-local means, VPI, the host copy logged once, a change of size, the auto backend, the header, capture time and frame id; `ExposureFusionOp` against `ExposureFusion` with 3 and 2 brackets matched exactly and within a window, unmatched brackets never fused, tone mapping float and 16-bit frames; rejected inputs and settings |
+| `denoise_auto_run` | GPU | A graph with `DenoiseOp` on the auto backend under a plain `holoscan::run(plan)`, on one worker, in a process of its own: it starts, and on a CI runner auto ran VPI's TNR on the VIC (Jetson, with VPI) or the cuda backend (x86_64) |
 | `denoise_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
 | `denoise_params` | Nothing | SDK-free (`tests/host/`, also run by the hosted CI job): names, validation, the auto backend's choice, the strength's mapping, pyramid levels, the tone map and fusion weight references |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a graph from host-memory frames through `DenoiseOp` and `ExposureFusionOp`,
-checking the PSNR gain and the fused shadow and window. Build it with the install prefix on
+installed package: a graph from host-memory frames through `DenoiseOp` (on the auto backend) and
+`ExposureFusionOp`, on one worker and under a plain `holoscan::run(plan)`, checking the PSNR gain
+and the fused shadow and window. Build it with the install prefix on
 `CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
