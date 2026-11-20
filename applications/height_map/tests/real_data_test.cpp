@@ -217,10 +217,9 @@ class CheckOp final : public holoscan::Operator<> {
   }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
-    result.trigger(holoscan::OnAligned{
-        .ports =
-            holoscan::PortList{std::vector<holoscan::PortRef>{point_cloud, elevation, map_info}},
-        .window = std::chrono::nanoseconds{0}});
+    result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{std::vector<holoscan::PortRef>{
+                                           point_cloud, elevation, map_info}},
+                                       .window = std::chrono::nanoseconds{0}});
     result.input(point_cloud, holoscan::Exact{});
     result.input(elevation, holoscan::Exact{});
     result.input(map_info, holoscan::Exact{});
@@ -266,8 +265,8 @@ class CheckOp final : public holoscan::Operator<> {
         status != cudaSuccess) {
       return fail(std::string("update: ") + cudaGetErrorString(status));
     }
-    if (const cudaError_t status =
-            reference_.write_layers(hm::MapLayers{.elevation = static_cast<float*>(layer_)}, stream);
+    if (const cudaError_t status = reference_.write_layers(
+            hm::MapLayers{.elevation = static_cast<float*>(layer_)}, stream);
         status != cudaSuccess) {
       return fail(std::string("write_layers: ") + cudaGetErrorString(status));
     }
@@ -294,10 +293,11 @@ class CheckOp final : public holoscan::Operator<> {
                                                                          g.resolution, 400.0, 400.0}
                               ? 0U
                               : 1U;
-    tally_->wrong_cells += cells - static_cast<std::size_t>(std::count_if(
-                                       got.begin(), got.end(), [&, i = std::size_t{0}](float v) mutable {
-                                         return std::memcmp(&v, &want[i++], sizeof(float)) == 0;
-                                       }));
+    tally_->wrong_cells +=
+        cells - static_cast<std::size_t>(
+                    std::count_if(got.begin(), got.end(), [&, i = std::size_t{0}](float v) mutable {
+                      return std::memcmp(&v, &want[i++], sizeof(float)) == 0;
+                    }));
     if (tally_->maps.fetch_add(1U) == 0U) {
       tally_->first_frame_id = cloud->metadata.frame_id;
     } else {

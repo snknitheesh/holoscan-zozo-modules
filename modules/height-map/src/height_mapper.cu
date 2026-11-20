@@ -533,8 +533,8 @@ cudaError_t HeightMapper::update(const float* xyz, std::uint32_t count,
   }
   // The encoding writes only as many run lengths as there are runs; the scan
   // reads most_runs of them, so the rest are zero rather than uninitialized.
-  if (const cudaError_t status = cudaMemsetAsync(s.run_counts.as<void>(), 0,
-                                                 most_runs * sizeof(std::uint32_t), stream);
+  if (const cudaError_t status =
+          cudaMemsetAsync(s.run_counts.as<void>(), 0, most_runs * sizeof(std::uint32_t), stream);
       status != cudaSuccess) {
     return status;
   }

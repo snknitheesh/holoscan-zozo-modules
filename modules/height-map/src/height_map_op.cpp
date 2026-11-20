@@ -156,8 +156,8 @@ holoscan::expected<void, holoscan::Error> HeightMapOp::compute(
   if (!config_.cloud_frame_id.empty()) {
     const std::string frame = cloud.header ? cloud.header->frame_id : std::string();
     if (frame != config_.cloud_frame_id) {
-      return holoscan::make_unexpected(invalid("the cloud is in frame '" + frame + "', not '" +
-                                               config_.cloud_frame_id + "'"));
+      return holoscan::make_unexpected(
+          invalid("the cloud is in frame '" + frame + "', not '" + config_.cloud_frame_id + "'"));
     }
   }
   const holoscan::Tensor& tensor = *cloud.points;

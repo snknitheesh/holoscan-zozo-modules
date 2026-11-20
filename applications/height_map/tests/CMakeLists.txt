@@ -54,8 +54,8 @@ add_test(
   NAME height_map_app_stopped
   COMMAND
     ${CMAKE_COMMAND} -DEXPECT_EXIT=1
-    "-DEXPECT_OUTPUT=frames=[0-9]+/100000 .*verdict=STOPPED.*camera_info_removed"
-    -P "${_run_and_match}" -- sh -c
+    "-DEXPECT_OUTPUT=frames=[0-9]+/100000 .*verdict=STOPPED.*camera_info_removed" -P
+    "${_run_and_match}" -- sh -c
     "rm -rf \"$2\" && mkdir -p \"$2\" || exit 1
      TMPDIR=\"$2\" \"$1\" --count 100000 --period-ms 10 --width 64 --height 48 --display false &
      for i in $(seq 600)

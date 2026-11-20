@@ -3,6 +3,8 @@
 
 #include "report_op.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -15,8 +17,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#include <cuda_runtime_api.h>
 
 #include "terrain_camera_op.hpp"
 
@@ -65,7 +65,8 @@ ReportOp::ReportOp(ReportConfig config)
 
 void ReportOp::start() {
   const std::size_t cells = config_.geometry.cells();
-  if (host_ == nullptr && cudaMallocHost(&host_, cells * (5U * sizeof(float) + 1U)) != cudaSuccess) {
+  if (host_ == nullptr &&
+      cudaMallocHost(&host_, cells * (5U * sizeof(float) + 1U)) != cudaSuccess) {
     host_ = nullptr;
   }
 }
@@ -207,8 +208,8 @@ holoscan::expected<void, holoscan::Error> ReportOp::compute(holoscan::ExecutionC
       const std::size_t i = static_cast<std::size_t>(r) * cols + c;
       const bool layers_agree =
           (unknowns[i] != 0U) == std::isnan(costs[i]) &&
-          (unknowns[i] != 0U || (slopes[i] >= 0.0F && step_heights[i] >= 0.0F && roughnesses[i] >= 0.0F &&
-                                 costs[i] >= 0.0F && costs[i] <= 1.0F));
+          (unknowns[i] != 0U || (slopes[i] >= 0.0F && step_heights[i] >= 0.0F &&
+                                 roughnesses[i] >= 0.0F && costs[i] >= 0.0F && costs[i] <= 1.0F));
       report.mask_wrong += layers_agree ? 0U : 1U;
       const float e = heights[i];
       if (!std::isfinite(e)) {

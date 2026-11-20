@@ -72,17 +72,18 @@ class CloudSourceOp final : public holoscan::Operator<> {
     msg::declare_point_cloud_output(
         spec, point_cloud, "point_cloud",
         {.max_points = kMaxPoints, .memory_kind = holoscan::MemoryKind::kHost});
-    spec.output(pose, "pose").produces_tensor(holoscan::TensorOutputSpec{
-        .representation =
-            holoscan::TensorRepresentation{
-                .memory_kind = holoscan::MemoryKind::kHost,
-                .dtype = hm::kFloat64,
-                .rank = 2U,
-                .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-            },
-        .bounds = holoscan::tensor_bounds(16U * sizeof(double)),
-        .storage = holoscan::TensorOutputStorage::kRuntimePool,
-    });
+    spec.output(pose, "pose")
+        .produces_tensor(holoscan::TensorOutputSpec{
+            .representation =
+                holoscan::TensorRepresentation{
+                    .memory_kind = holoscan::MemoryKind::kHost,
+                    .dtype = hm::kFloat64,
+                    .rank = 2U,
+                    .strides = holoscan::TensorStridePolicy::kContiguousOnly,
+                },
+            .bounds = holoscan::tensor_bounds(16U * sizeof(double)),
+            .storage = holoscan::TensorOutputStorage::kRuntimePool,
+        });
   }
 
   [[nodiscard]] holoscan::Contract contract() const override {
@@ -121,11 +122,12 @@ class CloudSourceOp final : public holoscan::Operator<> {
       return backpressure(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
                                         : holoscan::make_unexpected(std::move(loan).error());
     }
-    if (auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& w)
-                                                       -> holoscan::expected<void, holoscan::Error> {
-          std::memcpy(w.data_as<double>(), matrix.data(), sizeof(matrix));
-          return {};
-        });
+    if (auto written =
+            loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& w)
+                                            -> holoscan::expected<void, holoscan::Error> {
+              std::memcpy(w.data_as<double>(), matrix.data(), sizeof(matrix));
+              return {};
+            });
         !written) {
       return written;
     }
@@ -143,7 +145,8 @@ class CloudSourceOp final : public holoscan::Operator<> {
 
  private:
   holoscan::expected<void, holoscan::Error> send_cloud(holoscan::ExecutionContext& context,
-                                                      double sx, const holoscan::EmitOptions& emit) {
+                                                       double sx,
+                                                       const holoscan::EmitOptions& emit) {
     const hm::Terrain terrain = scene();
     std::vector<float> xyz;
     xyz.reserve(kMaxPoints * 3U);
@@ -155,7 +158,8 @@ class CloudSourceOp final : public holoscan::Operator<> {
                    {x - static_cast<float>(sx), y, hm::terrain_height(terrain, x, y) - 1.0F});
       }
     }
-    const msg::PointCloudShape shape = msg::unorganized_cloud(static_cast<std::int64_t>(kMaxPoints));
+    const msg::PointCloudShape shape =
+        msg::unorganized_cloud(static_cast<std::int64_t>(kMaxPoints));
     auto loan = msg::allocate_point_cloud(point_cloud, shape, {}, context.cuda_stream());
     if (!loan) {
       return holoscan::make_unexpected(std::move(loan).error());

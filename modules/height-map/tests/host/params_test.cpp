@@ -4,20 +4,21 @@
 // The settings' rules, each refusal naming its field; the grid's size; and
 // whether a transform is rigid: no SDK, CUDA or GPU.
 
+#include "holoscan/height_map/params.hpp"
+
 #include <cmath>
 #include <functional>
 #include <limits>
 #include <string>
 
 #include "holoscan/height_map/grid.hpp"
-#include "holoscan/height_map/params.hpp"
 #include "test_support.hpp"
 
 namespace holoscan::height_map {
 namespace {
 
 constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
-constexpr float kInf = std::numeric_limits<float>::infinity();
+constexpr float kInfinity = std::numeric_limits<float>::infinity();
 
 // `change` applied to the defaults is refused, and the reason names `field`.
 template <typename Params>
@@ -42,7 +43,7 @@ void check_map_params() {
   refuses<P>([](P& p) { p.geometry.resolution = kNan; }, "resolution");
   refuses<P>([](P& p) { p.geometry.rows = 0; }, "rows and cols");
   refuses<P>([](P& p) { p.geometry.cols = kMaxGridSide + 1; }, "rows and cols");
-  refuses<P>([](P& p) { p.geometry.origin_x = kInf; }, "origin");
+  refuses<P>([](P& p) { p.geometry.origin_x = kInfinity; }, "origin");
   refuses<P>([](P& p) { p.mode = static_cast<MapMode>(7); }, "mode");
   refuses<P>([](P& p) { p.elevation = static_cast<ElevationMode>(7); }, "elevation");
   refuses<P>(
@@ -56,18 +57,18 @@ void check_map_params() {
   refuses<P>([](P& p) { p.max_range = kNan; }, "min_range");
   // A point at the sensor needs noise_base for a finite weight.
   refuses<P>([](P& p) { p.noise_base = 0.0F; }, "noise_base");
-  refuses<P>([](P& p) { p.noise_base = kInf; }, "noise_base");
+  refuses<P>([](P& p) { p.noise_base = kInfinity; }, "noise_base");
   refuses<P>([](P& p) { p.noise_quadratic = -0.1F; }, "noise_quadratic");
   refuses<P>([](P& p) { p.min_variance = 0.0F; }, "min_variance");
   refuses<P>([](P& p) { p.mahalanobis_gate = -1.0F; }, "mahalanobis_gate");
   refuses<P>([](P& p) { p.rejection_variance = -1.0F; }, "rejection_variance");
   refuses<P>([](P& p) { p.max_age = -1.0F; }, "max_age");
-  refuses<P>([](P& p) { p.variance_growth = kInf; }, "variance_growth");
+  refuses<P>([](P& p) { p.variance_growth = kInfinity; }, "variance_growth");
   refuses<P>([](P& p) { p.max_variance = -1.0F; }, "max_variance");
   // Limits that are open on one side are fine.
   HeightMapParams open;
-  open.min_height = -kInf;
-  open.max_range = kInf;
+  open.min_height = -kInfinity;
+  open.max_range = kInfinity;
   open.noise_quadratic = 0.0F;
   VERIFY(valid_params(open));
 }
@@ -81,7 +82,7 @@ void check_traversability_params() {
   refuses<P>([](P& p) { p.min_valid_fraction = kNan; }, "min_valid_fraction");
   refuses<P>([](P& p) { p.step_radius = 0; }, "step_radius");
   refuses<P>([](P& p) { p.max_slope_deg = 0.0F; }, "max_slope_deg");
-  refuses<P>([](P& p) { p.max_step = kInf; }, "max_step");
+  refuses<P>([](P& p) { p.max_step = kInfinity; }, "max_step");
   refuses<P>([](P& p) { p.slope_weight = -1.0F; }, "weights");
   refuses<P>(
       [](P& p) {
