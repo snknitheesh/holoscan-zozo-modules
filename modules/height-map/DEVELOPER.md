@@ -33,7 +33,7 @@ hold a hyphen, so the headers, namespace and target say `height_map`.
 | Consumer form | `find_package(holoscan-height-map)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Debian package | `holoscan-height-map`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
 | External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit (header-only) |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7.2, Jetson Orin with JetPack 7.2) |
 | Test labels | `height_map` and `gpu` on all |
 
 ## Conventions

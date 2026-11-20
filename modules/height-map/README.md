@@ -22,7 +22,7 @@ Both can emit color images of their layers for HoloViz. The
 | Headers | `<holoscan/height_map/...>` |
 | C++ namespace | `holoscan::height_map` |
 | Debian package | `holoscan-height-map` |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7.2, Jetson Orin with JetPack 7.2) |
 
 ## The grid
 
@@ -236,10 +236,10 @@ use `-ffp-contract=off`. Every result is the same on every run.
 
 A map update is `HeightMapper::update()` and `write_layers()` of the elevation and the variance, as
 `HeightMapOp` runs them, on a depth camera's cloud of the demo's course, the window following a
-sensor moving 1 cm a frame; mean milliseconds of GPU time over 200 runs (100 on the Orin);
+sensor moving 1 cm a frame; mean milliseconds of GPU time over 200 runs (100 on the Jetson Orin);
 `height_map_benchmark` measures it. Both maps are 10 m square.
 
-| Step | Map | RTX 5090, 640x480 | RTX 5090, 1280x720 | Orin, 640x480 | Orin, 1280x720 |
+| Step | Map | RTX 5090, 640x480 | RTX 5090, 1280x720 | Jetson Orin, 640x480 | Jetson Orin, 1280x720 |
 | --- | --- | --- | --- | --- | --- |
 | Map update (fused) | 200x200, 5 cm | 0.058 | 0.117 | 0.296 | 0.881 |
 | Map update (fused) | 500x500, 2 cm | 0.054 | 0.080 | 0.414 | 0.968 |
@@ -249,8 +249,8 @@ sensor moving 1 cm a frame; mean milliseconds of GPU time over 200 runs (100 on 
 | Traversability (5x5 plane fit) | 500x500 | 0.012 | 0.010 | 0.104 | 0.096 |
 | Elevation and cost images | 500x500 | 0.009 | 0.008 | 0.057 | 0.054 |
 
-The x86_64 machine has an RTX 5090; the Orin is a Jetson AGX Orin developer kit (64 GB) with JetPack
-7.2 in MAXN. The results, accuracy included, are the same on both. The update is the sort of the points by cell and one pass per
+The x86_64 machine has an RTX 5090; the Jetson Orin runs JetPack 7.2 in its highest power mode.
+The results, accuracy included, are the same on both. The update is the sort of the points by cell and one pass per
 cell; it grows with the points, and with the most crowded cell, whose points one thread sums, which
 is why 1280x720 into 5 cm cells costs more than into 2 cm cells. The traversability's time grows
 with the known cells.
@@ -309,4 +309,4 @@ current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, s
 
 ## Licenses
 
-Apache-2.0. See [NOTICE](NOTICE).
+Apache-2.0; compiles in CUB (BSD-3-Clause), NVIDIA's CUDA primitives library. See [NOTICE](NOTICE).
