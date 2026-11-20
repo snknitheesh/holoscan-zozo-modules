@@ -21,9 +21,18 @@ namespace {
 
 namespace dn = holoscan::denoise;
 constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
+// One bit per output: noisy, bracket0, bracket1, bracket2.
+constexpr std::uint32_t kAllSent = 0xFU;
 
 holoscan::Error failure(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, "SceneSourceOp: " + message};
+}
+
+// Whether `error` says a consumer is still busy with earlier frames: an emit
+// refused before delivery, or every slot of the output's pool still held.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
 }
 
 }  // namespace
@@ -68,7 +77,11 @@ holoscan::Contract SceneSourceOp::contract() const {
   return result;
 }
 
-void SceneSourceOp::start() { emitted_ = 0; }
+void SceneSourceOp::start() {
+  emitted_ = 0;
+  capture_.reset();
+  sent_ = 0U;
+}
 
 holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
     holoscan::ExecutionContext& context) {
@@ -86,8 +99,10 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
   const int height = config_.scene.height;
   const int frame = static_cast<int>(emitted_);
   const std::array<std::int64_t, 3> shape{height, width, 3};
-  const holoscan::EmitOptions options{.capture_time = context.activation_time(),
-                                      .frame_id = emitted_ + 1U};
+  if (!capture_) {
+    capture_ = context.activation_time();  // Kept until every output is out.
+  }
+  const holoscan::EmitOptions options{.capture_time = *capture_, .frame_id = emitted_ + 1U};
   // Renders one image into a loan of `port` and sends it.
   const auto send = [&](holoscan::Output<holoscan::schema::ImageT>& port,
                         const auto& render) -> holoscan::expected<void, holoscan::Error> {
@@ -111,28 +126,51 @@ holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
     descriptor.encoding = holoscan::schema::ImageEncoding_RGB8;
     descriptor.header = std::make_shared<holoscan::schema::HeaderT>();
     descriptor.header->frame_id = "synthetic_camera";
+    descriptor.header->capture_timestamp_ns = capture_->timestamp_ns;
     return port.emit_tensor(std::move(*loan), std::move(descriptor), options);
   };
-  // The checker paces the source, so no lossless queue is full when it sends.
-  if (auto sent = send(noisy,
-                       [&](const dn::ImageView& view) {
-                         return dn::render_noisy(config_.scene, config_.noise, frame, view, stream);
-                       });
+  // Sends output `bit` unless it already went out; a busy consumer leaves it
+  // for the next tick, any other failure fails the run.
+  bool busy = false;
+  const auto send_once = [&](std::uint32_t bit, holoscan::Output<holoscan::schema::ImageT>& port,
+                             const auto& render) -> holoscan::expected<void, holoscan::Error> {
+    if ((sent_ & bit) != 0U || busy) return {};
+    auto sent = send(port, render);
+    if (sent) {
+      sent_ |= bit;
+      return {};
+    }
+    if (consumers_busy(sent.error())) {
+      busy = true;
+      return {};
+    }
+    return sent;
+  };
+  if (auto sent = send_once(1U, noisy,
+                            [&](const dn::ImageView& view) {
+                              return dn::render_noisy(config_.scene, config_.noise, frame, view,
+                                                      stream);
+                            });
       !sent) {
     return sent;
   }
   const std::array<holoscan::Output<holoscan::schema::ImageT>*, 3> brackets{&bracket0, &bracket1,
                                                                             &bracket2};
   for (int k = 0; k < 3; ++k) {
-    if (auto sent = send(*brackets[k],
-                         [&](const dn::ImageView& view) {
-                           return dn::render_bracket(config_.hdr, frame, dn::kBracketExposures[k],
-                                                     view, stream);
-                         });
+    if (auto sent = send_once(2U << k, *brackets[k],
+                              [&](const dn::ImageView& view) {
+                                return dn::render_bracket(config_.hdr, frame,
+                                                          dn::kBracketExposures[k], view, stream);
+                              });
         !sent) {
       return sent;
     }
   }
+  if (sent_ != kAllSent) {
+    return {};  // The rest of this frame goes on the next tick.
+  }
+  sent_ = 0U;
+  capture_.reset();
   ++emitted_;
   return {};
 }

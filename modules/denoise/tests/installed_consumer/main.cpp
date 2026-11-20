@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,7 +64,10 @@ holoscan::TensorOutputSpec host_rgb() {
 }
 
 // kFrames frames on each output, then idle; each once the sinks have counted the
-// one before (`counted` goes up by two per frame).
+// one before (`counted` goes up by two per frame). An output a consumer refuses
+// (kBackpressured, or kResourceExhausted while its pool is held) goes again on
+// the next tick, with the same capture time; the outputs already out are not
+// sent twice.
 class SourceOp final : public holoscan::Operator<> {
  public:
   explicit SourceOp(std::shared_ptr<const std::atomic<std::uint32_t>> counted)
@@ -89,21 +93,25 @@ class SourceOp final : public holoscan::Operator<> {
     if (emitted_ >= kFrames || counted_->load(std::memory_order_acquire) < 2U * emitted_) {
       return {};
     }
-    const holoscan::EmitOptions options{.capture_time = context.activation_time(),
-                                        .frame_id = emitted_ + 1U};
+    if (!capture_) capture_ = context.activation_time();  // Kept until all four are out.
+    const holoscan::EmitOptions options{.capture_time = *capture_, .frame_id = emitted_ + 1U};
     const int frame = static_cast<int>(emitted_);
-    if (auto sent = send(noisy, dn::render_noisy(kScene, kNoise, frame), options); !sent) {
-      return sent;
-    }
-    std::array<holoscan::Output<holoscan::schema::ImageT>*, 3> brackets{&bracket0, &bracket1,
-                                                                        &bracket2};
-    for (int k = 0; k < 3; ++k) {
-      if (auto sent =
-              send(*brackets[k], dn::render_bracket(kHdr, 0, dn::kBracketExposures[k]), options);
-          !sent) {
-        return sent;
+    const std::array<holoscan::Output<holoscan::schema::ImageT>*, 4> ports{&noisy, &bracket0,
+                                                                           &bracket1, &bracket2};
+    for (std::uint32_t k = 0; k < ports.size(); ++k) {
+      if ((sent_ & (1U << k)) != 0U) continue;
+      const std::vector<std::uint8_t> rgb =
+          k == 0 ? dn::render_noisy(kScene, kNoise, frame)
+                 : dn::render_bracket(kHdr, 0, dn::kBracketExposures[k - 1]);
+      auto sent = send(*ports[k], rgb, options);
+      if (!sent) {
+        // A busy consumer: the rest of this frame goes on the next tick.
+        return consumers_busy(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
       }
+      sent_ |= 1U << k;
     }
+    sent_ = 0U;
+    capture_.reset();
     ++emitted_;
     return {};
   }
@@ -133,8 +141,15 @@ class SourceOp final : public holoscan::Operator<> {
     return port.emit_tensor(std::move(*loan), descriptor, options);
   }
 
+  static bool consumers_busy(const holoscan::Error& error) {
+    return error.code == holoscan::ErrorCode::kBackpressured ||
+           error.code == holoscan::ErrorCode::kResourceExhausted;
+  }
+
   std::shared_ptr<const std::atomic<std::uint32_t>> counted_;
   std::uint32_t emitted_{};
+  std::optional<holoscan::TimePoint> capture_;
+  std::uint32_t sent_{};  // A bit per output of this frame already out.
 };
 
 struct Tally {

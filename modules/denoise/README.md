@@ -181,9 +181,19 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
     .operator_path = "denoise", .output_port = "denoised", .device = holoscan::DeviceId{0}});
 ```
 
-A lossless (`kBlocking`) edge whose queue is full fails the frame. Keep the camera at most one
-frame ahead of the slowest consumer, as the demo's source does, or connect consumers that only need
-the newest frame, such as a display, with `QueuePolicy::kDropOldest` and depth 1.
+A graph whose every frame must arrive (`QueuePolicy::kBlocking` edges) runs on one worker, and its
+source sends a refused frame again on its next tick: across workers, a source runs while its
+consumer's queue is full, and its emit fails with `kBackpressured` (an allocation with
+`kResourceExhausted`), as the [messages module](../messages/README.md#run-a-graph-on-one-worker)
+explains. `DenoiseOp` and `ExposureFusionOp` have taken their input by the time they emit, so a
+refused output fails the run. Connect consumers that only need the newest frame, such as a display,
+with `QueuePolicy::kDropOldest` and depth 1.
+
+```cpp
+graph.partition("my_app").include_all();  // Every operator of the graph, on one worker.
+const auto plan = holoscan::compile(graph, std::move(options));
+// plan.scheduler_plan().worker_count is 1.
+```
 
 Without a graph, `Denoiser` (`<holoscan/denoise/denoiser.hpp>`), `ExposureFusion` and `ToneMapper`
 (`<holoscan/denoise/exposure_fusion.hpp>`) run on `ImageView`s of device memory and a CUDA stream.

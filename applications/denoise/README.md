@@ -74,10 +74,11 @@ right, the fused image. The low-light scene has dark gradients, coloured patches
 checkerboard and a bright disc moving back and forth; the HDR scene a striped shadow, mid-tones and
 a striped window about 13 stops brighter, its stripes drifting a pixel a frame.
 
-The operators cannot send a refused output again, so the source keeps one frame in flight: it
-renders the next frame only once the checker has counted the previous one, and no lossless queue
-ever fills. The display branch keeps only the newest frames (`QueuePolicy::kDropOldest`, depth 1),
-so it never holds the pipeline back.
+The graph is lossless, so it runs on one worker (`graph.partition("denoise").include_all()`;
+`--compile-only true` prints `workers=1`). The source sends any output a consumer refused again on
+its next tick, and keeps one frame in flight: it renders the next frame only once the checker has
+counted the previous one. The display branch, and the offscreen render check after HoloViz, keep
+only the newest frames (`QueuePolicy::kDropOldest`, depth 1), so they never hold the pipeline back.
 
 ## What it checks
 

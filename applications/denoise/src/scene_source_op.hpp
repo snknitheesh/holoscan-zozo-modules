@@ -6,9 +6,11 @@
 // patches, stripes and a checkerboard) and three exposure brackets of its HDR
 // scene, all with one capture time; a fixed number, then idle.
 //
-// Its consumers cannot send a refused output again, so with `finished` the
-// source keeps one frame in flight: it renders the next only once the checker
-// has counted the previous one.
+// An output its consumers refuse (kBackpressured, or kResourceExhausted while
+// every slot of its pool is held) goes again on the next tick, with the same
+// capture time and frame id, and the outputs that went out are not sent twice.
+// With `finished` the source also keeps one frame in flight: it renders the
+// next only once the checker has counted the previous one.
 
 #pragma once
 
@@ -16,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -60,6 +63,9 @@ class SceneSourceOp final : public holoscan::Operator<> {
  private:
   SceneSourceConfig config_;
   std::uint32_t emitted_{};
+  // The frame being sent: its capture time, and a bit per output already out.
+  std::optional<holoscan::TimePoint> capture_;
+  std::uint32_t sent_{};
 };
 
 }  // namespace denoise_demo
