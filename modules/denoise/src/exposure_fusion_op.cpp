@@ -163,9 +163,9 @@ holoscan::expected<void, holoscan::Error> ExposureFusionOp::compute(
     if (auto committed = std::move(*writer).commit(); !committed) {
       return holoscan::make_unexpected(std::move(committed).error());
     }
-    return image.emit_tensor(std::move(*loan),
-                             detail::image_descriptor(format, view.width, view.height, input, false),
-                             emit_options(*sample));
+    return image.emit_tensor(
+        std::move(*loan), detail::image_descriptor(format, view.width, view.height, input, false),
+        emit_options(*sample));
   }
 
   // Fusion: every bracket is received, so that each is consumed once.

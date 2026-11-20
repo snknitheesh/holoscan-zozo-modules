@@ -534,8 +534,9 @@ void check_fusion_unstamped() {
   config.max_width = 256;
   config.max_height = 256;
   auto h = holoscan::testing::create_operator_test<ExposureFusionOp>(config);
-  h.push_samples("bracket0", {holoscan::testing::sample_at(
-                                 bracket_image(scene, kBracketExposures[0], false), capture_time(0))});
+  h.push_samples("bracket0",
+                 {holoscan::testing::sample_at(bracket_image(scene, kBracketExposures[0], false),
+                                               capture_time(0))});
   h.push_samples("bracket1", {holoscan::testing::TestSample<holoscan::schema::ImageT>{
                                  .data = bracket_image(scene, kBracketExposures[2], false)}});
   h.output_device("image", holoscan::DeviceId{0});

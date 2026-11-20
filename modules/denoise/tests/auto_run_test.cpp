@@ -149,10 +149,8 @@ int main() {
   holoscan::Graph graph{"denoise_auto_run"};
   auto stats = std::make_shared<dn::DenoiseStats>();
   auto count = std::make_shared<std::atomic<std::uint32_t>>(0U);
-  dn::DenoiseOpConfig config{.backend = dn::Backend::kAuto,
-                             .max_width = kWidth,
-                             .max_height = kHeight,
-                             .stats = stats};
+  dn::DenoiseOpConfig config{
+      .backend = dn::Backend::kAuto, .max_width = kWidth, .max_height = kHeight, .stats = stats};
   // The settings VPI's TNR runs: auto may choose it.
   config.params.spatial = dn::SpatialFilter::kNone;
   auto source = graph.op<SourceOp>("source");
