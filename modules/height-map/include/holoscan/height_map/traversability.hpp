@@ -31,32 +31,10 @@
 
 #include <cstdint>
 
+#include <holoscan/height_map/params.hpp>
+
 namespace holoscan::height_map {
 
-struct TraversabilityParams {
-  // The plane fit's window, 1..10 cells around the cell.
-  int window_radius{2};
-  // The share of the plane fit's window that must be known, 0..1.
-  float min_valid_fraction{0.5F};
-  // The step height's window, 1..10 cells around the cell.
-  int step_radius{2};
-  // Where the cost reaches 1; positive.
-  float max_slope_deg{30.0F};
-  float max_step{0.2F};
-  float max_roughness{0.05F};
-  // The cost's weights below the maxima; not negative, not all 0.
-  float slope_weight{0.5F};
-  float step_weight{0.25F};
-  float roughness_weight{0.25F};
-};
-
-// Whether `params` are usable; if not, `what` (when given) names the first
-// unusable field.
-[[nodiscard]] bool valid_params(const TraversabilityParams& params, const char** what = nullptr);
-
-// Where compute_traversability() puts each layer, [rows, cols] in device
-// memory, or null to skip it. `unknown` is uint8, 1 where unknown; the others
-// are float32, NaN where unknown.
 struct TraversabilityLayers {
   float* cost{};
   std::uint8_t* unknown{};

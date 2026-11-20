@@ -60,6 +60,7 @@ add_library(
   src/height_mapper.cu
   src/host_input.cpp
   src/kernel_common.cu
+  src/params.cpp
   src/synthetic_terrain.cu
   src/terrain_camera_info.cpp
   src/traversability.cu

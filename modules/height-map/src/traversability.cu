@@ -183,36 +183,8 @@ __global__ void traversability_kernel(const float* __restrict__ elevation, Param
 }
 
 bool positive(float value) { return std::isfinite(value) && value > 0.0F; }
-bool not_negative(float value) { return std::isfinite(value) && value >= 0.0F; }
 
 }  // namespace
-
-bool valid_params(const TraversabilityParams& p, const char** what) {
-  const auto fail = [what](const char* message) {
-    if (what != nullptr) {
-      *what = message;
-    }
-    return false;
-  };
-  if (p.window_radius < 1 || p.window_radius > 10) {
-    return fail("window_radius must be 1..10");
-  }
-  if (!(p.min_valid_fraction >= 0.0F && p.min_valid_fraction <= 1.0F)) {
-    return fail("min_valid_fraction must be 0..1");
-  }
-  if (p.step_radius < 1 || p.step_radius > 10) {
-    return fail("step_radius must be 1..10");
-  }
-  if (!positive(p.max_slope_deg) || !positive(p.max_step) || !positive(p.max_roughness)) {
-    return fail("max_slope_deg, max_step and max_roughness must be positive");
-  }
-  if (!not_negative(p.slope_weight) || !not_negative(p.step_weight) ||
-      !not_negative(p.roughness_weight) ||
-      !(p.slope_weight + p.step_weight + p.roughness_weight > 0.0F)) {
-    return fail("the weights must not be negative, nor all 0");
-  }
-  return true;
-}
 
 cudaError_t compute_traversability(const float* elevation, int rows, int cols, float resolution,
                                    const TraversabilityParams& params,
