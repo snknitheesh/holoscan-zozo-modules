@@ -15,6 +15,7 @@ if(TSDF_RECONSTRUCTION_ENABLE_VISUALIZATION)
   list(APPEND _holoscan_components visualization)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(holoscan-tsdf 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
@@ -31,7 +32,7 @@ target_compile_features(tsdf_reconstruction_app_ops PUBLIC cxx_std_20)
 target_include_directories(tsdf_reconstruction_app_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   tsdf_reconstruction_app_ops
-  PUBLIC holoscan::tsdf holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::tsdf holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 # The reporters evaluate the scene as the GPU renders it: without contracting.
 target_compile_options(tsdf_reconstruction_app_ops PUBLIC -ffp-contract=off)

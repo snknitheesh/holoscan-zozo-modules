@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "TSDF Reconstruction",
-    "description": "Dense 3D reconstruction on the GPU with holoscan-tsdf: a synthetic RGB-D camera circles a known tabletop scene with known poses, TsdfIntegrateOp integrates every frame into a TSDF volume, and TsdfMeshOp ray casts the volume from each pose and extracts its mesh every N frames. Every ray cast is checked against the scene's exact depth and every mesh against its exact surfaces, and HoloViz shows the input depth beside the shaded ray cast.",
+    "description": "Dense 3D reconstruction on the GPU with holoscan-tsdf: a synthetic RGB-D camera circles a known tabletop scene with known poses, its calibration sent from a camera_info file by holoscan-messages' CameraInfoSourceOp; TsdfIntegrateOp integrates every frame into a TSDF volume, and TsdfMeshOp ray casts the volume from each pose into a depth image and a point cloud and extracts its mesh every N frames. Every ray cast is checked against the scene's exact depth and every mesh against its exact surfaces, and HoloViz shows the input depth beside the shaded ray cast.",
     "authors": [
       {
         "name": "zozo",
@@ -44,6 +44,9 @@
     },
     "dependencies": {
       "modules": [
+        {
+          "name": "messages"
+        },
         {
           "name": "tsdf"
         }

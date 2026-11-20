@@ -35,7 +35,6 @@ holoscan::TensorOutputSpec tensor_spec(holoscan::MemoryKind memory, std::uint32_
           holoscan::TensorRepresentation{
               .memory_kind = memory,
               .rank = rank,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
           },
       .bounds = holoscan::tensor_bounds(bytes),
       .storage = holoscan::TensorOutputStorage::kRuntimePool,
@@ -68,8 +67,9 @@ void validate_config(const SceneCameraConfig& config) {
   if (config.width < 64 || config.height < 48 || config.width > 4096 || config.height > 4096) {
     throw std::invalid_argument("camera images must be 64x48 to 4096x4096");
   }
-  if (config.count == 0 || config.orbit == 0 || config.period <= std::chrono::nanoseconds::zero()) {
-    throw std::invalid_argument("the camera needs a positive count, orbit and period");
+  if (config.count == 0 || config.orbit == 0 || config.period <= std::chrono::nanoseconds::zero() ||
+      config.mesh_every == 0) {
+    throw std::invalid_argument("the camera needs a positive count, orbit, period and mesh_every");
   }
 }
 
@@ -95,14 +95,19 @@ holoscan::Contract SceneCameraOp::contract() const {
   return result;
 }
 
-void SceneCameraOp::start() { emitted_ = 0; }
+void SceneCameraOp::start() {
+  emitted_ = 0;
+  ticks_ = 0;
+}
 
 holoscan::expected<void, holoscan::Error> SceneCameraOp::compute(
     holoscan::ExecutionContext& context) {
-  if (emitted_ >= config_.count) {
-    return {};  // Done: idle until the reporters complete the run.
+  if (ticks_++ == 0 || emitted_ >= config_.count) {
+    return {};  // The camera info's tick, or done: idle until the reporters complete the run.
   }
-  if (config_.finished && config_.finished->load(std::memory_order_acquire) < emitted_) {
+  if (config_.progress &&
+      (config_.progress->raycasts.load(std::memory_order_acquire) < emitted_ ||
+       config_.progress->meshes.load(std::memory_order_acquire) < emitted_ / config_.mesh_every)) {
     return {};  // The previous frame is still in flight.
   }
   cudaStream_t stream = context.cuda_stream().get();
@@ -114,22 +119,22 @@ holoscan::expected<void, holoscan::Error> SceneCameraOp::compute(
       ht::orbit_pose(ht::SceneKind::kTabletop, emitted_ % config_.orbit, config_.orbit);
   const ht::CameraIntrinsics intrinsics = ht::synthetic_intrinsics(config_.width, config_.height);
 
+  // Every loan first: when the runtime has no room for one, nothing is sent
+  // and the frame goes out on a later tick.
   const std::array<std::int64_t, 2> image_shape{config_.height, config_.width};
   const std::array<std::int64_t, 3> color_shape{config_.height, config_.width, 3};
   auto depth_loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = image_shape, .dtype = config_.millimeters ? kUInt16 : kFloat32});
-  if (!depth_loan) {
-    return holoscan::make_unexpected(std::move(depth_loan).error());
-  }
   auto color_loan =
       color.allocate_tensor(holoscan::TensorLoanRequest{.shape = color_shape, .dtype = kUInt8});
-  if (!color_loan) {
-    return holoscan::make_unexpected(std::move(color_loan).error());
-  }
   auto pose_loan = pose.allocate_tensor(
       holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 2>{4, 4}, .dtype = kFloat64});
-  if (!pose_loan) {
-    return holoscan::make_unexpected(std::move(pose_loan).error());
+  for (const auto* loan : {&depth_loan, &color_loan, &pose_loan}) {
+    if (!*loan) {
+      return loan->error().code == holoscan::ErrorCode::kResourceExhausted
+                 ? holoscan::expected<void, holoscan::Error>{}
+                 : holoscan::make_unexpected(loan->error());
+    }
   }
   {
     auto depth_writer = depth_loan->write(stream);

@@ -57,19 +57,17 @@ RaycastReportOp::RaycastReportOp(ReportConfig config) : config_(std::move(config
 
 void RaycastReportOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(depth, "depth");
-  spec.input(normals, "normals");
-  spec.input(colors, "colors");
+  spec.input(cloud, "cloud");
   spec.input(pose, "pose");
 }
 
 holoscan::Contract RaycastReportOp::contract() const {
   holoscan::Contract result;
   result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{depth, normals, colors, pose}},
+      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{depth, cloud, pose}},
       .window = 0ns});
   result.input(depth, holoscan::Exact{});
-  result.input(normals, holoscan::Exact{});
-  result.input(colors, holoscan::Exact{});
+  result.input(cloud, holoscan::Exact{});
   result.input(pose, holoscan::Exact{});
   return result;
 }
@@ -77,44 +75,46 @@ holoscan::Contract RaycastReportOp::contract() const {
 holoscan::expected<void, holoscan::Error> RaycastReportOp::compute(
     holoscan::ExecutionContext& context) {
   auto depth_sample = depth.receive();
-  auto normal_sample = normals.receive();
-  auto color_sample = colors.receive();
+  auto cloud_sample = cloud.receive();
   auto pose_sample = pose.receive();
   if (!depth_sample) {
     return holoscan::make_unexpected(std::move(depth_sample).error());
   }
-  if (!normal_sample) {
-    return holoscan::make_unexpected(std::move(normal_sample).error());
-  }
-  if (!color_sample) {
-    return holoscan::make_unexpected(std::move(color_sample).error());
+  if (!cloud_sample) {
+    return holoscan::make_unexpected(std::move(cloud_sample).error());
   }
   if (!pose_sample) {
     return holoscan::make_unexpected(std::move(pose_sample).error());
   }
   const holoscan::schema::ImageT& image = depth_sample->data;
-  const holoscan::schema::ImageT& color_image = color_sample->data;
-  if (!image.data || image.width != config_.width || image.height != config_.height ||
-      !color_image.data) {
-    return holoscan::make_unexpected(failure("RaycastReportOp", "unexpected ray-cast image"));
+  const holoscan::messages::schema::PointCloudT& ray_cloud = cloud_sample->data;
+  if (auto checked = holoscan::messages::check_point_cloud(ray_cloud); !checked) {
+    return checked;
   }
+  const std::vector<std::int64_t> organized{config_.height, config_.width, 3};
+  if (!image.data || image.width != config_.width || image.height != config_.height ||
+      !ray_cloud.organized || ray_cloud.normals->shape() != organized ||
+      ray_cloud.colors->shape() != organized) {
+    return holoscan::make_unexpected(failure("RaycastReportOp", "unexpected ray cast"));
+  }
+  cudaStream_t stream = context.cuda_stream().get();
+  if (stream == nullptr) {
+    return holoscan::make_unexpected(
+        failure("RaycastReportOp", "the runtime gave no CUDA stream for the device inputs"));
+  }
+  // Three copies, and one wait for all of them.
   const std::size_t count = static_cast<std::size_t>(config_.width) * config_.height;
   pixels_.resize(count);
   normals_.resize(3U * count);
   colors_.resize(3U * count);
-  if (auto copied = image.data->copy_to_host(pixels_.data(), count * 4U, context.cuda_stream());
-      !copied) {
-    return copied;
-  }
-  if (auto copied =
-          normal_sample->data.copy_to_host(normals_.data(), count * 12U, context.cuda_stream());
-      !copied) {
-    return copied;
-  }
-  if (auto copied =
-          color_image.data->copy_to_host(colors_.data(), count * 3U, context.cuda_stream());
-      !copied) {
-    return copied;
+  if (cudaMemcpyAsync(pixels_.data(), image.data->data(), count * 4U, cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(normals_.data(), ray_cloud.normals->data(), count * 12U,
+                      cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+      cudaMemcpyAsync(colors_.data(), ray_cloud.colors->data(), count * 3U, cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess) {
+    return holoscan::make_unexpected(failure("RaycastReportOp", "copying the ray cast failed"));
   }
   const holoscan::Tensor& pose_tensor = pose_sample->data;
   if (pose_tensor.size() != 16 || pose_tensor.dtype().bits != 32) {
@@ -188,14 +188,15 @@ holoscan::expected<void, holoscan::Error> RaycastReportOp::compute(
   // Nearly every hit has the color of the surface it hit.
   report.bad_hits += 100U * colored < 99U * hits ? 1U : 0U;
   if (report.frames >= report.warmup_frames) {
+    ++report.judged;
     report.worst_median_m = std::max(report.worst_median_m, median);
     report.worst_outliers = std::max(report.worst_outliers, outlier_share);
     report.worst_p95_m = std::max(report.worst_p95_m, p95);
     report.worst_coverage = std::min(report.worst_coverage, coverage);
   }
   ++report.frames;
-  if (config_.finished) {
-    config_.finished->fetch_add(1U, std::memory_order_release);
+  if (config_.progress) {
+    config_.progress->raycasts.fetch_add(1U, std::memory_order_release);
   }
   maybe_complete(report, context);
   return {};
@@ -256,12 +257,19 @@ holoscan::expected<void, holoscan::Error> MeshReportOp::compute(
   // Only the counted vertices and triangles are copied.
   points_.resize(static_cast<std::size_t>(n) * 3U);
   normals_.resize(static_cast<std::size_t>(n) * 3U);
+  colors_.resize(static_cast<std::size_t>(n) * 3U);
   triangles_.resize(static_cast<std::size_t>(t) * 3U);
   cudaStream_t stream = context.cuda_stream().get();
+  if (stream == nullptr) {
+    return holoscan::make_unexpected(
+        failure("MeshReportOp", "the runtime gave no CUDA stream for the device inputs"));
+  }
   if ((n != 0U &&
        (cudaMemcpyAsync(points_.data(), vertex_sample->data.data(), points_.size() * 4U,
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
         cudaMemcpyAsync(normals_.data(), normal_sample->data.data(), normals_.size() * 4U,
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaMemcpyAsync(colors_.data(), color_sample->data.data(), colors_.size(),
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess)) ||
       (t != 0U &&
        cudaMemcpyAsync(triangles_.data(), triangle_sample->data.data(), triangles_.size() * 4U,
@@ -279,6 +287,13 @@ holoscan::expected<void, holoscan::Error> MeshReportOp::compute(
     bad_normals +=
         std::abs(std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - 1.0F) < 1e-3F ? 0U : 1U;
   }
+  // Every surface of the scene has a color: nearly every vertex must have
+  // one (black only where a cube's voxels had none yet).
+  std::uint32_t black = 0;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const std::uint8_t* c = &colors_[3U * i];
+    black += c[0] == 0U && c[1] == 0U && c[2] == 0U ? 1U : 0U;
+  }
   const ht::SyntheticScene scene = ht::synthetic_scene(ht::SceneKind::kTabletop);
   std::vector<double> errors;
   errors.reserve(n);
@@ -290,6 +305,10 @@ holoscan::expected<void, holoscan::Error> MeshReportOp::compute(
   Report& report = *config_.report;
   const std::lock_guard lock(report.mutex);
   ++report.meshes;
+  if (config_.progress) {
+    config_.progress->meshes.fetch_add(1U, std::memory_order_release);
+  }
+  report.bad_colors += 100U * static_cast<std::uint64_t>(black) > n ? 1U : 0U;
   report.bad_triangles += bad_triangles;
   report.bad_normals += bad_normals;
   report.overflows +=

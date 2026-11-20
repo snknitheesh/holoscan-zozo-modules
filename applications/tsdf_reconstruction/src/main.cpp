@@ -2,27 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // TSDF Reconstruction: a synthetic RGB-D camera circles a known tabletop
-// scene with known poses; holoscan-tsdf's TsdfIntegrateOp integrates every
-// frame into a TSDF volume, and TsdfMeshOp ray casts the volume from each
-// pose and extracts its mesh every N frames. Reporters check every ray cast
-// against the scene's exact depth and every mesh against its exact surfaces,
-// and with a display HoloViz shows the input depth beside the shaded ray
-// cast. At the end the mesh can be saved as a PLY file.
+// scene with known poses; its calibration is written to a camera_info file
+// that CameraInfoSourceOp sends. holoscan-tsdf's TsdfIntegrateOp integrates
+// every frame into a TSDF volume, and TsdfMeshOp ray casts the volume from
+// each pose and extracts its mesh every N frames. Reporters check every ray
+// cast against the scene's exact depth and every mesh against its exact
+// surfaces, and with a display HoloViz shows the input depth beside the
+// shaded ray cast. At the end the mesh can be saved as a PLY file. The
+// lossless graph runs on one worker.
 
 #include <algorithm>
-#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -34,6 +37,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #include <holoscan/tsdf/synthetic_scene.hpp>
 #include <holoscan/tsdf/tsdf_integrate_op.hpp>
@@ -50,13 +56,14 @@
 
 namespace {
 
-using std::chrono_literals::operator""ms;
 namespace app = tsdf_reconstruction_app;
+namespace hm = holoscan::messages;
 namespace ht = holoscan::tsdf;
 
 constexpr std::string_view kAppName = "tsdf_reconstruction";
 constexpr float kDepthMin = 0.1F;
 constexpr float kDepthMax = 3.0F;
+constexpr char kCameraFrame[] = "camera_optical";
 
 enum class DisplayMode { kAuto, kOn, kOff, kOffscreen };
 
@@ -175,6 +182,9 @@ bool env_set(const char* name) {
 }
 
 void validate(const Options& opts) {
+  if (opts.count == 0) {
+    throw std::invalid_argument("--count must be positive");
+  }
   if (opts.period_ms == 0 || opts.period_ms > 1000 || opts.timeout_seconds == 0) {
     throw std::invalid_argument("--period-ms must be 1..1000 and --timeout-seconds positive");
   }
@@ -193,7 +203,65 @@ void validate(const Options& opts) {
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
+// Closes the signal domain on every way out of execute().
+class SignalCloser {
+ public:
+  explicit SignalCloser(SignalDomain& signals) : signals_(signals) {}
+  ~SignalCloser() {
+    if (signals_) {
+      if (auto closed = signals_->close(); !closed) {
+        std::cerr << kAppName << ": warning: closing the signal domain failed: "
+                  << holoscan::runtime_error_message(closed.error()) << '\n';
+      }
+    }
+  }
+  SignalCloser(const SignalCloser&) = delete;
+  SignalCloser& operator=(const SignalCloser&) = delete;
+
+ private:
+  SignalDomain& signals_;
+};
+
+// The synthetic camera's camera_info file, written for CameraInfoSourceOp to
+// read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every way out of the run.
+class CameraInfoFile {
+ public:
+  CameraInfoFile(int width, int height) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(ht::synthetic_camera_info(width, height, kCameraFrame), path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~CameraInfoFile() { remove(); }
+  CameraInfoFile(const CameraInfoFile&) = delete;
+  CameraInfoFile& operator=(const CameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
+
 int execute(const Options& opts, SignalDomain& signals) {
+  const SignalCloser close_signals(signals);
   const bool display_available =
       env_set("DISPLAY") || (env_set("WAYLAND_DISPLAY") && env_set("XDG_RUNTIME_DIR"));
   const bool display = opts.display == DisplayMode::kOn ||
@@ -216,7 +284,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   std::cout << kAppName << ": volume " << opts.dims << "^3, " << std::fixed << std::setprecision(2)
             << 1000.0F * volume_config.voxel_size << " mm voxels, " << (volume->bytes() >> 20)
             << " MiB on the GPU\n";
-  const ht::CameraIntrinsics intrinsics = ht::synthetic_intrinsics(opts.width, opts.height);
+  // The camera's calibration, as a ROS camera_info file. CameraInfoSourceOp
+  // reads it again when the run starts, so it stays until the run is over.
+  const CameraInfoFile camera_info_file(opts.width, opts.height);
   // The mesh's capacity: the scene's mesh has about 3.5 dims^2 vertices (900
   // thousand at 512^3).
   const std::uint32_t max_vertices = std::max(
@@ -224,7 +294,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   const std::uint32_t max_triangles = 2U * max_vertices;
 
   holoscan::Graph graph{std::string(kAppName)};
-  auto finished = std::make_shared<std::atomic<std::uint32_t>>(0U);
+  auto progress = std::make_shared<app::Progress>();
   auto camera = graph.op<app::SceneCameraOp>(
       "camera", app::SceneCameraConfig{.width = opts.width,
                                        .height = opts.height,
@@ -232,28 +302,28 @@ int execute(const Options& opts, SignalDomain& signals) {
                                        .orbit = opts.orbit,
                                        .millimeters = opts.millimeters,
                                        .period = std::chrono::milliseconds(opts.period_ms),
-                                       .finished = finished});
+                                       .progress = progress,
+                                       .mesh_every = opts.mesh_every});
+  auto camera_info = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file.path()});
   auto integrate = graph.op<ht::TsdfIntegrateOp>(
       "integrate", ht::TsdfIntegrateConfig{.volume = volume,
-                                           .intrinsics = intrinsics,
                                            .depth_scale = opts.millimeters ? 0.001F : 1.0F,
                                            .depth_min = kDepthMin,
                                            .depth_max = kDepthMax,
                                            .color = true,
                                            .max_width = opts.width,
                                            .max_height = opts.height});
-  auto mesh = graph.op<ht::TsdfMeshOp>(
-      "mesh", ht::TsdfMeshConfig{.volume = volume,
-                                 .mesh = true,
-                                 .mesh_every = opts.mesh_every,
-                                 .max_vertices = max_vertices,
-                                 .max_triangles = max_triangles,
-                                 .raycast = true,
-                                 .raycast_params = ht::RaycastParams{.intrinsics = intrinsics,
-                                                                     .width = opts.width,
-                                                                     .height = opts.height,
-                                                                     .depth_min = kDepthMin,
-                                                                     .depth_max = kDepthMax}});
+  auto mesh = graph.op<ht::TsdfMeshOp>("mesh", ht::TsdfMeshConfig{.volume = volume,
+                                                                  .mesh = true,
+                                                                  .mesh_every = opts.mesh_every,
+                                                                  .max_vertices = max_vertices,
+                                                                  .max_triangles = max_triangles,
+                                                                  .raycast = true,
+                                                                  .raycast_depth_min = kDepthMin,
+                                                                  .raycast_depth_max = kDepthMax,
+                                                                  .max_width = opts.width,
+                                                                  .max_height = opts.height});
   auto report = std::make_shared<app::Report>();
   report->expected_frames = opts.count;
   report->expected_meshes = opts.count / opts.mesh_every;
@@ -262,22 +332,24 @@ int execute(const Options& opts, SignalDomain& signals) {
                                         .volume = volume_config,
                                         .width = opts.width,
                                         .height = opts.height,
-                                        .finished = finished};
+                                        .progress = progress};
   auto raycast_report = graph.op<app::RaycastReportOp>("raycast_report", report_config);
   auto mesh_report = graph.op<app::MeshReportOp>("mesh_report", report_config);
 
   // Lossless edges: every frame is integrated, ray cast and checked, and
   // every mesh checked, in order. The camera keeps one frame in flight, so no
-  // queue fills.
+  // queue fills. The camera info keeps only the newest.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(camera->depth, integrate->depth, lossless);
   graph.add_flow(camera->color, integrate->color, lossless);
   graph.add_flow(camera->pose, integrate->pose, lossless);
+  graph.add_flow(camera_info->camera_info, integrate->camera_info,
+                 hm::latest_camera_info_connection());
+  graph.add_flow(camera_info->camera_info, mesh->camera_info, hm::latest_camera_info_connection());
   graph.add_flow(integrate->integrated_pose, mesh->pose, lossless);
   graph.add_flow(integrate->integrated_pose, raycast_report->pose, lossless);
   graph.add_flow(mesh->raycast_depth, raycast_report->depth, lossless);
-  graph.add_flow(mesh->raycast_normals, raycast_report->normals, lossless);
-  graph.add_flow(mesh->raycast_colors, raycast_report->colors, lossless);
+  graph.add_flow(mesh->raycast_cloud, raycast_report->cloud, lossless);
   graph.add_flow(mesh->vertices, mesh_report->vertices, lossless);
   graph.add_flow(mesh->normals, mesh_report->normals, lossless);
   graph.add_flow(mesh->colors, mesh_report->colors, lossless);
@@ -294,7 +366,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   on_gpu("camera", "depth");
   on_gpu("camera", "color");
   for (const char* port : {"vertices", "normals", "colors", "triangles", "mesh_counts",
-                           "raycast_depth", "raycast_normals", "raycast_colors"}) {
+                           "raycast_depth", "raycast_cloud"}) {
     on_gpu("mesh", port);
   }
 
@@ -325,8 +397,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     const holoscan::ConnectionOptions latest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
                                              .queue_depth = 1U};
     graph.add_flow(camera->depth, view->depth, latest);
-    graph.add_flow(mesh->raycast_normals, view->normals, latest);
-    graph.add_flow(mesh->raycast_colors, view->colors, latest);
+    graph.add_flow(mesh->raycast_cloud, view->cloud, latest);
     graph.add_flow(view->image, visualizer->image_layer_input(0), latest);
     on_gpu("view", "image");
     if (offscreen) {
@@ -337,6 +408,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 #endif
 
+  // Every frame must arrive: the whole graph on one worker. Split by the
+  // automatic partitioning (four workers here, six with the display), an
+  // operator can run while its consumer's lossless queue is full, and fail on
+  // the refused emit; see the messages module's README.
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   if (!plan.diagnostics().empty()) {
@@ -345,8 +421,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!plan.ok()) {
     return 1;
   }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    std::cout << kAppName << ": plan=OK workers=" << workers << '\n';
     return 0;
   }
   if (!signals) {
@@ -356,12 +433,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   const auto started = std::chrono::steady_clock::now();
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
-  const auto deadline = started + std::chrono::seconds(opts.timeout_seconds) +
-                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const bool timed_out = session.is_running();
+  const auto allowance = std::chrono::seconds(opts.timeout_seconds) +
+                         std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
+  const bool timed_out = !session.wait_for(allowance);
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
@@ -376,13 +450,6 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!session.diagnostics().empty() && !sdk_reported) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
   }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
-  }
-
   bool saved = true;
   if (!opts.ply.empty()) {
     try {
@@ -404,7 +471,8 @@ int execute(const Options& opts, SignalDomain& signals) {
                       shown && saved;
   const double voxel_mm = 1000.0 * r.voxel;
   std::cout << std::fixed << std::setprecision(2) << kAppName << ": frames=" << r.frames << '/'
-            << opts.count << " fps=" << (seconds > 0.0 ? r.frames / seconds : 0.0)
+            << opts.count << " judged=" << r.judged
+            << " fps=" << (seconds > 0.0 ? r.frames / seconds : 0.0)
             << " raycast: worst_median_mm=" << 1000.0 * r.worst_median_m
             << " worst_p95_mm=" << 1000.0 * r.worst_p95_m
             << " worst_outliers=" << 100.0 * r.worst_outliers << '%'

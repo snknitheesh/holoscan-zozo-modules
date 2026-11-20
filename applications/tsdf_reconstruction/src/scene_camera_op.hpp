@@ -5,12 +5,19 @@
 // scene, as a tracked camera sends it: depth (uint16 millimeters or float32
 // meters, 0 where there is none) with noise, aligned RGB color, both in
 // device memory, and the camera's known pose (world_from_camera, float64
-// [4, 4], host memory), all with the same capture time and frame id. A fixed
-// number of frames on a clock, then idle.
+// [4, 4], host memory), all with the same capture time and frame id. Its
+// calibration is ht::synthetic_camera_info(), which the demo writes to a
+// camera_info file for CameraInfoSourceOp. A fixed number of frames on a
+// clock, from the second tick (CameraInfoSourceOp sends when the run starts,
+// so the camera info is there before the first frame), then idle.
 //
 // The operators cannot send a refused output again, so a full queue must
-// never meet them: with `finished`, the camera keeps one frame in flight,
-// sending the next only once the last consumer has counted the previous one.
+// never meet them: with `progress`, the camera keeps one frame in flight,
+// sending the next only once both reporters have counted the previous one
+// (its ray cast, and its mesh when it was meshed). The demo runs on one
+// worker, where the SDK runs one operator at a time, but it may still run the
+// camera's next tick before the reporters. A frame the runtime has no room
+// for is sent on the next tick.
 
 #pragma once
 
@@ -30,6 +37,12 @@
 
 namespace tsdf_reconstruction_app {
 
+// What the reporters have counted, for the camera.
+struct Progress {
+  std::atomic<std::uint32_t> raycasts{};
+  std::atomic<std::uint32_t> meshes{};
+};
+
 struct SceneCameraConfig {
   int width{640};
   int height{480};
@@ -38,8 +51,10 @@ struct SceneCameraConfig {
   std::uint32_t orbit{120};
   bool millimeters{true};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
-  // Frames the last consumer has finished; none sends on every tick.
-  std::shared_ptr<const std::atomic<std::uint32_t>> finished;
+  // The reporters' counts and how often a frame is meshed; without them the
+  // camera sends on every tick.
+  std::shared_ptr<const Progress> progress;
+  std::uint32_t mesh_every{1};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -66,6 +81,7 @@ class SceneCameraOp final : public holoscan::Operator<> {
  private:
   SceneCameraConfig config_;
   std::uint32_t emitted_{};
+  std::uint64_t ticks_{};
 };
 
 }  // namespace tsdf_reconstruction_app

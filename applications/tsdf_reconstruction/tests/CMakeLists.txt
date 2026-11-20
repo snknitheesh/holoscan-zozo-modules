@@ -16,34 +16,40 @@ function(tsdf_app_test name status output)
 endfunction()
 
 # Every frame and every mesh checked against the scene's truth: float32 depth, a finer volume,
-# 720p, and the mesh every frame.
-set(_pass "bad_triangles=0 bad_normals=0.*verdict=PASS")
+# 720p, and the mesh every frame. The ray casts are judged after the first 10 frames, and a run
+# with none judged fails: each runs more.
+set(_pass "judged=[1-9].*bad_triangles=0 bad_normals=0.*verdict=PASS")
 tsdf_app_test(tsdf_app_float_depth 0 "${_pass}"
   --count 20 --orbit 20 --mesh-every 10 --period-ms 10 --depth m --dims 128 --display false
 )
 tsdf_app_test(tsdf_app_720p 0 "${_pass}"
-  --count 10 --orbit 20 --mesh-every 5 --period-ms 20 --width 1280 --height 720 --dims 192
+  --count 14 --orbit 20 --mesh-every 7 --period-ms 20 --width 1280 --height 720 --dims 192
   --display false
 )
-tsdf_app_test(tsdf_app_mesh_every_frame 0 "meshes=8/8.*verdict=PASS"
-  --count 8 --orbit 40 --mesh-every 1 --period-ms 10 --dims 96 --display false
+tsdf_app_test(tsdf_app_mesh_every_frame 0 "meshes=12/12.*verdict=PASS"
+  --count 12 --orbit 40 --mesh-every 1 --period-ms 10 --dims 96 --display false
 )
 # The final mesh saved as a PLY file.
 tsdf_app_test(tsdf_app_ply 0 "saved the mesh to .*verdict=PASS"
   --count 12 --orbit 12 --mesh-every 12 --period-ms 10 --dims 96 --display false
   --ply "${CMAKE_CURRENT_BINARY_DIR}/tsdf_app_test.ply"
 )
-# HoloViz renders both views offscreen, into CUDA memory.
-tsdf_app_test(tsdf_app_offscreen 0 "showing=[1-9].*verdict=PASS"
-  --count 20 --orbit 20 --mesh-every 10 --period-ms 30 --dims 128 --display offscreen
-)
-# The display graph compiles, without a display server.
-tsdf_app_test(tsdf_app_display_graph 0 "plan=OK" --display true --compile-only true)
+# The lossless graph on one worker.
+tsdf_app_test(tsdf_app_one_worker 0 "plan=OK workers=1[^0-9]" --display false --compile-only true)
+if(TSDF_RECONSTRUCTION_ENABLE_VISUALIZATION)
+  # HoloViz renders both views offscreen, into CUDA memory.
+  tsdf_app_test(tsdf_app_offscreen 0 "showing=[1-9].*verdict=PASS"
+    --count 20 --orbit 20 --mesh-every 10 --period-ms 30 --dims 128 --display offscreen
+  )
+  # The display graph compiles, without a display server, on one worker.
+  tsdf_app_test(tsdf_app_display_graph 0 "plan=OK workers=1[^0-9]" --display true --compile-only true)
+endif()
 
 # Unusable arguments are usage errors.
 tsdf_app_test(tsdf_app_rejects_size 2 "^error: camera images" --width 10)
 tsdf_app_test(tsdf_app_rejects_dims 2 "^error: --dims" --dims 1024)
 tsdf_app_test(tsdf_app_rejects_mesh_every 2 "^error: --mesh-every" --mesh-every 0)
+tsdf_app_test(tsdf_app_rejects_count 2 "^error: --count must be positive" --count 0)
 tsdf_app_test(tsdf_app_rejects_depth 2 "^error: --depth" --depth cm)
 tsdf_app_test(tsdf_app_rejects_option 2 "^error: unknown option" --frames 3)
 

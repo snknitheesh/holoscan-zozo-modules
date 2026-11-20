@@ -15,6 +15,7 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace tsdf_reconstruction_app {
@@ -37,10 +38,9 @@ class ViewOp final : public holoscan::Operator<> {
 
   // MONO16 millimeters or MONO32F meters [H, W], on the GPU.
   holoscan::Input<holoscan::schema::ImageT> depth;
-  // float32 [H, W, 3] camera-frame normals, NaN where nothing was hit.
-  holoscan::Input<holoscan::Tensor> normals;
-  // RGB8 [H, W, 3] ray-cast colors.
-  holoscan::Input<holoscan::schema::ImageT> colors;
+  // The ray cast's organized cloud: its camera-frame normals (NaN where
+  // nothing was hit) and RGB8 colors shade the picture.
+  holoscan::Input<holoscan::messages::schema::PointCloudT> cloud;
   // RGB8 [H, 2W, 3].
   holoscan::Output<holoscan::schema::ImageT> image;
 

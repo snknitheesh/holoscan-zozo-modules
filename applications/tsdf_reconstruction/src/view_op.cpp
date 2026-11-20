@@ -34,8 +34,7 @@ ViewOp::ViewOp(ViewConfig config) : config_(config) {}
 
 void ViewOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(depth, "depth");
-  spec.input(normals, "normals");
-  spec.input(colors, "colors");
+  spec.input(cloud, "cloud");
   const auto bytes = static_cast<std::uint64_t>(config_.width) * 2U *
                      static_cast<std::uint64_t>(config_.height) * 3U;
   spec.output(image, "image")
@@ -45,7 +44,6 @@ void ViewOp::setup(holoscan::OperatorSpec& spec) {
                   .memory_kind = holoscan::MemoryKind::kCudaDevice,
                   .dtype = kUInt8,
                   .rank = 3U,
-                  .strides = holoscan::TensorStridePolicy::kContiguousOnly,
               },
           .bounds = holoscan::tensor_bounds(bytes),
           .storage = holoscan::TensorOutputStorage::kRuntimePool,
@@ -58,38 +56,38 @@ void ViewOp::setup(holoscan::OperatorSpec& spec) {
 holoscan::Contract ViewOp::contract() const {
   holoscan::Contract result;
   result.trigger(holoscan::OnAligned{
-      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{depth, normals, colors}},
-      .window = 0ns});
+      .ports = holoscan::PortList{std::vector<holoscan::PortRef>{depth, cloud}}, .window = 0ns});
   result.input(depth, holoscan::Exact{});
-  result.input(normals, holoscan::Exact{});
-  result.input(colors, holoscan::Exact{});
+  result.input(cloud, holoscan::Exact{});
   return result;
 }
 
 holoscan::expected<void, holoscan::Error> ViewOp::compute(holoscan::ExecutionContext& context) {
   auto depth_sample = depth.receive();
-  auto normal_sample = normals.receive();
-  auto color_sample = colors.receive();
+  auto cloud_sample = cloud.receive();
   if (!depth_sample) {
     return holoscan::make_unexpected(std::move(depth_sample).error());
   }
-  if (!normal_sample) {
-    return holoscan::make_unexpected(std::move(normal_sample).error());
-  }
-  if (!color_sample) {
-    return holoscan::make_unexpected(std::move(color_sample).error());
+  if (!cloud_sample) {
+    return holoscan::make_unexpected(std::move(cloud_sample).error());
   }
   const holoscan::schema::ImageT& depth_image = depth_sample->data;
-  const holoscan::schema::ImageT& color_image = color_sample->data;
-  if (!depth_image.data || !color_image.data) {
-    return holoscan::make_unexpected(invalid("an image without pixels"));
+  const holoscan::messages::schema::PointCloudT& ray_cloud = cloud_sample->data;
+  if (auto checked = holoscan::messages::check_point_cloud(ray_cloud); !checked) {
+    return checked;
+  }
+  if (!depth_image.data) {
+    return holoscan::make_unexpected(invalid("a depth image without pixels"));
   }
   const std::span<const std::int64_t> depth_shape = depth_image.data->shape_span();
-  const std::span<const std::int64_t> normal_shape = normal_sample->data.shape_span();
+  const std::vector<std::int64_t> organized{config_.height, config_.width, 3};
   if (depth_shape.size() < 2 || depth_shape[0] != config_.height ||
-      depth_shape[1] != config_.width || normal_shape.size() != 3 ||
-      normal_shape[0] != config_.height || normal_shape[1] != config_.width) {
-    return holoscan::make_unexpected(invalid("expected [H, W] depth and [H, W, 3] normals"));
+      depth_shape[1] != config_.width || !ray_cloud.organized ||
+      ray_cloud.normals->shape() != organized ||
+      (holoscan::messages::is_present(ray_cloud.colors) &&
+       ray_cloud.colors->shape() != organized)) {
+    return holoscan::make_unexpected(
+        invalid("expected [H, W] depth and an organized [H, W] cloud with normals"));
   }
   const bool millimeters = depth_image.encoding == holoscan::schema::ImageEncoding_MONO16;
   cudaStream_t stream = context.cuda_stream().get();
@@ -112,10 +110,13 @@ holoscan::expected<void, holoscan::Error> ViewOp::compute(holoscan::ExecutionCon
           millimeters ? holoscan::tsdf::DepthType::kUint16 : holoscan::tsdf::DepthType::kFloat32,
           millimeters ? 0.001F : 1.0F, config_.width, config_.height, config_.depth_min,
           config_.depth_max, rgb, row, stream) != cudaSuccess ||
-      holoscan::tsdf::shade_raycast(
-          static_cast<const float*>(normal_sample->data.data()),
-          static_cast<const std::uint8_t*>(color_image.data->data()), config_.width, config_.height,
-          rgb + 3U * static_cast<std::size_t>(config_.width), row, stream) != cudaSuccess) {
+      holoscan::tsdf::shade_raycast(static_cast<const float*>(ray_cloud.normals->data()),
+                                    holoscan::messages::is_present(ray_cloud.colors)
+                                        ? static_cast<const std::uint8_t*>(ray_cloud.colors->data())
+                                        : nullptr,
+                                    config_.width, config_.height,
+                                    rgb + 3U * static_cast<std::size_t>(config_.width), row,
+                                    stream) != cudaSuccess) {
     return holoscan::make_unexpected(invalid("drawing failed"));
   }
   if (auto committed = std::move(*writer).commit(); !committed) {

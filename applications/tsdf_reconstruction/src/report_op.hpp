@@ -6,20 +6,19 @@
 //
 //   RaycastReportOp  each frame's ray cast from the camera's pose against the
 //                    exact depth from that pose: the error and the share of
-//                    the surfaces inside the volume it sees; and that every
-//                    hit has a unit normal facing the camera, and nearly
-//                    every hit a color.
+//                    the surfaces inside the volume it sees; and from its
+//                    point cloud, that every hit has a unit normal facing the
+//                    camera, and nearly every hit a color.
 //   MeshReportOp     each mesh's vertices against the exact surfaces: the
 //                    distance of every vertex to the nearest surface; and
-//                    that every triangle indexes written vertices and every
-//                    vertex has a unit normal.
+//                    that every triangle indexes written vertices, every
+//                    vertex has a unit normal and nearly every one a color.
 //
 // Both write into one Report, and the one that completes it (every frame
 // and every mesh checked) completes the run.
 
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -32,8 +31,11 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/point_cloud.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 #include <holoscan/tsdf/tsdf_volume.hpp>
+
+#include "scene_camera_op.hpp"
 
 namespace tsdf_reconstruction_app {
 
@@ -44,8 +46,9 @@ struct Report {
   std::uint32_t expected_meshes{};
   std::uint32_t warmup_frames{10};  // Frames not judged while the volume fills.
   float voxel{};
-  // The ray casts.
+  // The ray casts, and those judged (after the warm-up).
   std::uint32_t frames{};
+  std::uint32_t judged{};
   double worst_median_m{};  // The worst frame's median depth error.
   double worst_p95_m{};     // The worst frame's 95th percentile.
   // The worst frame's share of hits more than three voxels off: rays that
@@ -60,6 +63,7 @@ struct Report {
   std::uint32_t overflows{};      // Meshes beyond the capacity.
   std::uint64_t bad_triangles{};  // Triangles indexing vertices not written.
   std::uint64_t bad_normals{};    // Vertices without a unit normal.
+  std::uint32_t bad_colors{};     // Meshes with more than 1% of vertices black.
   std::uint32_t last_vertices{};
   std::uint32_t last_triangles{};
   double last_mean_m{};
@@ -67,13 +71,13 @@ struct Report {
   double last_max_m{};
   bool completed{};
 
-  // Thresholds: the ray cast within half a voxel at the median and 1.5
-  // voxels at the 95th percentile, under 2% of hits more than three voxels
-  // off, seeing 95% of the surfaces; the last mesh within 0.35 voxels on
-  // average and one voxel at the 95th percentile.
+  // Thresholds: at least one ray cast judged; the ray cast within half a
+  // voxel at the median and 1.5 voxels at the 95th percentile, under 2% of
+  // hits more than three voxels off, seeing 95% of the surfaces; the last
+  // mesh within 0.35 voxels on average and one voxel at the 95th percentile.
   [[nodiscard]] bool passed() const {
-    return frames == expected_frames && meshes == expected_meshes && overflows == 0 &&
-           bad_hits == 0 && bad_triangles == 0 && bad_normals == 0 &&
+    return frames == expected_frames && judged > 0 && meshes == expected_meshes && overflows == 0 &&
+           bad_hits == 0 && bad_triangles == 0 && bad_normals == 0 && bad_colors == 0 &&
            worst_median_m < 0.5 * voxel && worst_p95_m < 1.5 * voxel && worst_outliers < 0.02 &&
            worst_coverage >= 0.95 &&
            (expected_meshes == 0 ||
@@ -86,8 +90,8 @@ struct ReportConfig {
   holoscan::tsdf::TsdfVolumeConfig volume;
   int width{};
   int height{};
-  // Frames the ray-cast reporter has finished, for the camera.
-  std::shared_ptr<std::atomic<std::uint32_t>> finished;
+  // What the reporters have counted, for the camera.
+  std::shared_ptr<Progress> progress;
 };
 
 class RaycastReportOp final : public holoscan::Operator<> {
@@ -101,10 +105,9 @@ class RaycastReportOp final : public holoscan::Operator<> {
 
   // MONO32F [H, W] meters on the GPU.
   holoscan::Input<holoscan::schema::ImageT> depth;
-  // float32 [H, W, 3] camera-frame normals on the GPU.
-  holoscan::Input<holoscan::Tensor> normals;
-  // RGB8 [H, W, 3] on the GPU.
-  holoscan::Input<holoscan::schema::ImageT> colors;
+  // The ray cast's organized cloud on the GPU: camera-frame normals and RGB8
+  // colors are checked.
+  holoscan::Input<holoscan::messages::schema::PointCloudT> cloud;
   // float32 [4, 4] world_from_camera, host memory.
   holoscan::Input<holoscan::Tensor> pose;
 
@@ -139,6 +142,7 @@ class MeshReportOp final : public holoscan::Operator<> {
   ReportConfig config_;
   std::vector<float> points_;
   std::vector<float> normals_;
+  std::vector<std::uint8_t> colors_;
   std::vector<std::uint32_t> triangles_;
 };
 
