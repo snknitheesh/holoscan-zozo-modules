@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <holoscan/fiducials/types.hpp>
@@ -44,8 +45,19 @@ class DetectorBackend {
   [[nodiscard]] virtual std::vector<std::optional<Point2>> refine_saddles(
       const GrayImageView& image, std::span<const SaddleSeed> seeds, cudaStream_t stream) = 0;
 
+  // The CPU waits for the GPU and the bytes copied between host and device memory by the
+  // calls since the last take_transfers() (none for the cpu backend), and counts anew.
+  [[nodiscard]] TransferCounts take_transfers() noexcept { return std::exchange(transfers_, {}); }
+
  protected:
   DetectorBackend() = default;
+  // For a backend to count what it waits for and copies.
+  void count_transfer(std::uint32_t host_waits, std::uint64_t copied_bytes) noexcept {
+    transfers_ += TransferCounts{.host_waits = host_waits, .copied_bytes = copied_bytes};
+  }
+
+ private:
+  TransferCounts transfers_;
 };
 
 // The facts about this process's platform that resolve_auto() needs.

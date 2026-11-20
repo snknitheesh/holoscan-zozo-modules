@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -14,12 +16,13 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/fiducials/fiducial_messages.hpp>
-#include <holoscan/fiducials/overlay_drawing.hpp>
 #include <holoscan/fiducials/pose.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 #include <holoscan/visualization/holoviz_op.hpp>
 
 #include "image_output.hpp"
+#include "overlay_drawing.hpp"
 
 namespace holoscan::fiducials {
 namespace {
@@ -37,11 +40,20 @@ FiducialOverlayOp::FiducialOverlayOp(FiducialOverlayConfig config) : config_(std
   if (config_.width <= 0 || config_.height <= 0) {
     throw std::invalid_argument("FiducialOverlayOp: width and height must be positive");
   }
-  if (config_.intrinsics) validate_intrinsics(*config_.intrinsics);
+  if (config_.draw_axes) {
+    if (!(std::isfinite(config_.marker_length) && config_.marker_length > 0)) {
+      throw std::invalid_argument("FiducialOverlayOp: marker_length must be positive to draw axes");
+    }
+    if (config_.camera_info_input.max_age <= std::chrono::nanoseconds::zero()) {
+      throw std::invalid_argument("FiducialOverlayOp: camera_info_input.max_age must be > 0");
+    }
+  }
 }
 
 void FiducialOverlayOp::setup(holoscan::OperatorSpec& spec) {
+  // Two detections queued: the one being drawn and the next; the same for camera info.
   spec.input(detections, "detections").queue_depth(2U);
+  if (config_.draw_axes) spec.input(camera_info, "camera_info").queue_depth(2U);
   image_output(spec, overlay, "overlay", holoscan::MemoryKind::kHost, config_.width, config_.height,
                4);
   spec.output(labels, "labels")
@@ -59,13 +71,32 @@ void FiducialOverlayOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract FiducialOverlayOp::contract() const {
+  if (config_.draw_axes) {
+    return messages::camera_info_contract(config_.camera_info_input, camera_info, detections);
+  }
   holoscan::Contract result;
   result.trigger(holoscan::OnEach{detections});
   return result;
 }
 
+void FiducialOverlayOp::start() {
+  camera_.reset();
+  unstamped_logged_ = false;
+}
+
 holoscan::expected<void, holoscan::Error> FiducialOverlayOp::compute(
     holoscan::ExecutionContext& context) {
+  const messages::CameraInfo* camera = nullptr;
+  if (config_.draw_axes) {
+    auto info = camera_.update(camera_info);
+    if (!info) {
+      holoscan::Error error = std::move(info).error();
+      error.message = "FiducialOverlayOp: " + error.message;
+      return holoscan::make_unexpected(std::move(error));
+    }
+    if (*info == nullptr) return {};  // No camera info yet: skip these detections.
+    camera = *info;
+  }
   auto received = detections.receive();
   if (!received) return holoscan::make_unexpected(std::move(received).error());
   const schema::FiducialDetectionsT& message = received->data;
@@ -77,11 +108,30 @@ holoscan::expected<void, holoscan::Error> FiducialOverlayOp::compute(
                         "FiducialOverlayOp: image size outside the configured " +
                             std::to_string(config_.width) + "x" + std::to_string(config_.height)});
   }
+  if (camera != nullptr) {
+    try {
+      check_camera_size(*camera, width, height);
+    } catch (const std::invalid_argument& error) {
+      return holoscan::make_unexpected(
+          holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
+                          std::string("FiducialOverlayOp: ") + error.what()});
+    }
+  }
   const std::size_t markers = std::min<std::size_t>(message.markers.size(), kMaxMarkersPerFrame);
-  // The frame's capture time, so HoloViz draws these over the image they came from; unstamped
-  // detections are stamped now, since HoloViz selects layers by capture time.
+  // The frame's capture time, so HoloViz draws these over the image they came from. HoloViz
+  // selects layers by capture time, so unstamped detections cannot be drawn without one: they
+  // get this activation's time, which says when they were drawn, not captured, and a warning
+  // says so once.
   holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*received);
-  if (!received->metadata.source_clock_id.valid()) emit.capture_time = context.activation_time();
+  if (!received->metadata.source_clock_id.valid()) {
+    emit.capture_time = context.activation_time();
+    if (!unstamped_logged_) {
+      unstamped_logged_ = true;
+      HOLOSCAN_LOG_WARN(
+          "FiducialOverlayOp: detections without a capture time; drawn with the time they are "
+          "drawn at, so the overlay may not match its image");
+    }
+  }
 
   // Allocates a host tensor on `output` and has `fill` write it.
   const auto write =
@@ -107,9 +157,8 @@ holoscan::expected<void, holoscan::Error> FiducialOverlayOp::compute(
     for (std::size_t m = 0; m < markers; ++m) {
       const Marker marker = from_message(message.markers[m]);
       draw_marker(canvas, marker.corners);
-      if (marker.pose && config_.intrinsics && config_.marker_length > 0) {
-        if (const auto axes =
-                target_axes(*marker.pose, *config_.intrinsics, 0.5 * config_.marker_length)) {
+      if (marker.pose && camera != nullptr) {
+        if (const auto axes = target_axes(*marker.pose, *camera, 0.5 * config_.marker_length)) {
           draw_axes(canvas, *axes);
         }
       }
@@ -118,8 +167,8 @@ holoscan::expected<void, holoscan::Error> FiducialOverlayOp::compute(
       for (const schema::CharucoCorner& corner : message.board->corners) {
         draw_corner(canvas, {corner.image().x(), corner.image().y()});
       }
-      if (message.board->has_pose && message.board->pose && config_.intrinsics) {
-        if (const auto axes = target_axes(from_message(*message.board->pose), *config_.intrinsics,
+      if (message.board->has_pose && message.board->pose && camera != nullptr) {
+        if (const auto axes = target_axes(from_message(*message.board->pose), *camera,
                                           2.0 * message.board->square_length)) {
           draw_axes(canvas, *axes);
         }

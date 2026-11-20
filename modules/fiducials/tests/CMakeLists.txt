@@ -26,6 +26,12 @@ set_tests_properties(
   fiducials_operators
   PROPERTIES LABELS "fiducials;gpu" TIMEOUT 900
 )
+# The cpu backend on host images with no GPU visible: it must touch no CUDA.
+add_test(NAME fiducials_cpu_without_gpu COMMAND fiducials_operator_test --cpu-only)
+set_tests_properties(
+  fiducials_cpu_without_gpu
+  PROPERTIES LABELS "fiducials" TIMEOUT 600 ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1"
+)
 
 # The SDK-free tests, which the hosted CI job also builds on their own.
 add_subdirectory(host)

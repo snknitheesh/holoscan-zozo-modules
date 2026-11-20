@@ -3,13 +3,13 @@
 //
 // CharucoDetectorOp: an image in, one view of a ChArUco board out: its markers, its chessboard
 // corners with their ids, sub-pixel image positions and board positions, a quality summary and,
-// when the camera's intrinsics are known, the board's pose. That is the observation a camera
-// calibration takes.
+// with estimate_pose, the board's pose from the camera info on the mandatory `camera_info`
+// input. Without it, that is the observation a camera calibration takes, which needs no
+// calibration yet.
 
 #pragma once
 
 #include <memory>
-#include <optional>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -20,6 +20,8 @@
 #include <holoscan/fiducials/charuco.hpp>
 #include <holoscan/fiducials/fiducial_detections_schema_traits.hpp>
 #include <holoscan/fiducials/types.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace holoscan::fiducials {
@@ -33,8 +35,11 @@ struct CharucoDetectorConfig {
   // The detector's settings; the dictionary is the board's, whatever options.dictionary says.
   DetectorOptions options;
   CharucoOptions charuco;
-  // With them, the board's pose.
-  std::optional<CameraIntrinsics> intrinsics;
+  // Give the board's pose: declares the `camera_info` input, which must then be connected.
+  bool estimate_pose{false};
+  // With estimate_pose, how the camera info arrives: kLatest (the default) at any rate, as from
+  // CameraInfoSourceOp; kEveryFrame with every image, with its capture time.
+  holoscan::messages::CameraInfoInputOptions camera_info_input;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -60,6 +65,8 @@ class CharucoDetectorOp final : public holoscan::Operator<> {
 
   // MONO8, RGB8, BGR8, RGBA8 or BGRA8, in host or CUDA device memory.
   holoscan::Input<holoscan::schema::ImageT> image;
+  // As ArucoDetectorOp::camera_info: declared with estimate_pose only, and then mandatory.
+  holoscan::Input<holoscan::messages::schema::CameraInfoT> camera_info;
   // One message per image, with the board's view (even when nothing of it was found).
   holoscan::Output<schema::FiducialDetectionsT> detections;
 
@@ -67,6 +74,7 @@ class CharucoDetectorOp final : public holoscan::Operator<> {
   CharucoDetectorConfig config_;
   CharucoBoard board_;
   std::unique_ptr<FrameDetector> detector_;
+  holoscan::messages::LatestCameraInfo<holoscan::messages::schema::CameraInfoT> camera_;
 };
 
 }  // namespace holoscan::fiducials

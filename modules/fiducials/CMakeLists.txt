@@ -61,6 +61,11 @@ if(HOLOSCAN_FIDUCIALS_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info message and its contract: the target of this build when the repository root
+# added holoscan-messages first, else its installed package.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # The detections message, generated from its FlatBuffers schema into the public include tree.
 set(_generated_include_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
@@ -119,6 +124,7 @@ target_link_libraries(
   PUBLIC
     holoscan::core
     holoscan::sensor_io
+    holoscan::messages
     CUDA::cudart
     "$<BUILD_INTERFACE:holoscan_fiducials_schema>"
 )

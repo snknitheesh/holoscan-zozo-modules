@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // What both detector operators do with an image before and around detection: check it, take a
-// CUDA stream, convert it to gray where the backend reads it (logging once when that copies
-// between host and device), build the backend, resolve `auto` at start, and warn about frames
-// over capacity.
+// CUDA stream when the frame's path needs one, convert it to gray where the backend reads it
+// (logging once when that copies between host and device), build the backend, resolve `auto` at
+// start, count CPU waits and copies, and warn about frames over capacity.
 
 #pragma once
 
@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
@@ -26,6 +27,12 @@
 #include "gray_converter.hpp"
 
 namespace holoscan::fiducials {
+
+// `error` with its message prefixed by the operator's name, its code and provenance kept.
+[[nodiscard]] inline holoscan::Error named_error(std::string_view op, holoscan::Error error) {
+  error.message = std::string(op) + ": " + error.message;
+  return error;
+}
 
 class FrameDetector {
  public:
@@ -46,15 +53,21 @@ class FrameDetector {
   struct Frame {
     GrayImageView gray;
     DetectorBackend* backend;
-    cudaStream_t stream;
-    std::uint64_t number;                         // Frames prepared before this one since start.
+    cudaStream_t stream;   // Null when nothing of this frame runs on the GPU.
+    std::uint64_t number;  // Frames prepared before this one since start.
     std::chrono::steady_clock::time_point start;  // When conversion began.
   };
 
-  // Checks `image`, waits for its producer, and converts it for the backend, which is built on
-  // the first image and again when the size changes.
+  // Checks `image` (and that `camera`, when given, is for its size), waits for its producer,
+  // and converts it for the backend, which is built on the first image and again when the size
+  // changes. `stream` is null for a host image on the cpu backend, which needs no CUDA.
   [[nodiscard]] holoscan::expected<Frame, holoscan::Error> prepare(
-      const holoscan::schema::ImageT& image, holoscan::ExecutionContext& context);
+      const holoscan::schema::ImageT& image, holoscan::ExecutionContext& context,
+      const messages::CameraInfo* camera = nullptr);
+
+  // The CPU waits and host/device copies of the frames prepared and detected since the last
+  // call, and counts anew.
+  [[nodiscard]] TransferCounts take_transfers() noexcept;
 
   // An error from an exception thrown while detecting; nothing queued may still read the image.
   [[nodiscard]] holoscan::Error error(const std::exception& exception, cudaStream_t stream) const;
@@ -80,6 +93,7 @@ class FrameDetector {
   // For frames whose activation has no runtime CUDA stream; made on first use.
   std::unique_ptr<CUstream_st, StreamDestroy> own_stream_;
   std::uint64_t frames_{};
+  std::uint32_t waits_{};  // Host waits for producers since the last take_transfers().
   bool cross_copy_logged_{};
   std::uint64_t overflowed_frames_{};
   std::optional<std::chrono::steady_clock::time_point> last_overflow_warning_;

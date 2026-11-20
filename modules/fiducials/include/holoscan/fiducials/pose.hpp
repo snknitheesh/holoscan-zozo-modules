@@ -12,26 +12,32 @@
 #include <span>
 
 #include <holoscan/fiducials/types.hpp>
+#include <holoscan/messages/camera_info.hpp>
 
 namespace holoscan::fiducials {
 
-// @throws std::invalid_argument unless fx, fy are finite and positive and the rest finite.
-void validate_intrinsics(const CameraIntrinsics& intrinsics);
+// Cameras are holoscan-messages' CameraInfo, valid (messages::validate()), with any of its lens
+// models: none, plumb_bob, rational_polynomial or equidistant, and skew.
+
+// Checks that `camera` describes images of `width` x `height` pixels: intrinsics are in the
+// pixels of one image size, so a calibration of another size would give wrong poses.
+// @throws std::invalid_argument naming both sizes.
+void check_camera_size(const messages::CameraInfo& camera, int width, int height);
 
 // Where a point in the camera frame (z > 0) appears, distortion applied.
-[[nodiscard]] Point2 project(const CameraIntrinsics& intrinsics, const Point3& camera_point);
+[[nodiscard]] Point2 project(const messages::CameraInfo& camera, const Point3& camera_point);
 // Where a point of the target appears, for the target at `pose`.
-[[nodiscard]] Point2 project(const CameraIntrinsics& intrinsics, const Pose& pose,
+[[nodiscard]] Point2 project(const messages::CameraInfo& camera, const Pose& pose,
                              const Point3& target_point);
 // A pixel's undistorted normalized coordinates: (x / z, y / z) of the points it sees.
-[[nodiscard]] Point2 undistort(const CameraIntrinsics& intrinsics, const Point2& pixel);
+[[nodiscard]] Point2 undistort(const messages::CameraInfo& camera, const Point2& pixel);
 
 // The pose of a planar target from at least four of its points (on its z = 0 plane, not all on
 // one line) and where they appear. Both poses a plane seen from afar can take are refined, and
 // the one that reprojects better is returned; nullopt if no pose fits.
 [[nodiscard]] std::optional<Pose> solve_planar_pose(std::span<const Point2> target_xy,
                                                     std::span<const Point2> image,
-                                                    const CameraIntrinsics& intrinsics);
+                                                    const messages::CameraInfo& camera);
 
 // The corners of a marker `length` meters across its black border, in its own frame (centered
 // on it), in Marker::corners' order: top-left (-l/2, -l/2, 0), top-right (l/2, -l/2, 0),
@@ -40,6 +46,6 @@ void validate_intrinsics(const CameraIntrinsics& intrinsics);
 
 // The pose of `marker`'s frame, from its corners; nullopt if none fits.
 [[nodiscard]] std::optional<Pose> marker_pose(const Marker& marker,
-                                              const CameraIntrinsics& intrinsics, double length);
+                                              const messages::CameraInfo& camera, double length);
 
 }  // namespace holoscan::fiducials

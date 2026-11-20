@@ -59,7 +59,14 @@ SyntheticScene base_scene(std::string dictionary, int width, int height) {
   scene.height = height;
   scene.dictionary = std::move(dictionary);
   const double focal = 0.9 * width;
-  scene.intrinsics = {focal, focal, (width - 1) / 2.0, (height - 1) / 2.0};
+  scene.camera.header.frame_id = "camera";
+  scene.camera.width = static_cast<std::uint32_t>(width);
+  scene.camera.height = static_cast<std::uint32_t>(height);
+  scene.camera.state = messages::CameraState::kUndistorted;
+  scene.camera.fx = focal;
+  scene.camera.fy = focal;
+  scene.camera.cx = (width - 1) / 2.0;
+  scene.camera.cy = (height - 1) / 2.0;
   scene.noise_sigma = 2.0;
   return scene;
 }
@@ -76,7 +83,7 @@ struct Target {
 std::array<int, 4> pixel_box(const SyntheticScene& scene, const Target& target) {
   double x0 = HUGE_VAL, y0 = HUGE_VAL, x1 = -HUGE_VAL, y1 = -HUGE_VAL;
   for (const Point3& p : target.extent) {
-    const Point2 q = project(scene.intrinsics, target.pose, p);
+    const Point2 q = project(scene.camera, target.pose, p);
     x0 = std::min(x0, q[0]);
     y0 = std::min(y0, q[1]);
     x1 = std::max(x1, q[0]);
@@ -155,7 +162,7 @@ std::vector<Target> targets(const SyntheticScene& scene) {
 double trace(const SyntheticScene& scene, const std::vector<Target>& all,
              const std::vector<std::array<int, 4>>& boxes, double u, double v, int pu, int pv,
              double background) {
-  const auto& k = scene.intrinsics;
+  const auto& k = scene.camera;
   const std::array<double, 3> ray{(u - k.cx) / k.fx, (v - k.cy) / k.fy, 1.0};
   double nearest = HUGE_VAL;
   double value = background;
@@ -233,7 +240,7 @@ SyntheticScene make_marker_scene(const std::string& dictionary, std::uint32_t fr
                                  int height) {
   SyntheticScene scene = base_scene(dictionary, width, height);
   const int count = Dictionary(dictionary).count();
-  const double focal = scene.intrinsics.fx;
+  const double focal = scene.camera.fx;
   // Marker centers as fractions of the image size from its center, inside the frame at every
   // pose.
   constexpr std::array<std::array<double, 2>, 6> kAnchors{
@@ -264,7 +271,7 @@ SyntheticScene make_board_scene(const CharucoBoardConfig& config, std::uint32_t 
   const double board_w = config.squares_x * config.square_length;
   const double board_h = config.squares_y * config.square_length;
   // About half the image's height, from the board's larger side.
-  const double depth = scene.intrinsics.fx * std::max(board_w, board_h) / (0.55 * height) *
+  const double depth = scene.camera.fx * std::max(board_w, board_h) / (0.55 * height) *
                        (1.0 + 0.1 * std::sin(0.9 * t));
   const Pose pose{.rotation = multiply(rotation_y(0.6 * std::sin(t)),
                                        multiply(rotation_x(0.45 * std::cos(1.3 * t)),
@@ -275,8 +282,8 @@ SyntheticScene make_board_scene(const CharucoBoardConfig& config, std::uint32_t 
   const double cx = 0.5 * board_w;
   const double cy = 0.5 * board_h;
   SceneBoard placed{config, pose};
-  const double shift_x = 0.08 * width / scene.intrinsics.fx * depth * std::sin(0.4 * t);
-  const double shift_y = 0.06 * height / scene.intrinsics.fy * depth * std::cos(0.5 * t);
+  const double shift_x = 0.08 * width / scene.camera.fx * depth * std::sin(0.4 * t);
+  const double shift_y = 0.06 * height / scene.camera.fy * depth * std::cos(0.5 * t);
   placed.pose.translation = {-(r[0] * cx + r[1] * cy) + shift_x, -(r[3] * cx + r[4] * cy) + shift_y,
                              depth - (r[6] * cx + r[7] * cy)};
   scene.board = placed;
@@ -340,7 +347,7 @@ std::vector<std::uint8_t> render_scene(const SyntheticScene& scene, int channels
 std::array<Point2, 4> marker_truth(const SyntheticScene& scene, const SceneMarker& marker) {
   const auto corners = marker_object_corners(marker.length);
   std::array<Point2, 4> result;
-  for (int i = 0; i < 4; ++i) result[i] = project(scene.intrinsics, marker.pose, corners[i]);
+  for (int i = 0; i < 4; ++i) result[i] = project(scene.camera, marker.pose, corners[i]);
   return result;
 }
 
@@ -350,7 +357,7 @@ std::vector<CharucoCorner> board_truth(const SyntheticScene& scene) {
   const CharucoBoard board(scene.board->config);
   for (int id = 0; id < board.corner_count(); ++id) {
     const Point3 position = board.corner(id);
-    const Point2 pixel = project(scene.intrinsics, scene.board->pose, position);
+    const Point2 pixel = project(scene.camera, scene.board->pose, position);
     if (pixel[0] < 0.0 || pixel[1] < 0.0 || pixel[0] > scene.width - 1.0 ||
         pixel[1] > scene.height - 1.0) {
       continue;

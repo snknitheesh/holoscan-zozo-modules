@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -13,7 +14,33 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/messages/camera_info.hpp>
+
 namespace holoscan::fiducials::test {
+
+// A camera of `width` x `height` with these intrinsics and lens, valid
+// (holoscan::messages::validate()).
+inline messages::CameraInfo camera(
+    double fx, double fy, double cx, double cy, int width = 1280, int height = 720,
+    messages::DistortionModel model = messages::DistortionModel::kNone,
+    std::vector<double> coefficients = {}, double skew = 0.0) {
+  messages::CameraInfo info;
+  info.header.frame_id = "camera";
+  info.width = static_cast<std::uint32_t>(width);
+  info.height = static_cast<std::uint32_t>(height);
+  info.fx = fx;
+  info.fy = fy;
+  info.cx = cx;
+  info.cy = cy;
+  info.skew = skew;
+  info.distortion_model = model;
+  info.coefficients = std::move(coefficients);
+  bool distorted = false;
+  for (const double c : info.coefficients) distorted = distorted || c != 0.0;
+  info.state = distorted ? messages::CameraState::kRaw : messages::CameraState::kUndistorted;
+  messages::validate(info);
+  return info;
+}
 
 inline int& failures() {
   static int count = 0;

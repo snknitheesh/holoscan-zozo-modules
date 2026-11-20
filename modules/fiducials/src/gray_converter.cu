@@ -61,32 +61,55 @@ void to_gray_host(const ImageView& input, std::uint8_t* output) {
 
 int channels(PixelFormat format) noexcept { return order_of(format).stride; }
 
+void GrayConverter::reserve(const ImageView& input, MemoryLocation target) {
+  if (input.width != width_ || input.height != height_) {
+    plain_gray_ = {};
+    pinned_gray_.reset();
+    device_gray_.reset();
+    width_ = input.width;
+    height_ = input.height;
+  }
+  const std::size_t bytes = static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
+  const bool on_host = input.location == MemoryLocation::kHost;
+  const bool convert = input.format != PixelFormat::kMono8;
+  if (on_host && target == MemoryLocation::kHost) {
+    plain_gray_.resize(bytes);
+    return;
+  }
+  // Pinned: a host image converted before it goes to the device, or a gray image back from it.
+  const bool pinned = (on_host && convert) || target == MemoryLocation::kHost;
+  // Device: the backend's input, or a device image converted before it comes back.
+  const bool device = target == MemoryLocation::kDevice || convert;
+  if (pinned && !pinned_gray_) {
+    void* host = nullptr;
+    cuda_check(cudaMallocHost(&host, bytes), "cudaMallocHost(gray)");
+    pinned_gray_.reset(static_cast<std::uint8_t*>(host));
+  }
+  if (device && !device_gray_) {
+    void* memory = nullptr;
+    cuda_check(cudaMalloc(&memory, bytes), "cudaMalloc(gray)");
+    device_gray_.reset(static_cast<std::uint8_t*>(memory));
+  }
+}
+
 GrayImageView GrayConverter::convert(const ImageView& input, MemoryLocation target,
                                      cudaStream_t stream) {
   if (input.format == PixelFormat::kMono8 && input.location == target) {
     return {input.data, input.width, input.height, input.pitch, target};
   }
+  reserve(input, target);
   const auto width = static_cast<std::size_t>(input.width);
   const auto height = static_cast<std::size_t>(input.height);
-  if (input.width != width_ || input.height != height_) {
-    host_gray_.reset();
-    device_gray_.reset();
-    width_ = height_ = 0;
-    void* host = nullptr;
-    void* device = nullptr;
-    cuda_check(cudaMallocHost(&host, width * height), "cudaMallocHost(gray)");
-    host_gray_.reset(static_cast<std::uint8_t*>(host));
-    cuda_check(cudaMalloc(&device, width * height), "cudaMalloc(gray)");
-    device_gray_.reset(static_cast<std::uint8_t*>(device));
-    width_ = input.width;
-    height_ = input.height;
-  }
   const bool on_host = input.location == MemoryLocation::kHost;
+  if (on_host && target == MemoryLocation::kHost) {
+    to_gray_host(input, plain_gray_.data());
+    return {plain_gray_.data(), input.width, input.height, width, target};
+  }
   // Convert where the image is: a third (or a quarter) of the bytes then moves.
   const std::uint8_t* gray = input.data;
   std::size_t gray_pitch = input.pitch;
   if (input.format != PixelFormat::kMono8) {
-    std::uint8_t* out = on_host ? host_gray_.get() : device_gray_.get();
+    std::uint8_t* out = on_host ? pinned_gray_.get() : device_gray_.get();
     if (on_host) {
       to_gray_host(input, out);
     } else {
@@ -100,14 +123,17 @@ GrayImageView GrayConverter::convert(const ImageView& input, MemoryLocation targ
     gray = out;
     gray_pitch = width;
   }
-  std::uint8_t* result = target == MemoryLocation::kHost ? host_gray_.get() : device_gray_.get();
-  if (input.location != target) {
-    cuda_check(cudaMemcpy2DAsync(result, width, gray, gray_pitch, width, height,
-                                 on_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpy2DAsync(gray)");
-    if (target == MemoryLocation::kHost) {
-      cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+  if (input.location == target) {  // On the device, converted there.
+    return {gray, input.width, input.height, gray_pitch, target};
+  }
+  std::uint8_t* result = target == MemoryLocation::kHost ? pinned_gray_.get() : device_gray_.get();
+  cuda_check(cudaMemcpy2DAsync(result, width, gray, gray_pitch, width, height,
+                               on_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, stream),
+             "cudaMemcpy2DAsync(gray)");
+  transfers_.copied_bytes += width * height;
+  if (target == MemoryLocation::kHost) {
+    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    ++transfers_.host_waits;
   }
   return {result, input.width, input.height, width, target};
 }

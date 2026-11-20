@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // What FiducialOverlayOp draws into its RGBA8 layer: markers' outlines, chessboard corners and
-// targets' axes. Free of the SDK, so its test runs anywhere.
+// targets' axes. Internal to the module; free of the SDK, so its host test runs anywhere.
 
 #pragma once
 
@@ -102,14 +102,14 @@ struct TargetAxes {
 // The origin of a target at `pose` and points `length` along its x, y and z (z into the
 // target), projected; nullopt when the origin is behind the camera. A tip behind the camera is
 // left out.
-inline std::optional<TargetAxes> target_axes(const Pose& pose, const CameraIntrinsics& intrinsics,
+inline std::optional<TargetAxes> target_axes(const Pose& pose, const messages::CameraInfo& camera,
                                              double length) {
   const auto seen = [&](const Point3& p) -> std::optional<Point2> {
     const auto& r = pose.rotation;
     const auto& t = pose.translation;
     const double z = r[6] * p[0] + r[7] * p[1] + r[8] * p[2] + t[2];
     if (!(z > 1e-6)) return std::nullopt;
-    return project(intrinsics, pose, p);
+    return project(camera, pose, p);
   };
   const auto origin = seen({0, 0, 0});
   if (!origin) return std::nullopt;

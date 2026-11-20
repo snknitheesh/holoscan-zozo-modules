@@ -103,11 +103,12 @@ using Saddles = std::vector<std::optional<Point2>>;
 using SaddleRefiner = std::function<Saddles(std::span<const SaddleSeed>)>;
 
 // The observation of `board` in a width x height image whose markers are `markers`: each
-// corner predicted from its markers, refined by `refine`, and with intrinsics, the board's pose.
+// corner predicted from its markers, refined by `refine`, and with a `camera` (of the image's
+// size), the board's pose.
 [[nodiscard]] CharucoObservation observe_charuco(const CharucoBoard& board,
                                                  std::span<const Marker> markers,
                                                  const SaddleRefiner& refine, int width, int height,
                                                  const CharucoOptions& options,
-                                                 const std::optional<CameraIntrinsics>& intrinsics);
+                                                 const messages::CameraInfo* camera);
 
 }  // namespace holoscan::fiducials

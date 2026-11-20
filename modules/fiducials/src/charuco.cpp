@@ -159,7 +159,7 @@ bool CharucoBoard::has_marker(int x, int y) const noexcept {
 CharucoObservation observe_charuco(const CharucoBoard& board, std::span<const Marker> markers,
                                    const SaddleRefiner& refine, int width, int height,
                                    const CharucoOptions& options,
-                                   const std::optional<CameraIntrinsics>& intrinsics) {
+                                   const messages::CameraInfo* camera) {
   if (options.min_markers < 1 || options.min_markers > 2) {
     throw std::invalid_argument("min_markers must be 1 or 2");
   }
@@ -235,9 +235,9 @@ CharucoObservation observe_charuco(const CharucoBoard& board, std::span<const Ma
     board_xy.push_back({corner.board[0], corner.board[1]});
     image.push_back(corner.image);
   }
-  if (intrinsics && board_xy.size() >= 4 &&
+  if (camera != nullptr && board_xy.size() >= 4 &&
       spans_plane(board_xy, 0.5 * board.config().square_length)) {
-    result.pose = solve_planar_pose(board_xy, image, *intrinsics);
+    result.pose = solve_planar_pose(board_xy, image, *camera);
   }
   result.quality = CharucoQuality{
       .corners_found = static_cast<int>(result.corners.size()),

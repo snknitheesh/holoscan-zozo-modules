@@ -115,6 +115,9 @@ struct CandidateResult {
   std::int32_t marker;  // 1 when the candidate is a marker of the dictionary, else 0.
   std::int32_t id;
   std::int32_t hamming;  // Bits corrected.
+  // The candidate's slot, which the cuda backend sets to keep its decoded markers in candidate
+  // order. A field rather than padding, so that every byte copied to the host is written.
+  std::int32_t candidate;
   double corners[4][2];  // In the marker's order: top-left, top-right, bottom-right, bottom-left.
 };
 

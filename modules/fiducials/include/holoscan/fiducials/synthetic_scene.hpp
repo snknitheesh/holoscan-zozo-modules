@@ -16,6 +16,7 @@
 
 #include <holoscan/fiducials/charuco.hpp>
 #include <holoscan/fiducials/types.hpp>
+#include <holoscan/messages/camera_info.hpp>
 
 namespace holoscan::fiducials {
 
@@ -41,7 +42,9 @@ struct Occluder {
 struct SyntheticScene {
   int width{};
   int height{};
-  CameraIntrinsics intrinsics;  // No distortion.
+  // The camera: an undistorted pinhole (fx = fy = 0.9 width, the principal point at the
+  // center) of width x height, frame id "camera".
+  messages::CameraInfo camera;
   std::string dictionary;
   std::vector<SceneMarker> markers;
   std::optional<SceneBoard> board;

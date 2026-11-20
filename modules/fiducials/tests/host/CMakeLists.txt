@@ -3,7 +3,8 @@
 
 # Tests that need no Holoscan SDK, CUDA or GPU: the cpu detector on synthetic markers and
 # boards, the dictionaries, poses, the overlay's drawing and the auto backend's choice. They
-# build the module's CUDA-free sources themselves. Built on their own by the hosted CI job,
+# build the module's CUDA-free sources themselves, and the SDK-free part of holoscan-messages,
+# which the module depends on and which publishes it for this. Built on their own by the hosted CI job,
 # and as part of the module's full suite.
 cmake_minimum_required(VERSION 4.0)
 project(holoscan_fiducials_host_tests LANGUAGES CXX)
@@ -16,6 +17,7 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 set(_module "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${_module}/../messages/cmake/messages-host-core.cmake")
 add_library(
   fiducials_host_core
   STATIC
@@ -31,9 +33,11 @@ target_include_directories(
   fiducials_host_core
   PUBLIC "${_module}/include" "${_module}/src" "${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
+target_link_libraries(fiducials_host_core PUBLIC messages_host_core)
 target_compile_features(fiducials_host_core PUBLIC cxx_std_20)
-# As in the module: no FMA contraction where detection_core.hpp is compiled.
-target_compile_options(fiducials_host_core PRIVATE -ffp-contract=off)
+# As in the module: no FMA contraction where detection_core.hpp is compiled, which includes
+# the tests that include it, so that they round as the shipped build does.
+target_compile_options(fiducials_host_core PUBLIC -ffp-contract=off)
 set_target_properties(fiducials_host_core PROPERTIES CXX_EXTENSIONS OFF)
 
 foreach(
@@ -43,6 +47,7 @@ foreach(
 )
   add_executable(fiducials_${_test}_test ${_test}_test.cpp)
   target_link_libraries(fiducials_${_test}_test PRIVATE fiducials_host_core)
+  set_target_properties(fiducials_${_test}_test PROPERTIES CXX_EXTENSIONS OFF)
   add_test(NAME fiducials_${_test} COMMAND fiducials_${_test}_test)
   set_tests_properties(fiducials_${_test} PROPERTIES LABELS "fiducials;host" TIMEOUT 600)
 endforeach()

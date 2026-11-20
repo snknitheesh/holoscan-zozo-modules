@@ -19,19 +19,31 @@
 
 namespace holoscan::fiducials {
 
+namespace {
+
+constexpr const char* kName = "ArucoDetectorOp";
+
+}  // namespace
+
 void validate_config(const ArucoDetectorConfig& config) {
   validate_options(config.options);
-  if (config.intrinsics) {
-    validate_intrinsics(*config.intrinsics);
+  if (config.estimate_pose) {
     if (!(std::isfinite(config.marker_length) && config.marker_length > 0)) {
       throw std::invalid_argument("marker_length must be positive to estimate poses");
+    }
+    if (config.camera_info_input.max_age <= std::chrono::nanoseconds::zero()) {
+      throw std::invalid_argument("camera_info_input.max_age must be > 0");
     }
   }
 }
 
 ArucoDetectorOp::ArucoDetectorOp(ArucoDetectorConfig config) : config_(std::move(config)) {
-  validate_config(config_);
-  detector_ = std::make_unique<FrameDetector>("ArucoDetectorOp", config_.backend, config_.options);
+  try {
+    validate_config(config_);
+  } catch (const std::invalid_argument& error) {
+    throw std::invalid_argument(std::string(kName) + ": " + error.what());
+  }
+  detector_ = std::make_unique<FrameDetector>(kName, config_.backend, config_.options);
 }
 
 ArucoDetectorOp::~ArucoDetectorOp() = default;
@@ -39,33 +51,52 @@ ArucoDetectorOp::~ArucoDetectorOp() = default;
 Backend ArucoDetectorOp::resolved_backend() const noexcept { return detector_->resolved(); }
 
 void ArucoDetectorOp::setup(holoscan::OperatorSpec& spec) {
+  // Two images queued: the one being detected in and the next, so a producer one frame ahead
+  // does not wait on a lossless edge.
   spec.input(image, "image").queue_depth(2U);
+  if (config_.estimate_pose) {
+    // As for the images: a camera info sent with every image (kEveryFrame) keeps pace with them.
+    spec.input(camera_info, "camera_info").queue_depth(2U);
+  }
   spec.output(detections, "detections");
 }
 
 holoscan::Contract ArucoDetectorOp::contract() const {
+  if (config_.estimate_pose) {
+    return messages::camera_info_contract(config_.camera_info_input, camera_info, image);
+  }
   holoscan::Contract result;
   result.trigger(holoscan::OnEach{image});
   return result;
 }
 
-void ArucoDetectorOp::start() { detector_->start(); }
+void ArucoDetectorOp::start() {
+  camera_.reset();
+  detector_->start();
+}
 
 void ArucoDetectorOp::stop() { detector_->stop(); }
 
 holoscan::expected<void, holoscan::Error> ArucoDetectorOp::compute(
     holoscan::ExecutionContext& context) {
+  const messages::CameraInfo* camera = nullptr;
+  if (config_.estimate_pose) {
+    auto info = camera_.update(camera_info);
+    if (!info) return holoscan::make_unexpected(named_error(kName, std::move(info).error()));
+    if (*info == nullptr) return {};  // No camera info yet: skip the image.
+    camera = *info;
+  }
   auto sample = image.receive();
   if (!sample) return holoscan::make_unexpected(std::move(sample).error());
-  auto frame = detector_->prepare(sample->data, context);
+  auto frame = detector_->prepare(sample->data, context, camera);
   if (!frame) return holoscan::make_unexpected(std::move(frame).error());
 
   FrameMarkers found;
   try {
     found = frame->backend->detect(frame->gray, frame->stream);
-    if (config_.intrinsics) {
+    if (camera != nullptr) {
       for (Marker& marker : found.markers) {
-        marker.pose = marker_pose(marker, *config_.intrinsics, config_.marker_length);
+        marker.pose = marker_pose(marker, *camera, config_.marker_length);
       }
     }
   } catch (const std::exception& exception) {
@@ -89,6 +120,9 @@ holoscan::expected<void, holoscan::Error> ArucoDetectorOp::compute(
   message.detect_time_us =
       std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - frame->start)
           .count();
+  const TransferCounts transfers = detector_->take_transfers();
+  message.host_waits = transfers.host_waits;
+  message.copied_bytes = transfers.copied_bytes;
   return detections.emit(std::move(message), holoscan::sensor_io::derive_from(*sample));
 }
 

@@ -126,7 +126,7 @@ std::vector<std::uint8_t> clutter(std::uint32_t seed) {
   SyntheticScene scene;
   scene.width = kWidth;
   scene.height = kHeight;
-  scene.intrinsics = {1000, 1000, 640, 360};
+  scene.camera = test::camera(1000, 1000, 640, 360, kWidth, kHeight);
   scene.noise_sigma = 3.0;
   scene.blur_sigma = 0.7;
   scene.seed = seed;
@@ -191,8 +191,8 @@ void check_false_positives() {
 SceneMarker frontal(const SyntheticScene& scene, int id, double u, double v) {
   SceneMarker marker{.id = id, .length = 0.1, .pose = {}};
   marker.pose.rotation = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-  marker.pose.translation = {(u - scene.intrinsics.cx) / scene.intrinsics.fx,
-                             (v - scene.intrinsics.cy) / scene.intrinsics.fy, 1.0};
+  marker.pose.translation = {(u - scene.camera.cx) / scene.camera.fx,
+                             (v - scene.camera.cy) / scene.camera.fy, 1.0};
   return marker;
 }
 
@@ -200,7 +200,7 @@ SceneMarker frontal(const SyntheticScene& scene, int id, double u, double v) {
 void check_border() {
   SyntheticScene scene = make_marker_scene("DICT_5X5_100", 0, kWidth, kHeight);
   scene.markers.clear();
-  const double half = 0.5 * scene.intrinsics.fx * 0.1;  // Pixels from a marker's center to a side.
+  const double half = 0.5 * scene.camera.fx * 0.1;  // Pixels from a marker's center to a side.
   scene.markers.push_back(frontal(scene, 3, 3.0 + half, 300));                // 3 px from left.
   scene.markers.push_back(frontal(scene, 4, 640, kHeight - 1 - 3.0 - half));  // 3 px from bottom.
   scene.markers.push_back(frontal(scene, 5, kWidth - 1, 300));                // Cut in half.

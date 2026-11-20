@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "detection_core.hpp"
@@ -73,6 +75,46 @@ std::optional<Matrix3> nearest_rotation(Matrix3 m) {
   return m;
 }
 
+// Most iterations undistort() takes; each lens model's settles far sooner.
+constexpr int kUndistortIterations = 100;
+
+// plumb_bob's and rational_polynomial's radial factor at r^2: (1 + k1 r^2 + k2 r^4 + k3 r^6) /
+// (1 + k4 r^2 + k5 r^4 + k6 r^6), the denominator 1 for plumb_bob.
+double radial_factor(const messages::CameraInfo& k, double r2) {
+  const auto& c = k.coefficients;
+  const double numerator = 1.0 + r2 * (c[0] + r2 * (c[1] + r2 * c[4]));
+  if (k.distortion_model != messages::DistortionModel::kRationalPolynomial) return numerator;
+  return numerator / (1.0 + r2 * (c[5] + r2 * (c[6] + r2 * c[7])));
+}
+
+// Normalized coordinates (x / z, y / z) distorted by the camera's lens model, as ROS and OpenCV
+// define them.
+Point2 distort(const messages::CameraInfo& k, const Point2& p) {
+  const double x = p[0];
+  const double y = p[1];
+  const auto& c = k.coefficients;
+  switch (k.distortion_model) {
+    case messages::DistortionModel::kPlumbBob:
+    case messages::DistortionModel::kRationalPolynomial: {
+      const double r2 = x * x + y * y;
+      const double radial = radial_factor(k, r2);
+      return {x * radial + 2.0 * c[2] * x * y + c[3] * (r2 + 2.0 * x * x),
+              y * radial + c[2] * (r2 + 2.0 * y * y) + 2.0 * c[3] * x * y};
+    }
+    case messages::DistortionModel::kEquidistant: {
+      const double r = std::hypot(x, y);
+      if (r < 1e-15) return {x, y};
+      const double theta = std::atan(r);
+      const double t2 = theta * theta;
+      const double theta_d = theta * (1.0 + t2 * (c[0] + t2 * (c[1] + t2 * (c[2] + t2 * c[3]))));
+      return {x * theta_d / r, y * theta_d / r};
+    }
+    case messages::DistortionModel::kNone:
+      break;
+  }
+  return {x, y};
+}
+
 Point3 transform(const Pose& pose, const Point3& p) {
   const auto& r = pose.rotation;
   const auto& t = pose.translation;
@@ -82,7 +124,7 @@ Point3 transform(const Pose& pose, const Point3& p) {
 }
 
 // Squared reprojection errors summed, and each residual into `residuals` when given.
-double reprojection_cost(const CameraIntrinsics& k, const Pose& pose,
+double reprojection_cost(const messages::CameraInfo& k, const Pose& pose,
                          std::span<const Point2> target_xy, std::span<const Point2> image,
                          std::vector<double>* residuals = nullptr) {
   double cost = 0.0;
@@ -113,7 +155,7 @@ Pose moved(const Pose& pose, const std::array<double, 6>& delta) {
 }
 
 // Levenberg-Marquardt on the reprojection error, from `pose`.
-Pose refine(const CameraIntrinsics& k, Pose pose, std::span<const Point2> target_xy,
+Pose refine(const messages::CameraInfo& k, Pose pose, std::span<const Point2> target_xy,
             std::span<const Point2> image) {
   const std::size_t rows = 2 * image.size();
   std::vector<double> residuals(rows);
@@ -259,50 +301,75 @@ Pose flipped(const Pose& pose) {
 
 }  // namespace
 
-void validate_intrinsics(const CameraIntrinsics& k) {
-  bool finite = std::isfinite(k.cx) && std::isfinite(k.cy);
-  for (const double d : k.distortion) finite = finite && std::isfinite(d);
-  if (!(std::isfinite(k.fx) && k.fx > 0 && std::isfinite(k.fy) && k.fy > 0 && finite)) {
-    throw std::invalid_argument(
-        "intrinsics need finite, positive fx and fy and finite cx, cy and distortion");
+void check_camera_size(const messages::CameraInfo& camera, int width, int height) {
+  if (std::cmp_not_equal(camera.width, width) || std::cmp_not_equal(camera.height, height)) {
+    throw std::invalid_argument("camera info '" + camera.header.frame_id + "' is for " +
+                                std::to_string(camera.width) + "x" + std::to_string(camera.height) +
+                                " images, the image is " + std::to_string(width) + "x" +
+                                std::to_string(height));
   }
 }
 
-Point2 project(const CameraIntrinsics& k, const Point3& p) {
-  const double x = p[0] / p[2];
-  const double y = p[1] / p[2];
-  const auto& d = k.distortion;
-  const double r2 = x * x + y * y;
-  const double radial = 1.0 + r2 * (d[0] + r2 * (d[1] + r2 * d[4]));
-  const double xd = x * radial + 2.0 * d[2] * x * y + d[3] * (r2 + 2.0 * x * x);
-  const double yd = y * radial + d[2] * (r2 + 2.0 * y * y) + 2.0 * d[3] * x * y;
-  return {k.fx * xd + k.cx, k.fy * yd + k.cy};
+Point2 project(const messages::CameraInfo& k, const Point3& p) {
+  const Point2 d = distort(k, {p[0] / p[2], p[1] / p[2]});
+  return {k.fx * d[0] + k.skew * d[1] + k.cx, k.fy * d[1] + k.cy};
 }
 
-Point2 project(const CameraIntrinsics& k, const Pose& pose, const Point3& p) {
+Point2 project(const messages::CameraInfo& k, const Pose& pose, const Point3& p) {
   return project(k, transform(pose, p));
 }
 
-Point2 undistort(const CameraIntrinsics& k, const Point2& pixel) {
-  const double x0 = (pixel[0] - k.cx) / k.fx;
-  const double y0 = (pixel[1] - k.cy) / k.fy;
-  const auto& d = k.distortion;
-  double x = x0;
-  double y = y0;
-  // OpenCV's fixed-point iteration.
-  for (int i = 0; i < 20; ++i) {
-    const double r2 = x * x + y * y;
-    const double radial = 1.0 + r2 * (d[0] + r2 * (d[1] + r2 * d[4]));
-    const double dx = 2.0 * d[2] * x * y + d[3] * (r2 + 2.0 * x * x);
-    const double dy = d[2] * (r2 + 2.0 * y * y) + 2.0 * d[3] * x * y;
-    x = (x0 - dx) / radial;
-    y = (y0 - dy) / radial;
+Point2 undistort(const messages::CameraInfo& k, const Point2& pixel) {
+  const double yd = (pixel[1] - k.cy) / k.fy;
+  const double xd = (pixel[0] - k.cx - k.skew * yd) / k.fx;
+  const auto& c = k.coefficients;
+  switch (k.distortion_model) {
+    case messages::DistortionModel::kPlumbBob:
+    case messages::DistortionModel::kRationalPolynomial: {
+      // OpenCV's fixed-point iteration, run until it settles.
+      double x = xd;
+      double y = yd;
+      for (int i = 0; i < kUndistortIterations; ++i) {
+        const double r2 = x * x + y * y;
+        const double dx = 2.0 * c[2] * x * y + c[3] * (r2 + 2.0 * x * x);
+        const double dy = c[2] * (r2 + 2.0 * y * y) + 2.0 * c[3] * x * y;
+        const double radial = radial_factor(k, r2);
+        const double nx = (xd - dx) / radial;
+        const double ny = (yd - dy) / radial;
+        const bool settled = std::abs(nx - x) < 1e-15 && std::abs(ny - y) < 1e-15;
+        x = nx;
+        y = ny;
+        if (settled) break;
+      }
+      return {x, y};
+    }
+    case messages::DistortionModel::kEquidistant: {
+      // theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8), by Newton.
+      const double theta_d = std::hypot(xd, yd);
+      if (theta_d < 1e-15) return {xd, yd};
+      double theta = theta_d;
+      for (int i = 0; i < kUndistortIterations; ++i) {
+        const double t2 = theta * theta;
+        const double f =
+            theta * (1.0 + t2 * (c[0] + t2 * (c[1] + t2 * (c[2] + t2 * c[3])))) - theta_d;
+        const double df =
+            1.0 + t2 * (3.0 * c[0] + t2 * (5.0 * c[1] + t2 * (7.0 * c[2] + t2 * 9.0 * c[3])));
+        const double step = f / df;
+        theta -= step;
+        if (std::abs(step) < 1e-15) break;
+      }
+      const double scale = std::tan(theta) / theta_d;
+      return {xd * scale, yd * scale};
+    }
+    case messages::DistortionModel::kNone:
+      break;
   }
-  return {x, y};
+  return {xd, yd};
 }
 
 std::optional<Pose> solve_planar_pose(std::span<const Point2> target_xy,
-                                      std::span<const Point2> image, const CameraIntrinsics& k) {
+                                      std::span<const Point2> image,
+                                      const messages::CameraInfo& k) {
   if (target_xy.size() != image.size() || image.size() < 4) return std::nullopt;
   std::vector<Point2> normalized;
   normalized.reserve(image.size());
@@ -323,7 +390,8 @@ std::array<Point3, 4> marker_object_corners(double length) {
   return {{{-h, -h, 0.0}, {h, -h, 0.0}, {h, h, 0.0}, {-h, h, 0.0}}};
 }
 
-std::optional<Pose> marker_pose(const Marker& marker, const CameraIntrinsics& k, double length) {
+std::optional<Pose> marker_pose(const Marker& marker, const messages::CameraInfo& k,
+                                double length) {
   const auto corners = marker_object_corners(length);
   std::array<Point2, 4> target_xy;
   for (int i = 0; i < 4; ++i) target_xy[i] = {corners[i][0], corners[i][1]};

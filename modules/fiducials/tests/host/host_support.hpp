@@ -71,7 +71,7 @@ inline std::vector<Marker> detect_scene(const SyntheticScene& scene,
   const auto gray = render_scene(scene, 1);
   std::vector<Marker> markers = detector.detect(host_view(gray, scene.width, scene.height)).markers;
   const double length = scene.markers.empty() ? 0.1 : scene.markers.front().length;
-  for (Marker& marker : markers) marker.pose = marker_pose(marker, scene.intrinsics, length);
+  for (Marker& marker : markers) marker.pose = marker_pose(marker, scene.camera, length);
   return markers;
 }
 
@@ -93,7 +93,7 @@ inline CharucoObservation observe_scene(const SyntheticScene& scene, const Charu
   return observe_charuco(
       board, found.markers,
       [&](std::span<const SaddleSeed> seeds) { return detector.refine_saddles(view, seeds); },
-      scene.width, scene.height, charuco, scene.intrinsics);
+      scene.width, scene.height, charuco, &scene.camera);
 }
 
 // How a board's corners compare with the scene's.

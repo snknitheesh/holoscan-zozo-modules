@@ -12,7 +12,10 @@
 #include <vector>
 
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/fiducials/pose.hpp>
 #include <holoscan/logger/logger.hpp>
+
+#include "cuda_buffers.hpp"  // cuda_check
 
 namespace holoscan::fiducials {
 namespace {
@@ -70,6 +73,7 @@ void FrameDetector::start() {
                       facts.cuda_device ? "a CUDA device is usable" : "no CUDA device is usable");
   }
   frames_ = 0;
+  waits_ = 0;
   overflowed_frames_ = 0;
   last_overflow_warning_.reset();
 }
@@ -80,7 +84,7 @@ void FrameDetector::stop() {
 }
 
 holoscan::Error FrameDetector::error(const std::exception& exception, cudaStream_t stream) const {
-  cudaStreamSynchronize(stream);
+  if (stream != nullptr) cudaStreamSynchronize(stream);
   const bool bad_input = dynamic_cast<const std::invalid_argument*>(&exception) != nullptr;
   return holoscan::Error{
       bad_input ? holoscan::ErrorCode::kInvalidArgument : holoscan::ErrorCode::kFailure,
@@ -88,7 +92,8 @@ holoscan::Error FrameDetector::error(const std::exception& exception, cudaStream
 }
 
 holoscan::expected<FrameDetector::Frame, holoscan::Error> FrameDetector::prepare(
-    const holoscan::schema::ImageT& image, holoscan::ExecutionContext& context) {
+    const holoscan::schema::ImageT& image, holoscan::ExecutionContext& context,
+    const messages::CameraInfo* camera) {
   const auto invalid = [this](const std::string& message) {
     return holoscan::make_unexpected(
         holoscan::Error{holoscan::ErrorCode::kInvalidArgument, op_ + ": " + message});
@@ -133,28 +138,15 @@ holoscan::expected<FrameDetector::Frame, holoscan::Error> FrameDetector::prepare
                        .format = *format,
                        .location = on_device ? MemoryLocation::kDevice : MemoryLocation::kHost};
 
-  cudaStream_t stream = context.cuda_stream().get();
-  if (stream == nullptr) {
-    // No device memory on our ports, so no runtime stream: use our own, not the legacy default
-    // stream, which serializes with every other stream.
-    if (!own_stream_) {
-      cudaStream_t created = nullptr;
-      const cudaError_t status = cudaStreamCreateWithFlags(&created, cudaStreamNonBlocking);
-      if (status != cudaSuccess) {
-        return holoscan::make_unexpected(
-            holoscan::Error{holoscan::ErrorCode::kFailure,
-                            op_ + ": cudaStreamCreate: " + cudaGetErrorString(status)});
-      }
-      own_stream_.reset(created);
+  if (camera != nullptr) {
+    try {
+      check_camera_size(*camera, view.width, view.height);
+    } catch (const std::invalid_argument& exception) {
+      return invalid(exception.what());
     }
-    stream = own_stream_.get();
   }
-  // Wait for the producer's writes: on our stream for device memory, on the host otherwise.
-  auto ready = view.location == MemoryLocation::kDevice && tensor.has_readiness_stream_contract()
-                   ? tensor.synchronize_for_consumer_stream(stream)
-                   : tensor.synchronize_for_host();
-  if (!ready) return holoscan::make_unexpected(std::move(ready).error());
 
+  cudaStream_t stream = nullptr;
   try {
     if (!backend_ || view.width != width_ || view.height != height_) {
       backend_.reset();
@@ -163,6 +155,31 @@ holoscan::expected<FrameDetector::Frame, holoscan::Error> FrameDetector::prepare
       height_ = view.height;
     }
     const MemoryLocation target = backend_->input_location();
+    // A host image for a host backend needs no CUDA stream, so the cpu backend runs without a
+    // GPU; anything on the device or crossing to it does.
+    if (view.location == MemoryLocation::kDevice || target == MemoryLocation::kDevice) {
+      stream = context.cuda_stream().get();
+      if (stream == nullptr) {
+        // No device memory on our ports, so no runtime stream: use our own, not the legacy
+        // default stream, which serializes with every other stream.
+        if (!own_stream_) {
+          cudaStream_t created = nullptr;
+          cuda_check(cudaStreamCreateWithFlags(&created, cudaStreamNonBlocking),
+                     "cudaStreamCreate");
+          own_stream_.reset(created);
+        }
+        stream = own_stream_.get();
+      }
+    }
+    // Wait for the producer's writes: on our stream when the tensor says which stream they were
+    // on and the image is on the device; otherwise on the host, which with such a stream is a
+    // wait for it.
+    const bool readiness = tensor.has_readiness_stream_contract();
+    auto ready = view.location == MemoryLocation::kDevice && readiness
+                     ? tensor.synchronize_for_consumer_stream(stream)
+                     : tensor.synchronize_for_host();
+    if (!ready) return holoscan::make_unexpected(std::move(ready).error());
+    if (readiness && view.location == MemoryLocation::kHost) ++waits_;
     if (view.location != target && !cross_copy_logged_) {
       cross_copy_logged_ = true;
       log_cross_copy(op_, backend_->name(), view.location, view.width, view.height);
@@ -173,6 +190,14 @@ holoscan::expected<FrameDetector::Frame, holoscan::Error> FrameDetector::prepare
   } catch (const std::exception& exception) {
     return holoscan::make_unexpected(error(exception, stream));
   }
+}
+
+TransferCounts FrameDetector::take_transfers() noexcept {
+  TransferCounts counts{.host_waits = waits_};
+  waits_ = 0;
+  counts += converter_.take_transfers();
+  if (backend_) counts += backend_->take_transfers();
+  return counts;
 }
 
 void FrameDetector::warn_overflow(const Overflow& overflow) {

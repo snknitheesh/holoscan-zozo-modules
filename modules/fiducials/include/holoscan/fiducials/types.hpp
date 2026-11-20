@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Types shared by the detectors, the operators and the tests; no SDK, no CUDA.
+// Types shared by the detectors, the operators and the tests; no SDK, no CUDA. Cameras are
+// holoscan-messages' CameraInfo (its SDK-free plain value).
 
 #pragma once
 
@@ -12,6 +13,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <holoscan/messages/camera_info.hpp>
 
 namespace holoscan::fiducials {
 
@@ -51,16 +54,6 @@ struct GrayImageView {
   int height{};
   std::size_t pitch{};
   MemoryLocation location{MemoryLocation::kHost};
-};
-
-// A pinhole camera in pixels, pixel centers at integer coordinates (OpenCV, ROS `CameraInfo`),
-// with OpenCV's radial-tangential distortion k1, k2, p1, p2, k3 (all zero: none).
-struct CameraIntrinsics {
-  double fx{};
-  double fy{};
-  double cx{};
-  double cy{};
-  std::array<double, 5> distortion{};
 };
 
 // A target's frame in the camera frame: row-major rotation, translation in meters. Camera x
@@ -124,6 +117,19 @@ struct Overflow {
 struct FrameMarkers {
   std::vector<Marker> markers;
   Overflow overflow;
+};
+
+// What one frame cost in CPU waits for the GPU and in copies between host and device memory.
+struct TransferCounts {
+  std::uint32_t host_waits{};    // Times the CPU waited for GPU work (stream synchronizations).
+  std::uint64_t copied_bytes{};  // Bytes copied between host and device memory, both ways.
+
+  TransferCounts& operator+=(const TransferCounts& other) noexcept {
+    host_waits += other.host_waits;
+    copied_bytes += other.copied_bytes;
+    return *this;
+  }
+  friend bool operator==(const TransferCounts&, const TransferCounts&) = default;
 };
 
 // A chessboard corner to refine: where it is predicted and the half side of the square window

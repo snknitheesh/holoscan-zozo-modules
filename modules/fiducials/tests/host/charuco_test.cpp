@@ -203,7 +203,7 @@ void check_bad_configs() {
   VERIFY(test::throws<std::invalid_argument>([&] {
     (void)observe_charuco(
         board, {}, [](std::span<const SaddleSeed>) { return std::vector<std::optional<Point2>>{}; },
-        640, 480, CharucoOptions{.min_markers = 3}, std::nullopt);
+        640, 480, CharucoOptions{.min_markers = 3}, nullptr);
   }));
 }
 

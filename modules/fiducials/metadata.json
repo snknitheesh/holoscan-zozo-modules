@@ -47,11 +47,15 @@
       "hardware": [
         {
           "name": "NVIDIA GPU",
-          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for the cuda backend. The cpu backend needs none."
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for the cuda backend. The cpu backend on host images needs none."
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-fiducials",
       "install_commands": [

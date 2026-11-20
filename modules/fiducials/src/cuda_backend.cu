@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -89,7 +90,12 @@ constexpr int kWarps = 4;
 // Frame counters on the device.
 struct Counts {
   std::uint32_t candidates;  // Candidates found; those past the capacity were dropped.
+  std::uint32_t decoded;     // Candidates decoded as markers, packed into `decoded`.
 };
+
+// Decoded markers copied back with the counts, in the one wait of an ArUco frame; a frame with
+// more takes a second wait for the rest.
+constexpr std::uint32_t kReadbackMarkers = 64;
 
 __global__ void tile_range_kernel(Image image, Params p, std::uint8_t* lo, std::uint8_t* hi) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -240,10 +246,10 @@ __global__ void side_kernel(Params p, const std::int32_t* labels, const std::int
   }
 }
 
-// A warp per candidate.
-__global__ void examine_kernel(Image image, Params p, const Candidate* candidates,
-                               const Counts* counts, const std::uint64_t* codes,
-                               CandidateResult* results) {
+// A warp per candidate. Each candidate decoded as a marker is packed into `decoded`, in
+// whatever order the warps finish; the host puts them back in candidate order.
+__global__ void examine_kernel(Image image, Params p, const Candidate* candidates, Counts* counts,
+                               const std::uint64_t* codes, CandidateResult* decoded) {
   __shared__ double scratch[kWarps][core::kScratch];
   const int warp = static_cast<int>(threadIdx.x) / core::kLanes;
   const std::uint32_t s = blockIdx.x * kWarps + warp;
@@ -251,16 +257,19 @@ __global__ void examine_kernel(Image image, Params p, const Candidate* candidate
       counts->candidates < core::kMaxCandidates ? counts->candidates : core::kMaxCandidates;
   if (s >= found) return;  // The whole warp.
   const WarpLanes lanes{static_cast<int>(threadIdx.x) % core::kLanes};
-  const CandidateResult result =
-      core::examine(lanes, candidates[s], image, p, codes, scratch[warp]);
-  if (lanes.lane == 0) results[s] = result;
+  CandidateResult result = core::examine(lanes, candidates[s], image, p, codes, scratch[warp]);
+  if (lanes.lane != 0 || result.marker == 0) return;
+  result.candidate = static_cast<std::int32_t>(s);
+  decoded[atomicAdd(&counts->decoded, 1U)] = result;
 }
 
-// A chessboard corner to refine, as plain data for the device.
+// A chessboard corner to refine, as plain data for the device. `unused` fills what would be
+// padding, so that every byte copied is written.
 struct Seed {
   double x;
   double y;
   std::int32_t half_window;
+  std::int32_t unused;
 };
 
 // A chessboard corner refined, with whether it was found.
@@ -268,6 +277,7 @@ struct Saddle {
   double x;
   double y;
   std::int32_t found;
+  std::int32_t unused;
 };
 
 // A warp per chessboard corner.
@@ -282,7 +292,7 @@ __global__ void saddle_kernel(Image image, int min_contrast, const Seed* seeds, 
   double y = seeds[s].y;
   const bool found =
       core::refine_saddle(lanes, image, seeds[s].half_window, min_contrast, scratch[warp], x, y);
-  if (lanes.lane == 0) out[s] = Saddle{x, y, found ? 1 : 0};
+  if (lanes.lane == 0) out[s] = Saddle{x, y, found ? 1 : 0, 0};
 }
 
 class CudaBackend final : public DetectorBackend {
@@ -299,14 +309,18 @@ class CudaBackend final : public DetectorBackend {
     labels_ = DeviceBuffer<std::int32_t>(pixels);
     slots_ = DeviceBuffer<std::int32_t>(pixels);
     candidates_ = DeviceBuffer<Candidate>(core::kMaxCandidates);
-    results_ = DeviceBuffer<CandidateResult>(core::kMaxCandidates);
+    decoded_ = DeviceBuffer<CandidateResult>(core::kMaxCandidates);
     counts_ = DeviceBuffer<Counts>(1);
     codes_ = DeviceBuffer<std::uint64_t>(codes.size());
     host_counts_ = PinnedBuffer<Counts>(1);
-    host_results_ = PinnedBuffer<CandidateResult>(core::kMaxCandidates);
+    host_decoded_ = PinnedBuffer<CandidateResult>(core::kMaxCandidates);
     cuda_check(cudaMemcpy(codes_.get(), codes.data(), codes.size() * sizeof(std::uint64_t),
                           cudaMemcpyHostToDevice),
                "cudaMemcpy(codes)");
+    // Each frame copies the first kReadbackMarkers slots back whether or not they were
+    // written this frame: give them defined contents once.
+    cuda_check(cudaMemset(decoded_.get(), 0, core::kMaxCandidates * sizeof(CandidateResult)),
+               "cudaMemset(decoded)");
   }
 
   [[nodiscard]] std::string_view name() const noexcept override { return "cuda"; }
@@ -343,22 +357,28 @@ class CudaBackend final : public DetectorBackend {
     side_kernel<<<blocks_for(pixels), kBlock, 0, stream>>>(p, labels_.get(), slots_.get(),
                                                            candidates_.get());
     examine_kernel<<<core::kMaxCandidates / kWarps, kWarps * core::kLanes, 0, stream>>>(
-        image, p, candidates_.get(), counts_.get(), codes_.get(), results_.get());
+        image, p, candidates_.get(), counts_.get(), codes_.get(), decoded_.get());
     cuda_check(cudaGetLastError(), "cuda backend kernels");
-    cuda_check(cudaMemcpyAsync(host_counts_.get(), counts_.get(), sizeof(Counts),
-                               cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync(counts)");
-    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    const std::uint32_t total = host_counts_.get()->candidates;
+    // The counts and the first decoded markers in one wait; the rest, if any, in a second.
+    copy_to_host(host_counts_.get(), counts_.get(), sizeof(Counts), stream, "counts");
+    copy_to_host(host_decoded_.get(), decoded_.get(), kReadbackMarkers * sizeof(CandidateResult),
+                 stream, "decoded markers");
+    wait(stream);
+    const Counts counts = *host_counts_.get();
+    const std::uint32_t total = counts.candidates;
     const std::uint32_t examined = total < core::kMaxCandidates ? total : core::kMaxCandidates;
-    if (examined > 0) {
-      cuda_check(
-          cudaMemcpyAsync(host_results_.get(), results_.get(), examined * sizeof(CandidateResult),
-                          cudaMemcpyDeviceToHost, stream),
-          "cudaMemcpyAsync(results)");
-      cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    if (counts.decoded > kReadbackMarkers) {
+      copy_to_host(host_decoded_.get() + kReadbackMarkers, decoded_.get() + kReadbackMarkers,
+                   (counts.decoded - kReadbackMarkers) * sizeof(CandidateResult), stream,
+                   "decoded markers");
+      wait(stream);
     }
-    return collect_markers({host_results_.get(), examined}, total - examined);
+    std::span<CandidateResult> decoded{host_decoded_.get(), counts.decoded};
+    std::sort(decoded.begin(), decoded.end(),
+              [](const CandidateResult& a, const CandidateResult& b) {
+                return a.candidate < b.candidate;
+              });
+    return collect_markers(decoded, total - examined);
   }
 
   std::vector<std::optional<Point2>> refine_saddles(const GrayImageView& view,
@@ -379,19 +399,19 @@ class CudaBackend final : public DetectorBackend {
     }
     const auto count = static_cast<int>(seeds.size());
     for (int s = 0; s < count; ++s) {
-      host_seeds_.get()[s] = Seed{seeds[s].position[0], seeds[s].position[1], seeds[s].half_window};
+      host_seeds_.get()[s] =
+          Seed{seeds[s].position[0], seeds[s].position[1], seeds[s].half_window, 0};
     }
     cuda_check(cudaMemcpyAsync(saddle_seeds_.get(), host_seeds_.get(), count * sizeof(Seed),
                                cudaMemcpyHostToDevice, stream),
                "cudaMemcpyAsync(seeds)");
+    count_transfer(0U, count * sizeof(Seed));
     const Image image{view.data, view.width, view.height, view.pitch};
     saddle_kernel<<<(count + kWarps - 1) / kWarps, kWarps * core::kLanes, 0, stream>>>(
         image, params_.min_contrast, saddle_seeds_.get(), count, saddles_.get());
     cuda_check(cudaGetLastError(), "saddle_kernel");
-    cuda_check(cudaMemcpyAsync(host_saddles_.get(), saddles_.get(), count * sizeof(Saddle),
-                               cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync(saddles)");
-    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    copy_to_host(host_saddles_.get(), saddles_.get(), count * sizeof(Saddle), stream, "saddles");
+    wait(stream);
     refined.reserve(seeds.size());
     for (int s = 0; s < count; ++s) {
       const Saddle& saddle = host_saddles_.get()[s];
@@ -405,6 +425,19 @@ class CudaBackend final : public DetectorBackend {
   }
 
  private:
+  // Queues a copy of `bytes` from the device to pinned host memory, and counts it.
+  void copy_to_host(void* host, const void* device, std::size_t bytes, cudaStream_t stream,
+                    const char* what) {
+    cuda_check(cudaMemcpyAsync(host, device, bytes, cudaMemcpyDeviceToHost, stream),
+               (std::string("cudaMemcpyAsync(") + what + ")").c_str());
+    count_transfer(0U, bytes);
+  }
+  // Waits for `stream`, and counts the wait.
+  void wait(cudaStream_t stream) {
+    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    count_transfer(1U, 0U);
+  }
+
   void check(const GrayImageView& view) const {
     if (view.location != MemoryLocation::kDevice || view.width != params_.width ||
         view.height != params_.height || view.data == nullptr) {
@@ -418,11 +451,11 @@ class CudaBackend final : public DetectorBackend {
   DeviceBuffer<std::int32_t> labels_;
   DeviceBuffer<std::int32_t> slots_;  // Per root: its size, then its candidate slot or -1.
   DeviceBuffer<Candidate> candidates_;
-  DeviceBuffer<CandidateResult> results_;
+  DeviceBuffer<CandidateResult> decoded_;  // The candidates decoded as markers, packed.
   DeviceBuffer<Counts> counts_;
   DeviceBuffer<std::uint64_t> codes_;
   PinnedBuffer<Counts> host_counts_;
-  PinnedBuffer<CandidateResult> host_results_;
+  PinnedBuffer<CandidateResult> host_decoded_;
   // For refine_saddles, made on first use.
   DeviceBuffer<Seed> saddle_seeds_;
   DeviceBuffer<Saddle> saddles_;

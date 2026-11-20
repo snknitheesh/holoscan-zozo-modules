@@ -3,9 +3,13 @@
 //
 // The operators on their own, through the SDK's operator test harness: ArucoDetectorOp and
 // CharucoDetectorOp on images of each encoding and layout, from host and device memory, on each
-// backend, checked against ground truth; a change of image size; the auto backend's choice; a
-// host/device copy logged once, and only when there is one; provenance; unsupported images and
-// configurations rejected; and the overlay's HoloViz layers.
+// backend, checked against ground truth, with poses from camera info sent with every image
+// (kEveryFrame) or once before them (kLatest); images before the first camera info skipped; a
+// camera info of another size refused; a change of image size; the auto backend's choice; a
+// host/device copy logged once, and only when there is one; the CPU waits and copies of every
+// path; provenance; unsupported images and configurations rejected; and the overlay's HoloViz
+// layers. With --cpu-only, only the cpu backend on host images, which must run without a GPU
+// (CTest runs it with none visible).
 
 #include <cuda_runtime_api.h>
 #include <unistd.h>
@@ -33,6 +37,7 @@
 #include <holoscan/fiducials/fiducial_messages.hpp>
 #include <holoscan/fiducials/synthetic_scene.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 #if HOLOSCAN_FIDUCIALS_WITH_OVERLAY
 #include <holoscan/fiducials/fiducial_overlay_op.hpp>
@@ -53,6 +58,51 @@ CharucoBoardConfig test_board() {
           .square_length = 0.04,
           .marker_length = 0.03,
           .dictionary = "DICT_4X4_50"};
+}
+
+namespace hm = holoscan::messages;
+using std::chrono_literals::operator""ms;
+using std::chrono_literals::operator""s;
+
+// Image n's capture time.
+std::chrono::nanoseconds capture_time(std::size_t n) {
+  return std::chrono::milliseconds(100 * (static_cast<std::int64_t>(n) + 1));
+}
+
+// How the camera info goes with the images in a test.
+enum class CameraInfoMode {
+  kNone,        // No poses: no camera info input.
+  kEveryFrame,  // A camera info with every image, at its capture time.
+  kOnceBefore,  // One camera info before the first image (kLatest).
+  kAfterFirst,  // One camera info between the first image and the second (kLatest).
+};
+
+// Pushes `images` (each at capture_time(n)) and, as `mode` says, `camera`.
+template <typename Harness>
+void push_images(Harness& h, const std::vector<holoscan::schema::ImageT>& images,
+                 CameraInfoMode mode, const hm::CameraInfo& camera) {
+  const auto info = [&camera] {
+    return holoscan::testing::input("camera_info", hm::to_message(camera));
+  };
+  for (std::size_t n = 0; n < images.size(); ++n) {
+    if ((mode == CameraInfoMode::kOnceBefore && n == 0) ||
+        (mode == CameraInfoMode::kAfterFirst && n == 1)) {
+      h.push_frame(holoscan::testing::frame_at(capture_time(n) - 1ms, info()));
+    }
+    if (mode == CameraInfoMode::kEveryFrame) {
+      h.push_frame(holoscan::testing::frame_at(
+          capture_time(n), holoscan::testing::input("image", images[n]), info()));
+    } else {
+      h.push_frame(holoscan::testing::frame_at(capture_time(n),
+                                               holoscan::testing::input("image", images[n])));
+    }
+  }
+}
+
+// The camera info options for `mode`.
+hm::CameraInfoInputOptions camera_info_input(CameraInfoMode mode) {
+  return {.timing = mode == CameraInfoMode::kEveryFrame ? hm::CameraInfoTiming::kEveryFrame
+                                                        : hm::CameraInfoTiming::kLatest};
 }
 
 // A host tensor owning `bytes`, with `shape` and `strides` (in elements).
@@ -144,26 +194,33 @@ void check_markers(const schema::FiducialDetectionsT& message, const SyntheticSc
                  std::to_string(counts.missed) + ", extra " + std::to_string(counts.extra));
 }
 
+// Runs ArucoDetectorOp on `images`; `camera` goes with them as `mode` says (kNone: config
+// without poses). Expects `expected` messages (default: one per image).
 std::vector<schema::FiducialDetectionsT> run_aruco(
     const ArucoDetectorConfig& config, const std::vector<holoscan::schema::ImageT>& images,
-    bool device_input = false) {
+    bool device_input = false, CameraInfoMode mode = CameraInfoMode::kNone,
+    const hm::CameraInfo& camera = {}, std::optional<std::size_t> expected = std::nullopt) {
   auto h = holoscan::testing::create_operator_test<ArucoDetectorOp>(config);
   if (device_input) h.input_source_device("image", holoscan::DeviceId{0});
-  for (const auto& image : images) h.push("image", image);
+  push_images(h, images, mode, camera);
   h.capture<schema::FiducialDetectionsT>("detections");
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return {};
   auto messages = result.values<schema::FiducialDetectionsT>("detections");
-  VERIFY(messages.size() == images.size());
+  VERIFY_MSG(messages.size() == expected.value_or(images.size()),
+             std::to_string(messages.size()) + " messages from " + std::to_string(images.size()) +
+                 " images");
   return messages;
 }
 
-ArucoDetectorConfig aruco_config(Backend backend, const SyntheticScene& scene) {
+ArucoDetectorConfig aruco_config(Backend backend, const SyntheticScene& scene,
+                                 CameraInfoMode mode = CameraInfoMode::kEveryFrame) {
   return ArucoDetectorConfig{.backend = backend,
                              .options = DetectorOptions{.dictionary = scene.dictionary},
-                             .intrinsics = scene.intrinsics,
-                             .marker_length = scene.markers.front().length};
+                             .estimate_pose = true,
+                             .marker_length = scene.markers.front().length,
+                             .camera_info_input = camera_info_input(mode)};
 }
 
 void check_aruco(Backend backend, holoscan::schema::ImageEncoding encoding, bool rank2,
@@ -175,12 +232,63 @@ void check_aruco(Backend backend, holoscan::schema::ImageEncoding encoding, bool
     images.push_back(scene_image(scenes.back(), encoding, rank2));
     if (device_input) images.back().data = device_tensor(*images.back().data);
   }
-  const auto messages = run_aruco(aruco_config(backend, scenes[0]), images, device_input);
+  const auto messages = run_aruco(aruco_config(backend, scenes[0]), images, device_input,
+                                  CameraInfoMode::kEveryFrame, scenes[0].camera);
   for (std::size_t i = 0; i < messages.size(); ++i) {
     VERIFY(messages[i].frame == i);
     VERIFY(messages[i].backend == backend_name(backend));
     check_markers(messages[i], scenes[i], true);
   }
+}
+
+// Camera info at its own rate (kLatest): one before the images gives every image its pose; one
+// that comes after the first image skips that image and gives the rest their poses.
+void check_aruco_latest_camera_info(CameraInfoMode mode) {
+  std::vector<SyntheticScene> scenes;
+  std::vector<holoscan::schema::ImageT> images;
+  for (std::uint32_t frame = 0; frame < 3; ++frame) {
+    scenes.push_back(make_marker_scene(kDictionary, frame * 10, kWidth, kHeight));
+    images.push_back(scene_image(scenes.back(), holoscan::schema::ImageEncoding_MONO8));
+  }
+  const std::size_t skipped = mode == CameraInfoMode::kAfterFirst ? 1 : 0;
+  const auto messages = run_aruco(aruco_config(Backend::kCuda, scenes[0], mode), images, false,
+                                  mode, scenes[0].camera, images.size() - skipped);
+  for (std::size_t i = 0; i < messages.size(); ++i) {
+    check_markers(messages[i], scenes[i + skipped], true);
+  }
+}
+
+// A camera info of another size than the images fails the run, naming both sizes.
+void check_camera_size_refused(bool board) {
+  const SyntheticScene scene = make_marker_scene(kDictionary, 0, kWidth, kHeight);
+  const hm::CameraInfo other = make_marker_scene(kDictionary, 0, 640, 480).camera;
+  const std::vector<holoscan::schema::ImageT> images{
+      scene_image(scene, holoscan::schema::ImageEncoding_MONO8)};
+  std::string failure;
+  if (board) {
+    auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(
+        CharucoDetectorConfig{.backend = Backend::kCpu,
+                              .board = test_board(),
+                              .estimate_pose = true,
+                              .camera_info_input = camera_info_input(CameraInfoMode::kEveryFrame)});
+    push_images(h, images, CameraInfoMode::kEveryFrame, other);
+    h.capture<schema::FiducialDetectionsT>("detections");
+    const auto result = h.run();
+    VERIFY(!result.ok());
+    failure = result.describe_failure();
+  } else {
+    auto h = holoscan::testing::create_operator_test<ArucoDetectorOp>(
+        aruco_config(Backend::kCpu, scene));
+    push_images(h, images, CameraInfoMode::kEveryFrame, other);
+    h.capture<schema::FiducialDetectionsT>("detections");
+    const auto result = h.run();
+    VERIFY(!result.ok());
+    failure = result.describe_failure();
+  }
+  VERIFY_MSG(
+      failure.find("640x480") != std::string::npos &&
+          failure.find(std::to_string(kWidth) + "x" + std::to_string(kHeight)) != std::string::npos,
+      "the failure names both sizes: " + failure);
 }
 
 // The backend is rebuilt when the image size changes, and detects at both.
@@ -207,10 +315,13 @@ void check_charuco(Backend backend, bool device_input) {
     images.push_back(scene_image(scenes.back(), holoscan::schema::ImageEncoding_RGB8));
     if (device_input) images.back().data = device_tensor(*images.back().data);
   }
-  auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(CharucoDetectorConfig{
-      .backend = backend, .board = test_board(), .intrinsics = scenes[0].intrinsics});
+  auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(
+      CharucoDetectorConfig{.backend = backend,
+                            .board = test_board(),
+                            .estimate_pose = true,
+                            .camera_info_input = camera_info_input(CameraInfoMode::kEveryFrame)});
   if (device_input) h.input_source_device("image", holoscan::DeviceId{0});
-  for (const auto& image : images) h.push("image", image);
+  push_images(h, images, CameraInfoMode::kEveryFrame, scenes[0].camera);
   h.capture<schema::FiducialDetectionsT>("detections");
   const auto result = h.run();
   VERIFY_MSG(result.ok(), result.describe_failure());
@@ -384,6 +495,67 @@ void check_cross_copy_logged_once(Backend backend, bool device_input, std::size_
   }
 }
 
+// The CPU waits and host/device copies each path costs per frame, as the messages report them:
+// cpu on host images nothing; cuda one wait per ArUco frame (two per ChArUco frame) and the
+// readback of the counts and the first decoded markers, a fixed few kB; an image that crosses
+// between host and device its gray image, and one more wait when it comes back to the host.
+void check_transfers() {
+  const SyntheticScene scene = make_marker_scene(kDictionary, 0, kWidth, kHeight);
+  const std::uint64_t gray = static_cast<std::uint64_t>(kWidth) * kHeight;
+  const auto run = [&](Backend backend, bool device_input) {
+    std::vector<holoscan::schema::ImageT> images;
+    for (int i = 0; i < 3; ++i) {
+      images.push_back(scene_image(scene, holoscan::schema::ImageEncoding_RGB8));
+      if (device_input) images.back().data = device_tensor(*images.back().data);
+    }
+    const auto messages =
+        run_aruco(ArucoDetectorConfig{.backend = backend, .options = {.dictionary = kDictionary}},
+                  images, device_input);
+    std::optional<TransferCounts> counts;
+    for (const auto& message : messages) {
+      const TransferCounts frame{.host_waits = message.host_waits,
+                                 .copied_bytes = message.copied_bytes};
+      if (counts) VERIFY_MSG(frame == *counts, "every frame costs the same");
+      counts = frame;
+    }
+    std::cout << "  " << backend_name(backend) << (device_input ? " device" : " host")
+              << " images: " << (counts ? counts->host_waits : 0U) << " waits, "
+              << (counts ? counts->copied_bytes : 0U) << " bytes per frame\n";
+    return counts.value_or(TransferCounts{.host_waits = 99});
+  };
+  const TransferCounts cpu_host = run(Backend::kCpu, false);
+  VERIFY(cpu_host == TransferCounts{});
+  const TransferCounts cuda_device = run(Backend::kCuda, true);
+  VERIFY(cuda_device.host_waits == 1 && cuda_device.copied_bytes > 0 &&
+         cuda_device.copied_bytes < 8192);
+  const TransferCounts cuda_host = run(Backend::kCuda, false);
+  VERIFY(cuda_host.host_waits == 1 && cuda_host.copied_bytes == cuda_device.copied_bytes + gray);
+  const TransferCounts cpu_device = run(Backend::kCpu, true);
+  VERIFY(cpu_device.host_waits == 1 && cpu_device.copied_bytes == gray);
+
+  // ChArUco on cuda: the markers' wait, and one for the chessboard corners, whose seeds and
+  // results (24 bytes each way per corner) are copied.
+  const SyntheticScene board_scene = make_board_scene(test_board(), 0, kWidth, kHeight);
+  holoscan::schema::ImageT image = scene_image(board_scene, holoscan::schema::ImageEncoding_MONO8);
+  image.data = device_tensor(*image.data);
+  auto h = holoscan::testing::create_operator_test<CharucoDetectorOp>(
+      CharucoDetectorConfig{.backend = Backend::kCuda, .board = test_board()});
+  h.input_source_device("image", holoscan::DeviceId{0});
+  push_images(h, {image}, CameraInfoMode::kNone, {});
+  h.capture<schema::FiducialDetectionsT>("detections");
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto messages = result.values<schema::FiducialDetectionsT>("detections");
+  VERIFY(messages.size() == 1 && messages[0].board);
+  if (messages.size() != 1 || !messages[0].board) return;
+  const std::uint64_t corners = messages[0].board->corners.size();
+  std::cout << "  charuco cuda device images: " << messages[0].host_waits << " waits, "
+            << messages[0].copied_bytes << " bytes for " << corners << " corners\n";
+  VERIFY(messages[0].host_waits == 2 && corners > 0 &&
+         messages[0].copied_bytes >= cuda_device.copied_bytes + 48 * corners);
+}
+
 // kAuto chooses at start, logs the choice once, and reports it; until then it reports kAuto.
 void check_auto_backend() {
   holoscan::set_log_level(holoscan::LogLevel::INFO);
@@ -432,13 +604,25 @@ void check_rejects_bad_config() {
   VERIFY(test::throws<std::invalid_argument>(
       [] { ArucoDetectorOp op(ArucoDetectorConfig{.options = {.dictionary = "DICT_9X9_50"}}); }));
   VERIFY(test::throws<std::invalid_argument>([] {
-    ArucoDetectorOp op(ArucoDetectorConfig{.intrinsics = CameraIntrinsics{900, 900, 320, 240, {}},
-                                           .marker_length = 0.0});
+    ArucoDetectorOp op(ArucoDetectorConfig{.estimate_pose = true, .marker_length = 0.0});
   }));
   VERIFY(test::throws<std::invalid_argument>([] {
-    ArucoDetectorOp op(ArucoDetectorConfig{.intrinsics = CameraIntrinsics{-1, 900, 320, 240, {}},
-                                           .marker_length = 0.1});
+    ArucoDetectorOp op(ArucoDetectorConfig{
+        .estimate_pose = true, .marker_length = 0.1, .camera_info_input = {.max_age = {}}});
   }));
+  // Every refusal names the operator.
+  try {
+    ArucoDetectorOp op(ArucoDetectorConfig{.estimate_pose = true});
+    VERIFY_MSG(false, "estimate_pose without a marker length is refused");
+  } catch (const std::invalid_argument& error) {
+    VERIFY(std::string_view(error.what()).starts_with("ArucoDetectorOp: "));
+  }
+  try {
+    CharucoDetectorOp op(CharucoDetectorConfig{.charuco = {.min_markers = 3}});
+    VERIFY_MSG(false, "min_markers 3 is refused");
+  } catch (const std::invalid_argument& error) {
+    VERIFY(std::string_view(error.what()).starts_with("CharucoDetectorOp: "));
+  }
   VERIFY(test::throws<std::invalid_argument>(
       [] { CharucoDetectorOp op(CharucoDetectorConfig{.board = {.square_length = 0.02}}); }));
   VERIFY(test::throws<std::invalid_argument>(
@@ -487,8 +671,14 @@ struct OverlayOutput {
 
 std::optional<OverlayOutput> run_overlay(
     const FiducialOverlayConfig& config,
-    holoscan::testing::TestSample<schema::FiducialDetectionsT> sample) {
+    holoscan::testing::TestSample<schema::FiducialDetectionsT> sample,
+    const std::optional<hm::CameraInfo>& camera = std::nullopt) {
   auto h = holoscan::testing::create_operator_test<FiducialOverlayOp>(config);
+  if (camera) {
+    h.push_samples("camera_info",
+                   {holoscan::testing::sample_at(hm::to_message(*camera),
+                                                 sample.capture_coordinate.value_or(1s) - 1ms)});
+  }
   h.push_samples<schema::FiducialDetectionsT>("detections", {std::move(sample)});
   h.capture_snapshot<holoscan::schema::ImageT>("overlay");
   h.capture_snapshot<holoscan::Tensor>("labels");
@@ -538,13 +728,13 @@ void check_overlay() {
   VERIFY(label_text(out->labels, kOverlayLabelRows - 1) == "corners 1/24");
 }
 
-// With poses and intrinsics, the axes are drawn: x to the right in red, y down in green.
+// With poses and draw_axes, the axes are drawn from the camera info: x to the right in red, y
+// down in green.
 void check_overlay_pose() {
-  const auto out = run_overlay({.width = 200,
-                                .height = 100,
-                                .intrinsics = CameraIntrinsics{400, 400, 100, 50, {}},
-                                .marker_length = 0.4},
-                               {.data = overlay_message(true, true)});
+  const auto out =
+      run_overlay({.width = 200, .height = 100, .draw_axes = true, .marker_length = 0.4},
+                  {.data = overlay_message(true, true), .capture_coordinate = 500ms},
+                  test::camera(400, 400, 100, 50, 200, 100));
   if (!out) return;
   const auto& image = out->overlay.tensor(holoscan::schema::ImageTensorFields::data);
   // The marker's axes, 0.2 m from (100, 50): x to (140, 50), y to (100, 90).
@@ -563,18 +753,25 @@ void check_overlay_empty() {
          label_text(out->labels, kOverlayLabelRows - 1).empty());
 }
 
+// Unstamped detections are drawn with the drawing's time, which HoloViz needs, and a warning
+// says so, once.
 void check_overlay_unstamped() {
+  holoscan::set_log_level(holoscan::LogLevel::INFO);
   auto h = holoscan::testing::create_operator_test<FiducialOverlayOp>(
       FiducialOverlayConfig{.width = 200, .height = 100});
   h.push("detections", overlay_message(false, false));
-  h.capture_snapshot<holoscan::schema::ImageT>("overlay");
-  h.capture_snapshot<holoscan::Tensor>("labels");
-  const auto result = h.run();
-  VERIFY_MSG(result.ok(), result.describe_failure());
-  if (!result.ok()) return;
-  VERIFY(result.snapshot<holoscan::schema::ImageT>("overlay")
-             .sample_metadata()
-             .source_clock_id.valid());
+  h.push("detections", overlay_message(false, false));
+  h.capture_snapshot<holoscan::schema::ImageT>("overlay", 2);
+  h.capture_snapshot<holoscan::Tensor>("labels", 2);
+  std::optional<holoscan::testing::TestResult> result;
+  const std::string output = capture_output([&] { result.emplace(h.run()); });
+  VERIFY_MSG(result->ok(), result->describe_failure());
+  if (!result->ok()) return;
+  const auto images = result->snapshots<holoscan::schema::ImageT>("overlay");
+  VERIFY(images.size() == 2);
+  for (const auto& image : images) VERIFY(image.sample_metadata().source_clock_id.valid());
+  VERIFY_MSG(count_of(output, "detections without a capture time") == 1,
+             "the warning is logged once:\n" + output);
 }
 
 void check_overlay_too_large() {
@@ -586,16 +783,29 @@ void check_overlay_too_large() {
   VERIFY(!h.run().ok());
   VERIFY(test::throws<std::invalid_argument>(
       [] { FiducialOverlayOp op({.width = 0, .height = 10}); }));
+  VERIFY(test::throws<std::invalid_argument>(
+      [] { FiducialOverlayOp op({.width = 10, .height = 10, .draw_axes = true}); }));
 }
 #endif
 
 }  // namespace
 }  // namespace holoscan::fiducials
 
-int main() {
+int main(int argc, char** argv) {
   namespace f = holoscan::fiducials;
   using holoscan::fiducials::Backend;
   std::vector<f::test::TestCase> cases;
+  if (argc == 2 && std::string_view(argv[1]) == "--cpu-only") {
+    // The cpu backend on host images, which must need no GPU: CTest runs this with none visible.
+    for (const auto encoding :
+         {holoscan::schema::ImageEncoding_MONO8, holoscan::schema::ImageEncoding_RGB8}) {
+      cases.push_back(
+          {std::string("aruco cpu ") + holoscan::schema::EnumNameImageEncoding(encoding),
+           [=] { f::check_aruco(Backend::kCpu, encoding, false, false); }});
+    }
+    cases.push_back({"charuco cpu host images", [] { f::check_charuco(Backend::kCpu, false); }});
+    return f::test::run(cases);
+  }
   for (const Backend backend : f::available_backends()) {
     const std::string name(f::backend_name(backend));
     for (const auto encoding :
@@ -629,6 +839,15 @@ int main() {
            f::check_cross_copy_logged_once(backend, device_input, static_cast<std::size_t>(logs));
          }});
   }
+  cases.push_back({"camera info once before the images (kLatest)",
+                   [] { f::check_aruco_latest_camera_info(f::CameraInfoMode::kOnceBefore); }});
+  cases.push_back({"images before the first camera info skipped (kLatest)",
+                   [] { f::check_aruco_latest_camera_info(f::CameraInfoMode::kAfterFirst); }});
+  cases.push_back({"aruco: a camera info of another size fails the run",
+                   [] { f::check_camera_size_refused(false); }});
+  cases.push_back({"charuco: a camera info of another size fails the run",
+                   [] { f::check_camera_size_refused(true); }});
+  cases.push_back({"CPU waits and copies per frame", f::check_transfers});
   cases.push_back({"charuco reports an empty view", f::check_charuco_empty});
   cases.push_back({"auto backend", f::check_auto_backend});
   cases.push_back({"provenance forwarded", f::check_provenance});
@@ -638,7 +857,7 @@ int main() {
   cases.push_back({"overlay layers", f::check_overlay});
   cases.push_back({"overlay axes with poses", f::check_overlay_pose});
   cases.push_back({"overlay clears without detections", f::check_overlay_empty});
-  cases.push_back({"overlay stamps unstamped detections", f::check_overlay_unstamped});
+  cases.push_back({"overlay stamps unstamped detections, and says so", f::check_overlay_unstamped});
   cases.push_back({"overlay rejects images over its size", f::check_overlay_too_large});
 #endif
   return f::test::run(cases);

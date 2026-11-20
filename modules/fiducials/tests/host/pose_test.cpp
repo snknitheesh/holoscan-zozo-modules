@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Projection, undistortion and planar poses: the convention (z into the target), exact poses
-// from exact points with and without distortion, markers seen obliquely and from afar (the
-// planar ambiguity), noisy corners, and too few or collinear points.
+// Projection, undistortion and planar poses: the convention (z into the target), undistortion
+// inverting projection for every lens model of a ROS camera_info file (none, plumb_bob,
+// rational_polynomial, equidistant) and skew, exact poses from exact points through each, markers
+// seen obliquely and from afar (the planar ambiguity), noisy corners, too few or collinear points,
+// and a camera of another size than the image refused.
 
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <holoscan/fiducials/pose.hpp>
@@ -40,10 +44,26 @@ Matrix3 rotation(double yaw, double pitch, double roll) {
   return mul(y, mul(x, z));
 }
 
-const CameraIntrinsics kCamera{900.0, 905.0, 639.5, 359.5, {}};
-// A camera with strong barrel distortion.
-CameraIntrinsics distorted() {
-  return {900.0, 905.0, 641.2, 357.9, {-0.28, 0.09, 0.0007, -0.0004, -0.01}};
+using messages::DistortionModel;
+
+const messages::CameraInfo kCamera = test::camera(900.0, 905.0, 639.5, 359.5);
+
+// A camera of each lens model, with strong distortion, and one with skew.
+std::vector<messages::CameraInfo> lenses() {
+  return {
+      test::camera(900.0, 905.0, 641.2, 357.9, 1280, 720, DistortionModel::kPlumbBob,
+                   {-0.28, 0.09, 0.0007, -0.0004, -0.01}),
+      test::camera(900.0, 905.0, 641.2, 357.9, 1280, 720, DistortionModel::kRationalPolynomial,
+                   {0.8, -0.3, 0.0006, -0.0003, 0.02, 1.1, -0.2, 0.05}),
+      test::camera(600.0, 602.0, 640.3, 360.8, 1280, 720, DistortionModel::kEquidistant,
+                   {-0.03, 0.006, -0.002, 0.0004}),
+      test::camera(900.0, 905.0, 639.5, 359.5, 1280, 720, DistortionModel::kNone, {}, 1.5),
+  };
+}
+
+std::string lens_name(const messages::CameraInfo& camera) {
+  return std::string(messages::distortion_model_name(camera.distortion_model)) +
+         (camera.skew != 0.0 ? " with skew" : "");
 }
 
 double translation_error(const Pose& a, const Pose& b) {
@@ -65,15 +85,74 @@ void check_convention() {
 }
 
 void check_undistort() {
-  double worst = 0.0;
-  for (double x = -0.6; x <= 0.6; x += 0.1) {
-    for (double y = -0.35; y <= 0.35; y += 0.07) {
-      const Point2 pixel = project(distorted(), Point3{x, y, 1.0});
-      const Point2 back = undistort(distorted(), pixel);
-      worst = std::max(worst, std::hypot(back[0] - x, back[1] - y));
+  for (const messages::CameraInfo& camera : lenses()) {
+    double worst = 0.0;
+    for (double x = -0.6; x <= 0.6; x += 0.1) {
+      for (double y = -0.35; y <= 0.35; y += 0.07) {
+        const Point2 pixel = project(camera, Point3{x, y, 1.0});
+        const Point2 back = undistort(camera, pixel);
+        worst = std::max(worst, std::hypot(back[0] - x, back[1] - y));
+      }
     }
+    VERIFY_MSG(worst < 1e-9,
+               lens_name(camera) + ": undistort inverts project to " + std::to_string(worst));
   }
-  VERIFY_MSG(worst < 1e-6, "undistort inverts project: " + std::to_string(worst));
+}
+
+// The lens models as ROS and OpenCV define them, at one point each, worked out by hand.
+void check_lens_models() {
+  const Point3 p{0.3, -0.2, 1.0};  // r^2 = 0.13
+  const double r2 = 0.13;
+  {
+    const auto c = test::camera(500, 500, 0, 0, 1280, 720, DistortionModel::kPlumbBob,
+                                {0.1, 0.01, 0.001, 0.002, 0.001});
+    const double radial = 1 + 0.1 * r2 + 0.01 * r2 * r2 + 0.001 * r2 * r2 * r2;
+    const double x = 0.3 * radial + 2 * 0.001 * 0.3 * -0.2 + 0.002 * (r2 + 2 * 0.09);
+    const double y = -0.2 * radial + 0.001 * (r2 + 2 * 0.04) + 2 * 0.002 * 0.3 * -0.2;
+    const Point2 seen = project(c, p);
+    VERIFY(std::abs(seen[0] - 500 * x) < 1e-9 && std::abs(seen[1] - 500 * y) < 1e-9);
+  }
+  {
+    const auto c = test::camera(500, 500, 0, 0, 1280, 720, DistortionModel::kRationalPolynomial,
+                                {0.1, 0.01, 0, 0, 0.001, 0.2, 0.02, 0.002});
+    const double radial = (1 + 0.1 * r2 + 0.01 * r2 * r2 + 0.001 * r2 * r2 * r2) /
+                          (1 + 0.2 * r2 + 0.02 * r2 * r2 + 0.002 * r2 * r2 * r2);
+    const Point2 seen = project(c, p);
+    VERIFY(std::abs(seen[0] - 500 * 0.3 * radial) < 1e-9 &&
+           std::abs(seen[1] - 500 * -0.2 * radial) < 1e-9);
+  }
+  {
+    const auto c = test::camera(500, 500, 0, 0, 1280, 720, DistortionModel::kEquidistant,
+                                {0.1, 0.01, 0.001, 0.0001});
+    const double theta = std::atan(std::sqrt(r2));
+    const double t2 = theta * theta;
+    const double theta_d =
+        theta * (1 + 0.1 * t2 + 0.01 * t2 * t2 + 0.001 * t2 * t2 * t2 + 0.0001 * t2 * t2 * t2 * t2);
+    const double scale = theta_d / std::sqrt(r2);
+    const Point2 seen = project(c, p);
+    VERIFY(std::abs(seen[0] - 500 * 0.3 * scale) < 1e-9 &&
+           std::abs(seen[1] - 500 * -0.2 * scale) < 1e-9);
+  }
+  {
+    // u = fx x + skew y + cx.
+    const auto c = test::camera(500, 400, 10, 20, 1280, 720, DistortionModel::kNone, {}, 3.0);
+    const Point2 seen = project(c, p);
+    VERIFY(std::abs(seen[0] - (500 * 0.3 + 3.0 * -0.2 + 10)) < 1e-12 &&
+           std::abs(seen[1] - (400 * -0.2 + 20)) < 1e-12);
+  }
+}
+
+// A camera info describes images of one size; any other is refused, naming both.
+void check_size_refused() {
+  check_camera_size(kCamera, 1280, 720);
+  bool named = false;
+  try {
+    check_camera_size(kCamera, 640, 480);
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    named = what.find("1280x720") != std::string::npos && what.find("640x480") != std::string::npos;
+  }
+  VERIFY(named);
 }
 
 void check_exact_board_poses() {
@@ -85,7 +164,9 @@ void check_exact_board_poses() {
   }
   double worst_t = 0.0;
   double worst_r = 0.0;
-  for (const CameraIntrinsics& camera : {kCamera, distorted()}) {
+  std::vector<messages::CameraInfo> cameras = lenses();
+  cameras.push_back(kCamera);
+  for (const messages::CameraInfo& camera : cameras) {
     for (int trial = 0; trial < 30; ++trial) {
       const Pose truth{.rotation = rotation(angle(random), angle(random), 3.0 * angle(random)),
                        .translation = {-0.14 + 0.1 * angle(random), -0.1 + 0.1 * angle(random),
@@ -161,10 +242,6 @@ void check_degenerate() {
   const std::vector<Point2> four{{0, 0}, {1, 0}, {1, 1}, {0, 1}};
   // A square seen as a line: whatever comes back, nothing breaks.
   (void)solve_planar_pose(four, image, kCamera);
-  VERIFY(test::throws<std::invalid_argument>(
-      [] { validate_intrinsics(CameraIntrinsics{0.0, 900, 320, 240, {}}); }));
-  VERIFY(test::throws<std::invalid_argument>(
-      [] { validate_intrinsics(CameraIntrinsics{900, 900, 320, 240, {NAN, 0, 0, 0, 0}}); }));
 }
 
 }  // namespace
@@ -174,8 +251,10 @@ int main() {
   namespace f = holoscan::fiducials;
   return f::test::run({
       {"pose convention", f::check_convention},
-      {"undistort inverts project", f::check_undistort},
-      {"exact board poses, with distortion", f::check_exact_board_poses},
+      {"undistort inverts project, every lens model", f::check_undistort},
+      {"the lens models' formulas", f::check_lens_models},
+      {"a camera of another size is refused", f::check_size_refused},
+      {"exact board poses, every lens model", f::check_exact_board_poses},
       {"marker poses: the planar ambiguity", f::check_marker_ambiguity},
       {"noisy marker corners", f::check_noisy_marker},
       {"degenerate input", f::check_degenerate},

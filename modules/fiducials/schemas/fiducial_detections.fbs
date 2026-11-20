@@ -80,7 +80,8 @@ table FiducialDetections {
   // The backend and dictionary that produced the detections.
   backend: string (id: 4);
   dictionary: string (id: 5);
-  // Time spent detecting, from receiving the image to having results on the host.
+  // Time spent detecting, from receiving the image to having results on the host, including
+  // waiting for GPU work queued before it on the same CUDA stream.
   detect_time_us: float (id: 6);
   // At most 256 markers, by id; from CharucoDetectorOp, the board's markers only.
   markers: [Marker] (id: 7);
@@ -90,6 +91,10 @@ table FiducialDetections {
   truncated: bool (id: 9);
   // From CharucoDetectorOp: the board's view; absent from ArucoDetectorOp.
   board: CharucoView (id: 10);
+  // What this frame cost: the times the CPU waited for GPU work, and the bytes copied between
+  // host and device memory, both ways.
+  host_waits: uint (id: 11);
+  copied_bytes: ulong (id: 12);
 }
 
 root_type FiducialDetections;

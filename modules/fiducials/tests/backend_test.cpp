@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Both backends through the public factory: the cuda backend finds the same markers as the cpu
-// backend, with the same corners, and refines the same chessboard corners, on clean, blurred,
-// noisy, occluded, mirrored and cluttered images; both against ground truth; a frame over the
-// candidate capacity reports it; what auto resolves to; and each backend's time at 1280x720.
+// backend, with the same corners to the bit, and refines the same chessboard corners to the bit,
+// on clean, blurred, noisy, occluded, mirrored and cluttered images; both against ground truth;
+// a frame of more markers than one readback holds; the CPU waits and copies each backend reports;
+// a frame over the candidate capacity reports it; what auto resolves to; and each backend's time
+// at 1280x720.
 
 #include <cuda_runtime_api.h>
 
@@ -98,7 +100,7 @@ void compare(const TestImage& image, const DetectorOptions& options,
     seeds.assign(s.begin(), s.end());
     return cpu->refine_saddles(view_for(image, *cpu), s, stream);
   };
-  (void)observe_charuco(*board, a.markers, capture, image.width, image.height, {}, std::nullopt);
+  (void)observe_charuco(*board, a.markers, capture, image.width, image.height, {}, nullptr);
   const auto on_cpu = cpu->refine_saddles(view_for(image, *cpu), seeds, stream);
   const auto on_cuda = cuda->refine_saddles(view_for(image, *cuda), seeds, stream);
   VERIFY(on_cpu.size() == seeds.size() && on_cuda.size() == seeds.size());
@@ -154,7 +156,84 @@ void check_parity() {
             << " px\n";
   VERIFY(parity.markers > 100 && parity.saddles > 100);
   VERIFY(parity.mismatched_frames == 0 && parity.mismatched_saddles == 0);
-  VERIFY(parity.max_corner_diff < 1e-3 && parity.max_saddle_diff < 1e-3);
+  // The backends run the same arithmetic, without FMA contraction: bit for bit.
+  VERIFY(parity.max_corner_diff == 0.0 && parity.max_saddle_diff == 0.0);
+}
+
+// A 10 x 7 grid of markers facing the camera: 70 markers, more than the cuda backend copies back
+// with its counts, so it takes a second wait for the rest. Both backends find every one, alike.
+void check_many_markers() {
+  SyntheticScene scene = make_marker_scene("DICT_4X4_100", 0, kWidth, kHeight);
+  scene.markers.clear();
+  for (int row = 0; row < 7; ++row) {
+    for (int column = 0; column < 10; ++column) {
+      scene.markers.push_back(
+          {.id = row * 10 + column,
+           .length = 0.05,
+           .pose = {.rotation = {1, 0, 0, 0, 1, 0, 0, 0, 1},
+                    .translation = {0.075 * (column - 4.5), 0.075 * (row - 3.0), 1.0}}});
+    }
+  }
+  const TestImage image(render_scene(scene, 1), kWidth, kHeight);
+  const DetectorOptions options{.dictionary = "DICT_4X4_100"};
+  auto cpu = create_backend(Backend::kCpu, options, kWidth, kHeight);
+  auto cuda = create_backend(Backend::kCuda, options, kWidth, kHeight);
+  const FrameMarkers a = cpu->detect(view_for(image, *cpu), nullptr);
+  const FrameMarkers b = cuda->detect(view_for(image, *cuda), nullptr);
+  const TruthCounts counts = match_markers(scene, b.markers, [](const MarkerMatch&) {});
+  std::cout << "  " << b.markers.size() << " markers, missed " << counts.missed << ", extra "
+            << counts.extra << "\n";
+  VERIFY(counts.missed == 0 && counts.extra == 0);
+  VERIFY(a.markers.size() == b.markers.size());
+  for (std::size_t i = 0; i < a.markers.size() && i < b.markers.size(); ++i) {
+    VERIFY(a.markers[i].id == b.markers[i].id && a.markers[i].corners == b.markers[i].corners);
+  }
+  VERIFY(cuda->take_transfers().host_waits == 2);
+  VERIFY(cpu->take_transfers() == TransferCounts{});
+}
+
+// What each backend says it waited for and copied: nothing on the cpu; on the cuda backend one
+// wait per detection, with a fixed readback, and one per chessboard-corner refinement, with 24
+// bytes each way per corner.
+void check_transfers() {
+  const SyntheticScene scene = make_board_scene(CharucoBoardConfig{}, 3, kWidth, kHeight);
+  const TestImage image(render_scene(scene, 1), kWidth, kHeight);
+  const CharucoBoard board(CharucoBoardConfig{});
+  for (const Backend kind : available_backends()) {
+    auto backend = create_backend(kind, DetectorOptions{}, kWidth, kHeight);
+    const GrayImageView view = view_for(image, *backend);
+    std::uint64_t first = 0;
+    for (int frame = 0; frame < 3; ++frame) {
+      (void)backend->detect(view, nullptr);
+      const TransferCounts detected = backend->take_transfers();
+      if (frame == 0) first = detected.copied_bytes;
+      if (kind == Backend::kCpu) {
+        VERIFY(detected == TransferCounts{});
+      } else {
+        VERIFY(detected.host_waits == 1 && detected.copied_bytes == first && first > 0 &&
+               first < 8192);
+      }
+    }
+    std::vector<SaddleSeed> seeds;
+    const FrameMarkers found = backend->detect(view, nullptr);
+    (void)backend->take_transfers();
+    (void)observe_charuco(
+        board, found.markers,
+        [&](std::span<const SaddleSeed> s) {
+          seeds.assign(s.begin(), s.end());
+          return backend->refine_saddles(view, s, nullptr);
+        },
+        kWidth, kHeight, {}, nullptr);
+    const TransferCounts refined = backend->take_transfers();
+    std::cout << "  " << backend->name() << ": detection " << first << " bytes, " << seeds.size()
+              << " chessboard corners " << refined.copied_bytes << " bytes\n";
+    if (kind == Backend::kCpu) {
+      VERIFY(refined == TransferCounts{});
+    } else {
+      VERIFY(!seeds.empty() && refined.host_waits == 1 &&
+             refined.copied_bytes == 48 * seeds.size());
+    }
+  }
 }
 
 // The cuda backend against ground truth, markers and a board.
@@ -169,7 +248,7 @@ void check_cuda_accuracy() {
     const SyntheticScene scene = make_marker_scene("DICT_5X5_100", frame * 6, kWidth, kHeight);
     const TestImage image(render_scene(scene, 1), kWidth, kHeight);
     std::vector<Marker> markers = cuda->detect(view_for(image, *cuda), nullptr).markers;
-    for (Marker& m : markers) m.pose = marker_pose(m, scene.intrinsics, 0.1);
+    for (Marker& m : markers) m.pose = marker_pose(m, scene.camera, 0.1);
     const TruthCounts counts = match_markers(scene, markers, [&](const MarkerMatch& match) {
       for (const double e : match.corner_errors) max_corner = std::max(max_corner, e);
       if (match.translation_error) {
@@ -195,7 +274,7 @@ void check_cuda_accuracy() {
       [&](std::span<const SaddleSeed> seeds) {
         return board_backend->refine_saddles(view, seeds, nullptr);
       },
-      kWidth, kHeight, {}, scene.intrinsics);
+      kWidth, kHeight, {}, &scene.camera);
   const auto truth = board_truth(scene);
   VERIFY(observation.corners.size() == truth.size());
   double worst = 0.0;
@@ -281,7 +360,7 @@ void report_timings() {
           [&](std::span<const SaddleSeed> seeds) {
             return charuco->refine_saddles(view, seeds, stream);
           },
-          kWidth, kHeight, {}, std::nullopt);
+          kWidth, kHeight, {}, nullptr);
     });
     std::cout << "  " << aruco->name() << " at 1280x720: six markers " << aruco_ms
               << " ms, 9x6 ChArUco board (27 markers, 40 corners) " << charuco_ms << " ms\n";
@@ -295,7 +374,9 @@ void report_timings() {
 int main() {
   namespace f = holoscan::fiducials;
   return f::test::run({
-      {"cuda and cpu agree", f::check_parity},
+      {"cuda and cpu agree, to the bit", f::check_parity},
+      {"70 markers in one frame", f::check_many_markers},
+      {"CPU waits and copies", f::check_transfers},
       {"cuda against ground truth", f::check_cuda_accuracy},
       {"candidate overflow is reported", f::check_overflow},
       {"auto backend", f::check_auto},

@@ -4,10 +4,10 @@
 // The overlay's drawing: lines clipped to the canvas, a marker's outline and first corner, a
 // chessboard corner's cross, and a target's axes projected in the convention's directions.
 
+#include "overlay_drawing.hpp"
+
 #include <array>
 #include <vector>
-
-#include <holoscan/fiducials/overlay_drawing.hpp>
 
 #include "test_support.hpp"
 
@@ -49,7 +49,7 @@ void check_marker_and_corner() {
 }
 
 void check_axes() {
-  const CameraIntrinsics camera{400, 400, 100, 50, {}};
+  const messages::CameraInfo camera = test::camera(400, 400, 100, 50, 200, 100);
   const Pose facing{.rotation = {1, 0, 0, 0, 1, 0, 0, 0, 1}, .translation = {0, 0, 1}};
   const auto axes = target_axes(facing, camera, 0.1);
   VERIFY(axes.has_value());
