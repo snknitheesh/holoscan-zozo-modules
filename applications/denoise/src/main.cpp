@@ -25,7 +25,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -57,6 +56,15 @@ namespace app = denoise_demo;
 namespace dn = holoscan::denoise;
 
 constexpr std::string_view kAppName = "denoise";
+// How long a stopped run may take to wind down before the demo gives up on it.
+constexpr std::chrono::seconds kStopGrace{30};
+// The trail check, per frame: the denoised frame's mean squared error behind
+// the disc may be at most this share of the noisy frame's, and its mean error
+// there (a ghost of the bright disc raises it) at most this many code values
+// from the noisy frame's. What the filters achieve is well inside both (see the
+// README); a ghost a few code values deep is not.
+constexpr double kMaxTrailRatio = 1.0;
+constexpr double kMaxTrailBias = 1.5;
 
 enum class DisplayMode { kAuto, kOn, kOff, kOffscreen };
 
@@ -177,7 +185,7 @@ void usage(const char* argv0) {
       << "Usage: " << argv0
       << " [options]\n"
          "Input (rendered scenes with ground truth):\n"
-         "  --count N                 Frames (default: 300)\n"
+         "  --count N                 Frames, 1..1000000 (default: 300)\n"
          "  --period-ms N             Frame period, 1..1000 ms (default: 33)\n"
          "  --width N --height N      Frame size, even, 64x64 to 3840x2160 (default: 1280x720)\n"
          "  --read-noise SIGMA        Gaussian read noise, code values (default: 6)\n"
@@ -191,22 +199,33 @@ void usage(const char* argv0) {
          "                            Spatial filter (default: bilateral; none for vpi and auto)\n"
          "  --temporal true|false     Motion-adaptive temporal filter (default: true)\n"
          "  --strength S              0..1 (default: 0.5)\n"
-         "  --min-gain DB             PSNR gain every settled frame must reach (default: 5)\n"
+         "  --min-gain DB             PSNR gain every settled frame must reach, 0..100 (default: "
+         "5)\n"
          "Output:\n"
          "  --display auto|true|false|offscreen\n"
          "                            Show noisy | denoised and brackets | fused in HoloViz\n"
          "                            (default: auto, when a display is available); offscreen\n"
          "                            renders into CUDA memory and checks what was rendered\n"
-         "  --timeout-seconds N       Allowance beyond the expected run time (default: 120)\n"
+         "  --timeout-seconds N       Fail when no frame is checked for N s, 1..3600 (default: "
+         "120)\n"
          "  --compile-only true|false Build and compile the graph, then exit (default: false)\n";
 }
 
 void validate(Options& opts) {
-  if (opts.period_ms == 0 || opts.period_ms > 1000 || opts.timeout_seconds == 0) {
-    throw std::invalid_argument("--period-ms must be 1..1000 and --timeout-seconds positive");
+  if (opts.period_ms == 0 || opts.period_ms > 1000) {
+    throw std::invalid_argument("--period-ms must be 1..1000");
   }
-  if (opts.count == 0) {
-    throw std::invalid_argument("--count must be positive");
+  if (opts.timeout_seconds == 0 || opts.timeout_seconds > 3600) {
+    throw std::invalid_argument("--timeout-seconds must be 1..3600");
+  }
+  if (opts.count == 0 || opts.count > 1000000) {
+    throw std::invalid_argument("--count must be 1..1000000");
+  }
+  if (!(opts.min_gain >= 0.0 && opts.min_gain <= 100.0)) {
+    throw std::invalid_argument("--min-gain must be 0..100 dB");
+  }
+  if (opts.cut_frame < -1) {
+    throw std::invalid_argument("--cut-frame must be a frame number");
   }
   if (opts.width < 64 || opts.height < 64 || opts.width > 3840 || opts.height > 2160 ||
       opts.width % 2 != 0 || opts.height % 2 != 0) {
@@ -391,16 +410,33 @@ int execute(const Options& opts, SignalDomain& signals) {
               << "; an interrupt ends the process without a report\n";
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(opts.timeout_seconds) +
-                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
+  // The run times out when no frame has been checked for --timeout-seconds,
+  // however long a large, slow run takes in all.
+  const auto allowance =
+      std::chrono::seconds(opts.timeout_seconds) + std::chrono::milliseconds(opts.period_ms);
+  auto last_progress = std::chrono::steady_clock::now();
+  std::uint32_t last_finished = 0;
+  bool timed_out = false;
+  while (!session.wait_for(100ms)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (const std::uint32_t done = finished->load(); done != last_finished) {
+      last_finished = done;
+      last_progress = now;
+    } else if (now - last_progress > allowance) {
+      timed_out = true;
+      break;
+    }
   }
-  const bool timed_out = session.is_running();
   if (timed_out) {
-    std::cerr << kAppName << ": timed out\n";
+    std::cerr << kAppName << ": timed out: no frame checked for " << opts.timeout_seconds << " s\n";
     session.request_stop();
+    // Stopping is cooperative; an operator that never returns would hang here.
+    if (!session.wait_for(kStopGrace)) {
+      std::cerr << kAppName << ": the run did not stop within "
+                << std::chrono::duration_cast<std::chrono::seconds>(kStopGrace).count()
+                << " s; verdict=FAIL\n";
+      std::_Exit(1);
+    }
   }
   session.wait();
   const holoscan::RunTermination termination = session.termination();
@@ -421,11 +457,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   const double checked = r.checked == 0 ? 1.0 : static_cast<double>(r.checked);
   const double trail = r.trail_samples == 0 ? 0.0 : r.trail_squared / r.trail_samples;
   const double trail_input = r.trail_samples == 0 ? 0.0 : r.trail_input_squared / r.trail_samples;
-  // Every settled frame gains; the trail is no worse than the noise; the fused
-  // image clips none of the window and crushes none of the shadow, and keeps
-  // their texture.
+  // Every settled frame gains; behind the disc, every frame is no noisier than
+  // the input and shows no ghost; the fused image clips none of the window and
+  // crushes none of the shadow, and keeps their texture.
   const bool denoised_ok = r.checked != 0 && r.worst_gain >= opts.min_gain;
-  const bool trail_ok = opts.speed == 0.0F || (r.trail_samples != 0 && trail < trail_input);
+  const bool trail_ok =
+      opts.speed == 0.0F || (r.trail_samples != 0 && r.worst_trail_ratio <= kMaxTrailRatio &&
+                             r.worst_trail_bias <= kMaxTrailBias);
   const bool fused_ok = r.fused_clipped == 0 && r.fused_crushed == 0 &&
                         r.worst_shadow_texture >= 6.0 && r.worst_window_texture >= 6.0;
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
@@ -454,7 +492,10 @@ int execute(const Options& opts, SignalDomain& signals) {
             << " denoised_psnr=" << r.denoised_psnr_sum / checked
             << " mean_gain=" << (r.denoised_psnr_sum - r.noisy_psnr_sum) / checked
             << " worst_gain=" << r.worst_gain << " (min " << opts.min_gain << ")"
-            << " trail_mse=" << trail << " input_mse=" << trail_input << '\n'
+            << " trail_mse=" << trail << " input_mse=" << trail_input
+            << " worst_trail_ratio=" << r.worst_trail_ratio << " (max " << kMaxTrailRatio << ")"
+            << " worst_trail_bias=" << r.worst_trail_bias << " (max " << kMaxTrailBias << ")"
+            << '\n'
             << kAppName << ": fused_clipped=" << r.fused_clipped
             << " fused_crushed=" << r.fused_crushed << " shadow_texture=" << r.worst_shadow_texture
             << " window_texture=" << r.worst_window_texture;

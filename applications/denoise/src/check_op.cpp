@@ -126,6 +126,11 @@ holoscan::expected<void, holoscan::Error> CheckOp::compute(holoscan::ExecutionCo
     r.worst_gain = std::min(r.worst_gain, after - before);
   }
   // The trail behind the disc.
+  double frame_squared = 0.0;
+  double frame_input_squared = 0.0;
+  double frame_error = 0.0;
+  double frame_input_error = 0.0;
+  std::uint64_t frame_samples = 0;
   if (since_start >= 4) {
     for (int y = 0; y < scene.height; ++y) {
       for (int x = 0; x < scene.width; ++x) {
@@ -139,12 +144,25 @@ holoscan::expected<void, holoscan::Error> CheckOp::compute(holoscan::ExecutionCo
           const std::size_t i = (static_cast<std::size_t>(y) * scene.width + x) * 3U + c;
           const double out = static_cast<double>(denoised_[i]) - clean[i];
           const double in = static_cast<double>(noisy_[i]) - clean[i];
-          r.trail_squared += out * out;
-          r.trail_input_squared += in * in;
-          ++r.trail_samples;
+          frame_squared += out * out;
+          frame_input_squared += in * in;
+          frame_error += out;
+          frame_input_error += in;
+          ++frame_samples;
         }
       }
     }
+  }
+  if (frame_samples != 0) {
+    const auto n = static_cast<double>(frame_samples);
+    r.trail_squared += frame_squared;
+    r.trail_input_squared += frame_input_squared;
+    r.trail_samples += frame_samples;
+    r.worst_trail_ratio =
+        std::max(r.worst_trail_ratio,
+                 frame_input_squared > 0.0 ? frame_squared / frame_input_squared : frame_squared);
+    r.worst_trail_bias =
+        std::max(r.worst_trail_bias, std::abs(frame_error - frame_input_error) / n);
   }
   // Fusion.
   const dn::HdrScene& hdr = config_.hdr;

@@ -5,7 +5,8 @@
 // and fused images, and measures:
 // - the PSNR of the noisy and the denoised frame against the clean scene;
 // - the trail: the error, behind the moving disc (where it was in the last 4
-//   frames and no longer is), of the denoised frame against that of the noisy;
+//   frames and no longer is), of the denoised frame against that of the noisy,
+//   per frame: its mean square, and its mean, which a ghost of the disc shifts;
 // - the fused image's shadow and window: samples clipped or crushed, and the
 //   texture (standard deviation) each keeps.
 // The last frame ends the run.
@@ -36,10 +37,15 @@ struct Report {
   double noisy_psnr_sum{};
   double denoised_psnr_sum{};
   double worst_gain{99.0};
-  // Squared errors and samples behind the disc.
+  // Squared errors and samples behind the disc, over the run.
   double trail_squared{};
   double trail_input_squared{};
   std::uint64_t trail_samples{};
+  // Per frame, the worst: the denoised frame's mean squared error behind the
+  // disc over the noisy frame's, and how far the denoised frame's mean error
+  // there (its bias: a ghost of the bright disc) is from the noisy frame's.
+  double worst_trail_ratio{};
+  double worst_trail_bias{};
   // The fused images.
   std::uint64_t fused_clipped{};  // Window samples at 254 or more.
   std::uint64_t fused_crushed{};  // Shadow samples at 1 or less.

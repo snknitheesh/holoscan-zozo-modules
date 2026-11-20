@@ -65,6 +65,11 @@ if(DENOISE_DEMO_ENABLE_VISUALIZATION)
   )
 endif()
 
+# The checker can fail a run: no frame gains 60 dB.
+denoise_app_test(denoise_app_fails_unreachable_gain 1 "worst_gain=.*verdict=FAIL"
+  ${_fast} --min-gain 60
+)
+
 # Unusable arguments are usage errors.
 denoise_app_test(denoise_app_rejects_size 2 "^error: frames must be even" --width 641)
 denoise_app_test(denoise_app_rejects_strength 2 "^error: strength" --strength 2)
@@ -72,6 +77,9 @@ denoise_app_test(denoise_app_rejects_vpi_spatial 2 "^error: (the vpi backend|bac
   --backend vpi --spatial bilateral
 )
 denoise_app_test(denoise_app_rejects_option 2 "^error: unknown option" --frames 3)
+denoise_app_test(denoise_app_rejects_min_gain 2 "^error: --min-gain" --min-gain -1)
+denoise_app_test(denoise_app_rejects_count 2 "^error: --count" --count 0)
+denoise_app_test(denoise_app_rejects_timeout 2 "^error: --timeout-seconds" --timeout-seconds 0)
 
 get_property(_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_tests} PROPERTIES LABELS "denoise_app;gpu" TIMEOUT 300)
