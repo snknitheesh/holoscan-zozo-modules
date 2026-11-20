@@ -19,9 +19,10 @@
 // TNR gets the previous frame, and VPI may only be followed by kernels launched
 // directly on the wrapped stream once its own work there has finished.
 
-// VPI's C API.
-extern "C" {
+// VPI's C API. CUDAInterop.h includes the CUDA runtime's C++ headers, and
+// declares its own functions extern "C".
 #include <vpi/CUDAInterop.h>
+extern "C" {
 #include <vpi/Image.h>
 #include <vpi/Status.h>
 #include <vpi/Stream.h>
