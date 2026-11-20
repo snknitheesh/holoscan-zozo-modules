@@ -76,6 +76,7 @@ CheckOp::CheckOp(CheckConfig config) : config_(std::move(config)) {
 }
 
 void CheckOp::setup(holoscan::OperatorSpec& spec) {
+  // Two slots each: one frame in compute() while the next one arrives.
   spec.input(noisy, "noisy").queue_depth(2U);
   spec.input(denoised, "denoised").queue_depth(2U);
   spec.input(fused, "fused").queue_depth(2U);

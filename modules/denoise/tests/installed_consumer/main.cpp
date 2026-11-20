@@ -23,6 +23,7 @@
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/payload_options.hpp>
@@ -169,6 +170,7 @@ class DenoisedCheckOp final : public holoscan::Operator<> {
   DenoisedCheckOp(std::shared_ptr<Tally> tally, std::shared_ptr<std::atomic<int>> remaining)
       : tally_(std::move(tally)), remaining_(std::move(remaining)) {}
 
+  // Two slots: one image in compute() while the next one arrives.
   void setup(holoscan::OperatorSpec& spec) override { spec.input(image, "image").queue_depth(2U); }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
@@ -205,6 +207,7 @@ class FusedCheckOp final : public holoscan::Operator<> {
   FusedCheckOp(std::shared_ptr<Tally> tally, std::shared_ptr<std::atomic<int>> remaining)
       : tally_(std::move(tally)), remaining_(std::move(remaining)) {}
 
+  // Two slots: one image in compute() while the next one arrives.
   void setup(holoscan::OperatorSpec& spec) override { spec.input(image, "image").queue_depth(2U); }
   [[nodiscard]] holoscan::Contract contract() const override {
     holoscan::Contract result;
@@ -272,9 +275,20 @@ int main() {
     options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
         .operator_path = op, .output_port = port, .device = holoscan::DeviceId{0}});
   }
+  // A lossless chain stays on one worker: split across workers, the source
+  // runs while a consumer's lossless queue is full and its frame is refused.
+  graph.partition("denoise_consumer").include_all();
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
+  }
   if (!plan.ok()) {
-    std::cerr << plan.json() << '\n';
+    return 1;
+  }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "denoise_consumer: workers=" << workers << '\n';
+  if (workers != 1) {
+    std::cerr << "denoise_consumer: the graph must run on one worker\n";
     return 1;
   }
   if (const int status = holoscan::run(plan); status != 0) {

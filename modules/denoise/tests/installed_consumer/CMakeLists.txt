@@ -14,8 +14,7 @@ add_executable(denoise_consumer main.cpp)
 target_link_libraries(denoise_consumer PRIVATE holoscan::denoise)
 set_target_properties(denoise_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# The consumer's exit status is its verdict: it fails unless the graph runs on one worker and
+# every check holds.
 add_test(NAME denoise_installed_consumer COMMAND denoise_consumer)
-set_tests_properties(
-  denoise_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "denoise_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(denoise_installed_consumer PROPERTIES TIMEOUT 300)

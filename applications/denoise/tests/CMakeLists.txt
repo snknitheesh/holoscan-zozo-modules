@@ -47,12 +47,23 @@ denoise_app_test(denoise_app_1080p 0 "verdict=PASS"
 if(holoscan-denoise_WITH_VPI)
   denoise_app_test(denoise_app_vpi 0 "backend=vpi.*verdict=PASS" ${_fast} --backend vpi)
 endif()
-# HoloViz renders the view offscreen, into CUDA memory.
-denoise_app_test(denoise_app_offscreen 0 "showing=[1-9].*verdict=PASS"
-  --count 12 --period-ms 30 --width 640 --height 360 --display offscreen
+# The lossless graph runs on one worker, with no diagnostics.
+denoise_app_test(denoise_app_one_worker 0 "^denoise: plan=OK workers=1 diagnostics=0\n*$"
+  --display false --compile-only true
 )
-# The display graph compiles, without a display server.
-denoise_app_test(denoise_app_display_graph 0 "plan=OK" --display true --compile-only true)
+if(DENOISE_DEMO_ENABLE_VISUALIZATION)
+  # HoloViz renders the view offscreen, into CUDA memory.
+  denoise_app_test(denoise_app_offscreen 0 "showing=[1-9].*verdict=PASS"
+    --count 12 --period-ms 30 --width 640 --height 360 --display offscreen
+  )
+  # The display graphs compile, on one worker, without a display server.
+  denoise_app_test(denoise_app_display_graph 0 "^denoise: plan=OK workers=1 diagnostics=0\n*$"
+    --display true --compile-only true
+  )
+  denoise_app_test(denoise_app_offscreen_graph 0 "^denoise: plan=OK workers=1 diagnostics=0\n*$"
+    --display offscreen --compile-only true
+  )
+endif()
 
 # Unusable arguments are usage errors.
 denoise_app_test(denoise_app_rejects_size 2 "^error: frames must be even" --width 641)

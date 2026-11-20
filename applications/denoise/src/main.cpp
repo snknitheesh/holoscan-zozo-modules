@@ -280,7 +280,8 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                                 .finished = finished});
 
   // Lossless edges: every frame is denoised, fused and checked, in order. The
-  // source keeps one frame in flight, so no queue fills.
+  // whole graph runs on one worker (below), and the source sends a refused
+  // output again on its next tick.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->noisy, denoiser->image, lossless);
   graph.add_flow(source->bracket0, fusion->bracket0, lossless);
@@ -335,13 +336,18 @@ int execute(const Options& opts, SignalDomain& signals) {
     on_gpu("view", "view");
     if (offscreen) {
       auto render_check = graph.op<app::RenderCheckOp>("render_check", rendered);
-      graph.add_flow(visualizer->output(), render_check->frame, lossless);
+      // The check may skip rendered frames, so it never holds HoloViz back.
+      graph.add_flow(visualizer->output(), render_check->frame, latest);
       on_gpu("holoviz", "output");
     }
   }
 #endif
 
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
+  // A lossless chain stays on one worker: split across workers, a source runs
+  // while its consumer's lossless queue is full and its frame is refused (see
+  // the messages module's README, "Run a graph on one worker").
+  graph.partition(std::string(kAppName)).include_all();
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   if (!plan.diagnostics().empty()) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
@@ -349,9 +355,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!plan.ok()) {
     return 1;
   }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
-    return 0;
+    std::cout << kAppName << ": plan=OK workers=" << workers
+              << " diagnostics=" << plan.diagnostics().size() << '\n';
+    return workers == 1 && plan.diagnostics().empty() ? 0 : 1;
   }
   if (!signals) {
     std::cerr << kAppName << ": warning: running without managed SIGINT/SIGTERM handling: "
@@ -403,7 +411,7 @@ int execute(const Options& opts, SignalDomain& signals) {
 #else
   const bool shown = true;
 #endif
-  const bool passed = !timed_out && session.diagnostics().empty() &&
+  const bool passed = workers == 1 && !timed_out && session.diagnostics().empty() &&
                       termination == holoscan::RunTermination::kRequestedCompleted &&
                       r.frames == opts.count && r.frame_gaps == 0 && denoised_ok && trail_ok &&
                       fused_ok && shown;
@@ -415,7 +423,7 @@ int execute(const Options& opts, SignalDomain& signals) {
             << opts.count << " backend=" << (opts.backend == dn::Backend::kAuto ? "auto:" : "")
             << dn::backend_name(backend) << " spatial=" << dn::spatial_name(*opts.spatial)
             << " temporal=" << (opts.temporal ? "on" : "off") << " strength=" << opts.strength
-            << '\n'
+            << " workers=" << workers << '\n'
             << kAppName << ": noisy_psnr=" << r.noisy_psnr_sum / checked
             << " denoised_psnr=" << r.denoised_psnr_sum / checked
             << " mean_gain=" << (r.denoised_psnr_sum - r.noisy_psnr_sum) / checked
