@@ -3,6 +3,7 @@
 
 #include "holoscan/tsdf/volume_op.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <holoscan/logger/logger.hpp>
@@ -18,12 +20,28 @@
 #include "device_buffer.hpp"
 #include "host_input.hpp"
 
-namespace holoscan::tsdf {
+namespace holoscan::tsdf::detail {
 namespace {
 
 bool on_gpu(const holoscan::Tensor& tensor) {
   const DLDevice device = tensor.device();
   return device.device_type == kDLCUDA || device.device_type == kDLCUDAManaged;
+}
+
+// "GPU 1", "host memory", ... for errors.
+std::string where(const DLDevice& device) {
+  switch (device.device_type) {
+    case kDLCUDA:
+      return "GPU " + std::to_string(device.device_id);
+    case kDLCUDAManaged:
+      return "managed memory of GPU " + std::to_string(device.device_id);
+    case kDLCPU:
+      return "host memory";
+    case kDLCUDAHost:
+      return "pinned host memory";
+    default:
+      return "memory of DLPack device type " + std::to_string(static_cast<int>(device.device_type));
+  }
 }
 
 }  // namespace
@@ -50,10 +68,12 @@ bool packed(const holoscan::Tensor& tensor) {
 }
 
 struct VolumeOp::Impl {
-  std::array<detail::DeviceBuffer, 2> staging;
+  std::array<DeviceBuffer, 2> staging;
   // Used when the runtime gives this operator no CUDA stream, which it does
   // when every input is in host memory and every output too.
   cudaStream_t own_stream{};
+  // Whether this activation's work on own_stream reads an input in place.
+  bool settle{};
   bool logged_host_copy{};
   bool logged_pose_copy{};
 
@@ -68,10 +88,13 @@ struct VolumeOp::Impl {
   }
 };
 
-VolumeOp::VolumeOp(std::string name, std::shared_ptr<TsdfVolume> volume)
-    : name_(std::move(name)), volume_(std::move(volume)), impl_(std::make_unique<Impl>()) {
+VolumeOp::VolumeOp(std::string kind, std::shared_ptr<TsdfVolume> volume)
+    : kind_(std::move(kind)),
+      name_(kind_),
+      volume_(std::move(volume)),
+      impl_(std::make_unique<Impl>()) {
   if (!volume_) {
-    throw std::invalid_argument(name_ + " needs a volume");
+    throw std::invalid_argument(kind_ + " needs a volume");
   }
 }
 
@@ -81,6 +104,14 @@ void VolumeOp::stop() {
   // Frees the staging buffers; cudaFree waits for the work that may still use
   // them.
   impl_ = std::make_unique<Impl>();
+}
+
+void VolumeOp::bind(const holoscan::ExecutionContext& context) {
+  const std::string_view path = context.operator_path();
+  if (path != path_) {
+    path_ = std::string(path);
+    name_ = kind_ + " '" + path_ + "'";
+  }
 }
 
 holoscan::Error VolumeOp::invalid(const std::string& message) const {
@@ -109,7 +140,6 @@ holoscan::TensorOutputSpec VolumeOp::device_output(DLDataType dtype, std::uint64
           holoscan::TensorRepresentation{
               .memory_kind = holoscan::MemoryKind::kCudaDevice,
               .dtype = dtype,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
           },
       .bounds = holoscan::TensorBounds{.max_rank = 3U, .max_byte_span = bytes},
       .storage = holoscan::TensorOutputStorage::kRuntimePool,
@@ -122,7 +152,6 @@ holoscan::TensorOutputSpec VolumeOp::host_output(DLDataType dtype, std::uint64_t
           holoscan::TensorRepresentation{
               .memory_kind = holoscan::MemoryKind::kHost,
               .dtype = dtype,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
           },
       .bounds = holoscan::TensorBounds{.max_rank = 2U, .max_byte_span = bytes},
       .storage = holoscan::TensorOutputStorage::kRuntimePool,
@@ -131,6 +160,7 @@ holoscan::TensorOutputSpec VolumeOp::host_output(DLDataType dtype, std::uint64_t
 
 holoscan::expected<cudaStream_t, holoscan::Error> VolumeOp::stream_for(
     holoscan::ExecutionContext& context) {
+  impl_->settle = false;
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     // Not the legacy default stream, which would serialize with every other
@@ -201,34 +231,54 @@ holoscan::expected<Matrix4, holoscan::Error> VolumeOp::read_pose(const holoscan:
 }
 
 holoscan::expected<const void*, holoscan::Error> VolumeOp::on_device(const holoscan::Tensor& tensor,
-                                                                     std::size_t bytes, int slot,
+                                                                     std::size_t bytes,
+                                                                     std::size_t capacity, int slot,
                                                                      cudaStream_t stream) {
   const bool own = stream == impl_->own_stream;
-  if (on_gpu(tensor) || bytes == 0U) {
+  const DLDevice device = tensor.device();
+  if (on_gpu(tensor)) {
+    if (device.device_id != volume_->device()) {
+      return holoscan::make_unexpected(invalid("an input is in " + where(device) +
+                                               ", the volume on GPU " +
+                                               std::to_string(volume_->device())));
+    }
     if (own && bytes != 0U) {
-      // The runtime orders device input only on its own streams.
+      // The runtime orders device input only on its own streams, and its
+      // release only after them: wait for the producer here, and for this
+      // activation's work in settle().
       if (auto ready = tensor.synchronize_for_consumer_stream(stream); !ready) {
         return holoscan::make_unexpected(std::move(ready).error());
       }
-      if (auto held = detail::hold_until_done(tensor, stream, name_); !held) {
-        return holoscan::make_unexpected(std::move(held).error());
-      }
+      impl_->settle = true;
     }
+    return tensor.data();
+  }
+  if (device.device_type != kDLCPU && device.device_type != kDLCUDAHost) {
+    return holoscan::make_unexpected(invalid("an input is in " + where(device) +
+                                             "; use host, pinned host, device or managed memory"));
+  }
+  if (bytes == 0U) {
     return tensor.data();
   }
   // The runtime orders device, managed and stream-ready pinned memory on the
   // operator's stream before compute(); plain host memory it does not.
-  if (tensor.device().device_type == kDLCPU) {
+  if (device.device_type == kDLCPU) {
     if (auto ready = tensor.synchronize_for_host(); !ready) {
       return holoscan::make_unexpected(std::move(ready).error());
     }
   }
   if (!impl_->logged_host_copy) {
     impl_->logged_host_copy = true;
-    HOLOSCAN_LOG_INFO("{}: input in host memory; copying it to the GPU every frame", name_);
+    HOLOSCAN_LOG_INFO(
+        "{}: input in host memory; copying it to the GPU every frame (from pageable memory "
+        "the copy waits until it is staged; send pinned or device memory to avoid that)",
+        name_);
   }
-  detail::DeviceBuffer& staging = impl_->staging[slot == 0 ? 0 : 1];
-  if (const cudaError_t status = staging.reserve(bytes, stream); status != cudaSuccess) {
+  // Sized once to the largest input, so that it never grows (which would
+  // wait for the stream to free the old buffer).
+  DeviceBuffer& staging = impl_->staging[slot == 0 ? 0 : 1];
+  if (const cudaError_t status = staging.reserve(std::max(bytes, capacity), stream);
+      status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
   }
   if (const cudaError_t status =
@@ -240,17 +290,30 @@ holoscan::expected<const void*, holoscan::Error> VolumeOp::on_device(const holos
   // inputs after this operator's stream, but not of host-written pinned
   // memory, which is held here until the copy is done. Pageable memory needs
   // nothing: cudaMemcpyAsync has staged it by the time it returns.
-  if (tensor.device().device_type == kDLCUDAHost) {
+  if (device.device_type == kDLCUDAHost) {
     if (own) {
       // Destroyed at stop(), so no allocator may wait for this stream later.
       if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
         return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
       }
-    } else if (auto held = detail::hold_until_done(tensor, stream, name_); !held) {
+    } else if (auto held = hold_until_done(tensor, stream, name_); !held) {
       return holoscan::make_unexpected(std::move(held).error());
     }
   }
   return static_cast<const void*>(staging.as<void>());
+}
+
+holoscan::expected<void, holoscan::Error> VolumeOp::settle(cudaStream_t stream) {
+  if (!impl_->settle) {
+    return {};
+  }
+  impl_->settle = false;
+  // The operator's own stream is destroyed at stop(), so no allocator may be
+  // left to wait for it: the input is released when compute() returns.
+  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+    return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+  }
+  return {};
 }
 
 holoscan::expected<void, holoscan::Error> VolumeOp::allocate(
@@ -290,4 +353,4 @@ holoscan::expected<void, holoscan::Error> VolumeOp::send(OutputTensor& out,
   return {};
 }
 
-}  // namespace holoscan::tsdf
+}  // namespace holoscan::tsdf::detail

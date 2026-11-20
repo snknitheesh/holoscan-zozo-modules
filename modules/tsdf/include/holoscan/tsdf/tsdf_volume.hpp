@@ -142,6 +142,9 @@ struct RaycastImages {
   float* normals{};
   // RGB8 of the nearest voxel at the hit, black where a ray hits nothing.
   std::uint8_t* colors{};
+  // float32 x, y, z of the hit in the camera frame, meters (the pixel's ray
+  // times its depth); NaN where a ray hits nothing. An organized point cloud.
+  float* points{};
 };
 
 // The voxels of a volume, on the host: x fastest, then y, then z.

@@ -3,8 +3,10 @@
 //
 // Times integration, ray casting and meshing on the GPU for 640x480 and
 // 1280x720 depth images and 256^3 and 512^3 volumes of the tabletop scene,
-// and reports the GPU memory each volume and its mesh scratch take. A volume
-// that does not fit in the free GPU memory is skipped.
+// and reports the GPU memory each volume and its mesh scratch take, with the
+// GPU, the driver, CUDA and Holoscan SDK versions. A volume that does not fit
+// in the free GPU memory is skipped; when every one is, the benchmark fails.
+// The ray cast writes what TsdfMeshOp sends: depth, normals and points.
 //
 //   tsdf_benchmark [--iterations N] [--max-dims 256|512]
 
@@ -22,6 +24,7 @@
 #include <holoscan/tsdf/marching_cubes.hpp>
 #include <holoscan/tsdf/synthetic_scene.hpp>
 #include <holoscan/tsdf/tsdf_volume.hpp>
+#include <holoscan/version_config.hpp>
 
 #include "scene_support.hpp"
 
@@ -63,7 +66,17 @@ double time_ms(int iterations, cudaStream_t stream, Work&& work) {
 int run(int iterations, int max_dims) {
   cudaDeviceProp properties{};
   cuda_check(cudaGetDeviceProperties(&properties, 0), "cudaGetDeviceProperties");
-  std::printf("GPU: %s\n", properties.name);
+  int driver = 0;
+  int runtime = 0;
+  cuda_check(cudaDriverGetVersion(&driver), "cudaDriverGetVersion");
+  cuda_check(cudaRuntimeGetVersion(&runtime), "cudaRuntimeGetVersion");
+  std::printf("GPU: %s; CUDA driver API %d.%d, runtime %d.%d; Holoscan SDK %d.%d.%d\n",
+              properties.name, driver / 1000, (driver % 1000) / 10, runtime / 1000,
+              (runtime % 1000) / 10, HOLOSCAN_VERSION_MAJOR, HOLOSCAN_VERSION_MINOR,
+              HOLOSCAN_VERSION_PATCH);
+  std::printf("tsdf_benchmark --iterations %d --max-dims %d (median of the iterations)\n",
+              iterations, max_dims);
+  int measured = 0;
   cudaStream_t stream = nullptr;
   cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
   for (const int dims : {256, 512}) {
@@ -109,15 +122,18 @@ int run(int iterations, int max_dims) {
       const std::size_t pixels = static_cast<std::size_t>(width) * height;
       Device<float> depth(pixels);
       Device<float> normals(pixels * 3);
+      Device<float> points(pixels * 3);
       const ht::RaycastParams params{.intrinsics = frame.intrinsics,
                                      .width = width,
                                      .height = height,
                                      .depth_min = 0.1F,
                                      .depth_max = 3.0F};
       const double raycast = time_ms(iterations, stream, [&] {
-        cuda_check(volume.raycast(frame.pose, params,
-                                  ht::RaycastImages{depth.get(), normals.get(), nullptr}, stream),
-                   "raycast");
+        cuda_check(
+            volume.raycast(frame.pose, params,
+                           ht::RaycastImages{depth.get(), normals.get(), nullptr, points.get()},
+                           stream),
+            "raycast");
       });
       ht::MeshExtractor extractor(kMaxVertices, kMaxTriangles);
       Device<float> vertices(std::size_t{kMaxVertices} * 3);
@@ -139,9 +155,14 @@ int run(int iterations, int max_dims) {
           "  %dx%d: integrate %.3f ms, ray cast %.3f ms, mesh %.3f ms (%u vertices, %u "
           "triangles)\n",
           width, height, integrate, raycast, mesh, c[0], c[1]);
+      ++measured;
     }
   }
   cudaStreamDestroy(stream);
+  if (measured == 0) {
+    std::fprintf(stderr, "tsdf_benchmark: every volume was skipped; nothing was measured\n");
+    return 1;
+  }
   std::printf("tsdf_benchmark: done\n");
   return 0;
 }

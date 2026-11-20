@@ -61,10 +61,14 @@ class MeshExtractor {
   [[nodiscard]] std::uint32_t max_vertices() const noexcept { return max_vertices_; }
   [[nodiscard]] std::uint32_t max_triangles() const noexcept { return max_triangles_; }
 
+  // Allocates the scratch for `volume`'s size, so that extract() allocates
+  // nothing. Optional: extract() does it on its first call. Only a change of
+  // volume size waits for `stream`, to free the scratch of the old size.
+  cudaError_t prepare(const TsdfVolume& volume, cudaStream_t stream);
+
   // Extracts the mesh of `volume` into `out` on `stream`. Only the first
   // counts[kCountVertices] vertices and counts[kCountTriangles] triangles are
-  // written. Scratch is allocated on the first call for a volume size, which
-  // waits for the stream once.
+  // written. Never waits on the host once the scratch is prepared.
   cudaError_t extract(const TsdfVolume& volume, const MeshBuffers& out, cudaStream_t stream);
 
   // Device scratch held for a volume of `voxels` voxels.

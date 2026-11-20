@@ -45,13 +45,20 @@ if(HOLOSCAN_TSDF_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info and point cloud messages: in this build when the repository root added
+# holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::tsdf: the volume, the mesh extractor, the two operators and the synthetic scene.
 add_library(
   holoscan_tsdf
   src/host_input.cpp
   src/marching_cubes.cu
+  src/pinhole_camera.cpp
   src/ply.cpp
+  src/synthetic_camera_info.cpp
   src/synthetic_scene.cu
   src/tsdf_integrate_op.cpp
   src/tsdf_mesh_op.cpp
@@ -84,7 +91,10 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_tsdf PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_tsdf
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
 set_target_properties(
   holoscan_tsdf
   PROPERTIES

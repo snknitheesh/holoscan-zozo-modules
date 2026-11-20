@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Keeping host input alive while the GPU still copies it: shared by the
-// module's operators, which copy host input to the GPU asynchronously.
+// module's operators, which copy host input to the GPU asynchronously. The
+// same as holoscan-point-cloud's src/host_input.*, but for the namespace: a
+// module may not depend on another's private sources, so a fix to one belongs
+// in both.
 
 #pragma once
 

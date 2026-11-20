@@ -308,10 +308,22 @@ __global__ void raycast_kernel(RaycastArgs a) {
         a.images.colors[3 * pixel + r] = 0U;
       }
     }
+    if (a.images.points != nullptr) {
+      const float nan = __int_as_float(0x7FC00000);
+      for (int r = 0; r < 3; ++r) {
+        a.images.points[3 * pixel + r] = nan;
+      }
+    }
     return;
   }
   if (a.images.depth != nullptr) {
     a.images.depth[pixel] = hit_t;
+  }
+  if (a.images.points != nullptr) {
+    // The ray has z 1, so the hit is the ray times its depth.
+    for (int r = 0; r < 3; ++r) {
+      a.images.points[3 * pixel + r] = ray[r] * hit_t;
+    }
   }
   if (a.images.normals != nullptr) {
     // The gradient of the trilinear interpolant in the hit's cell, which

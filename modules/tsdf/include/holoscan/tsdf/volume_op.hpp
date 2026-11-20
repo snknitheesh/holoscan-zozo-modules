@@ -1,24 +1,29 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// VolumeOp: what TsdfIntegrateOp and TsdfMeshOp share. Each works on a
-// TsdfVolume it shares with the other through a std::shared_ptr; the volume
-// orders their GPU work (see tsdf_volume.hpp), so they may run on different
-// streams and threads.
+// detail::VolumeOp: what TsdfIntegrateOp and TsdfMeshOp share. Not a stable
+// API: it is installed only because the operators derive from it, and may
+// change in any release; derive from holoscan::Operator<> and use TsdfVolume
+// instead.
 //
-// The base finds the CUDA stream to work on, receives and checks a camera
-// pose, stages host input on the GPU, and allocates, commits and emits device
-// outputs; a refused emit fails the frame with an error that names the port.
+// Each operator works on a TsdfVolume it shares with the other through a
+// std::shared_ptr; the volume orders their GPU work (see tsdf_volume.hpp), so
+// they may run on different streams and threads. The base finds the CUDA
+// stream to work on, receives and checks a camera pose, stages host input on
+// the GPU, and allocates, commits and emits device outputs; a refused emit
+// fails the frame with an error that names the operator and the port.
 
 #pragma once
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/errors.hpp>
@@ -30,7 +35,7 @@
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/tsdf/tsdf_volume.hpp>
 
-namespace holoscan::tsdf {
+namespace holoscan::tsdf::detail {
 
 inline constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
 inline constexpr DLDataType kFloat64{kDLFloat, 64U, 1U};
@@ -60,8 +65,13 @@ class VolumeOp : public holoscan::Operator<> {
     }
   };
 
+  // `kind` is the operator's class, which errors name with the instance's
+  // path once compute() has run.
   // @throws std::invalid_argument if `volume` is null.
-  VolumeOp(std::string name, std::shared_ptr<TsdfVolume> volume);
+  VolumeOp(std::string kind, std::shared_ptr<TsdfVolume> volume);
+
+  // Names this activation's operator in errors; call first in compute().
+  void bind(const holoscan::ExecutionContext& context);
 
   // The runtime's CUDA stream for this activation, which must be on the
   // volume's GPU; when the runtime gives none (every input and output in
@@ -75,11 +85,22 @@ class VolumeOp : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<Matrix4, holoscan::Error> read_pose(
       const holoscan::Tensor& tensor, const char* name, cudaStream_t stream);
 
-  // `bytes` of `tensor` on the GPU: its own data when it is in device or
-  // managed memory, otherwise a copy in staging buffer `slot` (0 or 1),
-  // enqueued on `stream` (the first copy is logged once).
+  // `bytes` of `tensor` on the volume's GPU: its own data when it is in
+  // device or managed memory of that GPU, otherwise a copy in staging buffer
+  // `slot` (0 or 1), enqueued on `stream` (the first copy is logged once).
+  // The staging buffer is allocated once, of `capacity` bytes (at least
+  // `bytes`), so it never grows. Pageable host memory: the copy returns once
+  // the data is staged, which waits for it. A tensor on another GPU, or in
+  // memory of another kind, is refused.
   [[nodiscard]] holoscan::expected<const void*, holoscan::Error> on_device(
-      const holoscan::Tensor& tensor, std::size_t bytes, int slot, cudaStream_t stream);
+      const holoscan::Tensor& tensor, std::size_t bytes, std::size_t capacity, int slot,
+      cudaStream_t stream);
+
+  // Call after the activation's GPU work is enqueued on `stream`: on the
+  // operator's own stream, which the runtime does not order its inputs'
+  // release after, waits for the work to finish when it reads an input in
+  // place. Otherwise nothing.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> settle(cudaStream_t stream);
 
   // Allocates `out` on `port` and begins its write on `stream`.
   [[nodiscard]] holoscan::expected<void, holoscan::Error> allocate(
@@ -97,6 +118,7 @@ class VolumeOp : public holoscan::Operator<> {
   [[nodiscard]] holoscan::unexpected<holoscan::Error> emit_failure(const char* port,
                                                                    holoscan::Error error) const;
 
+  // "TsdfIntegrateOp 'integrate'", or the class alone before compute().
   [[nodiscard]] const std::string& op_name() const noexcept { return name_; }
 
   // A device output of `dtype` of any shape up to rank 3, of at most `bytes`.
@@ -109,6 +131,8 @@ class VolumeOp : public holoscan::Operator<> {
  private:
   struct Impl;
 
+  std::string kind_;
+  std::string path_;
   std::string name_;
   std::shared_ptr<TsdfVolume> volume_;
   std::unique_ptr<Impl> impl_;
@@ -120,4 +144,4 @@ class VolumeOp : public holoscan::Operator<> {
 // an axis of extent 1.
 [[nodiscard]] bool packed(const holoscan::Tensor& tensor);
 
-}  // namespace holoscan::tsdf
+}  // namespace holoscan::tsdf::detail

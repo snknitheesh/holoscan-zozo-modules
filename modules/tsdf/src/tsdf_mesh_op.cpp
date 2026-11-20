@@ -4,6 +4,8 @@
 #include "holoscan/tsdf/tsdf_mesh_op.hpp"
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -15,8 +17,15 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
+#include "pinhole_camera.hpp"
+
 namespace holoscan::tsdf {
 namespace {
+
+namespace hm = holoscan::messages;
+using detail::kFloat32;
+using detail::kUInt32;
+using detail::kUInt8;
 
 holoscan::PayloadOptions image_payload() {
   return holoscan::PayloadOptions{
@@ -53,7 +62,18 @@ void validate_config(const TsdfMeshConfig& config) {
     }
   }
   if (config.raycast) {
-    validate_params(config.raycast_params);
+    if (!(std::isfinite(config.raycast_depth_min) && std::isfinite(config.raycast_depth_max) &&
+          config.raycast_depth_min > 0.0F && config.raycast_depth_max > config.raycast_depth_min)) {
+      throw std::invalid_argument(
+          "the ray-cast depth range needs 0 < raycast_depth_min < raycast_depth_max, finite");
+    }
+    if (config.max_width < 1 || config.max_height < 1 || config.max_width > 8192 ||
+        config.max_height > 8192) {
+      throw std::invalid_argument("max_width and max_height must be 1..8192");
+    }
+    if (config.camera_info.max_age <= std::chrono::nanoseconds::zero()) {
+      throw std::invalid_argument("camera_info.max_age must be > 0");
+    }
   }
 }
 
@@ -70,9 +90,9 @@ TsdfMeshOp::~TsdfMeshOp() = default;
 bool TsdfMeshOp::color() const noexcept { return volume()->config().color; }
 
 void TsdfMeshOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(pose, "pose").queue_depth(2U);
-  // Optional ports exist only when configured: an emit into an unconnected
-  // output fails.
+  spec.input(pose, "pose");
+  // Optional ports exist only when configured: an unconnected input would
+  // never be satisfied, and an emit into an unconnected output fails.
   if (config_.mesh) {
     const std::uint64_t v = config_.max_vertices;
     const std::uint64_t t = config_.max_triangles;
@@ -86,28 +106,40 @@ void TsdfMeshOp::setup(holoscan::OperatorSpec& spec) {
         .produces_tensor(device_output(kUInt32, kMeshCountsSize * 4U));
   }
   if (config_.raycast) {
-    const auto pixels = static_cast<std::uint64_t>(config_.raycast_params.width) *
-                        static_cast<std::uint64_t>(config_.raycast_params.height);
+    // Mandatory: an unconnected camera_info fails compile().
+    spec.input(camera_info, "camera_info");
+    const auto pixels = static_cast<std::uint64_t>(config_.max_width) *
+                        static_cast<std::uint64_t>(config_.max_height);
     spec.output(raycast_depth, "raycast_depth")
         .produces_tensor(device_output(kFloat32, pixels * 4U))
         .payload_options(image_payload());
-    spec.output(raycast_normals, "raycast_normals")
-        .produces_tensor(device_output(kFloat32, pixels * 12U));
-    if (color()) {
-      spec.output(raycast_colors, "raycast_colors")
-          .produces_tensor(device_output(kUInt8, pixels * 3U))
-          .payload_options(image_payload());
-    }
+    hm::declare_point_cloud_output(spec, raycast_cloud, "raycast_cloud",
+                                   {.max_points = pixels, .colors = color(), .normals = true});
   }
 }
 
 holoscan::Contract TsdfMeshOp::contract() const {
+  if (config_.raycast) {
+    return hm::camera_info_contract(config_.camera_info, camera_info, pose);
+  }
   holoscan::Contract result;
   result.trigger(holoscan::OnEach{pose});
   return result;
 }
 
-void TsdfMeshOp::start() { poses_ = 0; }
+void TsdfMeshOp::start() {
+  poses_ = 0;
+  info_.reset();
+  intrinsics_.reset();
+  if (config_.mesh) {
+    // The scratch, now rather than on the first mesh: extract() then
+    // allocates nothing. Fresh buffers wait for no stream.
+    if (const cudaError_t status = extractor_->prepare(*volume(), nullptr); status != cudaSuccess) {
+      throw std::runtime_error(
+          op_name() + ": allocating the mesh scratch failed: " + cudaGetErrorString(status));
+    }
+  }
+}
 
 void TsdfMeshOp::stop() {
   if (config_.mesh) {
@@ -118,9 +150,37 @@ void TsdfMeshOp::stop() {
 }
 
 holoscan::expected<void, holoscan::Error> TsdfMeshOp::compute(holoscan::ExecutionContext& context) {
+  bind(context);
   auto sample = pose.receive();
   if (!sample) {
     return holoscan::make_unexpected(std::move(sample).error());
+  }
+  // The camera to ray cast through.
+  const hm::CameraInfo* camera = nullptr;
+  if (config_.raycast) {
+    auto info = info_.update(camera_info);
+    if (!info) {
+      return holoscan::make_unexpected(std::move(info).error());
+    }
+    if (*info == nullptr) {
+      return {};  // No camera info yet: this pose is skipped.
+    }
+    camera = *info;
+    if (info_.changed() || !intrinsics_) {
+      intrinsics_.reset();
+      auto intrinsics = detail::pinhole_intrinsics(*camera, op_name());
+      if (!intrinsics) {
+        return holoscan::make_unexpected(std::move(intrinsics).error());
+      }
+      intrinsics_ = *intrinsics;
+    }
+    if (std::cmp_greater(camera->width, config_.max_width) ||
+        std::cmp_greater(camera->height, config_.max_height)) {
+      return holoscan::make_unexpected(invalid(
+          "camera info '" + camera->header.frame_id + "' is for " + std::to_string(camera->width) +
+          "x" + std::to_string(camera->height) + " images, larger than the configured " +
+          std::to_string(config_.max_width) + "x" + std::to_string(config_.max_height)));
+    }
   }
   auto stream = stream_for(context);
   if (!stream) {
@@ -169,17 +229,22 @@ holoscan::expected<void, holoscan::Error> TsdfMeshOp::compute(holoscan::Executio
     }
   }
 
+  // The ray cast: one kernel writes the depth image and the cloud's points,
+  // normals and colors.
   std::optional<holoscan::TensorOutputLoan> depth_loan;
   std::optional<holoscan::TensorOutputWriteGuard> depth_writer;
-  std::optional<holoscan::TensorOutputLoan> color_loan;
-  std::optional<holoscan::TensorOutputWriteGuard> color_writer;
-  OutputTensor out_ray_normals;
-  const RaycastParams& rp = config_.raycast_params;
+  std::optional<hm::PointCloudLoan> cloud;
+  hm::PointCloudShape cloud_shape;
   if (config_.raycast) {
-    const std::array<std::int64_t, 2> image_shape{rp.height, rp.width};
-    const std::array<std::int64_t, 3> normal_shape{rp.height, rp.width, 3};
-    auto loan = raycast_depth.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = image_shape, .dtype = kFloat32});
+    const int width = static_cast<int>(camera->width);
+    const int height = static_cast<int>(camera->height);
+    const RaycastParams params{.intrinsics = *intrinsics_,
+                               .width = width,
+                               .height = height,
+                               .depth_min = config_.raycast_depth_min,
+                               .depth_max = config_.raycast_depth_max};
+    auto loan = raycast_depth.allocate_tensor(holoscan::TensorLoanRequest{
+        .shape = std::array<std::int64_t, 2>{height, width}, .dtype = kFloat32});
     if (!loan) {
       return holoscan::make_unexpected(std::move(loan).error());
     }
@@ -189,28 +254,45 @@ holoscan::expected<void, holoscan::Error> TsdfMeshOp::compute(holoscan::Executio
       return holoscan::make_unexpected(std::move(writer).error());
     }
     depth_writer.emplace(std::move(*writer));
-    if (auto made = allocate(out_ray_normals, raycast_normals, normal_shape, kFloat32, *stream);
-        !made) {
-      return made;
+    cloud_shape = hm::organized_cloud(height, width);
+    auto allocated = hm::allocate_point_cloud(
+        raycast_cloud, cloud_shape, {.colors = color(), .normals = true}, context.cuda_stream());
+    if (!allocated) {
+      return holoscan::make_unexpected(std::move(allocated).error());
     }
-    if (color()) {
-      auto rgb_loan = raycast_colors.allocate_tensor(
-          holoscan::TensorLoanRequest{.shape = normal_shape, .dtype = kUInt8});
-      if (!rgb_loan) {
-        return holoscan::make_unexpected(std::move(rgb_loan).error());
+    cloud.emplace(std::move(*allocated));
+    const auto raycast =
+        [&](float* points, float* normals_out,
+            std::uint8_t* colors_out) -> holoscan::expected<void, holoscan::Error> {
+      if (const cudaError_t status = volume()->raycast(
+              *camera_pose, params,
+              RaycastImages{depth_writer->data_as<float>(), normals_out, colors_out, points},
+              *stream);
+          status != cudaSuccess) {
+        return holoscan::make_unexpected(cuda_failure("ray cast", status));
       }
-      color_loan.emplace(std::move(*rgb_loan));
-      auto rgb_writer = color_loan->write(*stream);
-      if (!rgb_writer) {
-        return holoscan::make_unexpected(std::move(rgb_writer).error());
-      }
-      color_writer.emplace(std::move(*rgb_writer));
-    }
-    const RaycastImages images{depth_writer->data_as<float>(), out_ray_normals.data<float>(),
-                               color_writer ? color_writer->data_as<std::uint8_t>() : nullptr};
-    if (const cudaError_t status = volume()->raycast(*camera_pose, rp, images, *stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("ray cast", status));
+      return {};
+    };
+    using Guard = holoscan::TensorOutputWriteGuard;
+    auto written = cloud->write_and_commit(
+        hm::PointCloudFields::points, context.cuda_stream(),
+        [&](const Guard& points) -> holoscan::expected<void, holoscan::Error> {
+          return cloud->write_and_commit(
+              hm::PointCloudFields::normals, context.cuda_stream(),
+              [&](const Guard& normals_out) -> holoscan::expected<void, holoscan::Error> {
+                if (!color()) {
+                  return raycast(points.data_as<float>(), normals_out.data_as<float>(), nullptr);
+                }
+                return cloud->write_and_commit(hm::PointCloudFields::colors, context.cuda_stream(),
+                                               [&](const Guard& colors_out) {
+                                                 return raycast(points.data_as<float>(),
+                                                                normals_out.data_as<float>(),
+                                                                colors_out.data_as<std::uint8_t>());
+                                               });
+              });
+        });
+    if (!written) {
+      return written;
     }
   }
 
@@ -240,24 +322,21 @@ holoscan::expected<void, holoscan::Error> TsdfMeshOp::compute(holoscan::Executio
     depth_writer.reset();
     if (auto sent = raycast_depth.emit_tensor(
             std::move(*depth_loan),
-            descriptor(rp.width, rp.height, holoscan::schema::ImageEncoding_MONO32F), emit);
+            descriptor(static_cast<int>(camera->width), static_cast<int>(camera->height),
+                       holoscan::schema::ImageEncoding_MONO32F),
+            emit);
         !sent) {
       return emit_failure("raycast_depth", std::move(sent).error());
     }
-    if (auto sent = send(out_ray_normals, raycast_normals, "raycast_normals", emit); !sent) {
-      return sent;
+    hm::Header header{.frame_id = camera->header.frame_id};
+    if (sample->metadata.source_clock_id.valid()) {
+      header.capture_timestamp_ns = sample->metadata.capture_timestamp_ns;
     }
-    if (color()) {
-      if (auto committed = std::move(*color_writer).commit(); !committed) {
-        return holoscan::make_unexpected(std::move(committed).error());
-      }
-      color_writer.reset();
-      if (auto sent = raycast_colors.emit_tensor(
-              std::move(*color_loan),
-              descriptor(rp.width, rp.height, holoscan::schema::ImageEncoding_RGB8), emit);
-          !sent) {
-        return emit_failure("raycast_colors", std::move(sent).error());
-      }
+    // Counting the hits would wait for the kernel: -1, not counted.
+    if (auto sent =
+            hm::emit_point_cloud(raycast_cloud, std::move(*cloud), header, cloud_shape, -1, emit);
+        !sent) {
+      return emit_failure("raycast_cloud", std::move(sent).error());
     }
   }
   return {};

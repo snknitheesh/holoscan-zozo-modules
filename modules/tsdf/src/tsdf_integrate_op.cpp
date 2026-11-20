@@ -16,16 +16,35 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
+
+#include "pinhole_camera.hpp"
 
 namespace holoscan::tsdf {
 namespace {
 
-using std::chrono_literals::operator""ns;
+namespace hm = holoscan::messages;
+using detail::is_dtype;
+using detail::kFloat32;
+using detail::kUInt16;
+using detail::kUInt8;
+using detail::packed;
 
-bool valid_intrinsics(const CameraIntrinsics& k) {
-  return std::isfinite(k.fx) && k.fx > 0.0F && std::isfinite(k.fy) && k.fy > 0.0F &&
-         std::isfinite(k.cx) && std::isfinite(k.cy);
+// The error for a pose the runtime could not select by capture time, or
+// nothing (none was recent enough: the frame is skipped).
+std::optional<std::string> pose_selection_error(holoscan::SelectionReason reason) {
+  switch (reason) {
+    case holoscan::SelectionReason::kCaptureTimeAbsent:
+      return "a depth image or its pose has no capture time, so they cannot be matched; send "
+             "both with EmitOptions::capture_time";
+    case holoscan::SelectionReason::kClockIncomparable:
+    case holoscan::SelectionReason::kConversionUnavailable:
+      return "the pose's capture time is in another clock domain than the depth image's, so "
+             "they cannot be matched";
+    default:
+      return std::nullopt;
+  }
 }
 
 }  // namespace
@@ -33,16 +52,6 @@ bool valid_intrinsics(const CameraIntrinsics& k) {
 void validate_config(const TsdfIntegrateConfig& config) {
   if (!config.volume) {
     throw std::invalid_argument("volume is required");
-  }
-  if (config.intrinsics) {
-    if (!valid_intrinsics(*config.intrinsics)) {
-      throw std::invalid_argument("intrinsics need finite, positive fx and fy and finite cx, cy");
-    }
-    if (config.intrinsics_input) {
-      throw std::invalid_argument("give intrinsics or enable the intrinsics input, not both");
-    }
-  } else if (!config.intrinsics_input) {
-    throw std::invalid_argument("give intrinsics or enable the intrinsics input");
   }
   if (!(std::isfinite(config.depth_scale) && config.depth_scale > 0.0F)) {
     throw std::invalid_argument("depth_scale must be finite and positive");
@@ -58,6 +67,12 @@ void validate_config(const TsdfIntegrateConfig& config) {
       config.max_height > 8192) {
     throw std::invalid_argument("max_width and max_height must be 1..8192");
   }
+  if (config.camera_info.max_age <= std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("camera_info.max_age must be > 0");
+  }
+  if (config.pose_max_age < std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("pose_max_age must be >= 0");
+  }
 }
 
 TsdfIntegrateOp::TsdfIntegrateOp(TsdfIntegrateConfig config)
@@ -68,17 +83,15 @@ TsdfIntegrateOp::TsdfIntegrateOp(TsdfIntegrateConfig config)
 TsdfIntegrateOp::~TsdfIntegrateOp() = default;
 
 void TsdfIntegrateOp::setup(holoscan::OperatorSpec& spec) {
-  // Two slots per input: one frame in compute() while the next one arrives.
-  spec.input(depth, "depth").queue_depth(2U);
+  spec.input(depth, "depth");
   // Optional ports exist only when configured: an unconnected input would
   // never be satisfied, and an emit into an unconnected output fails.
   if (config_.color) {
-    spec.input(color, "color").queue_depth(2U);
+    spec.input(color, "color");
   }
-  spec.input(pose, "pose").queue_depth(2U);
-  if (config_.intrinsics_input) {
-    spec.input(intrinsics, "intrinsics").queue_depth(2U);
-  }
+  spec.input(pose, "pose");
+  // Mandatory: an unconnected camera_info fails compile().
+  spec.input(camera_info, "camera_info");
   if (config_.pose_output) {
     spec.output(integrated_pose, "integrated_pose")
         .produces_tensor(host_output(kFloat32, 16U * sizeof(float)));
@@ -86,36 +99,34 @@ void TsdfIntegrateOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract TsdfIntegrateOp::contract() const {
-  // Every input of one frame carries the same capture time.
-  std::vector<holoscan::PortRef> ports{depth, pose};
-  if (config_.color) {
-    ports.emplace_back(color);
+  // The depth image and its color carry one capture time; so does the pose,
+  // unless it comes on its own clock (pose_max_age).
+  if (config_.pose_max_age == std::chrono::nanoseconds::zero()) {
+    return config_.color
+               ? hm::camera_info_contract(config_.camera_info, camera_info, depth, pose, color)
+               : hm::camera_info_contract(config_.camera_info, camera_info, depth, pose);
   }
-  if (config_.intrinsics_input) {
-    ports.emplace_back(intrinsics);
-  }
-  holoscan::Contract result;
-  result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
-  result.input(depth, holoscan::Exact{});
-  result.input(pose, holoscan::Exact{});
-  if (config_.color) {
-    result.input(color, holoscan::Exact{});
-  }
-  if (config_.intrinsics_input) {
-    result.input(intrinsics, holoscan::Exact{});
-  }
+  holoscan::Contract result =
+      config_.color ? hm::camera_info_contract(config_.camera_info, camera_info, depth, color)
+                    : hm::camera_info_contract(config_.camera_info, camera_info, depth);
+  result.input(pose, holoscan::LatestWithin{.max_age = config_.pose_max_age});
+  result.on_missing(pose, holoscan::SafeDefault{});
   return result;
+}
+
+// Each run starts without a camera; the SDK may start an operator again.
+void TsdfIntegrateOp::start() {
+  info_.reset();
+  intrinsics_.reset();
+  warned_no_pose_ = false;
 }
 
 holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
     holoscan::ExecutionContext& context) {
+  bind(context);
   auto depth_sample = depth.receive();
   if (!depth_sample) {
     return holoscan::make_unexpected(std::move(depth_sample).error());
-  }
-  auto pose_sample = pose.receive();
-  if (!pose_sample) {
-    return holoscan::make_unexpected(std::move(pose_sample).error());
   }
   std::optional<holoscan::Sample<holoscan::schema::ImageT>> color_sample;
   if (config_.color) {
@@ -125,13 +136,42 @@ holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
     }
     color_sample.emplace(std::move(*sample));
   }
-  std::optional<holoscan::Sample<holoscan::Tensor>> intrinsics_sample;
-  if (config_.intrinsics_input) {
-    auto sample = intrinsics.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
+  auto info = info_.update(camera_info);
+  if (!info) {
+    return holoscan::make_unexpected(std::move(info).error());
+  }
+  if (*info == nullptr) {
+    return {};  // No camera info yet: this depth image is skipped.
+  }
+  const hm::CameraInfo& camera = **info;
+  // A camera refused before is checked again, and refused again, rather than
+  // used: intrinsics_ is empty until a camera passes.
+  if (info_.changed() || !intrinsics_) {
+    intrinsics_.reset();
+    auto intrinsics = detail::pinhole_intrinsics(camera, op_name());
+    if (!intrinsics) {
+      return holoscan::make_unexpected(std::move(intrinsics).error());
     }
-    intrinsics_sample.emplace(std::move(*sample));
+    intrinsics_ = *intrinsics;
+  }
+  if (pose.is_missing()) {
+    // Only with pose_max_age: no pose recent enough for this depth image.
+    if (auto error = pose_selection_error(pose.selection().reason)) {
+      return holoscan::make_unexpected(invalid(*error));
+    }
+    if (!warned_no_pose_) {
+      warned_no_pose_ = true;
+      HOLOSCAN_LOG_WARN(
+          "{}: no pose captured within pose_max_age ({} ms) before a depth image; such images "
+          "are skipped",
+          op_name(),
+          std::chrono::duration_cast<std::chrono::milliseconds>(config_.pose_max_age).count());
+    }
+    return {};
+  }
+  auto pose_sample = pose.receive();
+  if (!pose_sample) {
+    return holoscan::make_unexpected(std::move(pose_sample).error());
   }
   auto stream = stream_for(context);
   if (!stream) {
@@ -174,6 +214,13 @@ holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
   }
   image.height = static_cast<int>(shape[0]);
   image.width = static_cast<int>(shape[1]);
+  if (std::cmp_not_equal(image.width, camera.width) ||
+      std::cmp_not_equal(image.height, camera.height)) {
+    return holoscan::make_unexpected(invalid(
+        "the depth image is " + std::to_string(image.width) + "x" + std::to_string(image.height) +
+        " but camera info '" + camera.header.frame_id + "' is for " + std::to_string(camera.width) +
+        "x" + std::to_string(camera.height) + " images"));
+  }
   image.scale = config_.depth_scale;
   if (!packed(depth_tensor)) {
     return holoscan::make_unexpected(invalid("depth rows must be packed"));
@@ -181,38 +228,18 @@ holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
   const std::size_t pixels =
       static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
 
-  // The pose and the intrinsics.
+  // The pose.
   auto camera_pose = read_pose(pose_sample->data, "pose", *stream);
   if (!camera_pose) {
     return holoscan::make_unexpected(std::move(camera_pose).error());
   }
   IntegrateParams params;
+  params.intrinsics = *intrinsics_;
   params.depth_min = config_.depth_min;
   params.depth_max = config_.depth_max;
-  if (config_.intrinsics_input) {
-    const holoscan::Tensor& tensor = intrinsics_sample->data;
-    if (!is_dtype(tensor.dtype(), kFloat32) || tensor.size() != 4 || !packed(tensor)) {
-      return holoscan::make_unexpected(invalid("intrinsics must be float32 [fx, fy, cx, cy]"));
-    }
-    std::array<float, 4> k{};
-    if (tensor.device().device_type == kDLCUDA || tensor.device().device_type == kDLCUDAManaged) {
-      if (auto copied = tensor.copy_to_host(k.data(), sizeof(k), *stream); !copied) {
-        return holoscan::make_unexpected(std::move(copied).error());
-      }
-    } else {
-      if (auto ready = tensor.synchronize_for_host(); !ready) {
-        return holoscan::make_unexpected(std::move(ready).error());
-      }
-      std::memcpy(k.data(), tensor.data(), sizeof(k));
-    }
-    params.intrinsics = {k[0], k[1], k[2], k[3]};
-    if (!valid_intrinsics(params.intrinsics)) {
-      return holoscan::make_unexpected(
-          invalid("intrinsics need finite, positive fx and fy and finite cx, cy"));
-    }
-  } else {
-    params.intrinsics = *config_.intrinsics;
-  }
+  // The staging buffers are sized for the largest image: they never grow.
+  const std::size_t largest =
+      static_cast<std::size_t>(config_.max_width) * static_cast<std::size_t>(config_.max_height);
 
   // The color image.
   ColorImage color_image;
@@ -253,14 +280,14 @@ holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
     if (!packed(tensor)) {
       return holoscan::make_unexpected(invalid("color rows must be packed"));
     }
-    auto data =
-        on_device(tensor, pixels * static_cast<std::size_t>(color_image.channels), 1, *stream);
+    auto data = on_device(tensor, pixels * static_cast<std::size_t>(color_image.channels),
+                          largest * 4U, 1, *stream);
     if (!data) {
       return holoscan::make_unexpected(std::move(data).error());
     }
     color_image.data = static_cast<const std::uint8_t*>(*data);
   }
-  auto depth_data = on_device(depth_tensor, pixels * element, 0, *stream);
+  auto depth_data = on_device(depth_tensor, pixels * element, largest * element, 0, *stream);
   if (!depth_data) {
     return holoscan::make_unexpected(std::move(depth_data).error());
   }
@@ -273,6 +300,9 @@ holoscan::expected<void, holoscan::Error> TsdfIntegrateOp::compute(
                                                      *camera_pose, params, *stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("integration", status));
+  }
+  if (auto settled = settle(*stream); !settled) {
+    return settled;
   }
 
   if (!config_.pose_output) {

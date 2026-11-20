@@ -4,7 +4,7 @@
     "name": "holoscan-tsdf",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Dense 3D reconstruction on the GPU: depth images (uint16 millimeters or float32 meters), optionally with color, integrated into a fixed-size truncated signed distance volume from known camera poses; the volume ray cast into depth, normal and color images from any pose; and its surface extracted as an indexed triangle mesh with normals and colors by deterministic marching cubes into fixed-size outputs, on demand or every N frames. The volume can be reset and saved as a PLY mesh without a graph.",
+    "description": "Dense 3D reconstruction on the GPU, on the messages of holoscan-messages: depth images (uint16 millimeters or float32 meters), optionally with color, their CameraInfo and known camera poses integrated into a fixed-size truncated signed distance volume; the volume ray cast through a CameraInfo's camera from any pose into a depth image and an organized PointCloud with normals and colors; and its surface extracted as an indexed triangle mesh with normals and colors by deterministic marching cubes into fixed-size outputs, on demand or every N frames. The volume can be reset and saved as a PLY mesh without a graph.",
     "authors": [
       {
         "name": "zozo",
@@ -50,11 +50,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-tsdf",
       "install_commands": [
-        "sudo apt install ./holoscan-tsdf_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-tsdf_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

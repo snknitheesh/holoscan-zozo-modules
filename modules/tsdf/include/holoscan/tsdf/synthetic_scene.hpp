@@ -5,7 +5,8 @@
 // and color images of a pinhole camera at a known pose, with optional depth
 // noise; camera paths around it; and the scene's exact distance and depth
 // functions, on the host, to check a reconstruction against. For tests,
-// benchmarks and demos; nothing here needs the Holoscan SDK.
+// benchmarks and demos; nothing here needs the Holoscan SDK (the camera's
+// calibration is the SDK-free CameraInfo of holoscan-messages).
 //
 // The world is z up. The scenes:
 //   kTabletop  a floor (the plane z = 0, solid below), a box standing on it
@@ -22,7 +23,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
+#include <holoscan/messages/camera_info.hpp>
 #include <holoscan/tsdf/tsdf_volume.hpp>
 
 #if defined(__CUDACC__)
@@ -182,6 +185,12 @@ HOLOSCAN_TSDF_HOST_DEVICE inline void scene_color(SceneSurface surface, const fl
 // A camera of `width` x `height` pixels with a horizontal field of view of
 // about 64 degrees, square pixels, centered.
 [[nodiscard]] CameraIntrinsics synthetic_intrinsics(int width, int height);
+
+// The same camera as a calibration: undistorted images of `width` x `height`
+// with synthetic_intrinsics(), in the frame `frame_id`. Write it with
+// holoscan::messages::write_camera_info_yaml() for CameraInfoSourceOp to read.
+[[nodiscard]] holoscan::messages::CameraInfo synthetic_camera_info(int width, int height,
+                                                                   std::string frame_id);
 
 // A camera at `eye` looking at `target`, the image's up toward world z.
 [[nodiscard]] Matrix4 look_at(const float eye[3], const float target[3]);

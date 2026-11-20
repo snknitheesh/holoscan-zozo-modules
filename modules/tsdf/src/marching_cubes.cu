@@ -48,11 +48,11 @@ constexpr int kBlock = 256;
 constexpr bool kReverseWinding = true;
 
 __constant__ std::int8_t c_triangles[256][16] = HOLOSCAN_TSDF_TRIANGLE_TABLE;
-// Corner k of a cube, as an offset from its first voxel (kCubeCorners).
+// Corner k of a cube, as an offset from its first voxel.
 __constant__ std::uint8_t c_corners[8][3] = {
     {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1},
 };
-// Edge e of a cube (kCubeEdges): the offset of its first voxel from the
+// Edge e of a cube: the offset of its first voxel from the
 // cube's, and its axis.
 __constant__ std::uint8_t c_edges[12][4] = {
     {0, 0, 0, 0}, {1, 0, 0, 1}, {0, 1, 0, 0}, {0, 0, 0, 1}, {0, 0, 1, 0}, {1, 0, 1, 1},
@@ -264,6 +264,11 @@ __global__ void count_kernel(Volume v, std::uint32_t voxels, Counts* __restrict_
   }
 }
 
+// The counts are uint32. A cube gives at most 5 triangles and a voxel owns at
+// most 3 vertices, so a volume of kMaxVoxels (2^30) could in theory need more
+// than 2^32 triangles and wrap the totals; a real surface crosses a small
+// fraction of the cubes (about 3.5 dims^2 vertices for the test scenes), far
+// from that bound, and the capacities stay below kMaxMeshCapacity (2^28).
 __global__ void totals_kernel(const Counts* __restrict__ offsets,
                               const Counts* __restrict__ block_counts, std::uint32_t blocks,
                               std::uint32_t max_vertices, std::uint32_t max_triangles,
@@ -419,17 +424,13 @@ std::uint64_t MeshExtractor::scratch_bytes(std::uint64_t voxels, std::uint32_t m
          9U * (std::uint64_t{max_vertices} + max_triangles);
 }
 
-cudaError_t MeshExtractor::extract(const TsdfVolume& volume, const MeshBuffers& out,
-                                   cudaStream_t stream) {
-  if (out.vertices == nullptr || out.triangles == nullptr || out.counts == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  const TsdfVolumeConfig& config = volume.config();
+cudaError_t MeshExtractor::prepare(const TsdfVolume& volume, cudaStream_t stream) {
   const std::uint64_t voxels = volume.voxel_count();
   const std::uint32_t blocks = blocks_for(voxels);
   Impl& s = *impl_;
   // Scratch: the lists at their capacities, and per-block counts for this
-  // volume size.
+  // volume size. Fresh buffers are allocated without a wait; only a change of
+  // volume size waits for `stream` before it frees the old ones.
   if (s.voxels != voxels) {
     std::size_t scan = 0;
     if (const cudaError_t status = cub::DeviceScan::ExclusiveScan(
@@ -455,6 +456,21 @@ cudaError_t MeshExtractor::extract(const TsdfVolume& volume, const MeshBuffers& 
     s.scan_bytes = scan;
     s.voxels = voxels;
   }
+  return cudaSuccess;
+}
+
+cudaError_t MeshExtractor::extract(const TsdfVolume& volume, const MeshBuffers& out,
+                                   cudaStream_t stream) {
+  if (out.vertices == nullptr || out.triangles == nullptr || out.counts == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  const TsdfVolumeConfig& config = volume.config();
+  const std::uint64_t voxels = volume.voxel_count();
+  const std::uint32_t blocks = blocks_for(voxels);
+  if (const cudaError_t status = prepare(volume, stream); status != cudaSuccess) {
+    return status;
+  }
+  Impl& s = *impl_;
 
   const TsdfVolume::DeviceView view = volume.view();
   Volume v{};

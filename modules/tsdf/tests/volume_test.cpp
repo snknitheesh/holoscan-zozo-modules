@@ -33,6 +33,7 @@
 #include <holoscan/tsdf/synthetic_scene.hpp>
 #include <holoscan/tsdf/tsdf_volume.hpp>
 
+#include "device_buffer.hpp"
 #include "reference.hpp"
 #include "scene_support.hpp"
 #include "test_support.hpp"
@@ -256,11 +257,34 @@ void check_raycast() {
     Device<float> depth(pixels);
     Device<float> normals(pixels * 3);
     Device<std::uint8_t> colors(pixels * 3);
-    cuda_check(volume.raycast(pose, params, RaycastImages{depth.get(), normals.get(), colors.get()},
+    Device<float> points(pixels * 3);
+    cuda_check(volume.raycast(pose, params,
+                              RaycastImages{depth.get(), normals.get(), colors.get(), points.get()},
                               nullptr),
                "raycast");
     const std::vector<float> got = depth.host();
     const std::vector<float> got_normals = normals.host();
+    // Each point is its pixel's ray (z 1) times its depth, exactly, and NaN
+    // where nothing is hit.
+    const std::vector<float> got_points = points.host();
+    std::size_t wrong_points = 0;
+    for (int v = 0; v < kHeight; ++v) {
+      for (int u = 0; u < kWidth; ++u) {
+        const std::size_t i = static_cast<std::size_t>(v) * kWidth + u;
+        const float* p = &got_points[3 * i];
+        if (got[i] > 0.0F) {
+          const float ray[3] = {
+              (static_cast<float>(u) - params.intrinsics.cx) / params.intrinsics.fx,
+              (static_cast<float>(v) - params.intrinsics.cy) / params.intrinsics.fy, 1.0F};
+          wrong_points +=
+              p[0] == ray[0] * got[i] && p[1] == ray[1] * got[i] && p[2] == got[i] ? 0U : 1U;
+        } else {
+          wrong_points += std::isnan(p[0]) && std::isnan(p[1]) && std::isnan(p[2]) ? 0U : 1U;
+        }
+      }
+    }
+    VERIFY_MSG(wrong_points == 0,
+               std::to_string(wrong_points) + " ray-cast points are not their ray times depth");
     std::vector<double> errors;
     std::size_t expected_hits = 0;
     std::size_t hits = 0;
@@ -723,6 +747,25 @@ void check_settings() {
   }
 }
 
+// The staging and scratch buffer grows by at least half, so that an input
+// that grows a little each frame does not reallocate (and wait) every time.
+void check_device_buffer() {
+  detail::DeviceBuffer buffer;
+  cuda_check(buffer.reserve(1000, nullptr), "reserve");
+  VERIFY(buffer.bytes() == 1000);
+  const void* first = buffer.as<void>();
+  cuda_check(buffer.reserve(1000, nullptr), "reserve");
+  VERIFY_MSG(buffer.as<void>() == first, "a reserve that fits keeps the buffer");
+  cuda_check(buffer.reserve(1010, nullptr), "reserve");
+  VERIFY_MSG(buffer.bytes() == 1500, "a buffer grows by half: " + std::to_string(buffer.bytes()));
+  const void* grown = buffer.as<void>();
+  cuda_check(buffer.reserve(1400, nullptr), "reserve");
+  VERIFY_MSG(buffer.as<void>() == grown && buffer.bytes() == 1500,
+             "a slightly larger input fits the grown buffer");
+  cuda_check(buffer.reserve(4000, nullptr), "reserve");
+  VERIFY(buffer.bytes() == 4000);
+}
+
 }  // namespace
 
 int run_all() {
@@ -739,6 +782,7 @@ int run_all() {
       {"mesh capacity and reset", check_capacity_and_reset},
       {"PLY export", check_ply},
       {"settings", check_settings},
+      {"device buffer growth", check_device_buffer},
   });
 }
 

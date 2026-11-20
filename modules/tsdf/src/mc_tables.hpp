@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// The marching cubes triangle table of Paul Bourke's "Polygonising a scalar
-// field" (https://paulbourke.net/geometry/polygonise/), by Cory Gene Bloyd,
-// released to the public domain. Corner k of a cube is bit k of its case:
-// set where the corner is inside (TSDF below zero). The corners and edges are
-// numbered as kCubeCorners and kCubeEdges in marching_cubes.cu. Each row lists
-// the edges of up to five triangles, -1 after the last.
+// The marching cubes triangle table of "Polygonising a scalar field"
+// (https://paulbourke.net/geometry/polygonise/), released to the public
+// domain. Corner k of a cube is bit k of its case: set where the corner is
+// inside (TSDF below zero). The corners and edges are numbered as c_corners
+// and c_edges in marching_cubes.cu. Each row lists the edges of up to five
+// triangles, -1 after the last.
 
 #pragma once
 
