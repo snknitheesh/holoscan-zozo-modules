@@ -2,7 +2,8 @@
 
 A Holoscan SDK 5 Module that detects [ArUco](https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html)
 markers and ChArUco boards. `ArucoDetectorOp` takes an image and emits the markers it contains,
-with sub-pixel corners and, given the camera's intrinsics, each marker's 6-DoF pose.
+with sub-pixel corners and, given the camera's calibration (`CameraInfo` from
+[holoscan-messages](../messages/)), each marker's 6-DoF pose.
 `CharucoDetectorOp` emits one view of a ChArUco board: its chessboard corners with their ids,
 sub-pixel image positions and board positions, the board's pose and a quality summary, which is
 the observation a camera calibration takes. Both run on the CPU or the GPU (CUDA).
@@ -16,7 +17,8 @@ the observation a camera calibration takes. Both run on the CPU or the GPU (CUDA
 | Headers | `<holoscan/fiducials/...>` |
 | C++ namespace | `holoscan::fiducials` |
 | Debian package | `holoscan-fiducials` |
-| Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
+| Depends on | [holoscan-messages](../messages/) 1.0 |
 
 ## Operators
 
@@ -25,23 +27,30 @@ the observation a camera calibration takes. Both run on the CPU or the GPU (CUDA
 | Port | Type | |
 | --- | --- | --- |
 | `image` (input) | `holoscan::schema::ImageT` | MONO8, RGB8, BGR8, RGBA8 or BGRA8, in host or CUDA device memory |
+| `camera_info` (input, with `estimate_pose` only, then mandatory) | `holoscan::messages::schema::CameraInfoT` | The camera the images come from, of their size |
 | `detections` (output) | `holoscan::fiducials::schema::FiducialDetectionsT` | One message per image, without a board |
 
 `ArucoDetectorConfig` holds the backend, the `DetectorOptions` (the dictionary first) and, for
-poses, the camera's `intrinsics` and the markers' `marker_length`, the side of the black border in
-meters.
+poses, `estimate_pose`, the markers' `marker_length` (the side of the black border, in meters) and
+`camera_info_input`, how the camera info arrives (holoscan-messages' `CameraInfoInputOptions`).
+With `estimate_pose`, the operator declares the `camera_info` input, takes it with
+holoscan-messages' consumer contract (`camera_info_contract()`, `LatestCameraInfo`), skips the
+images before the first camera info, and fails the run on a camera info of another image size
+than the image's. Without, it has no `camera_info` input and reports no poses.
 
 ### `CharucoDetectorOp`
 
 | Port | Type | |
 | --- | --- | --- |
 | `image` (input) | `holoscan::schema::ImageT` | As above |
+| `camera_info` (input, with `estimate_pose` only, then mandatory) | `holoscan::messages::schema::CameraInfoT` | As above |
 | `detections` (output) | `holoscan::fiducials::schema::FiducialDetectionsT` | One message per image, with the board's view, even when none of it was found |
 
 `CharucoDetectorConfig` holds the backend, the board (`CharucoBoardConfig`: `squares_x`,
 `squares_y`, `square_length`, `marker_length`, `dictionary`, `legacy_pattern`,
 `first_marker_id`), the `DetectorOptions` (whose dictionary is replaced by the board's),
-`CharucoOptions::min_markers` and, for the board's pose, the camera's `intrinsics`.
+`CharucoOptions::min_markers` and, for the board's pose, `estimate_pose` and `camera_info_input`,
+as above. A calibration, which has no camera info yet, leaves `estimate_pose` off.
 
 Boards are laid out as OpenCV 4.6 and later lays them out (`cv::aruco::CharucoBoard`): square
 `(x, y)` holds a marker when `x + y` is odd, the markers take the ids from `first_marker_id` up,
@@ -61,19 +70,22 @@ does not pass for a corner.
 | Port | Type | |
 | --- | --- | --- |
 | `detections` (input) | `FiducialDetectionsT` | From either detector |
-| `overlay` (output) | `holoscan::schema::ImageT` | A HoloViz RGBA8 image layer: markers' outlines in yellow, with the first corner marked in red; chessboard corners as magenta crosses; markers' and the board's X, Y and Z axes as red, green and blue arrows, when there are poses and intrinsics |
+| `camera_info` (input, with `draw_axes` only, then mandatory) | `holoscan::messages::schema::CameraInfoT` | The camera the detections' images came from |
+| `overlay` (output) | `holoscan::schema::ImageT` | A HoloViz RGBA8 image layer: markers' outlines in yellow, with the first corner marked in red; chessboard corners as magenta crosses; markers' and the board's X, Y and Z axes as red, green and blue arrows, with `draw_axes` and poses |
 | `labels` (output) | `holoscan::Tensor` | A HoloViz text layer: `id N` per marker, and `corners found/total` for a board |
 
 The overlay emits the labels first and then the drawing, both stamped with the frame's capture time,
 so a HoloViz `FrameTrigger` on the overlay layer draws each frame's labels and drawing together over
-the image they came from. Keep at least four images queued on the HoloViz image edge; the demo shows
+the image they came from. Detections without a capture time are drawn with the time they are
+drawn at, and a warning says so once. Keep at least four images queued on the HoloViz image edge; the demo shows
 the wiring.
 
 ## The message
 
 Each `FiducialDetections` message ([schema](schemas/fiducial_detections.fbs)) holds the frame
 number, the image header's `device_sequence`, the image size, the backend that ran, the dictionary,
-the detection time, and per marker its id, corrected bits, four corners and, when known, its pose.
+the detection time, what the frame cost (`host_waits`, the times the CPU waited for the GPU, and
+`copied_bytes` between host and device memory; see [Backends](#backends)), and per marker its id, corrected bits, four corners and, when known, its pose.
 A message carries at most 256 markers: `dropped` counts the rest, and `truncated` says the detector
 ran out of candidate capacity (4096 dark regions a frame), so markers may be missing (which ones
 can differ between the backends, and from run to run on the GPU); the operator then also logs a
@@ -90,10 +102,10 @@ board frame, as in OpenCV.
 
 ### Conventions
 
-- **Pixels.** Pixel centers are at integer coordinates, as in OpenCV and ROS `CameraInfo`. Give the
-  intrinsics that way: `fx`, `fy`, `cx`, `cy` and OpenCV's distortion `k1, k2, p1, p2, k3`
-  (`CameraIntrinsics::distortion`, zero for none). Corners are reported where they are in the
-  image, distorted; poses account for the distortion.
+- **Pixels.** Pixel centers are at integer coordinates, as in OpenCV and ROS `CameraInfo`. The
+  camera is holoscan-messages' `CameraInfo`, from a ROS camera_info file: any of its lens models
+  (`none`, `plumb_bob`, `rational_polynomial`, `equidistant`) and skew. Corners are reported where
+  they are in the image, distorted; poses account for the distortion.
 - **Corners.** A marker's corners are the outer corners of its black border, in OpenCV's order:
   top-left, top-right, bottom-right, bottom-left as printed.
 - **Poses.** The same convention as `holoscan-apriltag`: a pose places the target's frame in the
@@ -136,7 +148,7 @@ the ids agree with OpenCV's, and the corners and poses with `holoscan-apriltag`'
 | Backend | Runs on | Notes |
 | --- | --- | --- |
 | `Backend::kCpu` | CPU | One thread. |
-| `Backend::kCuda` | GPU | Thresholding, connected components, quads, edge refinement, decoding and chessboard corners on the GPU; only the markers and corners are copied to the host. |
+| `Backend::kCuda` | GPU | Thresholding, connected components, quads, edge refinement, decoding and chessboard corners on the GPU; only the decoded markers and the chessboard corners are copied to the host. |
 | `Backend::kAuto` | One of the above | Chosen once, at start: `cuda` where a CUDA device is usable, else `cpu`. Opt-in; the default is `kCuda`. |
 
 Both backends run the same code for every step ([`src/detection_core.hpp`](src/detection_core.hpp)):
@@ -161,6 +173,20 @@ usable`. `holoscan::fiducials::resolve_auto()` is the rule itself, and `probe_pl
 | --- | --- | --- |
 | `cpu` | Read in place (color is converted to gray on the CPU). | Gray copied to the host. |
 | `cuda` | Gray copied to the GPU. | Read in place (color is converted to gray on the GPU); no copy. |
+
+What a frame costs in CPU waits for the GPU and in copies between host and device memory, as each
+message reports it (`host_waits`, `copied_bytes`) and `fiducials_backends` and
+`fiducials_operators` check it:
+
+| Path | Waits per frame | Copied per frame |
+| --- | --- | --- |
+| `cpu`, host image | 0 (no CUDA at all: it runs without a GPU) | 0 |
+| `cpu`, device image | 1 | The gray image, device to host (`width x height` bytes) |
+| `cuda`, device image, `ArucoDetectorOp` | 1 (2 with more than 64 markers) | The counts and up to 64 markers, 5128 bytes, device to host; 80 bytes per marker beyond |
+| `cuda`, host image | As above | As above, plus the gray image host to device |
+| `cuda`, `CharucoDetectorOp` | One more | One more: 48 bytes per chessboard corner, both ways |
+
+A host image whose producer says it was written on a CUDA stream adds a wait for that stream.
 
 When the image is not where the backend reads it, the operator says so once, at info level, at the
 first such frame: which backend, which direction, the bytes per frame, and how to avoid the copy.
@@ -192,51 +218,78 @@ dictionary. Heavy blur next to the markers in a board (2 px against 6 px margins
 chessboard corners to about 0.2 px.
 
 Detection time at 1280x720, from the gray image to the markers or chessboard corners on the host,
-the mean over 20 frames on an otherwise idle machine (`fiducials_backends` prints it):
+the mean over 20 frames on an otherwise idle machine (`fiducials_backends` prints it); Holoscan SDK
+5.0.0, CUDA 13:
 
 | | Six markers | 9x6 ChArUco board (27 markers, 40 corners) |
 | --- | --- | --- |
 | x86_64, RTX 5090, `cuda` | 1.3 ms | 1.7 ms |
 | x86_64, `cpu` | 6.6 ms | 6.9 ms |
-| Jetson AGX Orin, `cuda` | 4.9 ms | 5.9 ms |
-| Jetson AGX Orin, `cpu` | 16.0 ms | 17.4 ms |
+| Jetson Orin, `cuda` | 4.9 ms | 5.9 ms |
+| Jetson Orin, `cpu` | 16.0 ms | 17.4 ms |
 
 ## Use it in your graph
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
-find_package(holoscan-fiducials 1.0 REQUIRED CONFIG)
+find_package(holoscan-fiducials 1.0 REQUIRED CONFIG)  # Finds holoscan-messages too.
 target_link_libraries(my_app PRIVATE holoscan::fiducials)   # add holoscan::fiducials_overlay for the overlay
 ```
 
 ```cpp
+#include <holoscan/fiducials/aruco_detector_op.hpp>
 #include <holoscan/fiducials/charuco_detector_op.hpp>
 #include <holoscan/fiducials/fiducial_messages.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
 
 namespace fd = holoscan::fiducials;
+namespace hm = holoscan::messages;
 
+// Markers with their poses: the camera's ROS camera_info file, sent by CameraInfoSourceOp.
+auto info = graph.op<hm::CameraInfoSourceOp>(
+    "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = "camera.yaml"});
+auto markers = graph.op<fd::ArucoDetectorOp>(
+    "markers", fd::ArucoDetectorConfig{.backend = fd::Backend::kCuda,
+                                       .options = {.dictionary = "DICT_5X5_100"},
+                                       .estimate_pose = true,
+                                       .marker_length = 0.05});
+graph.add_flow(camera->image, markers->image);            // Output<holoscan::schema::ImageT>
+graph.add_flow(info->camera_info, markers->camera_info, hm::latest_camera_info_connection());
+
+// The views of a board for a calibration, which needs no camera info.
 auto board = graph.op<fd::CharucoDetectorOp>(
     "charuco", fd::CharucoDetectorConfig{
                    .backend = fd::Backend::kCuda,
                    .board = {.squares_x = 7, .squares_y = 5, .square_length = 0.04,
-                             .marker_length = 0.03, .dictionary = "DICT_5X5_100"},
-                   .intrinsics = fd::CameraIntrinsics{910.5, 910.5, 639.5, 359.5, {}}});
-graph.add_flow(camera->image, board->image);              // Output<holoscan::schema::ImageT>
+                             .marker_length = 0.03, .dictionary = "DICT_5X5_100"}});
+graph.add_flow(camera->image, board->image);
 graph.add_flow(board->detections, calibrator->views);     // Output<fd::schema::FiducialDetectionsT>
 // In the consumer: fd::board_of(message)->corners, each {id, image, board}.
 ```
+
+Keep a lossless graph on one worker, as the demo does: `graph.partition("name").include_all()`.
+A second source (`CameraInfoSourceOp`) or a fork (one camera into two detectors) makes the SDK's
+automatic partitioning split the graph onto several workers, and across workers a producer can run
+while its consumer's lossless queue is full: its emit fails with `kBackpressured`, or its
+allocation with `kResourceExhausted`, which fails the run. Live sources keep `kDropOldest` edges of
+depth 1 instead.
 
 The detectors need no Holoscan graph: `create_backend()` in
 `<holoscan/fiducials/detector_backend.hpp>` finds markers and refines chessboard corners,
 `observe_charuco()` in `<holoscan/fiducials/charuco.hpp>` turns markers into a board's view, and
 `<holoscan/fiducials/pose.hpp>` projects points and fits poses. `<holoscan/fiducials/synthetic_scene.hpp>`
 renders scenes of markers and boards at known poses, with blur, noise, occluders and mirroring, and
-checks detections against them, for tests.
+checks detections against them, for tests and demos; their camera is a `CameraInfo`, which
+`messages::write_camera_info_yaml()` writes as the file `CameraInfoSourceOp` reads. These headers
+are the module's public API for all of 1.x; the overlay's drawing is internal.
 
 ## Requirements
 
 - Holoscan SDK 5.0 (Core and Sensor I/O; Visualization for the overlay; Testing for the tests),
-  CUDA 13, CMake 4.0 or later and a C++20 compiler. Nothing else: no OpenCV.
+  [holoscan-messages](../messages/) 1.0, CUDA 13, CMake 4.0 or later and a C++20 compiler.
+  Nothing else: no OpenCV.
+- The `cuda` backend needs a CUDA-capable GPU; the `cpu` backend on host images needs none.
 
 ## Build, test and install
 
@@ -266,18 +319,20 @@ The tests generate all their data, synthetic scenes with ground truth:
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `fiducials_backends` | GPU | The `cuda` backend against the `cpu` backend to the bit (markers, corners, chessboard corners) on clean, blurred, noisy, occluded and mirrored scenes; `cuda` against ground truth; candidate overflow; `auto`; the timings above |
-| `fiducials_operators` | GPU | The three operators through the SDK's operator test harness: every encoding and backend, host and device images, size changes, ChArUco views against ground truth, `auto` and its log, the copy log (once when frames cross between host and device, never otherwise), provenance, bad input and configuration, and the overlay's layers |
+| `fiducials_cpu_without_gpu` | Nothing | The `cpu` backend on host images through the operators with no GPU visible (`CUDA_VISIBLE_DEVICES=-1`) |
+| `fiducials_operators` | GPU | The three operators through the SDK's operator test harness: every encoding and backend, host and device images, size changes, ChArUco views against ground truth, `auto` and its log, the copy log (once when frames cross between host and device, never otherwise), provenance, bad input and configuration, camera info (its contract, the images before the first one, a camera info of the wrong size) and the CPU waits and copies of each path, and the overlay's layers |
 | `fiducials_marker_detection` | Nothing | The `cpu` detector on ten dictionaries: every marker, corner and pose against ground truth; blur and noise; partial occlusion; no false positives on clutter; markers at and across the image's border; a mirrored image; the wrong dictionary; the options |
 | `fiducials_charuco` | Nothing | Board geometry against OpenCV's; four boards (one legacy, one from id 30): every corner's id, board position and image position, poses and quality; other boards; blur and noise; occlusion and `min_markers`; a board cut by the image's edge; bad boards |
-| `fiducials_pose` | Nothing | The pose convention, undistortion, exact poses with distortion, the planar ambiguity, noisy corners, degenerate input |
+| `fiducials_pose` | Nothing | The pose convention, undistortion and exact poses with every lens model and skew, the camera's size check, the planar ambiguity, noisy corners, degenerate input |
 | `fiducials_dictionary` | Nothing | Every dictionary's size and correction, codes against OpenCV and the AprilTag library, prefixes, rotations and uniqueness |
 | `fiducials_overlay_drawing` | Nothing | The overlay's drawing |
 | `fiducials_backend_resolution` | Nothing | `auto`'s choice and the backend names |
 
 The tests marked "Nothing" are also a project of their own, [`tests/host/`](tests/host/), which the
 hosted CI job builds and runs. [`tests/installed_consumer/`](tests/installed_consumer/) is a
-separate project that uses the installed package: a small graph that runs both detectors on every
-backend.
+separate project that uses the installed package: a small graph, on one worker, that runs both
+detectors on every backend with poses from a camera_info file, and the overlay when the package
+has it.
 
 ## Debian package
 
@@ -289,7 +344,7 @@ holoscan --project-root modules/fiducials package holoscan-fiducials --language 
 ```
 
 This builds for every major GPU architecture and writes `holoscan-fiducials_1.0.0_<arch>.deb`. It
-installs to `/usr` and depends on `holoscan (>= 5.0.0)`.
+installs to `/usr` and depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0)`.
 
 ## Licenses
 

@@ -62,8 +62,10 @@ which markers such a frame misses differs, and on the GPU from run to run.
 - Code lives in `holoscan::fiducials`; inside it, `schema::` means this module's FlatBuffers
   namespace, and the SDK's schemas are written `holoscan::schema::...`.
 - Public headers carry only SDK, CUDA runtime and standard types. `types.hpp`, `dictionary.hpp`,
-  `charuco.hpp`, `pose.hpp`, `synthetic_scene.hpp` and `overlay_drawing.hpp` need neither the SDK
-  nor CUDA, so the host tests build them, with the CPU detector, from source.
+  `charuco.hpp`, `pose.hpp` and `synthetic_scene.hpp` need neither the SDK nor CUDA (only
+  holoscan-messages' SDK-free `camera_info.hpp`), so the host tests build them, with the CPU
+  detector and that part of holoscan-messages, from source. The overlay's drawing,
+  `src/overlay_drawing.hpp`, is internal, and so is everything else under `src/`.
 - Logging goes through `HOLOSCAN_LOG_*`. Nothing is logged per frame: a host/device copy is logged
   once, capacity warnings at most every five seconds.
 - The CMake project must also work inside another one: only its own paths, options other than the
