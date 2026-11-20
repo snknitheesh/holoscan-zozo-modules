@@ -219,7 +219,9 @@ chessboard corners to about 0.2 px.
 
 Detection time at 1280x720, from the gray image to the markers or chessboard corners on the host,
 the mean over 20 frames on an otherwise idle machine (`fiducials_backends` prints it); Holoscan SDK
-5.0.0, CUDA 13:
+5.0.0, CUDA 13.2, the Jetson Orin in its MAXN power mode with JetPack 7.2. The GPU's clocks rise
+with the load, so on a Jetson the first frames of a run, and a machine running other work, can take
+several times as long:
 
 | | Six markers | 9x6 ChArUco board (27 markers, 40 corners) |
 | --- | --- | --- |
