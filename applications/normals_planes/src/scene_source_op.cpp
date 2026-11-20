@@ -1,0 +1,162 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+#include "scene_source_op.hpp"
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+#include <holoscan/core/payload_options.hpp>
+#include <holoscan/core/tensor_contract.hpp>
+#include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/normals/synthetic_scene.hpp>
+
+namespace normals_planes_app {
+namespace {
+
+constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
+
+holoscan::TensorOutputSpec device_image(DLDataType dtype, std::uint32_t rank, std::uint64_t bytes) {
+  return holoscan::TensorOutputSpec{
+      .representation =
+          holoscan::TensorRepresentation{
+              .memory_kind = holoscan::MemoryKind::kCudaDevice,
+              .dtype = dtype,
+              .rank = rank,
+              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
+          },
+      .bounds = holoscan::tensor_bounds(bytes),
+      .storage = holoscan::TensorOutputStorage::kRuntimePool,
+  };
+}
+
+holoscan::PayloadOptions image_payload() {
+  return holoscan::PayloadOptions{
+      .schema = holoscan::schema_identity<holoscan::schema::ImageT>(),
+  };
+}
+
+holoscan::schema::ImageT descriptor(int width, int height, holoscan::schema::ImageEncoding encoding,
+                                    const std::string& frame_id, std::int64_t capture_ns) {
+  holoscan::schema::ImageT image;
+  image.width = width;
+  image.height = height;
+  image.encoding = encoding;
+  image.header = std::make_shared<holoscan::schema::HeaderT>();
+  image.header->frame_id = frame_id;
+  image.header->capture_timestamp_ns = capture_ns;
+  return image;
+}
+
+// Whether `error` says the consumers are still busy with earlier frames: an
+// emit refused before delivery, or every slot of the output's pool still held.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
+
+holoscan::Error cuda_failure(const char* what, cudaError_t status) {
+  return holoscan::Error{holoscan::ErrorCode::kFailure,
+                         std::string("SceneSourceOp: ") + what + ": " + cudaGetErrorString(status)};
+}
+
+}  // namespace
+
+void validate_config(const SceneSourceConfig& config) {
+  if (config.width < 64 || config.height < 48 || config.width > 4096 || config.height > 4096) {
+    throw std::invalid_argument("scene images must be 64x48 to 4096x4096");
+  }
+  if (config.count == 0 || config.period <= std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("the scene source needs a positive count and period");
+  }
+}
+
+SceneSourceOp::SceneSourceOp(SceneSourceConfig config) : config_(config) {
+  validate_config(config_);
+}
+
+void SceneSourceOp::setup(holoscan::OperatorSpec& spec) {
+  const auto pixels =
+      static_cast<std::uint64_t>(config_.width) * static_cast<std::uint64_t>(config_.height);
+  spec.output(depth, "depth")
+      .produces_tensor(device_image(kFloat32, 2U, pixels * 4U))
+      .payload_options(image_payload());
+}
+
+holoscan::Contract SceneSourceOp::contract() const {
+  holoscan::Contract result;
+  result.trigger(holoscan::OnClock{.period = config_.period});
+  return result;
+}
+
+void SceneSourceOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+  capture_.reset();
+}
+
+holoscan::expected<void, holoscan::Error> SceneSourceOp::compute(
+    holoscan::ExecutionContext& context) {
+  if (emitted_ >= config_.count) {
+    return {};  // Done: idle until the reporter completes the run.
+  }
+  if (!delayed_) {
+    delayed_ = true;
+    return {};  // A tick for the camera info to come first.
+  }
+  // Frames 1 and 2 go out without waiting, then frame k + 1 once frame k - 1
+  // is finished: a frame before the camera info, which never finishes, holds
+  // nothing back, as the reporter marks it finished with the next one.
+  if (config_.finished && emitted_ >= 2U &&
+      config_.finished->load(std::memory_order_acquire) + 1U < emitted_) {
+    return {};
+  }
+  cudaStream_t stream = context.cuda_stream().get();
+  if (stream == nullptr) {
+    return holoscan::make_unexpected(holoscan::Error{
+        holoscan::ErrorCode::kFailure, "SceneSourceOp: the runtime gave no CUDA stream"});
+  }
+  if (!capture_) {
+    capture_ = context.activation_time();
+  }
+  // Frame ids count from 1; 0 means none.
+  const holoscan::EmitOptions emit{.capture_time = *capture_, .frame_id = emitted_ + 1U};
+  const holoscan::normals::SyntheticScene scene =
+      holoscan::normals::synthetic_scene(config_.width, config_.height, emitted_);
+  auto loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
+      .shape = std::array<std::int64_t, 2>{config_.height, config_.width}, .dtype = kFloat32});
+  if (!loan) {
+    return consumers_busy(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                        : holoscan::make_unexpected(std::move(loan).error());
+  }
+  auto writer = loan->write(stream);
+  if (!writer) {
+    return holoscan::make_unexpected(std::move(writer).error());
+  }
+  if (const cudaError_t status = holoscan::normals::render_synthetic_scene(
+          scene, writer->data_as<float>(), nullptr, nullptr, stream);
+      status != cudaSuccess) {
+    return holoscan::make_unexpected(cuda_failure("render", status));
+  }
+  if (auto committed = std::move(*writer).commit(); !committed) {
+    return holoscan::make_unexpected(std::move(committed).error());
+  }
+  auto sent = depth.emit_tensor(
+      std::move(*loan),
+      descriptor(config_.width, config_.height, holoscan::schema::ImageEncoding_MONO32F,
+                 config_.frame_id, capture_->timestamp_ns),
+      emit);
+  if (!sent) {
+    // Refused before delivery: the same frame goes again on the next tick.
+    return consumers_busy(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
+  }
+  capture_.reset();
+  ++emitted_;
+  return {};
+}
+
+}  // namespace normals_planes_app

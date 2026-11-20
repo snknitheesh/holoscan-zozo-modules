@@ -1,0 +1,14 @@
+holoscan-icp
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-icp uses the following open source software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+CUB, part of the CUDA C++ Core Libraries (https://github.com/NVIDIA/cccl)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0 with LLVM Exceptions. Header-only, from the CUDA Toolkit; its
+templates are compiled into the library.

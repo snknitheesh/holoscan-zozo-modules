@@ -15,7 +15,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
+#include <holoscan/messages/camera_info.hpp>
 #include <holoscan/point_cloud/camera_intrinsics.hpp>
 
 #if defined(__CUDACC__)
@@ -94,6 +96,12 @@ HOLOSCAN_POINT_CLOUD_HOST_DEVICE inline void synthetic_color(const SyntheticFram
   rgb[1] = static_cast<std::uint8_t>(255 * v / f.height);
   rgb[2] = static_cast<std::uint8_t>((f.frame * 7U) & 0xFFU);
 }
+
+// The CameraInfo of frame `f`'s camera, as the operators take it: undistorted
+// (no distortion model), its size and intrinsics, and `frame_id`. The
+// intrinsics are the frame's floats, exactly, as doubles.
+[[nodiscard]] holoscan::messages::CameraInfo synthetic_camera_info(
+    const SyntheticFrame& f, std::string frame_id = "synthetic_camera");
 
 // Renders `f` into device buffers on `stream`: depth as float32 meters or,
 // with `millimeters`, uint16 millimeters; color as RGB8 when `rgb` is given.

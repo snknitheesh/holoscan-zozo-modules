@@ -1,0 +1,66 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-messages",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "The messages every module of this collection uses: CameraInfo (one camera's intrinsics, distortion and whether its images are raw, undistorted or rectified), StereoCameraInfo (a pair and its extrinsics in one message) and PointCloud (points with optional colors, normals and intensities as host or device tensors), in the SDK's FlatBuffers schema system; the ROS camera_info YAML reader and writer, with a stereo pair's extrinsics recovered from R and P; CameraInfoSourceOp, which sends a calibration read from those files; and the measured consumer contract for frames aligned by capture time with camera info at any rate.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::messages"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Camera",
+      "Calibration",
+      "Stereo",
+      "Point Cloud"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/messages",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "CameraInfoSourceOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for point clouds in device memory and the tests."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-messages",
+      "install_commands": [
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
