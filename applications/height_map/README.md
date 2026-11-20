@@ -2,15 +2,20 @@
 
 The demo of the [holoscan-height-map](../../modules/height-map/) module. A synthetic depth camera,
 1.1 m up and tilted 35 degrees down, drives along a course with a 15 degree ramp, four 8 cm steps, a
-30 cm box and a 20 cm deep pit, swaying a little in yaw, with depth noise; holoscan-point-cloud's
-`DepthToPointCloudOp` deprojects each frame, `HeightMapOp` maps the clouds with the camera's pose
-into an elevation map that follows the camera, and `TraversabilityOp` computes slope, step height,
+30 cm box and a 20 cm deep pit, swaying a little in yaw, with depth noise. holoscan-messages'
+`CameraInfoSourceOp` reads the camera's calibration from a camera_info file that the demo writes
+when it starts, into a temporary folder of its own that it removes on every way out (a pass, a
+failure, an error or Ctrl+C). holoscan-point-cloud's `DepthToPointCloudOp` deprojects each frame
+with it into a `PointCloud` message, `HeightMapOp` maps the clouds with the camera's pose into an
+elevation map that follows the camera, and `TraversabilityOp` computes slope, step height,
 roughness and a cost. A reporter checks every map against the course's truth, and HoloViz shows the
 elevation beside the cost. It uses the installed modules the way any other project would:
-`find_package(holoscan-point-cloud)` and `find_package(holoscan-height-map)`.
+`find_package(holoscan-messages)`, `find_package(holoscan-point-cloud)` and
+`find_package(holoscan-height-map)`.
 
 ```mermaid
 flowchart LR
+    I[CameraInfoSourceOp] -.->|camera_info, newest| D
     C[Terrain camera] -->|depth| D[DepthToPointCloudOp]
     C -->|pose| M[HeightMapOp]
     D -->|point_cloud| M
@@ -23,7 +28,8 @@ flowchart LR
 
 ## Requirements
 
-- holoscan-point-cloud and holoscan-height-map, installed (see their READMEs), and what they need:
+- holoscan-messages, holoscan-point-cloud 2.x and holoscan-height-map, installed (see their
+  READMEs), and what they need:
   Holoscan SDK 5.0 with Core and Sensor I/O (Visualization for the display), CUDA 13, CMake 4.0 or
   later and a C++20 compiler.
 
@@ -31,7 +37,7 @@ The demo downloads nothing and needs no models or data: it renders its frames.
 
 ## Build and run
 
-From the repository root, after installing both modules into `install/`:
+From the repository root, after installing the three modules into `install/`:
 
 ```bash
 cmake -S applications/height_map -B build/height_map -G Ninja \
@@ -51,7 +57,7 @@ build/height_map/height_map --count 60 --period-ms 10 --display false  # ci mode
 | `--elevation fused\|mean\|max` | `fused` | The elevation layer: the fused estimate, or the latest observation's mean or highest point |
 | `--display auto\|true\|false\|offscreen` | `auto` | Show the elevation and cost in HoloViz; `auto` when `DISPLAY` or Wayland is set; `offscreen` renders into CUDA memory and checks what was rendered |
 | `--timeout-seconds N` | `120` | Allowance beyond the expected run time |
-| `--compile-only true\|false` | `false` | Build and check the graph without running it |
+| `--compile-only true\|false` | `false` | Build and check the graph and print its workers, without running it |
 
 | CMake option | Default | |
 | --- | --- | --- |
@@ -64,10 +70,14 @@ ground) to red at the ramp's top (0.4 m); on the right the cost, green where it 
 the ramp, red at the steps', the box's and the pit's edges. Cells never seen, such as those behind
 the box and the camera, are dark gray.
 
-The operators cannot send a refused output again, so the camera keeps one frame in flight: it
-renders the next frame only once the reporter has counted the previous one, and no lossless queue
-ever fills. The display branch keeps only the newest map (`QueuePolicy::kDropOldest`, depth 1), so
-it never holds the pipeline back.
+Every frame must be mapped, costed and checked, so the graph runs on one worker, as holoscan-messages'
+README explains in [Run a graph on one worker](../../modules/messages/README.md#run-a-graph-on-one-worker);
+`--compile-only true` prints `workers=1`. The operators cannot send a refused output again, so the
+camera also keeps one frame in flight, as a test sink's pacing: it renders the next frame only once
+the reporter has counted the previous one, and no lossless queue ever fills. Its first tick sends
+nothing, so that the camera info comes before the first frame. The camera info and the display
+branch keep only the newest message (`QueuePolicy::kDropOldest`, depth 1), so they never hold the
+pipeline back.
 
 ## What it checks
 
@@ -94,14 +104,16 @@ height_map: verdict=PASS
 ```
 
 The values are the worst over the frames. The `ci` mode passes only when every frame passes. A stop
-request (Ctrl+C) ends the run with `verdict=STOPPED`.
+request (Ctrl+C, or SIGTERM) ends the run with `verdict=STOPPED`.
 
 ## Tests
 
 With `-DBUILD_TESTING=ON`, `ctest --test-dir build/height_map` runs the demo with each elevation
 layer, with a finer 500x500 map, and at 1280x720, all checked against the truth; renders both maps
-offscreen in HoloViz and checks the frames; compiles the window display graph without a display;
-and checks that unusable arguments are usage errors.
+offscreen in HoloViz and checks the frames; checks that the graph, with and without the display,
+compiles to one worker (without a display server); stops a run with SIGTERM and checks its verdict
+and that the camera_info file's folder is gone; and checks that unusable arguments are usage
+errors.
 
 ## Licenses
 

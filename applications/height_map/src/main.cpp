@@ -3,25 +3,29 @@
 //
 // Height Map: a synthetic depth camera drives over a course with a ramp,
 // steps, a box and a pit. holoscan-point-cloud's DepthToPointCloudOp
-// deprojects each depth image; holoscan-height-map's HeightMapOp maps the
-// clouds, with the camera's pose, into an elevation map that follows the
+// deprojects each depth image with the camera's info, which
+// holoscan-messages' CameraInfoSourceOp reads from a camera_info file written
+// at run time; holoscan-height-map's HeightMapOp maps the PointCloud
+// messages, with the camera's pose, into an elevation map that follows the
 // camera, and TraversabilityOp turns it into slope, step height and a cost.
 // A reporter checks every map against the course's truth, and with a display
-// HoloViz shows the elevation beside the cost.
+// HoloViz shows the elevation beside the cost. The graph runs on one worker.
 
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -35,6 +39,9 @@
 #include <holoscan/height_map/height_map_op.hpp>
 #include <holoscan/height_map/traversability_op.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #if HEIGHT_MAP_ENABLE_VISUALIZATION
@@ -47,10 +54,10 @@
 
 namespace {
 
-using std::chrono_literals::operator""ms;
 namespace app = height_map_app;
 namespace pc = holoscan::point_cloud;
 namespace hm = holoscan::height_map;
+namespace msg = holoscan::messages;
 
 constexpr std::string_view kAppName = "height_map";
 
@@ -165,6 +172,65 @@ bool env_set(const char* name) {
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
+// Closes the signal domain, if there is one, on every way out of main().
+class CloseSignals {
+ public:
+  explicit CloseSignals(SignalDomain& signals) noexcept : signals_(signals) {}
+  ~CloseSignals() {
+    if (!signals_) {
+      return;
+    }
+    if (auto closed = signals_->close(); !closed) {
+      std::cerr << kAppName << ": warning: closing the signal domain failed: "
+                << holoscan::runtime_error_message(closed.error()) << '\n';
+    }
+  }
+  CloseSignals(const CloseSignals&) = delete;
+  CloseSignals& operator=(const CloseSignals&) = delete;
+
+ private:
+  SignalDomain& signals_;
+};
+
+// The synthetic camera's camera_info file, for CameraInfoSourceOp to read, in
+// a folder of its own that mkdtemp() names unpredictably, so that nothing can
+// be planted where the file goes. Removed with this object, on every way out
+// of the run: a pass, a failure, an error, or a stop request (SIGINT,
+// SIGTERM), which ends the run normally.
+class CameraInfoFile {
+ public:
+  explicit CameraInfoFile(const msg::CameraInfo& camera) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      msg::write_camera_info_yaml(camera, path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~CameraInfoFile() { remove(); }
+  CameraInfoFile(const CameraInfoFile&) = delete;
+  CameraInfoFile& operator=(const CameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
+
 int execute(const Options& opts, SignalDomain& signals) {
   const bool display_available =
       env_set("DISPLAY") || (env_set("WAYLAND_DISPLAY") && env_set("XDG_RUNTIME_DIR"));
@@ -200,15 +266,17 @@ int execute(const Options& opts, SignalDomain& signals) {
                                          .count = opts.count,
                                          .period = std::chrono::milliseconds(opts.period_ms),
                                          .finished = finished});
+  // The camera's calibration, from the file CameraInfoSourceOp reads; the run
+  // reads it again when it starts, so the file stays until the run is over.
+  const CameraInfoFile camera_info_file(hm::camera_info_of(camera, app::kCameraFrame));
+  auto camera_info = graph.op<msg::CameraInfoSourceOp>(
+      "camera_info", msg::CameraInfoSourceConfig{.camera_info_path = camera_info_file.path()});
   auto deproject = graph.op<pc::DepthToPointCloudOp>(
-      "deproject",
-      pc::DepthToPointCloudConfig{
-          .intrinsics = pc::CameraIntrinsics{camera.fx, camera.fy, camera.cx, camera.cy},
-          .depth_scale = 1.0F,
-          .depth_min = 0.1F,
-          .depth_max = camera.max_depth,
-          .max_width = opts.width,
-          .max_height = opts.height});
+      "deproject", pc::DepthToPointCloudConfig{.depth_scale = 1.0F,
+                                               .depth_min = 0.1F,
+                                               .depth_max = camera.max_depth,
+                                               .max_width = opts.width,
+                                               .max_height = opts.height});
   hm::HeightMapConfig map_config;
   map_config.map.geometry = geometry;
   map_config.map.mode = hm::MapMode::kFollow;
@@ -219,6 +287,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   map_config.map.min_height = -1.0F;
   map_config.map.max_height = 1.0F;
   map_config.pose_input = true;
+  map_config.cloud_frame_id = app::kCameraFrame;
   map_config.outputs.variance = false;
   map_config.outputs.image = images;
   map_config.frame_id = "map";
@@ -250,10 +319,14 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                                       .finished = finished});
 
   // Lossless edges: every frame is mapped, costed and checked, in order. The
-  // camera keeps one frame in flight, so no queue fills.
+  // camera keeps one frame in flight, so no queue fills. The camera info is
+  // the newest one, kept by the deprojection; its edge never holds back the
+  // source.
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   graph.add_flow(source->depth, deproject->depth, lossless);
-  graph.add_flow(deproject->point_cloud, mapper->points, lossless);
+  graph.add_flow(camera_info->camera_info, deproject->camera_info,
+                 msg::latest_camera_info_connection());
+  graph.add_flow(deproject->point_cloud, mapper->point_cloud, lossless);
   graph.add_flow(source->pose, mapper->pose, lossless);
   graph.add_flow(mapper->elevation, traversability->elevation, lossless);
   graph.add_flow(mapper->map_info, traversability->map_info, lossless);
@@ -323,8 +396,16 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 #endif
 
+  // One worker for the whole graph, as holoscan-messages' README advises for a
+  // lossless chain: with the camera info source the graph has two sources,
+  // forks and joins, and the automatic partitioning would split it onto six
+  // workers (seven with the display). There a producer runs while its
+  // consumer's queue or its output's pool is full, and an operator in the
+  // middle cannot send the refused output again: the run fails.
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
+  // Warnings on an accepted plan, as well as the reasons for a rejected one.
   if (!plan.diagnostics().empty()) {
     std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
   }
@@ -332,7 +413,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on: one per partition that runs operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -341,13 +423,9 @@ int execute(const Options& opts, SignalDomain& signals) {
               << "; an interrupt ends the process without a report\n";
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(opts.timeout_seconds) +
-                        std::chrono::milliseconds(2LL * opts.count * opts.period_ms);
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const bool timed_out = session.is_running();
+  const bool timed_out =
+      !session.wait_for(std::chrono::seconds(opts.timeout_seconds) +
+                        std::chrono::milliseconds(2LL * (opts.count + 1U) * opts.period_ms));
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
@@ -359,12 +437,6 @@ int execute(const Options& opts, SignalDomain& signals) {
                             holoscan::log_level() <= holoscan::LogLevel::ERROR;
   if (!session.diagnostics().empty() && !sdk_reported) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
-  }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
   }
 
   const bool stopped = !timed_out && termination == holoscan::RunTermination::kStopped;
@@ -426,6 +498,7 @@ int main(int argc, char** argv) try {
   // Take over SIGINT and SIGTERM while this is the only thread; the SDK
   // refuses a process that already runs others.
   SignalDomain signals = holoscan::ManagedShutdownSignals::create();
+  const CloseSignals close_signals(signals);
   const Options opts = parse_args(argc, argv);
   if (opts.help) {
     usage(argv[0]);

@@ -97,25 +97,86 @@ holoscan::Contract TerrainCameraOp::contract() const {
   return result;
 }
 
-void TerrainCameraOp::start() { emitted_ = 0; }
+void TerrainCameraOp::start() {
+  emitted_ = 0;
+  delayed_ = false;
+  capture_.reset();
+  depth_sent_ = false;
+}
+
+namespace {
+
+// Whether a refused send or allocation is backpressure: the consumer has no
+// room yet, and the same frame goes again on the next tick.
+bool backpressure(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
+
+}  // namespace
 
 holoscan::expected<void, holoscan::Error> TerrainCameraOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the reporter completes the run.
   }
-  if (config_.finished && config_.finished->load(std::memory_order_acquire) < emitted_) {
+  if (!delayed_) {
+    delayed_ = true;
+    return {};  // The camera info goes first.
+  }
+  if (!capture_ && config_.finished &&
+      config_.finished->load(std::memory_order_acquire) < emitted_) {
     return {};  // The previous frame is still in flight.
   }
+  if (!capture_) {
+    capture_ = context.activation_time();
+  }
+  // Frame numbers count from 1; 0 means none.
+  const std::uint64_t number = emitted_ + 1U;
+  const holoscan::EmitOptions emit{.capture_time = *capture_, .frame_id = number};
+  const hm::TerrainCamera camera = camera_for_frame(config_.width, config_.height, emitted_);
+  if (!depth_sent_) {
+    if (auto sent = send_depth(context, camera, emit); !sent) {
+      return backpressure(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
+    }
+    depth_sent_ = true;
+  }
+  auto pose_loan = pose.allocate_tensor(
+      holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 2>{4, 4}, .dtype = kFloat64});
+  if (!pose_loan) {
+    return backpressure(pose_loan.error())
+               ? holoscan::expected<void, holoscan::Error>{}
+               : holoscan::make_unexpected(std::move(pose_loan).error());
+  }
+  std::array<double, 16> matrix{};
+  std::memcpy(matrix.data(), camera.pose.m, sizeof(camera.pose.m));
+  matrix[15] = 1.0;
+  if (auto written =
+          pose_loan->write_host_and_commit([&matrix](const holoscan::TensorOutputWriteGuard& out)
+                                               -> holoscan::expected<void, holoscan::Error> {
+            std::memcpy(out.data_as<double>(), matrix.data(), sizeof(matrix));
+            return {};
+          });
+      !written) {
+    return written;
+  }
+  if (auto sent = pose.emit(std::move(*pose_loan), emit); !sent) {
+    return backpressure(sent.error()) ? holoscan::expected<void, holoscan::Error>{} : sent;
+  }
+  capture_.reset();
+  depth_sent_ = false;
+  ++emitted_;
+  return {};
+}
+
+holoscan::expected<void, holoscan::Error> TerrainCameraOp::send_depth(
+    holoscan::ExecutionContext& context, const hm::TerrainCamera& camera,
+    const holoscan::EmitOptions& emit) {
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
     return holoscan::make_unexpected(holoscan::Error{
         holoscan::ErrorCode::kFailure, "TerrainCameraOp: the runtime gave no CUDA stream"});
   }
-  // Frame ids count from 1; 0 means none.
-  const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
-                                   .frame_id = emitted_ + 1U};
-  const hm::TerrainCamera camera = camera_for_frame(config_.width, config_.height, emitted_);
   auto depth_loan = depth.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 2>{config_.height, config_.width}, .dtype = kFloat32});
   if (!depth_loan) {
@@ -133,39 +194,15 @@ holoscan::expected<void, holoscan::Error> TerrainCameraOp::compute(
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
   }
-  auto pose_loan = pose.allocate_tensor(
-      holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 2>{4, 4}, .dtype = kFloat64});
-  if (!pose_loan) {
-    return holoscan::make_unexpected(std::move(pose_loan).error());
-  }
-  std::array<double, 16> matrix{};
-  std::memcpy(matrix.data(), camera.pose.m, sizeof(camera.pose.m));
-  matrix[15] = 1.0;
-  if (auto written =
-          pose_loan->write_host_and_commit([&matrix](const holoscan::TensorOutputWriteGuard& out)
-                                               -> holoscan::expected<void, holoscan::Error> {
-            std::memcpy(out.data_as<double>(), matrix.data(), sizeof(matrix));
-            return {};
-          });
-      !written) {
-    return written;
-  }
   holoscan::schema::ImageT image;
   image.width = config_.width;
   image.height = config_.height;
   image.encoding = holoscan::schema::ImageEncoding_MONO32F;
-  auto sent = depth.emit_tensor(std::move(*depth_loan), image, emit);
-  if (!sent && sent.error().code == holoscan::ErrorCode::kBackpressured) {
-    return {};  // A consumer still busy refused it before delivery: send it on the next tick.
-  }
-  if (!sent) {
-    return sent;
-  }
-  if (auto sent_pose = pose.emit(std::move(*pose_loan), emit); !sent_pose) {
-    return sent_pose;
-  }
-  ++emitted_;
-  return {};
+  image.header = std::make_shared<holoscan::schema::HeaderT>();
+  image.header->capture_timestamp_ns = emit.capture_time->timestamp_ns;
+  image.header->frame_id = kCameraFrame;
+  image.header->device_sequence = *emit.frame_id;
+  return depth.emit_tensor(std::move(*depth_loan), image, emit);
 }
 
 }  // namespace height_map_app

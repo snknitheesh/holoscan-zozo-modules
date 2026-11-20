@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "Height Map",
-    "description": "A 2.5D elevation map and its traversability on the GPU with holoscan-height-map: a synthetic depth camera drives over a course with a ramp, steps, a box and a pit; holoscan-point-cloud's DepthToPointCloudOp deprojects each depth image, HeightMapOp maps the clouds with the camera's pose into a window that follows it, and TraversabilityOp computes slope, step height and a cost; every map is checked against the course's truth, and HoloViz shows the elevation beside the cost.",
+    "description": "A 2.5D elevation map and its traversability on the GPU with holoscan-height-map: a synthetic depth camera drives over a course with a ramp, steps, a box and a pit; holoscan-point-cloud's DepthToPointCloudOp deprojects each depth image with the camera's info, which holoscan-messages' CameraInfoSourceOp reads from a camera_info file written at run time, HeightMapOp maps the PointCloud messages with the camera's pose into a window that follows it, and TraversabilityOp computes slope, step height and a cost; every map is checked against the course's truth, and HoloViz shows the elevation beside the cost.",
     "authors": [
       {
         "name": "zozo",
@@ -44,6 +44,9 @@
     },
     "dependencies": {
       "modules": [
+        {
+          "name": "messages"
+        },
         {
           "name": "point-cloud"
         },
