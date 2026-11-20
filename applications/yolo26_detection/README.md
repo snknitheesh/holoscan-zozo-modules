@@ -27,7 +27,13 @@ flowchart LR
 
 ## Demo
 
-Videos of the demo on synthetic input and on real input go in [tests/video](tests/video).
+- [Real video](tests/video/yolo26_detection_real.mp4) (18 s): a phone video of an apple, an orange
+  and a banana moved by hand, run through the yolo26n base model in the demo's pipeline: the file
+  source, `Yolo26DetectionOp`, `Yolo26OverlayOp` and HoloViz. Each fruit, and the hand, is boxed and
+  labelled with its COCO class and score.
+
+The video is HoloViz's offscreen output, its rendered frames recorded one by one rather than
+captured from the screen.
 
 ## Requirements
 
