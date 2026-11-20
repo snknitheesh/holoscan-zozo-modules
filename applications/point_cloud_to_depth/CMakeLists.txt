@@ -14,7 +14,8 @@ if(BUILD_TESTING)
   list(APPEND _holoscan_components testing)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
-find_package(holoscan-point-cloud 1.1 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+find_package(holoscan-point-cloud 2.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
 # The sources, the ground-truth reporter and the PLY, PGM and PPM files.
@@ -29,7 +30,7 @@ target_compile_features(point_cloud_to_depth_ops PUBLIC cxx_std_20)
 target_include_directories(point_cloud_to_depth_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   point_cloud_to_depth_ops
-  PUBLIC holoscan::point_cloud holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::point_cloud holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 # Host code that makes or checks the synthetic clouds computes what the module computes
 # on the GPU: without contracting, whatever the compiler's default. Everything that
