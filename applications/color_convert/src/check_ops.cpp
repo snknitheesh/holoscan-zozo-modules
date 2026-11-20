@@ -6,18 +6,26 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <iomanip>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <holoscan/color_convert/camera_info.hpp>
 #include <holoscan/color_convert/image_view.hpp>
 #include <holoscan/color_convert/reference.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/conversion.hpp>
 
 #include "camera_op.hpp"
 
@@ -25,7 +33,6 @@ namespace color_convert_app {
 namespace {
 
 namespace cc = holoscan::color_convert;
-using std::chrono_literals::operator""ns;
 
 cc::ImageView host_view(std::vector<std::uint8_t>& bytes, cc::PixelFormat format, int width,
                         int height) {
@@ -70,6 +77,19 @@ std::string describe(const Difference& d) {
 }
 
 }  // namespace
+
+holoscan::messages::CameraInfo synthetic_camera(int width, int height) {
+  holoscan::messages::CameraInfo info;
+  info.header.frame_id = "synthetic_camera";
+  info.width = static_cast<std::uint32_t>(width);
+  info.height = static_cast<std::uint32_t>(height);
+  info.state = holoscan::messages::CameraState::kUndistorted;
+  info.fx = width;
+  info.fy = width;
+  info.cx = (width - 1) / 2.0;
+  info.cy = (height - 1) / 2.0;
+  return info;
+}
 
 std::vector<std::uint8_t> camera_frame(const Pipeline& p, std::uint32_t frame) {
   std::vector<std::uint8_t> rgb(cc::packed_size(cc::PixelFormat::kRgb8, p.width, p.height));
@@ -133,16 +153,16 @@ FrameCheckOp::FrameCheckOp(FrameCheckConfig config) : config_(std::move(config))
 void FrameCheckOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(converted, "converted").queue_depth(2U);
   spec.input(resized, "resized").queue_depth(2U);
+  spec.input(resized_camera_info, "resized_camera_info").queue_depth(2U);
 }
 
 holoscan::Contract FrameCheckOp::contract() const {
-  holoscan::Contract result;
-  // A frame's two outputs carry its capture time.
-  result.trigger(
-      holoscan::OnAligned{.ports = holoscan::PortList{{converted, resized}}, .window = 0ns});
-  result.input(converted, holoscan::Exact{});
-  result.input(resized, holoscan::Exact{});
-  return result;
+  // A frame's two outputs and its resized camera info carry its capture time:
+  // ResizeOp sends a camera info with every image.
+  return holoscan::messages::camera_info_contract(
+      holoscan::messages::CameraInfoInputOptions{
+          .timing = holoscan::messages::CameraInfoTiming::kEveryFrame},
+      resized_camera_info, converted, resized);
 }
 
 holoscan::expected<void, holoscan::Error> FrameCheckOp::compute(
@@ -151,6 +171,8 @@ holoscan::expected<void, holoscan::Error> FrameCheckOp::compute(
   if (!a) return holoscan::make_unexpected(std::move(a).error());
   auto b = resized.receive();
   if (!b) return holoscan::make_unexpected(std::move(b).error());
+  auto info = resized_camera_info.receive();
+  if (!info) return holoscan::make_unexpected(std::move(info).error());
   const Pipeline& p = config_.pipeline;
   const auto frame = static_cast<std::uint32_t>(a->metadata.frame_id - 1U);
   auto got_a = fetch(a->data, cc::packed_size(p.converted, p.width, p.height), p.width, p.height,
@@ -161,15 +183,23 @@ holoscan::expected<void, holoscan::Error> FrameCheckOp::compute(
   if (!got_b) return holoscan::make_unexpected(std::move(got_b).error());
   const Difference da = compare(*got_a, expected_converted(p, frame));
   const Difference db = compare(*got_b, expected_resized(p, frame));
+  // The resized camera, with the frame's capture time.
+  holoscan::messages::CameraInfo want_camera =
+      cc::resized_camera_info(p.calibration, p.width, p.height, p.resized_width, p.resized_height,
+                              p.resized, p.resize_params);
+  want_camera.header.capture_timestamp_ns = b->metadata.capture_timestamp_ns;
+  const bool camera_ok = holoscan::messages::from_message(info->data) == want_camera;
   Report& report = *config_.report;
   {
     const std::lock_guard lock(report.mutex);
     keep_worst(report.converted, da);
     keep_worst(report.resized, db);
-    if (!within(da, config_.converted) || !within(db, config_.resized)) {
+    report.wrong_cameras += camera_ok ? 0U : 1U;
+    if (!within(da, config_.converted) || !within(db, config_.resized) || !camera_ok) {
       if (report.failed_frames++ == 0) {
         report.first_failure = "frame " + std::to_string(frame) + ": converted " + describe(da) +
-                               "; resized " + describe(db);
+                               "; resized " + describe(db) +
+                               (camera_ok ? "" : "; the resized camera info differs");
       }
     }
   }
@@ -177,7 +207,65 @@ holoscan::expected<void, holoscan::Error> FrameCheckOp::compute(
   return {};
 }
 
+// Writes RGBA renders as PPM files on a thread of its own, in order, so that
+// the disk never holds up the graph.
+class PpmWriter {
+ public:
+  PpmWriter() : thread_([this] { loop(); }) {}
+  ~PpmWriter() {
+    {
+      const std::lock_guard lock(mutex_);
+      done_ = true;
+    }
+    wake_.notify_one();
+    thread_.join();
+  }
+  PpmWriter(const PpmWriter&) = delete;
+  PpmWriter& operator=(const PpmWriter&) = delete;
+
+  void write(std::filesystem::path path, std::vector<std::uint8_t> rgba, int width, int height) {
+    {
+      const std::lock_guard lock(mutex_);
+      queue_.push_back(Job{std::move(path), std::move(rgba), width, height});
+    }
+    wake_.notify_one();
+  }
+
+ private:
+  struct Job {
+    std::filesystem::path path;
+    std::vector<std::uint8_t> rgba;
+    int width{};
+    int height{};
+  };
+
+  void loop() {
+    std::unique_lock lock(mutex_);
+    for (;;) {
+      wake_.wait(lock, [this] { return done_ || !queue_.empty(); });
+      if (queue_.empty()) return;  // Done, and every file written.
+      Job job = std::move(queue_.front());
+      queue_.pop_front();
+      lock.unlock();
+      std::ofstream file(job.path, std::ios::binary);
+      file << "P6\n" << job.width << ' ' << job.height << "\n255\n";
+      for (std::size_t i = 0; i < job.rgba.size(); i += 4) {
+        file.write(reinterpret_cast<const char*>(job.rgba.data() + i), 3);
+      }
+      lock.lock();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<Job> queue_;
+  bool done_{};
+  std::thread thread_;  // Last: started once the rest exists.
+};
+
 RenderCheckOp::RenderCheckOp(RenderCheckConfig config) : config_(std::move(config)) {}
+
+RenderCheckOp::~RenderCheckOp() = default;
 
 void RenderCheckOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(rendered, "rendered").queue_depth(2U);
@@ -188,6 +276,14 @@ holoscan::Contract RenderCheckOp::contract() const {
   result.trigger(holoscan::OnEach{rendered});
   return result;
 }
+
+void RenderCheckOp::start() {
+  if (!config_.image_dir.empty()) {
+    writer_ = std::make_unique<PpmWriter>();
+  }
+}
+
+void RenderCheckOp::stop() { writer_.reset(); }
 
 namespace {
 
@@ -224,15 +320,6 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
   auto got = fetch(sample->data, cc::packed_size(cc::PixelFormat::kRgba8, p.width, p.height),
                    p.width, p.height, context, "rendered");
   if (!got) return holoscan::make_unexpected(std::move(got).error());
-  if (!config_.image_dir.empty()) {
-    std::ostringstream name;
-    name << "render_" << std::setw(4) << std::setfill('0') << index << ".ppm";
-    std::ofstream file(config_.image_dir / name.str(), std::ios::binary);
-    file << "P6\n" << p.width << ' ' << p.height << "\n255\n";
-    for (std::size_t i = 0; i < got->size(); i += 4) {
-      file.write(reinterpret_cast<const char*>(got->data() + i), 3);
-    }
-  }
   const std::optional<std::uint32_t> frame = frame_shown(*got, p.width, config_.inset_y / 2);
   std::string problem;
   Difference d;
@@ -285,6 +372,11 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
     if (!problem.empty() && report.failed_renders++ == 0 && report.first_failure.empty()) {
       report.first_failure = "render " + std::to_string(index) + ": " + problem;
     }
+  }
+  if (writer_) {
+    std::ostringstream name;
+    name << "render_" << std::setw(4) << std::setfill('0') << index << ".ppm";
+    writer_->write(config_.image_dir / name.str(), std::move(*got), p.width, p.height);
   }
   report.rendered.fetch_add(1);
   return {};

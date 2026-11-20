@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Color Convert: a synthetic camera sends NV12 or YUYV frames of moving
-// colour bars over gradients; ColorConvertOp turns each into RGBA8 at full
-// size, and ResizeOp letterboxes it into a small RGBA8 image in the same pass.
-// HoloViz shows the full frame with the small one inset, in a window or
-// rendered offscreen. Headless and offscreen runs check every output, and
-// every render, against the module's CPU reference.
+// colour bars over gradients, and its camera_info file, written for the run,
+// goes to CameraInfoSourceOp; ColorConvertOp turns each frame into RGBA8 at
+// full size, and ResizeOp letterboxes it into a small RGBA8 image in the same
+// pass, with the camera of that image. HoloViz shows the full frame with the
+// small one inset, in a window or rendered offscreen. Headless and offscreen
+// runs check every output, every resized camera and every render against the
+// module's CPU reference, on one worker.
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -39,6 +44,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #if COLOR_CONVERT_APP_ENABLE_VISUALIZATION
 #include <holoscan/visualization/holoviz_op.hpp>
@@ -52,6 +60,7 @@ namespace {
 using std::chrono_literals::operator""ms;
 namespace app = color_convert_app;
 namespace cc = holoscan::color_convert;
+namespace hm = holoscan::messages;
 
 constexpr std::string_view kAppName = "color_convert";
 
@@ -237,7 +246,50 @@ void validate(Options& opts) {
                                        .output_format = cc::PixelFormat::kRgba8,
                                        .backend = opts.backend});
   cc::check_available(opts.backend);
+  if (opts.backend == cc::Backend::kVic && !cc::probe_platform().has_vic) {
+    throw std::invalid_argument(
+        "--backend vic: VPI reports no VIC on this platform; use cuda, or auto to take the VIC "
+        "where there is one");
+  }
 }
+
+// The synthetic camera's camera_info file, written for CameraInfoSourceOp to
+// read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every way out of the run.
+class CameraInfoFile {
+ public:
+  explicit CameraInfoFile(const hm::CameraInfo& camera) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(camera, path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~CameraInfoFile() { remove(); }
+  CameraInfoFile(const CameraInfoFile&) = delete;
+  CameraInfoFile& operator=(const CameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
 
 app::Pipeline pipeline(const Options& opts) {
   return app::Pipeline{
@@ -253,6 +305,7 @@ app::Pipeline pipeline(const Options& opts) {
                                             .mode = opts.mode,
                                             .letterbox = opts.letterbox,
                                             .fill_rgb = {48, 48, 48}},
+      .calibration = app::synthetic_camera(opts.width, opts.height),
   };
 }
 
@@ -288,18 +341,22 @@ int execute(const Options& opts, SignalDomain& signals) {
   const bool live = opts.display == Display::kWindow;
   const bool offscreen = opts.display == Display::kOffscreen;
 
-  // Lossless (no window): one frame in flight, sent once its outputs (and
-  // its render) are checked; every frame is converted, checked and rendered.
-  // Live (a window): every edge keeps only the newest frame.
-  app::SyntheticCameraConfig camera_config{.format = opts.camera,
+  // Lossless (no window): every frame is converted and checked, on one
+  // worker (below). Live (a window): every edge keeps only the newest frame.
+  auto camera = graph.op<app::SyntheticCameraOp>(
+      "camera", app::SyntheticCameraConfig{.format = opts.camera,
                                            .width = opts.width,
                                            .height = opts.height,
                                            .count = *opts.count,
-                                           .period = std::chrono::milliseconds(opts.period_ms)};
+                                           .period = std::chrono::milliseconds(opts.period_ms)});
+  // Checked runs take the camera's calibration from the camera_info file
+  // written for this run, and check the resized camera of every frame. The
+  // run reads the file again when it starts, so it stays until the run is
+  // over.
+  std::optional<CameraInfoFile> camera_info_file;
   if (!live) {
-    camera_config.done = [report] { return report->frames.load(); };
+    camera_info_file.emplace(pipe.calibration);
   }
-  auto camera = graph.op<app::SyntheticCameraOp>("camera", std::move(camera_config));
   auto convert = graph.op<cc::ColorConvertOp>(
       "convert", cc::ColorConvertConfig{.output_format = pipe.converted,
                                         .matrix = app::kCameraMatrix,
@@ -320,9 +377,11 @@ int execute(const Options& opts, SignalDomain& signals) {
                                  .matrix = app::kCameraMatrix,
                                  .range = app::kCameraRange,
                                  .backend = opts.backend,
-                                 .on_backend = [report](cc::Backend backend) {
-                                   report->resize_backend = static_cast<int>(backend);
-                                 }});
+                                 .on_backend =
+                                     [report](cc::Backend backend) {
+                                       report->resize_backend = static_cast<int>(backend);
+                                     },
+                                 .with_camera_info = !live});
 
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   const holoscan::ConnectionOptions newest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
@@ -331,6 +390,10 @@ int execute(const Options& opts, SignalDomain& signals) {
   graph.add_flow(camera->image, convert->image, edge);
   graph.add_flow(camera->image, resize->image, edge);
   if (!live) {
+    auto camera_info = graph.op<hm::CameraInfoSourceOp>(
+        "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file->path()});
+    graph.add_flow(camera_info->camera_info, resize->camera_info,
+                   hm::latest_camera_info_connection());
     // The cuda backend matches the reference byte for byte; the VIC within
     // its tolerance (the module's VIC parity test).
     const app::Tolerance tolerance{.exact = opts.backend == cc::Backend::kCuda};
@@ -340,6 +403,7 @@ int execute(const Options& opts, SignalDomain& signals) {
             .report = report, .pipeline = pipe, .converted = tolerance, .resized = tolerance});
     graph.add_flow(convert->converted, check->converted, lossless);
     graph.add_flow(resize->resized, check->resized, lossless);
+    graph.add_flow(resize->resized_camera_info, check->resized_camera_info, lossless);
   }
 
   holoscan::CompileOptions compile_options;
@@ -401,6 +465,16 @@ int execute(const Options& opts, SignalDomain& signals) {
     }
   }
 #endif
+  if (!live) {
+    // One worker for the whole graph. The camera info is a second source and
+    // the frames fan out, so the automatic partitioning would give the
+    // camera, the camera info and each operator after a fork or join a worker
+    // of its own; a producer would then run while its consumer's lossless
+    // queue is full, and an operator in the middle of the chain fail on the
+    // refused emit. The window's drop-oldest edges lose frames rather than
+    // wait, and keep the automatic partitioning.
+    graph.partition(std::string(kAppName)).include_all();
+  }
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   const auto plan = holoscan::compile(graph, std::move(compile_options));
@@ -411,7 +485,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition with operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -501,7 +576,8 @@ int execute(const Options& opts, SignalDomain& signals) {
       !timed_out && all_checked && auto_ok && termination != holoscan::RunTermination::kFailed;
   {
     const std::lock_guard lock(report->mutex);
-    passed = passed && report->failed_frames == 0 && report->failed_renders == 0;
+    passed = passed && report->failed_frames == 0 && report->failed_renders == 0 &&
+             report->wrong_cameras == 0;
     // Offscreen, HoloViz must have rendered, with the inset at least once.
     passed = passed && (!offscreen || (report->rendered.load() != 0 && report->insets_seen != 0));
     std::cout << std::fixed << std::setprecision(3) << kAppName
@@ -509,7 +585,8 @@ int execute(const Options& opts, SignalDomain& signals) {
               << " converted: mean=" << report->converted.mean << " p99=" << report->converted.p99
               << " max=" << report->converted.max << " differing=" << report->converted.wrong
               << " resized: mean=" << report->resized.mean << " p99=" << report->resized.p99
-              << " max=" << report->resized.max << " differing=" << report->resized.wrong;
+              << " max=" << report->resized.max << " differing=" << report->resized.wrong
+              << " cameras: wrong=" << report->wrong_cameras;
     if (offscreen) {
       std::cout << " renders=" << report->rendered.load() << " insets=" << report->insets_seen
                 << " render: mean=" << report->render.mean << " max=" << report->render.max;

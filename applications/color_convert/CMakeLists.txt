@@ -16,6 +16,7 @@ if(COLOR_CONVERT_APP_ENABLE_VISUALIZATION)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(holoscan-color-convert 1.0 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
 # The synthetic camera and the checks.
@@ -24,7 +25,7 @@ target_compile_features(color_convert_app_ops PUBLIC cxx_std_20)
 target_include_directories(color_convert_app_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   color_convert_app_ops
-  PUBLIC holoscan::color_convert holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::color_convert holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 
 add_executable(color_convert src/main.cpp)

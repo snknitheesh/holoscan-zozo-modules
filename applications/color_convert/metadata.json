@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "Color Convert",
-    "description": "A synthetic camera's NV12 or YUYV frames converted to RGBA by holoscan-color-convert's ColorConvertOp and letterboxed by its ResizeOp in the same pass, shown by HoloViz in a window or rendered offscreen, with every output and render checked against the module's CPU reference.",
+    "description": "A synthetic camera's NV12 or YUYV frames converted to RGBA by holoscan-color-convert's ColorConvertOp and letterboxed by its ResizeOp in the same pass, with the camera's info from a camera_info file resized alongside, shown by HoloViz in a window or rendered offscreen, with every output, resized camera info and render checked against the module's CPU reference on one worker.",
     "authors": [
       {
         "name": "zozo",
@@ -50,6 +50,9 @@
       "modules": [
         {
           "name": "color-convert"
+        },
+        {
+          "name": "messages"
         }
       ]
     },
@@ -63,14 +66,14 @@
         }
       },
       "offscreen": {
-        "description": "HoloViz renders offscreen into CUDA memory: 60 frames, each output checked against the CPU reference and each render against its frame.",
+        "description": "HoloViz renders offscreen into CUDA memory: 60 frames on one worker, each output and resized camera info checked against the CPU reference and each render against its frame.",
         "run": {
           "command": "\"<holohub_app_bin>/color_convert\" --camera nv12 --count 60 --period-ms 10 --display offscreen",
           "workdir": "holohub_app_bin"
         }
       },
       "ci": {
-        "description": "Finite headless check: 60 YUYV and 1080p frames on the auto backend, every output checked against the CPU reference (byte for byte on CUDA, within tolerance on the VIC); on a CI runner, auto must take the VIC on the Jetson and CUDA on x86_64.",
+        "description": "Finite headless check on one worker: 60 YUYV and 1080p frames on the auto backend, every output checked against the CPU reference (byte for byte on CUDA, within tolerance on the VIC) and every resized camera info against the resized camera; on a CI runner, auto must take the VIC on the Jetson and CUDA on x86_64.",
         "run": {
           "command": "\"<holohub_app_bin>/color_convert\" --camera yuyv --backend auto --count 60 --period-ms 10 --display none",
           "workdir": "holohub_app_bin"

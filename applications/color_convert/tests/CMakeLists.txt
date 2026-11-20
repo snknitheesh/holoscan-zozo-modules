@@ -32,20 +32,34 @@ color_convert_app_test(color_convert_app_auto 0 "verdict=PASS"
   --camera yuyv --backend auto --count 10 --period-ms 5 --display none
 )
 
+# The lossless graph runs on one worker.
+color_convert_app_test(color_convert_app_one_worker 0 "^color_convert: plan=OK workers=1\n*$"
+  --display none --compile-only true
+)
+
 # Invalid options fail fast with a usage error (exit status 2).
 color_convert_app_test(color_convert_app_rejects_camera 2 "^error: " --camera rgb8)
 color_convert_app_test(color_convert_app_rejects_odd_width 2 "^error: " --width 1921)
 color_convert_app_test(color_convert_app_rejects_zero_count 2 "^error: "
   --count 0 --display none
 )
+if(NOT holoscan-color-convert_WITH_VPI)
+  # Without a VIC, --backend vic is a usage error, not a failure at graph construction.
+  color_convert_app_test(color_convert_app_rejects_vic 2 "^error: [^\n]*vic" --backend vic)
+endif()
 
 if(COLOR_CONVERT_APP_ENABLE_VISUALIZATION)
   # HoloViz renders offscreen into CUDA memory; every render is checked against the frame.
   color_convert_app_test(color_convert_app_offscreen 0 "renders=[1-9][0-9]* insets=[1-9].*verdict=PASS"
     --camera nv12 --backend cuda --count 15 --period-ms 5 --display offscreen
   )
-  # The window graph compiles, with or without a display to run it.
-  color_convert_app_test(color_convert_app_window_plan 0 "plan=OK"
+  # The offscreen graph is lossless as well, on one worker.
+  color_convert_app_test(color_convert_app_offscreen_one_worker 0
+    "^color_convert: plan=OK workers=1\n*$" --display offscreen --compile-only true
+  )
+  # The window graph compiles, with or without a display to run it; its drop-oldest edges keep
+  # the automatic partitioning.
+  color_convert_app_test(color_convert_app_window_plan 0 "plan=OK workers=[1-9]"
     --display window --compile-only true
   )
 endif()

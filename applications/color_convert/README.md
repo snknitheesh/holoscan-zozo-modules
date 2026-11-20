@@ -5,9 +5,11 @@ sends 1920x1080 NV12 or YUYV frames (BT.709, limited range) of colour bars movin
 gradients. `ColorConvertOp` turns each frame into RGBA8, and `ResizeOp` letterboxes it into a
 640x640 RGBA8 image in the same pass, converting as it resizes. HoloViz shows the full frame with
 the small one inset in its top right corner, in a window or rendered offscreen into CUDA memory.
-Headless and offscreen, every output is checked against the module's CPU reference, and every
-render against its frame. It uses the installed module the way any other project would:
-`find_package(holoscan-color-convert)`.
+Headless and offscreen, the camera's calibration also comes from a camera_info file that the demo
+writes for the run (`CameraInfoSourceOp`), `ResizeOp` sends the camera of each resized image, and
+every output, every resized camera and every render is checked against the module's CPU
+reference. It uses the installed modules the way any other project would:
+`find_package(holoscan-color-convert)` and `find_package(holoscan-messages)`.
 
 ![An offscreen render: the converted frame, with the letterboxed resize inset](images/offscreen_render.png)
 
@@ -16,8 +18,8 @@ An offscreen render (shown at half size): the converted 1920x1080 frame, and in 
 
 ## Requirements
 
-- holoscan-color-convert, installed (see [its README](../../modules/color-convert/README.md)), and
-  what it needs: Holoscan SDK 5.0 with Core, Sensor I/O and Visualization, CUDA 13, CMake 4.0 or
+- holoscan-color-convert and holoscan-messages, installed (see
+  [its README](../../modules/color-convert/README.md)), and what they need: Holoscan SDK 5.0 with Core, Sensor I/O and Visualization, CUDA 13, CMake 4.0 or
   later and a C++20 compiler.
 - A display for the window; the offscreen and headless modes need none.
 
@@ -43,13 +45,19 @@ The modes in [metadata.json](metadata.json) are the three commands above:
 | Mode | What it does |
 | --- | --- |
 | `window` | Live, at 30 frames per second until the window is closed. Every edge keeps only the newest frame, so a slow display never holds back the camera. Nothing is checked. |
-| `offscreen` | HoloViz renders into CUDA memory instead of a window. Every frame's outputs are checked, and every render: outside the inset it must be the converted frame (it is, byte for byte), and the inset must show the letterbox's fill. A check finds which frame a render shows from where its colour bars are. |
-| `ci` | Headless and finite, the check CI runs: 60 YUYV frames on the `auto` backend, every output checked against the reference. When `HOLOSCAN_CI_PLATFORM` is set, as on the CI runners, `auto` must have taken the VIC on `jetson` and CUDA on `x86_64`. |
+| `offscreen` | HoloViz renders into CUDA memory instead of a window. Every frame's outputs and resized camera are checked, and every render: outside the inset it must be the converted frame (it is, byte for byte), and the inset must show the letterbox's fill. A check finds which frame a render shows from where its colour bars are. `--image-dir DIR` writes the renders on a thread of their own. |
+| `ci` | Headless and finite, the check CI runs: 60 YUYV frames on the `auto` backend, every output checked against the reference and every resized camera against the formula. When `HOLOSCAN_CI_PLATFORM` is set, as on the CI runners, `auto` must have taken the VIC on `jetson` and CUDA on `x86_64`. |
 
-Outside the window, the camera keeps one frame in flight: it sends the next once the last one's
-outputs are checked, so nothing is dropped. The `cuda` backend must match the reference byte for
-byte; the VIC within its tolerance, a mean difference of 1.5 codes and a 99th percentile of 4 (it
-interpolates chroma, so at the bars' edges it differs most).
+Outside the window, the graph is lossless and runs on one worker
+(`graph.partition("color_convert").include_all()`), so every frame is converted and checked, and
+the camera never waits for the checks; `--compile-only true` prints `workers=1`. The window keeps
+the automatic partitioning, since its drop-oldest edges lose frames rather than wait. The camera
+sends its first frame on its second tick, after the camera info, and treats a refusal (a full queue,
+or every slot of its output's pool still held) as backpressure: it sends the same frame again on
+the next tick. The `cuda` backend must match the reference byte for byte; the VIC within its
+tolerance, a mean difference of 1.5 codes and a 99th percentile of 4 (it interpolates chroma, so at
+the bars' edges it differs most). That tolerance is loose for geometry; the module's
+`color_convert_vic_parity` test checks the VIC's geometry against CUDA more tightly.
 
 On a Jetson, the demo links the Vulkan loader first: once VPI has loaded Tegra's EGL driver,
 HoloViz can no longer create its Vulkan instance. In a headless container there, leave `DISPLAY`
@@ -68,11 +76,13 @@ color_convert: frames=60/60 converted: mean=0.673 p99=2 max=181 differing=342841
 color_convert: verdict=PASS
 ```
 
-That is the `ci` mode on a Jetson AGX Orin, where `auto` takes the VIC; on x86_64 it takes CUDA,
+That is the `ci` mode on Jetson Orin, where `auto` takes the VIC; on x86_64 it takes CUDA,
 and every byte matches (`differing=0`).
 
 ## Tests
 
 `ctest` in the build folder runs the demo headless on CUDA for both camera formats and every
-sampling mode, byte for byte; on `auto`; offscreen, with every render checked; compiles the window
-graph; and checks that bad options exit with a usage error.
+sampling mode, byte for byte, with every resized camera checked; on `auto`; offscreen, with every
+render checked; checks that the headless and offscreen graphs compile to one worker and that the
+window graph compiles; and checks that bad options exit with a usage error, `--backend vic` among
+them where there is no VIC.

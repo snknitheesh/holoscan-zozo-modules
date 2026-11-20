@@ -27,6 +27,14 @@ holoscan::Error failure(const std::string& what) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, "SyntheticCameraOp: " + what};
 }
 
+// A refusal to send again on the next tick: a full lossless queue refuses the
+// emit (kBackpressured), and an output pool whose every slot is still held
+// refuses the allocation (kResourceExhausted). Neither sends anything.
+bool backpressure(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
+
 }  // namespace
 
 void validate_config(const SyntheticCameraConfig& config) {
@@ -75,6 +83,7 @@ holoscan::Contract SyntheticCameraOp::contract() const {
 }
 
 void SyntheticCameraOp::start() {
+  started_ = false;
   sent_ = 0;
   converter_ = std::make_unique<cc::Converter>(cc::Backend::kCuda);
   if (rgb_ == nullptr && cudaMalloc(&rgb_, cc::packed_size(cc::PixelFormat::kRgb8, config_.width,
@@ -94,7 +103,11 @@ void SyntheticCameraOp::stop() {
 
 holoscan::expected<void, holoscan::Error> SyntheticCameraOp::compute(
     holoscan::ExecutionContext& context) {
-  if ((config_.count != 0 && sent_ >= config_.count) || (config_.done && config_.done() < sent_)) {
+  if (!started_) {
+    started_ = true;  // The camera info goes first.
+    return {};
+  }
+  if (config_.count != 0 && sent_ >= config_.count) {
     return {};
   }
   cudaStream_t stream = context.cuda_stream().get();
@@ -112,7 +125,8 @@ holoscan::expected<void, holoscan::Error> SyntheticCameraOp::compute(
                                               : std::vector<std::int64_t>{h, w, 2};
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    return backpressure(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                      : holoscan::make_unexpected(std::move(loan).error());
   }
   auto writer = loan->write(stream);
   if (!writer) {
@@ -155,10 +169,8 @@ holoscan::expected<void, holoscan::Error> SyntheticCameraOp::compute(
     ++sent_;
     return {};
   }
-  // A busy consumer on a lossless edge refuses the frame: send it again next tick.
-  return emitted.error().code == holoscan::ErrorCode::kBackpressured
-             ? holoscan::expected<void, holoscan::Error>{}
-             : emitted;
+  // Refused: the same frame (sent_ unchanged) goes again on the next tick.
+  return backpressure(emitted.error()) ? holoscan::expected<void, holoscan::Error>{} : emitted;
 }
 
 }  // namespace color_convert_app

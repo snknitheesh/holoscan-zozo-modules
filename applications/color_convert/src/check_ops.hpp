@@ -3,7 +3,8 @@
 //
 // The demo's checks, against the module's CPU reference of each frame:
 // FrameCheckOp compares what ColorConvertOp and ResizeOp made of a camera
-// frame; RenderCheckOp compares HoloViz's offscreen render of them.
+// frame, and the resized camera; RenderCheckOp compares HoloViz's offscreen
+// render of them.
 
 #pragma once
 
@@ -24,6 +25,8 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace color_convert_app {
@@ -46,7 +49,13 @@ struct Pipeline {
   int resized_width{640};
   int resized_height{640};
   holoscan::color_convert::ConversionParams resize_params;
+  // The camera of the frames, from the camera_info file the demo writes.
+  holoscan::messages::CameraInfo calibration;
 };
+
+// The synthetic camera: `width` x `height`, undistorted, a focal length of the
+// width (about 53 degrees across), the principal point at the centre.
+holoscan::messages::CameraInfo synthetic_camera(int width, int height);
 
 // The bytes the camera sends for `frame`, and what ColorConvertOp and
 // ResizeOp should make of them.
@@ -69,11 +78,15 @@ struct Report {
   Difference render;
   std::uint32_t failed_frames{};
   std::uint32_t failed_renders{};
-  std::uint32_t insets_seen{};  // Renders that show the inset's letterbox band.
+  std::uint32_t wrong_cameras{};  // Resized camera infos that are not the expected one.
+  std::uint32_t insets_seen{};    // Renders that show the inset's letterbox band.
   std::string first_failure;
 };
 
-// Byte-exact (the cuda backend) or within the VIC's tolerance.
+// Byte-exact (the cuda backend) or within the VIC's tolerance. A mean and a
+// 99th percentile over a whole frame would let a small geometric error (a
+// shift of a pixel) through; the module's color_convert_vic_parity test pins
+// the VIC's geometry against CUDA (largest difference 10 on a smooth picture).
 struct Tolerance {
   bool exact{true};
   double mean{1.5};
@@ -87,8 +100,8 @@ struct FrameCheckConfig {
   Tolerance resized;
 };
 
-// Receives a frame's two outputs, paired by capture time, and checks each
-// against the reference.
+// Receives a frame's two outputs and the resized camera info, paired by
+// capture time, and checks each against the reference.
 class FrameCheckOp final : public holoscan::Operator<> {
  public:
   explicit FrameCheckOp(FrameCheckConfig config);
@@ -100,10 +113,13 @@ class FrameCheckOp final : public holoscan::Operator<> {
 
   holoscan::Input<holoscan::schema::ImageT> converted;
   holoscan::Input<holoscan::schema::ImageT> resized;
+  holoscan::Input<holoscan::messages::schema::CameraInfoT> resized_camera_info;
 
  private:
   FrameCheckConfig config_;
 };
+
+class PpmWriter;
 
 struct RenderCheckConfig {
   std::shared_ptr<Report> report;
@@ -114,7 +130,8 @@ struct RenderCheckConfig {
   int inset_y{};
   int inset_width{};
   int inset_height{};
-  // When set, every render is also written there as PPM.
+  // When set, every render is also written there as PPM, by a thread of its
+  // own: the files never hold up the graph.
   std::filesystem::path image_dir;
 };
 
@@ -124,9 +141,13 @@ struct RenderCheckConfig {
 class RenderCheckOp final : public holoscan::Operator<> {
  public:
   explicit RenderCheckOp(RenderCheckConfig config);
+  ~RenderCheckOp() override;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  void start() override;
+  // Waits for the files still to be written.
+  void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
@@ -134,6 +155,7 @@ class RenderCheckOp final : public holoscan::Operator<> {
 
  private:
   RenderCheckConfig config_;
+  std::unique_ptr<PpmWriter> writer_;
 };
 
 }  // namespace color_convert_app
