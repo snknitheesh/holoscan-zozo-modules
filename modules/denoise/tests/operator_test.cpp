@@ -545,7 +545,32 @@ void check_fusion_unstamped() {
   const std::size_t fused =
       result.ok() ? result.snapshots<holoscan::schema::ImageT>("image").size() : 0U;
   std::printf("  unstamped bracket: run %s, %zu fused\n", result.ok() ? "ok" : "failed", fused);
+  VERIFY_MSG(!result.ok(), "a bracket without a capture time did not fail the run");
   VERIFY_MSG(fused == 0, "a bracket without a capture time was fused");
+}
+
+// A bracket stamped before the one before it on its port fails the run.
+void check_fusion_backwards() {
+  const HdrScene scene{.width = kWidth, .height = kHeight, .channels = 3};
+  ExposureFusionOpConfig config{.brackets = 2};
+  config.max_width = 256;
+  config.max_height = 256;
+  auto h = holoscan::testing::create_operator_test<ExposureFusionOp>(config);
+  for (const char* port : {"bracket0", "bracket1"}) {
+    const float exposure =
+        std::string_view(port) == "bracket0" ? kBracketExposures[0] : kBracketExposures[2];
+    std::vector<holoscan::testing::TestSample<holoscan::schema::ImageT>> samples;
+    for (const std::uint32_t f : {1U, 0U}) {
+      samples.push_back(
+          holoscan::testing::sample_at(bracket_image(scene, exposure, false), capture_time(f)));
+    }
+    h.push_samples(port, std::move(samples));
+  }
+  h.output_device("image", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("image");
+  const auto result = h.run();
+  std::printf("  backwards brackets: run %s\n", result.ok() ? "ok" : "failed");
+  VERIFY_MSG(!result.ok(), "brackets stamped backwards did not fail the run");
 }
 
 // One float or 16-bit frame, tone mapped as the reference maps it (within one
@@ -694,6 +719,7 @@ int main() {
   cases.push_back({"ExposureFusionOp a dropped bracket", dn::check_fusion_dropped_bracket});
   cases.push_back({"ExposureFusionOp provenance", dn::check_fusion_provenance});
   cases.push_back({"ExposureFusionOp unstamped bracket", dn::check_fusion_unstamped});
+  cases.push_back({"ExposureFusionOp backwards brackets", dn::check_fusion_backwards});
   cases.push_back({"ExposureFusionOp tone map, host", [] { dn::check_tone_map_op(false); }});
   cases.push_back({"ExposureFusionOp tone map, device", [] { dn::check_tone_map_op(true); }});
   cases.push_back({"ExposureFusionOp rejections", dn::check_fusion_rejections});
