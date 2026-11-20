@@ -314,32 +314,59 @@ void ConversionRunner::reset() noexcept {
   if (staging_ != nullptr) {
     cudaFree(staging_);  // Waits for the work that may still read it.
   }
+  if (staging_read_ != nullptr) {
+    cudaEventDestroy(staging_read_);
+  }
   staging_ = nullptr;
   staging_bytes_ = 0;
+  staging_read_ = nullptr;
+  staging_recorded_ = false;
   logged_backend_.reset();
   copy_logged_ = false;
+  vic_logged_ = false;
 }
 
 holoscan::expected<void*, holoscan::Error> ConversionRunner::staging(std::size_t bytes,
                                                                      cudaStream_t stream) {
-  if (staging_bytes_ >= bytes) {
-    return staging_;
+  const auto cuda_failure = [this](const char* what, cudaError_t status) {
+    return holoscan::make_unexpected(error(holoscan::ErrorCode::kFailure, name_,
+                                           std::string(what) + ": " + cudaGetErrorString(status)));
+  };
+  if (staging_read_ == nullptr) {
+    if (const cudaError_t status = cudaEventCreateWithFlags(&staging_read_, cudaEventDisableTiming);
+        status != cudaSuccess) {
+      staging_read_ = nullptr;
+      return cuda_failure("cudaEventCreateWithFlags", status);
+    }
   }
-  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-    return holoscan::make_unexpected(
-        error(holoscan::ErrorCode::kFailure, name_,
-              std::string("cudaStreamSynchronize: ") + cudaGetErrorString(status)));
-  }
-  cudaFree(staging_);
-  staging_ = nullptr;
-  staging_bytes_ = 0;
-  if (const cudaError_t status = cudaMalloc(&staging_, bytes); status != cudaSuccess) {
+  if (staging_bytes_ < bytes) {
+    // A larger image: the old buffer goes once the last conversion has read
+    // it. The only CPU wait, and only when the input grows.
+    if (staging_recorded_) {
+      if (const cudaError_t status = cudaEventSynchronize(staging_read_); status != cudaSuccess) {
+        return cuda_failure("cudaEventSynchronize", status);
+      }
+      staging_recorded_ = false;
+    }
+    cudaFree(staging_);
     staging_ = nullptr;
-    return holoscan::make_unexpected(
-        error(holoscan::ErrorCode::kFailure, name_,
-              "cudaMalloc of " + std::to_string(bytes) + " bytes: " + cudaGetErrorString(status)));
+    staging_bytes_ = 0;
+    if (const cudaError_t status = cudaMalloc(&staging_, bytes); status != cudaSuccess) {
+      staging_ = nullptr;
+      return holoscan::make_unexpected(error(
+          holoscan::ErrorCode::kFailure, name_,
+          "cudaMalloc of " + std::to_string(bytes) + " bytes: " + cudaGetErrorString(status)));
+    }
+    staging_bytes_ = bytes;
   }
-  staging_bytes_ = bytes;
+  // The runtime gives no promise that `stream` is the stream of the last
+  // activation: order this frame's copy after the last read on the GPU.
+  if (staging_recorded_) {
+    if (const cudaError_t status = cudaStreamWaitEvent(stream, staging_read_, 0);
+        status != cudaSuccess) {
+      return cuda_failure("cudaStreamWaitEvent", status);
+    }
+  }
   return staging_;
 }
 
@@ -361,6 +388,12 @@ holoscan::expected<void, holoscan::Error> ConversionRunner::run(
     return holoscan::make_unexpected(std::move(viewed).error());
   }
   ImageView source = viewed->view;
+  if (target.input_format && source.format != *target.input_format) {
+    return holoscan::make_unexpected(
+        error(holoscan::ErrorCode::kInvalidArgument, name_,
+              "the image is " + std::string(format_name(source.format)) + ", and input_format is " +
+                  std::string(format_name(*target.input_format))));
+  }
   // The runtime gives a stream to an operator with device outputs, and orders
   // device and stream-ready inputs on it before compute().
   cudaStream_t stream = context.cuda_stream().get();
@@ -383,7 +416,7 @@ holoscan::expected<void, holoscan::Error> ConversionRunner::run(
               "a " + std::to_string(width) + "x" + std::to_string(height) + " " +
                   std::string(format_name(format)) + " image needs " + std::to_string(bytes) +
                   " bytes, more than the output's capacity of " + std::to_string(target.max_bytes) +
-                  "; raise max_width and max_height"));
+                  "; " + target.capacity_hint));
   }
 
   // Every backend reads device memory: host images are staged once a frame.
@@ -451,13 +484,32 @@ holoscan::expected<void, holoscan::Error> ConversionRunner::run(
     }
     if (viewed->view.location == MemoryLocation::kHost && !copy_logged_) {
       copy_logged_ = true;
+      const bool pinned = tensor.device().device_type == kDLCUDAHost;
       HOLOSCAN_LOG_INFO(
           "{} ({} backend): the images are in host memory and the backend reads CUDA device "
-          "memory, so each frame is copied host to device, {} bytes ({:.1f} MB) per frame; to "
+          "memory, so each frame is copied host to device, {} bytes ({:.1f} MB) per frame{}; to "
           "avoid the copy, send CUDA device images",
-          name_, backend_name(chosen), viewed->span, static_cast<double>(viewed->span) / 1e6);
+          name_, backend_name(chosen), viewed->span, static_cast<double>(viewed->span) / 1e6,
+          pinned ? ", without waiting"
+                 : ", and the CPU waits twice: for the image's writer, and for the copy out of "
+                   "pageable memory (pinned host images are copied without either)");
+    }
+    if (chosen == Backend::kVic && !vic_logged_) {
+      vic_logged_ = true;
+      HOLOSCAN_LOG_INFO(
+          "{} (vic): the VIC runs on its own VPI stream, so the operator's thread waits twice a "
+          "frame: for its CUDA stream before the VIC reads, and for the VIC before it returns",
+          name_);
     }
     (void)converter_.convert(source, destination, params, stream);
+    if (viewed->view.location == MemoryLocation::kHost) {
+      // The staging buffer was read: the next frame's copy waits for this.
+      if (const cudaError_t status = cudaEventRecord(staging_read_, stream);
+          status != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaEventRecord: ") + cudaGetErrorString(status));
+      }
+      staging_recorded_ = true;
+    }
   } catch (const std::exception& failure) {
     // Nothing queued may still use the images after this returns.
     cudaStreamSynchronize(stream);
@@ -469,10 +521,17 @@ holoscan::expected<void, holoscan::Error> ConversionRunner::run(
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
   }
+  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*sample);
+  if (target.before_emit) {
+    if (auto ready = target.before_emit(viewed->view.width, viewed->view.height, format, emit);
+        !ready) {
+      return ready;
+    }
+  }
   return output.emit_tensor(std::move(*loan),
                             output_descriptor(image, format, width, height, params.matrix,
                                               source.format, target.keep_roi),
-                            holoscan::sensor_io::derive_from(*sample));
+                            emit);
 }
 
 }  // namespace holoscan::color_convert::detail

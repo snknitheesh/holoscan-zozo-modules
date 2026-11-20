@@ -38,7 +38,17 @@ else()
     OFF
   )
 endif()
-option(HOLOSCAN_COLOR_CONVERT_WITH_VPI "Build the vic backend when VPI 4 is installed" ON)
+# The VIC is a Jetson's: on other platforms VPI would only add a dependency that reports no VIC.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set(_holoscan_color_convert_vpi_default ON)
+else()
+  set(_holoscan_color_convert_vpi_default OFF)
+endif()
+option(
+  HOLOSCAN_COLOR_CONVERT_WITH_VPI
+  "Build the vic backend when VPI 4 is installed"
+  ${_holoscan_color_convert_vpi_default}
+)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -50,6 +60,11 @@ if(HOLOSCAN_COLOR_CONVERT_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info messages: the target of this build when the repository root added
+# holoscan-messages first, else its installed package.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 set(HOLOSCAN_COLOR_CONVERT_VPI OFF)
 if(HOLOSCAN_COLOR_CONVERT_WITH_VPI)
@@ -63,9 +78,10 @@ if(HOLOSCAN_COLOR_CONVERT_WITH_VPI)
 endif()
 
 # holoscan::color_convert: the conversion engine (CUDA kernel and VIC), its CPU reference,
-# ColorConvertOp and ResizeOp.
+# ColorConvertOp, ResizeOp and the resized camera info.
 add_library(
   holoscan_color_convert
+  src/camera_info.cpp
   src/color_convert_op.cpp
   src/conversion.cpp
   src/converter.cpp
@@ -98,7 +114,17 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_color_convert PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_color_convert
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
+# A static library carries its private VPI link to the consumer, whose package config must
+# then find VPI as well.
+set(HOLOSCAN_COLOR_CONVERT_EXPORTS_VPI OFF)
+get_target_property(_holoscan_color_convert_type holoscan_color_convert TYPE)
+if(HOLOSCAN_COLOR_CONVERT_VPI AND _holoscan_color_convert_type STREQUAL "STATIC_LIBRARY")
+  set(HOLOSCAN_COLOR_CONVERT_EXPORTS_VPI ON)
+endif()
 set_target_properties(
   holoscan_color_convert
   PROPERTIES

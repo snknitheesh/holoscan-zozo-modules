@@ -5,8 +5,8 @@
 // from host and device memory, packed and planar, converted and resized as
 // the CPU reference does; the descriptors they publish (encoding, plane
 // layouts, colour space, header, ROI) and the capture time and frame id they
-// carry; the input's colour space; NV16 as CUSTOM; and unusable inputs and
-// configurations refused.
+// carry; the input's colour space; NV16 as CUSTOM; ResizeOp's camera info in
+// and out; and unusable inputs and configurations refused.
 
 #include <cuda_runtime_api.h>
 
@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <holoscan/color_convert/camera_info.hpp>
 #include <holoscan/color_convert/color_convert_op.hpp>
 #include <holoscan/color_convert/converter.hpp>
 #include <holoscan/color_convert/reference.hpp>
@@ -29,6 +30,7 @@
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 
 #include "test_support.hpp"
@@ -293,6 +295,116 @@ void check_resizes() {
                schema::ImageEncoding_BGR8, true);
 }
 
+namespace ht = holoscan::testing;
+namespace hm = holoscan::messages;
+
+template <typename T>
+void add_field(ht::TestFrame& frame, std::string name, T value, std::chrono::nanoseconds time,
+               std::uint64_t frame_id) {
+  auto sample = ht::sample_at(std::move(value), time);
+  sample.metadata.frame_id = frame_id;
+  std::vector<ht::TestSample<T>> samples;
+  samples.push_back(std::move(sample));
+  frame.fields.push_back({std::move(name), ht::staged_samples<T>(std::move(samples))});
+}
+
+// One frame at capture_time(frame): its camera info first, when given, then
+// the image, both with frame id 7 + frame.
+ht::TestFrame camera_frame(std::uint32_t frame, schema::ImageT image,
+                           std::optional<hm::CameraInfo> info) {
+  ht::TestFrame result;
+  if (info) {
+    info->header.capture_timestamp_ns = capture_time(frame).count();
+    add_field(result, "camera_info", hm::to_message(*info), capture_time(frame), 7U + frame);
+  }
+  add_field(result, "image", std::move(image), capture_time(frame), 7U + frame);
+  return result;
+}
+
+hm::CameraInfo test_camera(std::uint32_t width, std::uint32_t height) {
+  hm::CameraInfo info;
+  info.header.frame_id = "camera";
+  info.width = width;
+  info.height = height;
+  info.state = hm::CameraState::kUndistorted;
+  info.fx = 150.0;
+  info.fy = 151.0;
+  info.cx = width / 2.0 - 0.25;
+  info.cy = height / 2.0 + 0.5;
+  return info;
+}
+
+// ResizeOp with camera info: no image before the first camera info; then each
+// image with the camera of its own size and placement, sent before it with its
+// capture time and frame id; the newest camera info kept for later images; a
+// changed calibration followed from its frame on.
+void check_resize_camera_info() {
+  constexpr int kWidth = 160;
+  constexpr int kHeight = 90;
+  const ResizeConfig config{.width = 96,
+                            .height = 96,
+                            .crop = Rect{8, 4, 140, 80},
+                            .letterbox = true,
+                            .output_format = PixelFormat::kNv12,
+                            .with_camera_info = true};
+  const hm::CameraInfo info = test_camera(kWidth, kHeight);
+  hm::CameraInfo wider = info;
+  wider.fx = 120.0;
+  auto h = ht::create_operator_test<ResizeOp>(config);
+  // Frame 0 before any camera info; 1 with it; 2 without (keeps 1's); 3 with
+  // another calibration.
+  const std::optional<hm::CameraInfo> sent[] = {std::nullopt, info, std::nullopt, wider};
+  for (std::uint32_t frame = 0; frame < 4; ++frame) {
+    h.push_frame(camera_frame(
+        frame, message(pattern(PixelFormat::kYuyv, kWidth, kHeight, frame), true), sent[frame]));
+  }
+  h.input_source_device("image", holoscan::DeviceId{0});
+  h.output_device("resized", holoscan::DeviceId{0});
+  h.capture_snapshot<schema::ImageT>("resized", 8U);
+  h.capture<hm::schema::CameraInfoT>("resized_camera_info", 8U);
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto images = result.snapshots<schema::ImageT>("resized");
+  const auto infos = result.samples<hm::schema::CameraInfoT>("resized_camera_info");
+  VERIFY_MSG(images.size() == 3 && infos.size() == 3,
+             std::to_string(images.size()) + " images and " + std::to_string(infos.size()) +
+                 " camera infos out of 4 frames, the first without camera info");
+  const ConversionParams params{.crop = config.crop, .letterbox = true};
+  for (std::size_t i = 0; i < images.size() && i < infos.size(); ++i) {
+    const auto frame = static_cast<std::uint32_t>(i + 1);
+    const std::int64_t time = capture_time(frame).count();
+    VERIFY(images[i].sample_metadata().capture_timestamp_ns == time);
+    VERIFY(infos[i].metadata.capture_timestamp_ns == time &&
+           infos[i].metadata.frame_id == 7U + frame);
+    const hm::CameraInfo got = hm::from_message(infos[i].data);
+    VERIFY(got.header.capture_timestamp_ns == time && got.header.frame_id == "camera");
+    const hm::CameraInfo& from = frame == 3 ? wider : info;
+    hm::CameraInfo want =
+        resized_camera_info(from, kWidth, kHeight, 96, 96, PixelFormat::kNv12, params);
+    want.header.capture_timestamp_ns = time;
+    VERIFY_MSG(got == want, "frame " + std::to_string(frame) + ": the resized camera");
+    // By hand: the 140x80 crop letterboxed into 96x96 as NV12 (even offsets
+    // and sizes): 96x54 at y = 20, a scale of 96/140 across and 54/80 down.
+    VERIFY(std::abs(got.fx - from.fx * 96.0 / 140.0) < 1e-12);
+    VERIFY(std::abs(got.cy - ((from.cy + 0.5 - 4.0) * 54.0 / 80.0 - 0.5 + 20.0)) < 1e-12);
+    VERIFY(got.roi && got.roi->x == 8U && got.roi->width == 140U);
+  }
+}
+
+// A camera info for images of another size fails the run, naming both sizes.
+void check_resize_camera_info_size() {
+  auto h = ht::create_operator_test<ResizeOp>(
+      ResizeConfig{.width = 32, .height = 32, .with_camera_info = true});
+  h.push_frame(camera_frame(0, message(pattern(PixelFormat::kRgb8, 64, 48, 0), false),
+                            test_camera(320, 240)));
+  h.output_device("resized", holoscan::DeviceId{0});
+  const auto result = h.run();
+  VERIFY_MSG(!result.ok(), "a camera info of another size is refused");
+  VERIFY_MSG(result.describe_failure().find("the camera info is for 320x240") != std::string::npos,
+             result.describe_failure());
+}
+
 // Runs `config`'s operator on `image` and checks the failure names `what`.
 template <typename Op, typename Config>
 void check_rejects(const Config& config, schema::ImageT image, const char* output,
@@ -319,6 +431,9 @@ void check_rejected_inputs() {
                                 message(rgb, false), "converted", "raise max_width");
   check_rejects<ResizeOp>(ResizeConfig{.width = 32, .height = 32, .crop = Rect{40, 0, 40, 40}},
                           message(rgb, false), "resized", "is not inside");
+  check_rejects<ResizeOp>(
+      ResizeConfig{.width = 32, .height = 32, .input_format = PixelFormat::kMono8},
+      message(rgb, false), "resized", "the image is rgb8, and input_format is mono8");
   // The schema lets a 16-bit image travel as an opaque byte buffer; the
   // operators want its words.
   Image mono16 = pattern(PixelFormat::kMono16, 64, 48, 0);
@@ -353,13 +468,14 @@ int main() {
   namespace cc = holoscan::color_convert;
   int devices = 0;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-    std::cout << "no CUDA device; skipping\n";
-    return 77;
+    return cc::test::no_cuda_device();
   }
   return cc::test::run({
       {"ColorConvertOp conversions", cc::check_conversions},
       {"the input's colour space", cc::check_input_color_space},
       {"ResizeOp resizes", cc::check_resizes},
+      {"ResizeOp's camera info", cc::check_resize_camera_info},
+      {"ResizeOp refuses a camera info of another size", cc::check_resize_camera_info_size},
       {"unusable inputs rejected", cc::check_rejected_inputs},
       {"unusable configurations rejected", cc::check_rejected_configs},
   });

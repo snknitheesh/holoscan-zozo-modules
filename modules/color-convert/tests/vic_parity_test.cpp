@@ -177,7 +177,7 @@ void check_parity() {
               const Difference d = compare(a, b);
               ++compared;
               // The VIC interpolates chroma and rounds its own way; resizing adds
-              // its own sampling. Measured on Orin over every case here: mean up
+              // its own sampling. Measured on Jetson Orin over every case here: mean up
               // to 0.9, 99th percentile up to 3, largest 6 codes.
               const double mean_limit = resized ? 1.5 : 1.0;
               const int p99_limit = resized ? 4 : 3;
@@ -228,8 +228,7 @@ int main() {
   namespace cc = holoscan::color_convert;
   int devices = 0;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-    std::cout << "no CUDA device; skipping\n";
-    return 77;
+    return cc::test::no_cuda_device();
   }
   const cc::PlatformFacts facts = cc::probe_platform();
   if (!facts.vpi_compiled || !facts.has_vic) {

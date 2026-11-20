@@ -6,8 +6,9 @@
 # packages everything the module installs.
 include("${PROJECT_SOURCE_DIR}/cmake/holohub_configure_deb.cmake")
 
-# "holoscan" is the Debian package of the SDK 5.0 on its platforms.
-set(_depends "holoscan (>= 5.0.0)")
+# "holoscan" is the Debian package of the SDK 5.0 on its platforms; holoscan-messages this
+# collection's camera info messages.
+set(_depends "holoscan (>= 5.0.0), holoscan-messages (>= 1.0.0)")
 if(HOLOSCAN_COLOR_CONVERT_VPI)
   string(APPEND _depends ", libnvvpi4 (>= 4.0)")
 endif()

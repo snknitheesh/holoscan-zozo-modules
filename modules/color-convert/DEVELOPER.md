@@ -24,13 +24,14 @@ template's `holohub_configure_deb()` behind `PKG_holoscan_color_convert`.
 | | |
 | --- | --- |
 | Build contexts | Standalone top-level CMake project; or inside another project through `add_subdirectory()` or `FetchContent`, where its target is used as `holoscan::color_convert` |
-| Options | Standalone: `BUILD_TESTING` (`OFF`) and `BUILD_SHARED_LIBS` (`ON`). Inside another project those two are the project's and are left alone: the module sets `BUILD_SHARED_LIBS` `ON` in its own scope and builds its tests only with `HOLOSCAN_COLOR_CONVERT_BUILD_TESTING` (`OFF`). Both: `HOLOSCAN_COLOR_CONVERT_WITH_VPI` (`ON`), `PKG_holoscan_color_convert` (`OFF`) |
+| Options | Standalone: `BUILD_TESTING` (`OFF`) and `BUILD_SHARED_LIBS` (`ON`). Inside another project those two are the project's and are left alone: the module sets `BUILD_SHARED_LIBS` `ON` in its own scope and builds its tests only with `HOLOSCAN_COLOR_CONVERT_BUILD_TESTING` (`OFF`). Both: `HOLOSCAN_COLOR_CONVERT_WITH_VPI` (`ON` on aarch64, else `OFF`: only a Jetson has a VIC), `PKG_holoscan_color_convert` (`OFF`) |
 | Public target | `holoscan::color_convert` (`libholoscan_color_convert.so.1`) |
 | Include root | `include/`, installed to `<prefix>/include` |
-| Package | `<prefix>/lib/cmake/holoscan-color-convert/holoscan-color-convert-config.cmake`, `SameMajorVersion`; sets `holoscan-color-convert_WITH_VPI` |
-| Debian package | `holoscan-color-convert`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and, with VPI, `libnvvpi4 (>= 4.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, VPI 4 (optional) |
-| Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7) |
+| Package | `<prefix>/lib/cmake/holoscan-color-convert/holoscan-color-convert-config.cmake`, `SameMajorVersion`; finds `holoscan-messages`, and VPI for a static build with the `vic` backend; sets `holoscan-color-convert_WITH_VPI` |
+| Debian package | `holoscan-color-convert`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)`, `holoscan-messages (>= 1.0.0)` and, with VPI, `libnvvpi4 (>= 4.0)` |
+| Module dependencies | `messages` (`holoscan::messages`, public: `ResizeOp`'s camera info ports), in `module.dependencies` |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, VPI 4 (optional, on a Jetson) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 | Test labels | `color_convert` on all; `gpu` for the GPU tests; `host` for the SDK-free tests |
 
 ## How it fits together
@@ -53,7 +54,13 @@ template's `holohub_configure_deb()` behind `PKG_holoscan_color_convert`.
   CUDA memory) and uses `vpiSubmitConvertImageFormat` for a same-size conversion between formats
   and `vpiSubmitRescale` for everything else. `src/vic_unavailable.cpp` stands in without VPI.
 - `src/op_support.cpp` is what both operators share: reading an `ImageT` into a view, staging host
-  images, choosing and logging the backend, and publishing the result with its descriptor.
+  images (one device buffer; each frame's copy waits on the GPU, through an event, for the
+  conversion that read it last), choosing and logging the backend, and publishing the result with
+  its descriptor. `Target::before_emit` lets `ResizeOp` send the resized camera info just before
+  the image.
+- `camera_info.hpp` (SDK-free) is the resized camera: the intrinsics follow `compute_mapping()`,
+  the same geometry the kernel and the VIC use, so a change to the mapping changes both. The host
+  test checks every projection against the kernel's sampling formula.
 
 ## Conventions
 
@@ -65,8 +72,8 @@ template's `holohub_configure_deb()` behind `PKG_holoscan_color_convert`.
 - What the VIC can do is `vic_limitation()`, which `auto`, the `vic` backend's checks and the
   parity test all use. Measure before widening it: VPI drops a backend from an image whose format
   that backend cannot use, rather than failing, and the wrapper refuses such images.
-- Logging goes through `HOLOSCAN_LOG_*`, and nothing per frame: the host copy is logged once, and
-  `auto`'s choice when it is made or changes.
+- Logging goes through `HOLOSCAN_LOG_*`, and nothing per frame: the host copy and its CPU waits
+  are logged once, the VIC's waits once, and `auto`'s choice when it is made or changes.
 - The CMake project must also work inside another one: only its own paths, options other than the
   standard ones prefixed `HOLOSCAN_COLOR_CONVERT_`, and `HOLOSCAN_COLOR_CONVERT_BUILD_TESTING`,
   never `BUILD_TESTING`, to decide whether to build the tests.

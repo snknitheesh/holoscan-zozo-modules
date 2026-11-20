@@ -296,8 +296,7 @@ int main() {
   namespace cc = holoscan::color_convert;
   int devices = 0;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-    std::cout << "no CUDA device; skipping\n";
-    return 77;
+    return cc::test::no_cuda_device();
   }
   return cc::test::run({
       {"every format pair equals the reference", cc::check_every_pair},

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -39,7 +40,11 @@ void check_available(Backend backend);
 
 class Converter {
  public:
-  // @throws std::invalid_argument if `backend` is not compiled in (check_available()).
+  // kVic asks VPI here whether there is a VIC, which starts VPI's threads;
+  // kAuto asks on its first choice, so a graph that only constructs it starts
+  // none.
+  // @throws std::invalid_argument if `backend` is not compiled in
+  //         (check_available()), or is kVic where VPI reports no VIC.
   explicit Converter(Backend backend);
   ~Converter();
   Converter(const Converter&) = delete;
@@ -64,8 +69,12 @@ class Converter {
   [[nodiscard]] Backend backend() const noexcept { return backend_; }
 
  private:
+  // The platform's facts, asked once: at construction for kVic, at the first
+  // choice for kAuto, never for kCuda.
+  [[nodiscard]] const PlatformFacts& facts() const;
+
   Backend backend_;
-  PlatformFacts facts_{};
+  mutable std::optional<PlatformFacts> facts_;
   // Made on the first conversion on the VIC.
   std::unique_ptr<detail::VicEngine> vic_;
 };

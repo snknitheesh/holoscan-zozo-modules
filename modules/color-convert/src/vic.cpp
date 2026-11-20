@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Conversion and rescaling on the VIC of Jetson Orin and Thor, through VPI 4.
+// Conversion and rescaling on the VIC of Jetson Orin and Jetson Thor, through VPI 4.
 // VPI wraps the CUDA device images in place, so nothing is copied: a crop or
 // a letterbox content rectangle is wrapped as a sub-image at an offset. The
 // VIC runs on its own VPI stream, so it waits for the CUDA stream's work

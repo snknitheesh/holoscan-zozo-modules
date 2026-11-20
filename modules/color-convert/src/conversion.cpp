@@ -317,9 +317,9 @@ std::optional<std::string> vic_limitation(PixelFormat source, int source_width, 
     return std::string("the VIC has no area sampling; use nearest or bilinear");
   }
   // Where a matrix applies, only BT.709 gives the same colours on the VIC of
-  // every Jetson: Thor's applies BT.709 where BT.601 is asked, and VPI's
+  // every Jetson: Jetson Thor's applies BT.709 where BT.601 is asked, and VPI's
   // BT.2020 also converts the primaries. Luma computed on the VIC (MONO8 from
-  // colour) differs on Thor by tens of codes, so it is left to CUDA as well.
+  // colour) differs on Jetson Thor by tens of codes, so it is left to CUDA as well.
   const ColorModel from = format_info(source).model;
   const ColorModel to = format_info(destination).model;
   if (from != to) {

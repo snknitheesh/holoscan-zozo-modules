@@ -4,7 +4,7 @@
     "name": "holoscan-color-convert",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Colour conversion and resizing of camera images in one GPU pass: NV12, NV16, I420, YUYV, UYVY, RGB, BGR, RGBA, BGRA, MONO and 16-bit formats with the BT.601, BT.709 and BT.2020 matrices in full or limited range; nearest, bilinear and area resizing with crop and letterbox; on CUDA or, on Jetson, the VIC through VPI 4.",
+    "description": "Colour conversion and resizing of camera images in one GPU pass: NV12, NV16, I420, YUYV, UYVY, RGB, BGR, RGBA, BGRA, MONO and 16-bit formats with the BT.601, BT.709 and BT.2020 matrices in full or limited range; nearest, bilinear and area resizing with crop and letterbox, with the CameraInfo of the resized images; on CUDA or, on Jetson, the VIC through VPI 4.",
     "authors": [
       {
         "name": "zozo",
@@ -50,12 +50,16 @@
         },
         {
           "name": "VIC",
-          "description": "The Video Image Compositor of Jetson Orin or Thor, used by the vic backend, which is opt-in.",
+          "description": "The Video Image Compositor of Jetson Orin or Jetson Thor, used by the vic backend, which is opt-in.",
           "required": false
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-color-convert",
       "install_commands": [

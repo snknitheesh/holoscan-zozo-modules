@@ -38,7 +38,10 @@ ColorConvertOp::ColorConvertOp(ColorConvertConfig config) : config_(std::move(co
 ColorConvertOp::~ColorConvertOp() = default;
 
 void ColorConvertOp::setup(holoscan::OperatorSpec& spec) {
-  // Two slots: one image in compute() while the next one arrives.
+  // Two slots: one image in compute() while the next one arrives, so a
+  // lossless producer need not wait for compute() to return. An edge that sets
+  // no depth of its own keeps these two, a drop-oldest one too (the newest
+  // two); give a live edge queue_depth 1 to keep only the newest image.
   spec.input(image, "image").queue_depth(2U);
   spec.output(converted, "converted")
       .produces_tensor(detail::output_spec(
@@ -67,6 +70,7 @@ holoscan::expected<void, holoscan::Error> ColorConvertOp::compute(
       .use_input_color_space = config_.use_input_color_space,
       .custom_format = config_.custom_format,
       .max_bytes = packed_size(config_.output_format, config_.max_width, config_.max_height),
+      .capacity_hint = "raise max_width and max_height",
       .keep_roi = true,
       .on_backend = config_.on_backend,
   };

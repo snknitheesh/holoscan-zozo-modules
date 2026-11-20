@@ -41,10 +41,7 @@ void check_available(Backend backend) {
 
 Converter::Converter(Backend backend) : backend_(backend) {
   check_available(backend);
-  if (backend != Backend::kCuda) {
-    facts_ = probe_platform();
-  }
-  if (backend == Backend::kVic && !facts_.has_vic) {
+  if (backend == Backend::kVic && !facts().has_vic) {
     throw std::invalid_argument(
         "backend vic: VPI reports no VIC on this platform; use cuda, or auto to take the VIC "
         "where there is one");
@@ -52,6 +49,13 @@ Converter::Converter(Backend backend) : backend_(backend) {
 }
 
 Converter::~Converter() = default;
+
+const PlatformFacts& Converter::facts() const {
+  if (!facts_) {
+    facts_ = probe_platform();
+  }
+  return *facts_;
+}
 
 std::pair<Backend, std::string> Converter::choose(const ImageView& source,
                                                   const ImageView& destination,
@@ -62,13 +66,14 @@ std::pair<Backend, std::string> Converter::choose(const ImageView& source,
   const auto limitation =
       vic_limitation(source.format, source.width, source.height, destination.format,
                      destination.width, destination.height, params);
-  const Backend chosen = resolve_auto(facts_, !limitation.has_value());
+  const PlatformFacts& platform = facts();
+  const Backend chosen = resolve_auto(platform, !limitation.has_value());
   std::string reason;
   if (chosen == Backend::kVic) {
     reason = "VPI reports a VIC, which can do this conversion";
-  } else if (!facts_.vpi_compiled) {
+  } else if (!platform.vpi_compiled) {
     reason = "this build has no vic backend";
-  } else if (!facts_.has_vic) {
+  } else if (!platform.has_vic) {
     reason = "VPI reports no VIC on this platform";
   } else {
     reason = *limitation;

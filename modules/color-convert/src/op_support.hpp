@@ -24,6 +24,7 @@
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/execution_context.hpp>
 #include <holoscan/core/port.hpp>
+#include <holoscan/core/sample.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
@@ -57,12 +58,22 @@ struct Target {
   bool use_input_color_space{true};
   // What CUSTOM-encoded input holds.
   std::optional<PixelFormat> custom_format;
-  // The output port's capacity, which a larger image exceeds.
+  // When set, the only input format taken.
+  std::optional<PixelFormat> input_format;
+  // The output port's capacity, which a larger image exceeds, and what to
+  // change when one does.
   std::uint64_t max_bytes{};
+  std::string capacity_hint;
   // Whether the image's ROI offsets carry over (a same-size conversion).
   bool keep_roi{};
   // Told the backend of the first frame and of every change.
   std::function<void(Backend)> on_backend;
+  // Called after the conversion, before the image is emitted, with the
+  // input's size, the output's format and the emit options the image goes out
+  // with; an error stops the image.
+  std::function<holoscan::expected<void, holoscan::Error>(int, int, PixelFormat,
+                                                          const holoscan::EmitOptions&)>
+      before_emit;
 };
 
 class ConversionRunner {
@@ -83,6 +94,9 @@ class ConversionRunner {
   void reset() noexcept;
 
  private:
+  // The staging buffer, of at least `bytes`, free to be written by work queued
+  // on `stream` from now on: that work waits (on the GPU) for the conversion
+  // that read it last, whatever stream that ran on.
   [[nodiscard]] holoscan::expected<void*, holoscan::Error> staging(std::size_t bytes,
                                                                    cudaStream_t stream);
 
@@ -90,8 +104,12 @@ class ConversionRunner {
   Converter converter_;
   std::optional<Backend> logged_backend_;
   bool copy_logged_{};
+  bool vic_logged_{};
   void* staging_{};
   std::size_t staging_bytes_{};
+  // Recorded after each conversion that read the staging buffer.
+  cudaEvent_t staging_read_{};
+  bool staging_recorded_{};
 };
 
 }  // namespace holoscan::color_convert::detail

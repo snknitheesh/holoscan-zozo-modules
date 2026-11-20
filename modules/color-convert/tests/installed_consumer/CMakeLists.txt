@@ -8,6 +8,7 @@ project(holoscan_color_convert_consumer LANGUAGES CXX)
 enable_testing()
 
 find_package(holoscan-color-convert 1.0 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 message(
   STATUS
   "Found holoscan-color-convert ${holoscan-color-convert_VERSION} in ${holoscan-color-convert_DIR}"
@@ -15,7 +16,7 @@ message(
 )
 
 add_executable(color_convert_consumer main.cpp)
-target_link_libraries(color_convert_consumer PRIVATE holoscan::color_convert)
+target_link_libraries(color_convert_consumer PRIVATE holoscan::color_convert holoscan::messages)
 set_target_properties(color_convert_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
 add_test(NAME color_convert_installed_consumer COMMAND color_convert_consumer)

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Tests that need no Holoscan SDK, CUDA or GPU: the CPU reference against the colour
-# science, resizing, letterbox geometry, and the backend choice. Built on their own by the
-# hosted CI job, and as part of the module's full suite.
+# science, resizing, letterbox geometry, the backend choice, and the resized camera info.
+# Built on their own by the hosted CI job, and as part of the module's full suite.
 cmake_minimum_required(VERSION 4.0)
 project(holoscan_color_convert_host_tests LANGUAGES CXX)
 if(PROJECT_IS_TOP_LEVEL)
@@ -11,6 +11,7 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 set(_module "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(_messages "${_module}/../messages")
 
 # The module's SDK-free sources: the formats, the geometry, the backend choice and the
 # CPU reference. Without contraction, as the module builds the reference.
@@ -44,8 +45,23 @@ target_include_directories(
 target_link_libraries(color_convert_backend_choice_test PRIVATE color_convert_host_core)
 add_test(NAME color_convert_backend_choice COMMAND color_convert_backend_choice_test)
 
+# The resized camera info, with the SDK-free sources of holoscan-messages, which it uses.
+add_executable(
+  color_convert_camera_info_test
+  camera_info_test.cpp
+  "${_module}/src/camera_info.cpp"
+  "${_messages}/src/camera_info.cpp"
+)
+target_include_directories(
+  color_convert_camera_info_test
+  PRIVATE "${_messages}/include" "${_messages}/src" "${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+target_link_libraries(color_convert_camera_info_test PRIVATE color_convert_host_core)
+add_test(NAME color_convert_camera_info COMMAND color_convert_camera_info_test)
+
 set_tests_properties(
   color_convert_conversion_math
   color_convert_backend_choice
+  color_convert_camera_info
   PROPERTIES LABELS "color_convert;host" TIMEOUT 300
 )

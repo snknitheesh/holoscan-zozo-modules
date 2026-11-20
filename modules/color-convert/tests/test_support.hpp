@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -47,6 +48,19 @@ inline int run(const std::vector<TestCase>& cases) {
   std::cout << (failures() == 0 ? "all passed" : std::to_string(failures()) + " check(s) failed")
             << '\n';
   return failures() == 0 ? 0 : 1;
+}
+
+// The exit status of a test that needs a CUDA device and has none: skipped
+// (77) on a developer's machine, failed (1) inside a CI lane
+// (HOLOSCAN_CI_PLATFORM set), whose runner has a GPU, so that a lane with a
+// broken GPU does not pass silently.
+inline int no_cuda_device() {
+  if (std::getenv("HOLOSCAN_CI_PLATFORM") != nullptr) {
+    std::cerr << "HOLOSCAN_CI_PLATFORM is set, but there is no CUDA device\n";
+    return 1;
+  }
+  std::cout << "no CUDA device; skipping\n";
+  return 77;
 }
 
 template <typename Exception, typename Body>
