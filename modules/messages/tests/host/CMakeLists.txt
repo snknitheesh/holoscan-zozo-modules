@@ -11,25 +11,17 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 set(_module "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-add_library(
-  messages_host_core
-  STATIC
-  "${_module}/src/camera_info.cpp"
-  "${_module}/src/camera_info_yaml.cpp"
-  "${_module}/src/point_cloud_layout.cpp"
-  "${_module}/src/synthetic_calibration.cpp"
-  "${_module}/src/yaml_reader.cpp"
-)
-target_include_directories(
-  messages_host_core
-  PUBLIC "${_module}/include" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${_module}/src"
-)
-target_compile_features(messages_host_core PUBLIC cxx_std_20)
-set_target_properties(messages_host_core PROPERTIES CXX_EXTENSIONS OFF)
+# messages_host_core, which the host tests of the modules that depend on this one use too.
+include("${_module}/cmake/messages-host-core.cmake")
 
 foreach(_test camera_info yaml point_cloud_layout)
   add_executable(messages_${_test}_test ${_test}_test.cpp)
   target_link_libraries(messages_${_test}_test PRIVATE messages_host_core)
+  # The tests' helpers, and the YAML reader the yaml test checks directly.
+  target_include_directories(
+    messages_${_test}_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/.." "${_module}/src"
+  )
   set_target_properties(messages_${_test}_test PROPERTIES CXX_EXTENSIONS OFF)
   add_test(NAME messages_${_test} COMMAND messages_${_test}_test)
   set_tests_properties(messages_${_test} PROPERTIES LABELS "messages;host" TIMEOUT 300)
