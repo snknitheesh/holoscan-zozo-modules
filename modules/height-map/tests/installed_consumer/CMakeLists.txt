@@ -17,8 +17,7 @@ add_executable(height_map_consumer main.cpp)
 target_link_libraries(height_map_consumer PRIVATE holoscan::height_map)
 set_target_properties(height_map_consumer PROPERTIES CXX_EXTENSIONS OFF)
 
+# Passes on exit status 0, which the consumer returns only when it prints PASS (a
+# PASS_REGULAR_EXPRESSION would ignore the exit status, and pass a crash at teardown).
 add_test(NAME height_map_installed_consumer COMMAND height_map_consumer)
-set_tests_properties(
-  height_map_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "height_map_consumer: PASS" TIMEOUT 300
-)
+set_tests_properties(height_map_installed_consumer PROPERTIES TIMEOUT 300)
