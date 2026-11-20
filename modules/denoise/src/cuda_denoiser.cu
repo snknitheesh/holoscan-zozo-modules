@@ -41,8 +41,25 @@ namespace {
 namespace t = tuning;
 
 constexpr int kBilateralTaps = 2 * t::kBilateralRadius + 1;
-// exp(-(dx^2 + dy^2) / (2 s^2)) for the bilateral window, set once.
-__constant__ float c_spatial_weights[kBilateralTaps * kBilateralTaps];
+
+// exp(-(dx^2 + dy^2) / (2 s^2)) for the bilateral window. They travel with each
+// launch, in its parameters, which every device reads from its own constant
+// bank: no per-process or per-device state to upload.
+struct SpatialWeights {
+  float w[kBilateralTaps * kBilateralTaps];
+};
+
+SpatialWeights spatial_weights() {
+  SpatialWeights weights{};
+  for (int dy = -t::kBilateralRadius; dy <= t::kBilateralRadius; ++dy) {
+    for (int dx = -t::kBilateralRadius; dx <= t::kBilateralRadius; ++dx) {
+      weights.w[(dy + t::kBilateralRadius) * kBilateralTaps + dx + t::kBilateralRadius] =
+          std::exp(-static_cast<float>(dx * dx + dy * dy) /
+                   (2.0F * t::kBilateralSpatialSigma * t::kBilateralSpatialSigma));
+    }
+  }
+  return weights;
+}
 
 struct FilterArgs {
   int width{};  // Of the plane being filtered.
@@ -55,6 +72,7 @@ struct FilterArgs {
   const std::uint8_t* age{};
   int age_pitch{};
   bool half_resolution_age{};
+  SpatialWeights weights{};  // Bilateral only.
 };
 
 template <typename T>
@@ -275,9 +293,9 @@ __global__ void bilateral_kernel(FilterArgs a, const T* in, std::size_t in_pitch
         v[c] = value_of(q[c]);
         distance += (v[c] - c0[c]) * (v[c] - c0[c]);
       }
-      const float w = c_spatial_weights[(dy + t::kBilateralRadius) * kBilateralTaps + dx +
-                                        t::kBilateralRadius] *
-                      __expf(distance * inv);
+      const float w =
+          a.weights.w[(dy + t::kBilateralRadius) * kBilateralTaps + dx + t::kBilateralRadius] *
+          __expf(distance * inv);
       total += w;
       for (int c = 0; c < C; ++c) sum[c] += w * v[c];
     }
@@ -377,27 +395,10 @@ DeviceBuffer<T> allocate(std::size_t count) {
   return DeviceBuffer<T>(static_cast<T*>(p));
 }
 
-void upload_spatial_weights() {
-  static const cudaError_t status = [] {
-    float weights[kBilateralTaps * kBilateralTaps];
-    for (int dy = -t::kBilateralRadius; dy <= t::kBilateralRadius; ++dy) {
-      for (int dx = -t::kBilateralRadius; dx <= t::kBilateralRadius; ++dx) {
-        weights[(dy + t::kBilateralRadius) * kBilateralTaps + dx + t::kBilateralRadius] =
-            std::exp(-static_cast<float>(dx * dx + dy * dy) /
-                     (2.0F * t::kBilateralSpatialSigma * t::kBilateralSpatialSigma));
-      }
-    }
-    return cudaMemcpyToSymbol(c_spatial_weights, weights, sizeof(weights));
-  }();
-  check_cuda(status, "cudaMemcpyToSymbol");
-}
-
 class CudaDenoiser final : public Denoiser::Impl {
  public:
   explicit CudaDenoiser(const DenoiseParams& params)
-      : params_(params), limit_(t::history_frames(params)) {
-    upload_spatial_weights();
-  }
+      : params_(params), limit_(t::history_frames(params)), weights_(spatial_weights()) {}
 
   ~CudaDenoiser() override {
     // cudaFree waits for the work that may still use the buffers.
@@ -491,7 +492,8 @@ class CudaDenoiser final : public Denoiser::Impl {
                  .height = height,
                  .sigma = sigma_.get(),
                  .strength = params_.strength,
-                 .history_limit = limit_};
+                 .history_limit = limit_,
+                 .weights = weights_};
     if (params_.temporal) {
       a.age = age_out_.get();
       a.age_pitch = width_;
@@ -574,6 +576,7 @@ class CudaDenoiser final : public Denoiser::Impl {
 
   DenoiseParams params_;
   int limit_;
+  SpatialWeights weights_;
   int width_{};
   int height_{};
   PixelFormat format_{PixelFormat::kRgb8};
