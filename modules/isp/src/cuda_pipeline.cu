@@ -237,6 +237,7 @@ CudaPipeline::CudaPipeline(const IspParams& params, const std::vector<float>& lu
     check(cudaMalloc(&awb_accum_, sizeof(AwbAccum)), "cudaMalloc");
     check(cudaMalloc(&awb_state_, sizeof(AwbState)), "cudaMalloc");
     check(cudaMalloc(&stats_accum_, sizeof(StatsAccum)), "cudaMalloc");
+    check(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming), "cudaEventCreate");
     upload(lut.data(), lut.size() * sizeof(float), lut_);
     if (params_.lens_shading) {
       const std::vector<float>& gains = params_.lens_shading->gains;
@@ -258,6 +259,11 @@ void CudaPipeline::release() noexcept {
   cudaFree(awb_accum_);
   cudaFree(awb_state_);
   cudaFree(stats_accum_);
+  if (done_ != nullptr) {
+    cudaEventDestroy(done_);
+  }
+  done_ = nullptr;
+  queued_ = false;
   lut_ = lsc_ = nullptr;
   awb_accum_ = nullptr;
   awb_state_ = nullptr;
@@ -265,6 +271,9 @@ void CudaPipeline::release() noexcept {
 }
 
 void CudaPipeline::reset() {
+  if (queued_) {
+    check(cudaEventSynchronize(done_), "cudaEventSynchronize");
+  }
   const AwbState state = initial_white_balance(params_);
   upload(&state, sizeof(state), awb_state_);
 }
@@ -292,6 +301,13 @@ cudaError_t CudaPipeline::process(FrameParams p, const StatsOutput& stats,
   // Clear an error an earlier, unrelated call left behind, so the checks below
   // report this frame's launches only.
   static_cast<void>(cudaGetLastError());
+  // Every frame uses the same scratch and white balance state: on another
+  // stream, the GPU waits for the previous frame's work first.
+  if (queued_) {
+    if (const cudaError_t status = cudaStreamWaitEvent(stream, done_, 0); status != cudaSuccess) {
+      return status;
+    }
+  }
   if (params_.white_balance != WhiteBalanceMode::kManual) {
     if (const cudaError_t status = cudaMemsetAsync(awb_accum_, 0, sizeof(AwbAccum), stream);
         status != cudaSuccess) {
@@ -337,7 +353,14 @@ cudaError_t CudaPipeline::process(FrameParams p, const StatsOutput& stats,
     finish_stats_kernel<<<1, 1, 0, stream>>>(p, stats_accum_, params_.auto_exposure, exposure,
                                              stats.stats);
   }
-  return cudaGetLastError();
+  if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+    return status;
+  }
+  if (const cudaError_t status = cudaEventRecord(done_, stream); status != cudaSuccess) {
+    return status;
+  }
+  queued_ = true;
+  return cudaSuccess;
 }
 
 }  // namespace holoscan::isp::detail

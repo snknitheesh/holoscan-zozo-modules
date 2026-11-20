@@ -234,6 +234,102 @@ void cuda_matches_cpu() {
   }
 }
 
+// Frames queued on two streams in turn, never waited for in between, come out
+// as the CPU backend's in call order: each frame's GPU work waits for the
+// previous frame's, which shares the scratch and the white balance state.
+void two_streams() {
+  constexpr int kFrames = 8;
+  SyntheticRawConfig config = camera(BayerPattern::kRGGB, kFormats[2], 1920, 1080);
+  IspParams params = synthetic_isp_params(config, 9);
+  params.white_balance = WhiteBalanceMode::kGrayWorld;
+  params.sharpen = 0.5F;
+  std::vector<test::RawFrame> frames;
+  for (int f = 0; f < kFrames; ++f) {
+    config.frame = static_cast<std::uint32_t>(f);
+    // Gains that change from frame to frame, so the smoothed estimate depends on the order.
+    config.wb_gains = {f % 2 == 0 ? 1.9F : 1.4F, 1.0F, f % 2 == 0 ? 1.6F : 2.1F};
+    frames.push_back(test::render(config));
+  }
+  IspPipeline cpu(Backend::kCpu, params);
+  std::vector<Result> expected;
+  for (const test::RawFrame& frame : frames) expected.push_back(run(cpu, frame, OutputFormat::kRgb8));
+
+  const std::size_t image_bytes = static_cast<std::size_t>(config.width) * config.height * 3U;
+  const std::size_t histogram_bytes = sizeof(std::uint32_t) * kHistogramChannels * kHistogramBins;
+  const std::size_t stats_bytes = sizeof(float) * stats::kStatsSize;
+  std::vector<void*> buffers;
+  cudaStream_t streams[2] = {nullptr, nullptr};
+  const auto device_buffer = [&buffers](std::size_t bytes) {
+    void* pointer = nullptr;
+    test::cuda_check(cudaMalloc(&pointer, bytes), "cudaMalloc");
+    buffers.push_back(pointer);
+    return pointer;
+  };
+  try {
+    for (cudaStream_t& stream : streams) {
+      test::cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                       "cudaStreamCreate");
+    }
+    IspPipeline gpu(Backend::kCuda, params);
+    std::vector<void*> raws;
+    std::vector<void*> images;
+    std::vector<void*> histograms;
+    std::vector<void*> statistics;
+    for (const test::RawFrame& frame : frames) {
+      raws.push_back(device_buffer(frame.bytes.size()));
+      test::cuda_check(cudaMemcpy(raws.back(), frame.bytes.data(), frame.bytes.size(),
+                                  cudaMemcpyHostToDevice),
+                       "cudaMemcpy");
+      images.push_back(device_buffer(image_bytes));
+      histograms.push_back(device_buffer(histogram_bytes));
+      statistics.push_back(device_buffer(stats_bytes));
+    }
+    test::cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    for (int f = 0; f < kFrames; ++f) {
+      RawImageView view = frames[f].view();
+      view.data = raws[f];
+      gpu.process(view,
+                  RgbImageView{images[f], static_cast<std::size_t>(config.width) * 3U,
+                               OutputFormat::kRgb8},
+                  StatsOutput{static_cast<std::uint32_t*>(histograms[f]),
+                              static_cast<float*>(statistics[f])},
+                  {}, streams[f % 2]);
+    }
+    test::cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    for (int f = 0; f < kFrames; ++f) {
+      Result got{OutputFormat::kRgb8, config.width, config.height, {}, {}, {}};
+      got.image.resize(image_bytes);
+      got.histogram.resize(static_cast<std::size_t>(kHistogramChannels) * kHistogramBins);
+      got.stats.resize(stats::kStatsSize);
+      test::cuda_check(cudaMemcpy(got.image.data(), images[f], image_bytes, cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+      test::cuda_check(cudaMemcpy(got.histogram.data(), histograms[f], histogram_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+      test::cuda_check(
+          cudaMemcpy(got.stats.data(), statistics[f], stats_bytes, cudaMemcpyDeviceToHost),
+          "cudaMemcpy");
+      const std::string name = "frame " + std::to_string(f);
+      VERIFY_MSG(mismatches(got, expected[f]) == 0, name + ": the image differs");
+      VERIFY_MSG(got.histogram == expected[f].histogram, name + ": the histograms differ");
+      for (const int i : {stats::kMeanR, stats::kMeanG, stats::kMeanB, stats::kWbGainR,
+                          stats::kWbGainG, stats::kWbGainB, stats::kSaturatedFraction}) {
+        VERIFY_MSG(got.stats[i] == expected[f].stats[i],
+                   name + ": stats[" + std::to_string(i) + "] " + std::to_string(got.stats[i]) +
+                       " vs " + std::to_string(expected[f].stats[i]));
+      }
+    }
+  } catch (...) {
+    for (void* pointer : buffers) cudaFree(pointer);
+    for (cudaStream_t stream : streams) {
+      if (stream != nullptr) cudaStreamDestroy(stream);
+    }
+    throw;
+  }
+  for (void* pointer : buffers) cudaFree(pointer);
+  for (cudaStream_t stream : streams) cudaStreamDestroy(stream);
+}
+
 // The GPU renders the synthetic camera exactly as the host does.
 void synthetic_render_matches() {
   for (const SampleFormat& f : kFormats) {
@@ -630,6 +726,8 @@ int main() {
                holoscan::isp::cuda_matches_cpu},
       TestCase{"the synthetic camera renders the same on the GPU",
                holoscan::isp::synthetic_render_matches},
+      TestCase{"frames on two streams in turn run in call order",
+               holoscan::isp::two_streams},
       TestCase{"padded rows", holoscan::isp::padded_rows},
       TestCase{"auto white balance recovers the camera's gains", holoscan::isp::auto_white_balance},
       TestCase{"white balance smoothing", holoscan::isp::white_balance_smoothing},

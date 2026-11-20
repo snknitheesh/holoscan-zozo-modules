@@ -27,12 +27,13 @@ class CudaPipeline {
   CudaPipeline(const CudaPipeline&) = delete;
   CudaPipeline& operator=(const CudaPipeline&) = delete;
 
-  // Forgets the white balance estimate; no frame may be in flight.
+  // Forgets the white balance estimate, after the last frame queued is done.
   // @throws std::runtime_error if CUDA fails.
   void reset();
 
-  // Queues a frame on `stream`; `p` from make_frame_params() with null tables,
-  // its images and `stats` in device memory.
+  // Queues a frame on `stream`, after the previous frame's work on any stream;
+  // `p` from make_frame_params() with null tables, its images and `stats` in
+  // device memory.
   [[nodiscard]] cudaError_t process(FrameParams p, const StatsOutput& stats,
                                     const FrameExposure& exposure, cudaStream_t stream);
 
@@ -49,6 +50,9 @@ class CudaPipeline {
   AwbAccum* awb_accum_{};
   AwbState* awb_state_{};
   StatsAccum* stats_accum_{};
+  // Recorded after each frame's work; the next frame's stream waits for it.
+  cudaEvent_t done_{};
+  bool queued_{};
 };
 
 }  // namespace holoscan::isp::detail

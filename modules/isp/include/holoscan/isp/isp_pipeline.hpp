@@ -52,14 +52,17 @@ class IspPipeline {
   [[nodiscard]] MemoryLocation location() const noexcept;
   [[nodiscard]] const IspParams& params() const noexcept;
 
-  // Forgets the white balance estimate, so the next frame starts afresh. Call
-  // it when no frame is in flight on the GPU.
+  // Forgets the white balance estimate, so the next frame starts afresh. With
+  // kCuda it first waits for the frames already queued.
   // @throws std::runtime_error if CUDA fails.
   void reset();
 
   // Processes one frame. `out` is the raw image's size. CUDA: queued on
   // `stream`, all in device memory; CPU: done when this returns, all in host
-  // memory, `stream` unused.
+  // memory, `stream` unused. Calls may use different streams: the frames
+  // share the pipeline's scratch memory and white balance state, so each
+  // frame's GPU work waits for the previous frame's (on the GPU, never the
+  // host), and the frames run in the order of the calls.
   // @throws std::invalid_argument if a view is not usable.
   // @throws std::runtime_error if CUDA fails.
   void process(const RawImageView& raw, const RgbImageView& out, const StatsOutput& stats = {},
