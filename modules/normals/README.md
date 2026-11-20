@@ -2,14 +2,16 @@
 
 A Holoscan SDK 5 Module for the shape of point clouds on the GPU: surface normals, curvature, and
 the planes a scene is made of, for grasping, mapping, floor and table detection, or the clean-up
-before object segmentation.
+before object segmentation. Its operators take and send the `PointCloud` message of
+[holoscan-messages](../messages/).
 
 - `NormalEstimationOp` estimates each point's normal, oriented toward a viewpoint, and its
   curvature, by principal component analysis of the point's neighborhood: a window of the image
-  grid for organized clouds, or a radius or k-nearest search over a GPU grid for any cloud.
-- `PlaneSegmentationOp` finds up to `max_planes` planes, one after another, by RANSAC with normal
-  agreement, and labels every point with its plane. It emits each plane's coefficients, centroid
-  and inlier count, and can merge coplanar planes.
+  grid for organized clouds, or a radius or k-nearest search over a GPU grid for any cloud. It
+  sends the cloud on with the normals in it, its colors and intensities carried through.
+- `PlaneSegmentationOp` finds up to `max_planes` planes in a cloud with normals, one after another,
+  by RANSAC with normal agreement, and labels every point with its plane. It emits each plane's
+  coefficients, centroid and inlier count, and can merge coplanar planes.
 
 The [Normals and Planes demo](../../applications/normals_planes/) runs both end to end after
 holoscan-point-cloud's `DepthToPointCloudOp`, and shows the normals and planes in HoloViz.
@@ -21,22 +23,38 @@ holoscan-point-cloud's `DepthToPointCloudOp`, and shows the normals and planes i
 | Headers | `<holoscan/normals/...>` |
 | C++ namespace | `holoscan::normals` |
 | Debian package | `holoscan-normals` |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## The cloud
 
-The operators take clouds in the layout of [holoscan-point-cloud](../point-cloud/):
-`DepthToPointCloudOp`'s `point_cloud` connects to them directly. The module does not depend on
-holoscan-point-cloud; the layout is the contract.
+Both operators take a `PointCloud` message (see
+[holoscan-messages](../messages/README.md#pointcloud)) on `point_cloud`: float32 points `[N, 3]`,
+or organized `[H, W, 3]`, with optional colors, normals and intensities of the points' shape, in
+host, pinned host or device memory on the operator's GPU. A point with a non-finite coordinate
+(NaN, as `DepthToPointCloudOp` writes) is invalid. `DepthToPointCloudOp`'s `point_cloud` connects
+to `NormalEstimationOp` directly; `PlaneSegmentationOp` needs a cloud with normals, such as
+`NormalEstimationOp`'s `point_cloud_with_normals`. Neither needs the camera: the normals face a
+viewpoint given in the cloud's frame.
 
-| Port | Type | |
+Every output is in device memory and carries the cloud's capture time and frame id (and, for the
+cloud, its header). An operator cannot send a refused output again: a refused emit fails the
+frame, with an error that names the port. Each operator is configured only by the config passed
+to its constructor; there are no parameters to set afterwards, and no Python bindings.
+
+### Waits and copies
+
+What the host waits for and what is copied, per frame, once each operator's scratch has reached
+the size of the largest cloud so far (growing it, by at least half, waits for the stream once per
+buffer that grows; the first frame allocates without waiting):
+
+| Input memory | Copies to the GPU | Host waits |
 | --- | --- | --- |
-| `points` (input) | `holoscan::Tensor` | float32 `[N, 3]`, or organized `[H, W, 3]`, packed; in host, pinned or device memory on the operator's GPU. A point with a non-finite coordinate (NaN, as `DepthToPointCloudOp` writes) is invalid |
+| Device (`kCudaDevice`) | None: read in place | None (`NormalEstimationOp` with `kDense`: one, for the count) |
+| Pinned host (`kPinnedHost`) | Each field the cloud carries, through a staging buffer | None when the memory can be held until the copy's stream is done (`Tensor::set_deallocation_stream()`); else one per field, for its copy |
+| Host (`kHost`) | Each field the cloud carries, through a staging buffer | One per field for the producer, and the copy itself, which the CUDA runtime stages from pageable memory before returning |
 
-Every output is in device memory and carries the cloud's capture time and frame id. An output that
-exists must be connected, and an optional port exists only when configured. Inputs in host memory
-are copied to the GPU through a staging buffer. An operator cannot send a refused output again: a
-refused emit fails the frame, with an error that names the port.
+The first cloud in host or pinned host memory is logged once, with the bytes copied. Send clouds
+in device memory, as `DepthToPointCloudOp` does, and nothing is copied.
 
 ## Operators
 
@@ -54,7 +72,9 @@ has no normal: NaN.
   `depth_change_factor` of the point's range per pixel of distance, so the window does not reach
   across depth edges. The window is in pixels: at a higher resolution, widen it to cover the same
   surface (the demo uses 3 at 640x480 and 6 at 1280x720).
-- `NeighborSearch::kRadius`: every point within `radius`.
+- `NeighborSearch::kRadius`: every point within `radius`. There is no cap on the neighbors: each
+  point visits every point in the 27 cells of side `radius` around it, so its time grows with the
+  points per radius (see [Performance](#performance)); keep the radius small for dense, near clouds.
 - `NeighborSearch::kKnn`: the `k` nearest points within `radius`, exact, ties to the lower index.
 - `NeighborSearch::kAuto` (default): the window for `[H, W, 3]`, the k nearest for `[N, 3]`.
 
@@ -63,17 +83,11 @@ radix sort) and look each neighbor cell up by binary search; no FLANN or PCL.
 
 | Port | Type | |
 | --- | --- | --- |
-| `colors` (input, with `color`) | `holoscan::Tensor` | uint8 RGB of the points' shape |
-| `filtered_points` | `holoscan::Tensor` | float32 in the configured `layout`: `kKeep`, the input's shape, points without a normal NaN; `kDense`, `[M, 3]` of the points with a normal, in input order |
-| `filtered_colors` (with `color`) | `holoscan::Tensor` | uint8 RGB of `filtered_points`' shape, black where a point has no normal |
-| `normals` | `holoscan::Tensor` | float32 unit normals of `filtered_points`' shape, NaN where a point has none |
-| `curvature` | `holoscan::Tensor` | float32, one per point of `filtered_points` (`[H, W]`, `[N]` or `[M]`), NaN where a point has no normal |
+| `point_cloud` (input) | `PointCloud` | The cloud; normals it carries are replaced |
+| `point_cloud_with_normals` | `PointCloud` | The input's points, colors and intensities with the normals, in the configured `layout`: `kKeep`, the input's shape, a point without a normal NaN (black, NaN intensity), not counted (`valid_count` -1); `kDense`, `[M, 3]` of the points with a normal, in input order, `valid_count` M |
+| `curvature` | `holoscan::Tensor` | float32, one per point of the output cloud (`[H, W]`, `[N]` or `[M]`), NaN where a point has no normal |
 
-`kKeep` never waits for the GPU; `kDense` waits once per frame for the count before allocating its
-outputs. With colors, the operator runs once per cloud when the colors with exactly the same capture
-time have arrived.
-
-`NormalEstimationConfig::normals` is a `NormalParams`:
+The cloud goes out before the curvature. `NormalEstimationConfig::normals` is a `NormalParams`:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -82,11 +96,16 @@ time have arrived.
 | `depth_change_factor` | `0.02` | Window: the range step allowed per pixel, as a fraction of the point's range |
 | `radius` | `0.05` | Radius, k-nearest: the neighborhood in meters |
 | `k` | `24` | K-nearest: neighbors, the point included, 3..64 |
-| `min_neighbors` | `5` | Fewer neighbors give no normal, at least 3 |
+| `min_neighbors` | `5` | Fewer neighbors give no normal; at least 3, and no more than the window's pixels or `k` for the searches that use them |
 | `viewpoint` | `(0, 0, 0)` | Normals face this point: the camera, for a camera's cloud |
 
-and `color` (`false`), `layout` (`OutputLayout::kKeep`) and `max_points` (`2073600`, 1920x1080:
-the largest cloud accepted, which sizes the outputs).
+and:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `colors`, `intensity` | `false` | Room in the output for the clouds' colors and intensities, which it then carries through. A cloud that carries one without room fails the frame; a cloud without it leaves it absent |
+| `layout` | `OutputLayout::kKeep` | `kKeep` or `kDense`, as above |
+| `max_points` | `2073600` (1920x1080) | The largest cloud accepted; it sizes the outputs' pools, whose every slot holds that many points (24.9 MB of points and as much of normals at the default): set it to your clouds' size |
 
 ### `PlaneSegmentationOp`
 
@@ -102,18 +121,20 @@ the plane reported is the least-squares plane of exactly those inliers. The next
 among the points left; a plane with fewer than `min_inliers` ends the search. With
 `merge_coplanar`, a plane whose normal is within `merge_angle_deg` of an earlier plane's, with each
 centroid within `merge_distance` of the other's plane, is merged into it, refit, and the planes are
-renumbered. Everything is decided on the GPU: the host never waits.
+renumbered. Every decision is made on the GPU: the host does not wait for one (see
+[Waits and copies](#waits-and-copies)).
 
 | Port | Type | |
 | --- | --- | --- |
-| `normals` (input) | `holoscan::Tensor` | float32 of the points' shape, as `NormalEstimationOp` emits them; a point with a non-finite normal is on no plane |
+| `point_cloud` (input) | `PointCloud` | A cloud with normals; a point with a non-finite normal is on no plane. A cloud without normals fails the frame |
 | `labels` | `holoscan::Tensor` | uint8, one per point (`[H, W]` or `[N]`): plane `k` is `k + 1`; `kLabelNoPlane` (0) on no plane; `kLabelInvalid` (255) for an invalid point or one without a normal |
 | `plane_coefficients` | `holoscan::Tensor` | float32 `[max_planes, 4]` `(a, b, c, d)`: `a x + b y + c z + d = 0`, `(a, b, c)` a unit normal toward `viewpoint`; NaN past the planes found |
 | `plane_centroids` | `holoscan::Tensor` | float32 `[max_planes, 3]`, the mean of each plane's inliers; NaN past the planes found |
 | `plane_inliers` | `holoscan::Tensor` | uint32 `[max_planes]`, each plane's inliers; 0 past the planes found |
 
-The operator runs once per cloud when the normals with exactly the same capture time have arrived.
-Planes come in the order found, which is mostly largest first.
+The outputs go out in the order above. Planes come in the order found, which is mostly largest
+first. The labels and the plane tables are tensors of their own rather than fields of the cloud:
+the `PointCloud` message has no field for them.
 
 `PlaneSegmentationConfig::planes` is a `PlaneParams`:
 
@@ -137,29 +158,44 @@ and `max_points` (`2073600`).
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+find_package(holoscan-point-cloud 2.0 REQUIRED CONFIG)
 find_package(holoscan-normals 1.0 REQUIRED CONFIG)
-target_link_libraries(my_app PRIVATE holoscan::normals)
+target_link_libraries(my_app PRIVATE holoscan::normals holoscan::point_cloud)
 ```
 
+A depth camera's frames, its camera from a `camera_info` file, the cloud, its normals and its
+planes, every frame lossless, on one worker:
+
 ```cpp
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
 #include <holoscan/normals/normal_estimation_op.hpp>
 #include <holoscan/normals/plane_segmentation_op.hpp>
+#include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
 
+namespace hm = holoscan::messages;
 namespace hn = holoscan::normals;
+namespace pc = holoscan::point_cloud;
 
+auto camera = graph.op<hm::CameraInfoSourceOp>(
+    "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = "depth.yaml"});
+auto deproject = graph.op<pc::DepthToPointCloudOp>(
+    "deproject", pc::DepthToPointCloudConfig{.max_width = 640, .max_height = 480});
 auto normals = graph.op<hn::NormalEstimationOp>(
     "normals", hn::NormalEstimationConfig{.max_points = 640 * 480});
 auto planes = graph.op<hn::PlaneSegmentationOp>(
     "planes", hn::PlaneSegmentationConfig{.max_points = 640 * 480});
 
-graph.add_flow(deproject->point_cloud, normals->points);  // DepthToPointCloudOp
-graph.add_flow(normals->filtered_points, planes->points);
-graph.add_flow(normals->normals, planes->normals);
-graph.add_flow(normals->curvature, grasping->curvature);
-graph.add_flow(planes->labels, segmenter->labels);
-graph.add_flow(planes->plane_coefficients, planner->planes);
-graph.add_flow(planes->plane_centroids, planner->centroids);
-graph.add_flow(planes->plane_inliers, planner->inliers);
+// `depth_camera` is your camera's operator, sending holoscan::schema::ImageT depth images.
+const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
+graph.add_flow(depth_camera->depth, deproject->depth, lossless);
+graph.add_flow(camera->camera_info, deproject->camera_info, hm::latest_camera_info_connection());
+graph.add_flow(deproject->point_cloud, normals->point_cloud, lossless);
+graph.add_flow(normals->point_cloud_with_normals, planes->point_cloud, lossless);
+// planes->labels, plane_coefficients, plane_centroids and plane_inliers, and
+// normals->curvature, to your operators.
+graph.partition("my_app").include_all();
 ```
 
 The outputs are in device memory, so bind their GPU when compiling, for every output of both
@@ -171,9 +207,11 @@ options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlaceme
     .operator_path = "planes", .output_port = "labels", .device = holoscan::DeviceId{0}});
 ```
 
-A lossless (`kBlocking`) edge whose queue is full fails the frame. Keep the producer at most one
-frame ahead of the slowest consumer, as the demo's source does, or connect consumers that only need
-the newest frame with `QueuePolicy::kDropOldest`.
+A lossless (`kBlocking`) edge whose queue is full fails the frame, and across workers a stage that
+falls behind meets one. Keep a lossless chain on one worker, as above and as the demo does (see
+[holoscan-messages](../messages/README.md#run-a-graph-on-one-worker)), with a source that keeps its
+frames in flight below the queues' depth (two) and sends a refused frame again; or connect
+consumers that only need the newest frame with `QueuePolicy::kDropOldest`, depth 1.
 
 The kernels need no Holoscan graph: `NormalEstimator` in `<holoscan/normals/normals.hpp>` and
 `PlaneSegmenter` in `<holoscan/normals/planes.hpp>` work on device pointers and a CUDA stream.
@@ -181,7 +219,12 @@ The kernels need no Holoscan graph: `NormalEstimator` in `<holoscan/normals/norm
 `<holoscan/normals/synthetic_scene.hpp>` is the synthetic depth camera of the tests and the demo: a
 room with a floor, two walls, a table with a box on it, a box on the floor and a moving sphere, with
 depth noise and missing pixels, every pixel's surface and exact normal known, and every flat
-surface's plane.
+surface's plane. `synthetic_camera_info()` gives its camera as a `CameraInfo`, to write as a
+`camera_info` file with `write_camera_info_yaml()`.
+
+The library is `libholoscan_normals.so.1`: its soname is the major version, which a change to the
+public headers that breaks source or binary compatibility raises, as the CMake package's
+`SameMajorVersion` check expects.
 
 ## Accuracy
 
@@ -200,33 +243,50 @@ All on clouds made at test time; the scene has 2 mm of depth noise and 1 % of pi
 | Planes, labels, centroids, inliers | A CPU reference of the whole algorithm, with and without merging | Identical, bit for bit |
 
 The normals, plane and scene kernels are compiled without fused multiply-adds, so they compute what
-the CPU computes from the same expressions; host code that checks them exactly must use
-`-ffp-contract=off`. Every result is the same on every run.
+the CPU computes from the same expressions. The library compiles its own host code with
+`-ffp-contract=off` but does not pass that on: host code of yours that compares the synthetic
+scene's host functions with the GPU bit for bit must be compiled with `-ffp-contract=off` too, or
+the compiler may fuse its multiply-adds and give other bits. Every result is the same on every run.
+
+On the local recordings (real depth, no ground truth), `normals_real_data` checks the results'
+own rules: unit normals facing the camera, curvature within its range, the same bits on a second
+run, and each plane's labels within its distance and angle (the reported plane is the refit of its
+inliers, so up to 3 % of them may sit past the distance it took them at, none past 2.5 times it).
 
 ## Performance
 
-Each step as its operator runs it in the `kKeep` layout, on organized clouds of the synthetic scene,
-mean milliseconds of GPU time over 100 runs; `normals_benchmark` measures it.
+GPU time of each step's kernels, as the operators launch them in the `kKeep` layout, on organized
+clouds of the synthetic scene: the mean of 100 runs on one stream, between two CUDA events, in
+milliseconds. It leaves out the operators' receive, allocation and emit and any host time;
+`normals_benchmark` measures it. The near rows are the same clouds at a quarter of their distances,
+16 times the points per area.
 
-| Step | RTX 5090, 640x480 | RTX 5090, 1280x720 | Orin, 640x480 | Orin, 1280x720 |
+| Kernels | RTX 5090, 640x480 | RTX 5090, 1280x720 | Jetson Orin, 640x480 | Jetson Orin, 1280x720 |
 | --- | --- | --- | --- | --- |
-| NormalEstimationOp (window 7x7) | 0.039 | 0.098 | 0.81 | 2.16 |
-| NormalEstimationOp (window 11x11) | 0.071 | 0.184 | 2.11 | 4.14 |
-| NormalEstimationOp (radius 4 cm) | 0.337 | 1.497 | 4.58 | 26.5 |
-| NormalEstimationOp (k-nearest 24 within 10 cm) | 1.807 | 4.910 | 18.7 | 63.2 |
-| PlaneSegmentationOp (8 planes, 256 hypotheses each) | 1.587 | 1.897 | 4.07 | 8.46 |
-| Both (window 7x7, then the planes) | 1.623 | 1.989 | 4.80 | 10.6 |
+| Normals (window 7x7) | 0.039 | 0.098 | 0.746 | 2.23 |
+| Normals (window 11x11) | 0.071 | 0.183 | 1.42 | 4.22 |
+| Normals (radius 4 cm) | 0.337 | 1.50 | 5.11 | 26.6 |
+| Normals (k-nearest 24 within 10 cm) | 1.79 | 4.91 | 20.1 | 69.1 |
+| Normals (radius 4 cm), near | 2.08 | 12.9 | 28.2 | 246 |
+| Normals (k-nearest 24 within 10 cm), near | 4.84 | 22.5 | 40.7 | 235 |
+| Planes (8 planes, 256 hypotheses each) | 1.59 | 1.90 | 4.18 | 8.43 |
+| Both (window 7x7, then the planes) | 1.63 | 1.99 | 5.00 | 10.6 |
 
-The x86_64 machine has an RTX 5090, shared with other work during the runs; the Orin is a Jetson AGX
-Orin developer kit (64 GB) with JetPack 7.2, in the power mode it was set to, also running other
-jobs. The window search is the fast one, and the one to use for a depth camera's organized cloud.
-The plane search is a fixed number of small kernels per plane (about a dozen), so its time grows
-little with the cloud. The grid searches pay for a sort and for visiting cells: prefer the radius
-search when a cloud is unorganized and dense, and keep the k-nearest search for sparse or uneven
-clouds such as lidar's.
+The RTX 5090 ran driver 595.99.02 and the Jetson Orin JetPack 7.2 in power mode MAXN, both with CUDA
+13.2 and Holoscan SDK 5.0.0 in the repository's CI image. The RTX 5090 is shared with other work,
+which was idle during the runs (a resident inference server held memory at 0-1 % GPU use); the
+Jetson Orin had another job's container running, at 0 % GPU load before and after. The window search
+is the fast one, and the one to use for a depth camera's organized cloud. The plane search is a
+fixed number of small kernels per plane (about a dozen), so its time is mostly the gaps between
+launches and grows little with the cloud. The grid searches pay for a sort and for visiting cells.
+The radius search has no cap on its neighbors: its time grows with the points per radius, 5 to 9
+times for 16 times the points per area here, so keep its radius small for dense, near clouds; the
+k-nearest search grows less (2 to 5 times) from a higher start, and suits sparse or uneven clouds
+such as a lidar's.
 
 ## Requirements
 
+- holoscan-messages 1.0 (installed, or built in the same project before this module).
 - Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13 (with its CUB), CMake 4.0
   or later and a C++20 compiler.
 
@@ -234,10 +294,12 @@ The module downloads nothing and needs no models or data.
 
 ## Build, test and install
 
-From the repository root, in the repository's CI image or with the requirements above:
+From the repository root, in the repository's CI image or with the requirements above, after
+installing holoscan-messages into `install/`:
 
 ```bash
-cmake -S modules/normals -B build/normals -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S modules/normals -B build/normals -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DCMAKE_PREFIX_PATH="$PWD/install"
 cmake --build build/normals
 ctest --test-dir build/normals --output-on-failure
 cmake --install build/normals --prefix "$PWD/install"
@@ -249,19 +311,21 @@ cmake --install build/normals --prefix "$PWD/install"
 | `HOLOSCAN_NORMALS_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
-The tests, all on synthetic clouds made at test time:
+The tests, on synthetic clouds made at test time but for `normals_real_data`:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| `normals_normals` | GPU | `NormalEstimator`: the scene's GPU render against its host version and its true planes; every search against the analytic normals (median, 95th percentile, orientation) on organized and shuffled unorganized clouds; curvature on the flat surfaces and the sphere, with and without noise; the CPU reference; determinism across runs and fresh instances; empty, all-invalid, single-point, collinear and flat clouds; rejected settings |
+| `normals_normals` | GPU | `NormalEstimator`: the scene's GPU render against its host version and its true planes; every search against the analytic normals (median, 95th percentile, orientation) on organized and shuffled unorganized clouds; curvature on the flat surfaces and the sphere, with and without noise; the CPU reference; determinism across runs and fresh instances; scratch that grows by half, and an estimator whose clouds grow giving what a fresh one gives; empty, all-invalid, single-point, collinear and flat clouds; rejected settings, `min_neighbors` beyond the window or `k` among them |
 | `normals_planes` | GPU | `PlaneSegmenter`: the floor, both walls and the table top against the truth (angle, offset, label recall and precision) from organized and unorganized clouds; the CPU reference, bit for bit, with and without merging; determinism and another seed; empty, all-invalid, normal-less, single-plane and plane-free clouds; merging two parallel planes; rejected settings |
-| `normals_operators` | GPU | Both operators through the SDK's operator test harness: organized and unorganized input in host and device memory, with and without colors, both layouts, bit for bit against the kernels run directly; the capture time and frame id of every output; empty and all-invalid clouds; rejected inputs and settings |
-| `normals_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working |
+| `normals_operators` | GPU | Both operators through the SDK's operator test harness, on `PointCloud` messages: organized and unorganized clouds in pinned host and device memory, with and without colors and intensities, both layouts, bit for bit against the kernels run directly; the header, capture time and frame id of every output; empty and all-invalid clouds; refused clouds (bad layouts, too many points, fields without room, no normals) and settings. Through a graph, clouds from a producer's host and pinned host pools; and the holding of pinned host input until its copy is done |
+| `normals_real_data` | GPU, the local recordings | The kernels on each clip's first depth images with its `depth.yaml` (see [Accuracy](#accuracy)); runs when `HOLOSCAN_TEST_DATA` names the folder that holds `stereo-camera/`, and is skipped otherwise, as in CI |
+| `normals_benchmark` | GPU | Runs the benchmark briefly, so that it keeps working; it measures nothing. Label `benchmark`: `ctest -LE benchmark` leaves it out |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a graph from host-memory clouds of the synthetic scene with colors through both
-operators, checking that the floor and the back wall are found. Build it with the install prefix on
-`CMAKE_PREFIX_PATH` and run `ctest` there.
+installed package: a lossless graph, on one worker, from host-memory clouds of the synthetic scene
+with colors through both operators, checking that the floor and the back wall are found and that
+the cloud keeps its colors. It fails unless the graph runs on one worker. Build it with the install
+prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
 
@@ -273,10 +337,15 @@ holoscan --project-root modules/normals package holoscan-normals --language cpp 
 ```
 
 `--language cpp` selects the module rather than its package entry, which has the same name. This
-builds for every major GPU architecture and writes `holoscan-normals_1.0.0_<arch>.deb` to the
-current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
-`apt install ./holoscan-normals_1.0.0_<arch>.deb` needs NVIDIA's CUDA repository.
+builds for every major GPU architecture (`all-major`: the Jetson Orin runs the sm_80 code, the
+Jetson Thor sm_110's) and writes `holoscan-normals_1.0.0_<arch>.deb` to the current directory. It
+installs to `/usr` and depends on `holoscan (>= 5.0.0)`, on `holoscan-messages` 1.x, whose types
+its ports carry, and on the CUDA runtime's development files (`libcudart.so.13-dev`), which its
+CMake package needs, so
+`apt install ./holoscan-messages_1.0.0_<arch>.deb ./holoscan-normals_1.0.0_<arch>.deb` needs
+NVIDIA's CUDA repository.
 
 ## Licenses
 
-Apache-2.0. See [NOTICE](NOTICE).
+Apache-2.0. CUB, whose radix sort and scan are compiled into the library, is BSD-3-Clause; its
+license is in [NOTICE](NOTICE), which the package installs.
