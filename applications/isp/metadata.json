@@ -2,7 +2,7 @@
   "$schema": "urn:holoscan:application:v1",
   "application": {
     "name": "ISP",
-    "description": "Turns raw Bayer frames of a synthetic sensor (a moving colour checker scene with known black levels, white balance and vignetting, 8 to 16 bits or packed RAW10/RAW12) into RGB on the GPU with holoscan-isp's IspOp, checks every frame's PSNR against ground truth, and shows the raw mosaic beside the processed image in HoloViz.",
+    "description": "Turns raw Bayer frames of a synthetic sensor (a moving colour chart scene with known black levels, white balance and vignetting, 8 to 16 bits or packed RAW10/RAW12) into RGB on the GPU with holoscan-isp's IspOp, checks every frame's PSNR against ground truth, and shows the raw mosaic beside the processed image in HoloViz.",
     "authors": [
       {
         "name": "zozo",

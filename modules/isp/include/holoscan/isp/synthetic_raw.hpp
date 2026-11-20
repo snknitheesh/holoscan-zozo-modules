@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A synthetic raw camera with known ground truth, for tests and demos: a
-// colour checker, a gray ramp, a hue ramp, bars, a slanted edge and a disc
+// colour chart, a gray ramp, a hue ramp, bars, a slanted edge and a disc
 // (or, for white balance, a scene of grays only), moving from frame to frame,
 // softened by a lens blur of about two pixels and seen through a colour
 // matrix, white balance gains and lens vignetting that
@@ -33,7 +33,7 @@
 namespace holoscan::isp {
 
 enum class SceneKind : std::uint8_t {
-  kChart,  // Colour checker, ramps, bars, edge and disc.
+  kChart,  // Colour chart, ramps, bars, edge and disc.
   kGray,   // Grays only: a ramp and patches, gray on average in every channel.
 };
 
@@ -98,7 +98,7 @@ void render_synthetic_raw(const SyntheticRawScene& scene, void* data, std::size_
 
 namespace synthetic_detail {
 
-// The 24 colour checker patches, linear sRGB.
+// The 24 colour chart patches, linear sRGB.
 HOLOSCAN_ISP_SYNTHETIC_HD inline void checker_color(int index, float rgb[3]) {
   constexpr float kPatches[24][3] = {
       {0.1714F, 0.0844F, 0.0578F}, {0.5395F, 0.3050F, 0.2232F}, {0.1221F, 0.1946F, 0.3372F},
@@ -123,7 +123,7 @@ HOLOSCAN_ISP_SYNTHETIC_HD inline void set_rgb(float rgb[3], float r, float g, fl
 
 }  // namespace synthetic_detail
 
-// The colour checker's patch grid in a chart frame: 6 x 4 patches of
+// The colour chart's patch grid in a chart frame: 6 x 4 patches of
 // patch_width x patch_height pixels at a pitch of cell_width x cell_height,
 // the first at (left + scene.shift, top).
 struct ChartLayout {

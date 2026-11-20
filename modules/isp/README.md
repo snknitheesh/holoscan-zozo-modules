@@ -1,7 +1,8 @@
 # holoscan-isp
 
 A Holoscan SDK 5 Module that turns raw camera frames into display-ready RGB on the GPU: an image
-signal processor for cameras that deliver RAW, such as GMSL and CSI sensors.
+signal processor for cameras that deliver RAW, such as sensors on MIPI CSI-2 or a serial camera
+link.
 
 - `IspOp` takes a Bayer mosaic (any of RGGB, BGGR, GRBG, GBRG; 1 to 16 bits per sample in uint8 or
   uint16, or packed MIPI CSI-2 RAW10 / RAW12) and emits RGB8, RGBA8, RGB16 or float RGB, and on
@@ -51,8 +52,8 @@ edges.
    4097 entries, interpolated linearly (within 2e-5 of the formulas).
 8. **Statistics** (optional, below).
 
-Black and white levels, white balance gains and the colour matrix are the camera's calibration;
-`IspParams` holds them all, and `validate_params()` names the first unusable one.
+Black and white levels, white balance gains and the colour matrix are the camera's colour
+parameters; `IspParams` holds them all, and `validate_params()` names the first unusable one.
 
 ## `IspOp`
 
@@ -193,8 +194,8 @@ the newest frame, such as a display, with `QueuePolicy::kDropOldest` and depth 1
 
 Without a graph, `IspPipeline` in `<holoscan/isp/isp_pipeline.hpp>` runs the same pipeline on
 `RawImageView` and `RgbImageView` pointers and a CUDA stream (or host memory with `kCpu`).
-`<holoscan/isp/synthetic_raw.hpp>` is the synthetic raw sensor of the tests and the demo: a colour
-checker, gray and hue ramps, bars, a slanted edge and a moving disc, softened by a two-pixel lens
+`<holoscan/isp/synthetic_raw.hpp>` is the synthetic raw sensor of the tests and the demo: a 24-patch
+colour chart, gray and hue ramps, bars, a slanted edge and a moving disc, softened by a two-pixel lens
 blur, seen through a colour matrix, white balance gains and vignetting, mosaicked, offset by black
 levels, quantized and packed as a sensor would, with `synthetic_truth()` giving what an ideal ISP
 outputs at every pixel, and `synthetic_isp_params()` the settings that undo the camera.
@@ -204,7 +205,7 @@ outputs at every pixel, and `synthetic_isp_params()` the settings that undo the 
 
 All on frames rendered at test time, with per-channel black levels, white balance gains of 1.9 and
 1.6, a colour matrix and 40 % vignetting to undo. PSNR is over the whole 8-bit sRGB image against
-the truth; CIEDE2000 between the mean colours of the inner half of each of the 24 colour checker
+the truth; CIEDE2000 between the mean colours of the inner half of each of the 24 colour chart
 patches. 640x480, RGGB:
 
 | Samples | Bilinear PSNR | Malvar-He-Cutler PSNR | Patch CIEDE2000, mean / worst |
@@ -236,11 +237,11 @@ the dark patches to quantization after the white balance gains).
 
 ## Performance
 
-Mean GPU time per frame over 100 frames (300 on the Orin, the better of two runs), 12-bit raw in,
+Mean GPU time per frame over 100 frames (300 on the Jetson Orin, the better of two runs), 12-bit raw in,
 RGB8 out, from CUDA events; `isp_benchmark` measures it. "Plain" is black level, manual white balance, demosaic, colour matrix
 and sRGB; "full" adds lens shading, the gray world estimate, sharpening, histograms and statistics.
 
-| Frame | Demosaic | Stages | RTX 5090 | Orin |
+| Frame | Demosaic | Stages | RTX 5090 | Jetson Orin |
 | --- | --- | --- | --- | --- |
 | 1920x1080 | bilinear | plain | 0.017 ms | 0.354 ms |
 | 1920x1080 | bilinear | full | 0.090 ms | 1.080 ms |
@@ -252,9 +253,9 @@ and sRGB; "full" adds lens shading, the gray world estimate, sharpening, histogr
 | 3840x2160 | Malvar-He-Cutler | full | 0.237 ms | 4.018 ms |
 
 The cpu backend, on one thread, takes 24 ms (bilinear) and 38 ms (Malvar-He-Cutler) for a plain
-1920x1080 frame on the x86_64 machine, 52 and 64 ms full; 70 and 93 ms plain on the Orin. The
-x86_64 machine has an RTX 5090, shared with other work during the runs; the Orin is a Jetson AGX
-Orin developer kit (64 GB) with JetPack 7.2 in MAXN, also running other jobs. The plain pipeline is
+1920x1080 frame on the RTX 5090's x86_64 host, 52 and 64 ms full; 70 and 93 ms plain on the Jetson
+Orin. The RTX 5090 was shared with other work during the runs; the Jetson Orin ran JetPack 7.2 in
+power mode MAXN, also running other jobs. The plain pipeline is
 bound by memory: it reads each sample and writes each pixel once. The full one adds a read of the
 raw frame for the white balance estimate, a read of the output for the histograms, and the
 sharpening's second stage in the tile.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// ISP: a synthetic raw camera (holoscan-isp's colour checker scene, moving,
+// ISP: a synthetic raw camera (holoscan-isp's colour chart scene, moving,
 // mosaicked with known black levels, white balance and vignetting) feeds
 // holoscan-isp's IspOp, which turns each Bayer frame into RGB on the GPU. A
 // checker measures every frame's PSNR against the camera's truth, and with a

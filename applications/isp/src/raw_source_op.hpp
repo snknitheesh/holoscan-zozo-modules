@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// RawSourceOp: frames of holoscan-isp's synthetic raw camera as a GMSL or CSI
-// sensor delivers them: a Bayer mosaic in device memory, 8 to 16 bits per
+// RawSourceOp: frames of holoscan-isp's synthetic raw camera as a MIPI CSI-2
+// or serial-link sensor delivers them: a Bayer mosaic in device memory, 8 to 16 bits per
 // sample or packed MIPI RAW10 / RAW12, with the exposure time and gain of the
 // capture; a fixed number on a clock, then idle.
 //

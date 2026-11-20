@@ -1,8 +1,8 @@
 # ISP
 
 The demo of `IspOp` from the [holoscan-isp](../../modules/isp/) module. A synthetic raw sensor,
-mosaicked with known black levels, white balance gains and vignetting, sends Bayer frames as a GMSL
-or CSI camera would; `IspOp` turns them into RGB on the GPU; a checker measures every frame's PSNR
+mosaicked with known black levels, white balance gains and vignetting, sends Bayer frames as a MIPI
+CSI-2 or serial-link camera would; `IspOp` turns them into RGB on the GPU; a checker measures every frame's PSNR
 against the sensor's truth and checks its histograms; and HoloViz shows the raw mosaic beside the
 processed image. It uses the installed module the way any other project would:
 `find_package(holoscan-isp)`.
@@ -64,8 +64,8 @@ frames at 1280x720 with the display when there is one, and `ci`, 30 frames at 64
 
 The window shows each frame twice side by side: on the left the raw mosaic as gray (its square root,
 so that the dark half shows), as the sensor delivers it, with the chequer of the colour filters
-visible; on the right the processed image. The sensor sees a colour checker, a gray ramp, a hue
-ramp, bars of 4 to 16 pixels, a slanted edge and a red disc; the checker and the disc move.
+visible; on the right the processed image. The sensor sees a colour chart, a gray ramp, a hue
+ramp, bars of 4 to 16 pixels, a slanted edge and a red disc; the chart and the disc move.
 
 The ISP cannot send a refused output again, so the source keeps one frame in flight: it renders the
 next frame only once the checker has counted the previous one, and no lossless queue ever fills.

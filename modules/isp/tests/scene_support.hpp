@@ -260,7 +260,7 @@ inline double delta_e2000(const std::array<double, 3>& lab1, const std::array<do
 }
 
 // CIEDE2000 between the output and the truth over the inner half of each of
-// the colour checker's 24 patches, means compared; sRGB tone curve only.
+// the colour chart's 24 patches, means compared; sRGB tone curve only.
 struct PatchErrors {
   double mean{};
   double worst{};
