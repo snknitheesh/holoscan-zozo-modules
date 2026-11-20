@@ -16,6 +16,9 @@
 // terrain_height() runs on the host and on the GPU; the module compiles the
 // renderer without fused multiply-adds, so host code that evaluates the same
 // functions must not contract them either (-ffp-contract=off).
+//
+// This header is installed, as holoscan-point-cloud's synthetic depth camera
+// is: other projects' tests and demos can use the same terrain and camera.
 
 #pragma once
 
@@ -23,8 +26,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #include <holoscan/height_map/grid.hpp>
+#include <holoscan/messages/camera_info.hpp>
 
 #if defined(__CUDACC__)
 #define HOLOSCAN_HEIGHT_MAP_HOST_DEVICE __host__ __device__
@@ -126,6 +131,13 @@ struct TerrainCamera {
   float noise_quadratic{};
   std::uint32_t seed{};
 };
+
+// The camera's calibration, holoscan-messages' CameraInfo: undistorted, no
+// skew, of its image size, in frame `frame_id`. Write it with
+// write_camera_info_yaml() for CameraInfoSourceOp, as the demo does, so that
+// DepthToPointCloudOp deprojects the rendered depth with the same camera.
+[[nodiscard]] holoscan::messages::CameraInfo camera_info_of(const TerrainCamera& camera,
+                                                            std::string frame_id);
 
 // A camera at (x, y, z) in the map frame looking along `yaw_rad` (from +x
 // toward +y), tilted down by `pitch_down_rad`.

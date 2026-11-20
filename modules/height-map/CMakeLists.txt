@@ -61,6 +61,7 @@ add_library(
   src/host_input.cpp
   src/kernel_common.cu
   src/synthetic_terrain.cu
+  src/terrain_camera_info.cpp
   src/traversability.cu
   src/traversability_op.cpp
   src/views.cu

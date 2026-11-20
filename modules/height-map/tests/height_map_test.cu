@@ -533,6 +533,13 @@ void check_camera_view() {
   camera.noise_base = 0.001F;
   camera.noise_quadratic = 0.002F;
   camera.seed = 3U;
+  // Its calibration, as a CameraInfo for a camera_info file.
+  const holoscan::messages::CameraInfo info = camera_info_of(camera, "terrain_camera");
+  VERIFY(info.width == 320U && info.height == 240U && info.fx == 225.0 && info.fy == 225.0 &&
+         info.cx == 159.5 && info.cy == 119.5 && info.skew == 0.0 &&
+         info.state == holoscan::messages::CameraState::kUndistorted &&
+         info.header.frame_id == "terrain_camera");
+  VERIFY(!test::throws<std::invalid_argument>([&] { holoscan::messages::validate(info); }));
   const std::size_t pixels = 320U * 240U;
   test::Scratch<float> depth(pixels);
   test::Scratch<float> xyz(3 * pixels);
