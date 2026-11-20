@@ -35,6 +35,15 @@ struct ExposureFusionOpConfig {
   // kFusion: the brackets of one fused image are those whose capture times lie
   // within this window of each other (inclusive); 0 needs equal capture times.
   // 0..1 s.
+  //
+  // The window must be shorter than the time between two sets of brackets less
+  // the time one set takes to capture: the operator fuses whatever bracket heads
+  // its queues hold within the window, so with a wider one a single dropped
+  // bracket fuses brackets of two sets, and every later set stays out of step,
+  // silently. Best, stamp every bracket of a set with one capture time and keep
+  // 0; a camera that stamps each bracket when it was taken needs a window just
+  // over one set's capture time (3 ms for brackets taken 1 ms apart at 30 sets a
+  // second, never 33 ms or more).
   std::chrono::nanoseconds match_window{0};
   FusionParams fusion;
   ToneMapParams tone_map;
@@ -63,7 +72,11 @@ class ExposureFusionOp final : public holoscan::Operator<> {
 
   // kFusion: MONO8, RGB8 or RGBA8 brackets of one size and format, uint8 [H, W]
   // or [H, W, channels], in host or CUDA device memory, in any order of exposure.
-  // `bracket2` exists with 3 brackets.
+  // `bracket2` exists with 3 brackets. Every bracket needs a capture time
+  // (EmitOptions::capture_time), by which the sets are matched: an unstamped
+  // bracket, or one stamped before the bracket it follows on its port, fails the
+  // run; brackets whose capture times are not within `match_window` of the other
+  // ports' are never fused, and are dropped without a log.
   holoscan::Input<holoscan::schema::ImageT> bracket0;
   holoscan::Input<holoscan::schema::ImageT> bracket1;
   holoscan::Input<holoscan::schema::ImageT> bracket2;
@@ -72,8 +85,9 @@ class ExposureFusionOp final : public holoscan::Operator<> {
   holoscan::Input<holoscan::schema::ImageT> hdr;
   // The brackets' format (alpha 255), or MONO8, RGB8, RGBA8 for 1, 3, 4 HDR
   // channels; uint8 [H, W, channels], packed, in CUDA device memory. The
-  // descriptor keeps bracket0's (or the HDR frame's) header; the sample its
-  // capture time and frame id.
+  // descriptor keeps bracket0's (or the HDR frame's) header and colour space,
+  // with no exposure time or gain; the sample its capture time and frame id, and
+  // the flags (invalid, degraded) of every bracket.
   holoscan::Output<holoscan::schema::ImageT> image;
 
  private:

@@ -159,7 +159,7 @@ holoscan::expected<void, holoscan::Error> DenoiseOp::compute(holoscan::Execution
     config_.stats->frames.fetch_add(1U);
   }
   return denoised.emit_tensor(std::move(*loan),
-                              detail::image_descriptor(format, width, height, input),
+                              detail::image_descriptor(format, width, height, input, true),
                               holoscan::sensor_io::derive_from(*sample));
 }
 

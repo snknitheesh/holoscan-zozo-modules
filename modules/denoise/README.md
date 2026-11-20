@@ -109,10 +109,20 @@ of their histories. RGBA8's alpha passes through.
 | `bracket0`, `bracket1` (inputs, `kFusion`) | `schema::ImageT` | `MONO8`, `RGB8` or `RGBA8` brackets of one size and format, in any order of exposure; host or CUDA device memory |
 | `bracket2` (input, `kFusion` with 3 brackets) | `schema::ImageT` | |
 | `hdr` (input, `kToneMap`) | `schema::ImageT` | `MONO16`, `RGB16`, `RGBA16` (code values of `significant_bits`, else 16) or `MONO32F`, `RGB32F`, `RGBA32F` (linear, any scale); host or CUDA device memory |
-| `image` | `schema::ImageT` | The brackets' format (alpha 255), or `MONO8`, `RGB8`, `RGBA8` for 1, 3, 4 HDR channels: uint8 `[H, W, channels]` in CUDA device memory, with bracket0's (or the HDR frame's) header, capture time and frame id |
+| `image` | `schema::ImageT` | The brackets' format (alpha 255), or `MONO8`, `RGB8`, `RGBA8` for 1, 3, 4 HDR channels: uint8 `[H, W, channels]` in CUDA device memory, with bracket0's (or the HDR frame's) header, capture time and frame id, no exposure time or gain, and the flags (invalid, degraded) of every bracket |
 
 The brackets of one image are matched by capture time (`OnAligned`): equal times by default, or
-within `match_window` of each other, as when a camera captures them one after another.
+within `match_window` of each other, as when a camera captures them one after another. So every
+bracket needs a capture time (`EmitOptions::capture_time`): an unstamped bracket, or one stamped
+before the one it follows on its port, fails the run, and brackets the other ports have none
+within the window of are dropped without a log.
+
+`match_window` must be shorter than the time between two sets less the time one set takes to
+capture. The operator fuses whatever brackets head its queues within the window: with a wider
+window, one dropped bracket (on a drop-oldest edge, say) fuses brackets of two sets, and every later
+set stays one out of step, ghosted, with no error. Best, stamp all the brackets of a set with one
+capture time and keep the window at 0; with a capture time per bracket, use a window just over one
+set's capture time: 3 ms for brackets taken 1 ms apart at 30 sets a second, never 33 ms or more.
 
 `ExposureFusionOpConfig`:
 
@@ -120,7 +130,7 @@ within `match_window` of each other, as when a camera captures them one after an
 | --- | --- | --- |
 | `mode` | `FusionMode::kFusion` | `kFusion` or `kToneMap` |
 | `brackets` | `3` | 2 or 3 |
-| `match_window` | `0` | 0..1 s |
+| `match_window` | `0` | 0..1 s; below the time between sets less one set's capture time (above) |
 | `fusion.contrast_weight`, `.saturation_weight`, `.exposure_weight` | `1`, `1`, `1` | Mertens' exponents, 0..4 |
 | `fusion.exposure_sigma` | `0.2` | Width of the well-exposedness Gaussian around 0.5 |
 | `fusion.levels` | `0` | Pyramid levels, 1..16; 0 takes up to 6 (`kAutoFusionLevels`) |
@@ -167,8 +177,8 @@ auto denoiser = graph.op<dn::DenoiseOp>("denoise", config);
 graph.add_flow(camera->image, denoiser->image);  // Output<schema::ImageT>, RGB8 or NV12
 graph.add_flow(denoiser->denoised, detector->image);
 
-auto fusion = graph.op<dn::ExposureFusionOp>(
-    "fusion", dn::ExposureFusionOpConfig{.match_window = std::chrono::milliseconds(40)});
+// The camera stamps the three brackets of a set with one capture time: window 0.
+auto fusion = graph.op<dn::ExposureFusionOp>("fusion", dn::ExposureFusionOpConfig{});
 graph.add_flow(camera->short_exposure, fusion->bracket0);
 graph.add_flow(camera->mid_exposure, fusion->bracket1);
 graph.add_flow(camera->long_exposure, fusion->bracket2);

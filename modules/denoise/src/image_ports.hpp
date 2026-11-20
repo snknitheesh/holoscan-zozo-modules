@@ -99,10 +99,13 @@ class DeviceStaging {
 [[nodiscard]] std::array<std::int64_t, 3> image_shape(PixelFormat format, int width, int height);
 // A view of a packed output image of `format` at `data`.
 [[nodiscard]] ImageView packed_view(PixelFormat format, int width, int height, std::uint8_t* data);
-// The descriptor of an output image: `format`, the size, `source`'s header,
-// exposure and gain, and NV12's plane layouts.
+// The descriptor of an output image: `format`, the size, `source`'s header and
+// colour space, NV12's plane layouts, and with `keep_exposure` its exposure
+// time and gain (a denoised frame keeps them; a fused or tone-mapped image, made
+// of several exposures or none, has neither).
 [[nodiscard]] holoscan::schema::ImageT image_descriptor(PixelFormat format, int width, int height,
-                                                        const holoscan::schema::ImageT& source);
+                                                        const holoscan::schema::ImageT& source,
+                                                        bool keep_exposure);
 [[nodiscard]] holoscan::schema::ImageEncoding encoding_of(PixelFormat format) noexcept;
 
 }  // namespace holoscan::denoise::detail

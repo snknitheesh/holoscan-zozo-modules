@@ -164,7 +164,7 @@ holoscan::expected<void, holoscan::Error> ExposureFusionOp::compute(
       return holoscan::make_unexpected(std::move(committed).error());
     }
     return image.emit_tensor(std::move(*loan),
-                             detail::image_descriptor(format, view.width, view.height, input),
+                             detail::image_descriptor(format, view.width, view.height, input, false),
                              emit_options(*sample));
   }
 
@@ -217,10 +217,14 @@ holoscan::expected<void, holoscan::Error> ExposureFusionOp::compute(
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
   }
-  return image.emit_tensor(
-      std::move(*loan),
-      detail::image_descriptor(first.format, first.width, first.height, samples.front().data),
-      emit_options(samples.front()));
+  // bracket0's capture time and frame id; the flags of every bracket, so that an
+  // invalid or degraded bracket marks the fused image too.
+  holoscan::EmitOptions options = emit_options(samples.front());
+  for (const auto& sample : samples) options.flags |= sample.metadata.flags;
+  return image.emit_tensor(std::move(*loan),
+                           detail::image_descriptor(first.format, first.width, first.height,
+                                                    samples.front().data, false),
+                           options);
 }
 
 }  // namespace holoscan::denoise

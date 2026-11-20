@@ -415,7 +415,8 @@ holoscan::schema::ImageEncoding encoding_of(PixelFormat format) noexcept {
 }
 
 holoscan::schema::ImageT image_descriptor(PixelFormat format, int width, int height,
-                                          const holoscan::schema::ImageT& source) {
+                                          const holoscan::schema::ImageT& source,
+                                          bool keep_exposure) {
   holoscan::schema::ImageT image;
   image.width = width;
   image.height = height;
@@ -424,8 +425,10 @@ holoscan::schema::ImageT image_descriptor(PixelFormat format, int width, int hei
     image.header = std::make_shared<holoscan::schema::HeaderT>(*source.header);
   }
   image.color_space = source.color_space;
-  image.exposure_time_ns = source.exposure_time_ns;
-  image.gain = source.gain;
+  if (keep_exposure) {
+    image.exposure_time_ns = source.exposure_time_ns;
+    image.gain = source.gain;
+  }
   if (format == PixelFormat::kNv12) {
     const auto row = static_cast<std::uint64_t>(width);
     const auto rows = static_cast<std::uint64_t>(height);

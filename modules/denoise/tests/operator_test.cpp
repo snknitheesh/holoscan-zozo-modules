@@ -455,6 +455,98 @@ void check_fusion_unmatched() {
              "brackets 1 ms apart are not fused with a window of 0");
 }
 
+// Brackets taken 1 ms apart, 100 ms between sets, a 3 ms window, and bracket1
+// of set 1 lost (as on a drop-oldest edge): sets 0, 2 and 3 are fused each from
+// its own brackets, and set 1 not at all, so no set is fused out of step.
+void check_fusion_dropped_bracket() {
+  const HdrScene scene{.width = kWidth, .height = kHeight, .channels = 3};
+  ExposureFusionOpConfig config{.brackets = 3, .match_window = std::chrono::milliseconds(3)};
+  config.max_width = 256;
+  config.max_height = 256;
+  auto h = holoscan::testing::create_operator_test<ExposureFusionOp>(config);
+  const std::array<std::string, 3> ports{"bracket0", "bracket1", "bracket2"};
+  constexpr std::uint32_t kSets = 4;
+  for (std::size_t k = 0; k < 3; ++k) {
+    std::vector<holoscan::testing::TestSample<holoscan::schema::ImageT>> samples;
+    for (std::uint32_t f = 0; f < kSets; ++f) {
+      if (k == 1 && f == 1) continue;  // Lost.
+      auto sample = holoscan::testing::sample_at(
+          bracket_image(scene, kBracketExposures[k], false),
+          capture_time(f) + std::chrono::milliseconds(static_cast<int>(k)));
+      sample.metadata.frame_id = 70U + f;
+      samples.push_back(std::move(sample));
+    }
+    h.push_samples(ports[k], std::move(samples));
+  }
+  h.output_device("image", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("image");
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto images = result.snapshots<holoscan::schema::ImageT>("image");
+  VERIFY_MSG(images.size() == 3, std::to_string(images.size()) + " images for 3 whole sets");
+  const std::vector<float> exposures{kBracketExposures[0], kBracketExposures[1],
+                                     kBracketExposures[2]};
+  const auto expected = fused_directly(scene, exposures);
+  const std::array<std::uint32_t, 3> sets{0, 2, 3};
+  for (std::size_t i = 0; i < images.size() && i < sets.size(); ++i) {
+    VERIFY(bytes_of(images[i]) == expected);
+    VERIFY_MSG(images[i].sample_metadata().capture_timestamp_ns == capture_time(sets[i]).count(),
+               "image " + std::to_string(i) + " is not set " + std::to_string(sets[i]));
+    VERIFY(images[i].sample_metadata().frame_id == 70U + sets[i]);
+  }
+}
+
+// The fused image carries the flags of every bracket, and neither bracket's
+// exposure time nor gain.
+void check_fusion_provenance() {
+  const HdrScene scene{.width = kWidth, .height = kHeight, .channels = 3};
+  ExposureFusionOpConfig config{.brackets = 2};
+  config.max_width = 256;
+  config.max_height = 256;
+  auto h = holoscan::testing::create_operator_test<ExposureFusionOp>(config);
+  auto first = holoscan::testing::sample_at(bracket_image(scene, kBracketExposures[0], false),
+                                            capture_time(0));
+  auto second = holoscan::testing::sample_at(bracket_image(scene, kBracketExposures[2], false),
+                                             capture_time(0));
+  second.metadata.flags = holoscan::SampleFlags::kDegraded;
+  h.push_samples("bracket0", {std::move(first)});
+  h.push_samples("bracket1", {std::move(second)});
+  h.output_device("image", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("image");
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto images = result.snapshots<holoscan::schema::ImageT>("image");
+  VERIFY(images.size() == 1);
+  if (images.empty()) return;
+  VERIFY_MSG((images[0].sample_metadata().flags & holoscan::SampleFlags::kDegraded) ==
+                 holoscan::SampleFlags::kDegraded,
+             "bracket1's degraded flag is lost");
+  VERIFY(images[0].metadata().exposure_time_ns == 0);
+  VERIFY(images[0].metadata().gain == 0.0F);
+}
+
+// A bracket with no capture time is never fused.
+void check_fusion_unstamped() {
+  const HdrScene scene{.width = kWidth, .height = kHeight, .channels = 3};
+  ExposureFusionOpConfig config{.brackets = 2};
+  config.max_width = 256;
+  config.max_height = 256;
+  auto h = holoscan::testing::create_operator_test<ExposureFusionOp>(config);
+  h.push_samples("bracket0", {holoscan::testing::sample_at(
+                                 bracket_image(scene, kBracketExposures[0], false), capture_time(0))});
+  h.push_samples("bracket1", {holoscan::testing::TestSample<holoscan::schema::ImageT>{
+                                 .data = bracket_image(scene, kBracketExposures[2], false)}});
+  h.output_device("image", holoscan::DeviceId{0});
+  h.capture_snapshot<holoscan::schema::ImageT>("image");
+  const auto result = h.run();
+  const std::size_t fused =
+      result.ok() ? result.snapshots<holoscan::schema::ImageT>("image").size() : 0U;
+  std::printf("  unstamped bracket: run %s, %zu fused\n", result.ok() ? "ok" : "failed", fused);
+  VERIFY_MSG(fused == 0, "a bracket without a capture time was fused");
+}
+
 // One float or 16-bit frame, tone mapped as the reference maps it (within one
 // code value), from host and device memory.
 void check_tone_map_op(bool device) {
@@ -598,6 +690,9 @@ int main() {
   cases.push_back({"ExposureFusionOp brackets within a 3 ms window",
                    [] { dn::check_fusion_op(3, std::chrono::milliseconds(3), true, 3); }});
   cases.push_back({"ExposureFusionOp unmatched brackets", dn::check_fusion_unmatched});
+  cases.push_back({"ExposureFusionOp a dropped bracket", dn::check_fusion_dropped_bracket});
+  cases.push_back({"ExposureFusionOp provenance", dn::check_fusion_provenance});
+  cases.push_back({"ExposureFusionOp unstamped bracket", dn::check_fusion_unstamped});
   cases.push_back({"ExposureFusionOp tone map, host", [] { dn::check_tone_map_op(false); }});
   cases.push_back({"ExposureFusionOp tone map, device", [] { dn::check_tone_map_op(true); }});
   cases.push_back({"ExposureFusionOp rejections", dn::check_fusion_rejections});
