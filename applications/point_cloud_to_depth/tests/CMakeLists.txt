@@ -299,13 +299,24 @@ pcd_app_test(pcd_app_rejects_depth_scale_with_synthetic 2 "^error: .*drop --dept
   --depth-format uint16 --depth-scale 0.001
 )
 # An image folder that cannot be looked into is a usage error, not a failed
-# run: here a path through a link to itself, which no user can resolve.
+# run: here a path through a link to itself, which no user can resolve. The
+# link lives only while the test runs, so that nothing which walks the build
+# tree afterwards, such as the CI's log upload, runs into it.
 set(_looped "${CMAKE_CURRENT_BINARY_DIR}/looped")
-file(MAKE_DIRECTORY "${_looped}")
-file(CREATE_LINK loop "${_looped}/loop" SYMBOLIC)
+add_test(
+  NAME pcd_looped_setup
+  COMMAND sh -c "mkdir -p \"$1\" && rm -f \"$1/loop\" && ln -s loop \"$1/loop\"" sh "${_looped}"
+)
+add_test(
+  NAME pcd_looped_cleanup
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${_looped}"
+)
+set_tests_properties(pcd_looped_setup PROPERTIES FIXTURES_SETUP pcd_looped)
+set_tests_properties(pcd_looped_cleanup PROPERTIES FIXTURES_CLEANUP pcd_looped)
 pcd_app_test(pcd_app_rejects_unreadable_image_dir 2 "^error: --image-dir is not a directory"
   --count 1 --image-dir "${_looped}/loop/images"
 )
+set_tests_properties(pcd_app_rejects_unreadable_image_dir PROPERTIES FIXTURES_REQUIRED pcd_looped)
 # Only the plan's verdict: an accepted plan has no warnings. With CameraInfoSourceOp
 # the graph has two sources and still runs on one worker, as the demo lays it out.
 pcd_app_test(pcd_app_compile_only 0 "^point_cloud_to_depth: plan=OK workers=1\n*$"
@@ -323,13 +334,20 @@ add_test(
     $<TARGET_FILE:point_cloud_to_depth> --count 5 --period-ms 5 --image-dir "${_blocked}"
 )
 
-# The timeout is the longest wait for an image, not for the whole run. Checking
-# 2048x2048 images with 5x5 splats against the truth takes about 0.5 s each
-# here: eight of them outlast a 2 s timeout, yet the run goes on and passes.
-# A 4096x4096 image takes about 2 s, beyond a 1 s timeout: that run is stopped
-# and fails. Each holds 1 to 3 GiB of GPU memory, so it runs alone.
-pcd_app_test(pcd_app_slow_but_progressing 0 "frames=[78]/8 .*verdict=PASS"
-  --width 2048 --height 2048 --point-size 5 --count 8 --period-ms 1 --timeout-seconds 2
+# The timeout is the longest wait for an image, not for the whole run. Here the
+# source is slow, not the check: it sends an image every 250 ms, and making and
+# checking a 640x480 image takes about 8 ms on an RTX 5090 and 16 ms on a Jetson
+# Orin. So on every platform an image comes about 0.25 s after the last, far
+# within the 2 s timeout, while the 24 of them take over 6 s, three times the
+# timeout: the run goes on and passes. Images slow to check would tie the wait
+# to the platform: a 2048x2048 image with 5x5 splats takes 0.8 s on an RTX 5090
+# but 1.4 s and more on a Jetson Orin.
+# A 4096x4096 image with 5x5 splats takes about 2.5 s on an RTX 5090 and 6.4 s
+# on a Jetson Orin, beyond a 1 s timeout: that run is stopped and fails. It holds
+# 1 to 3 GiB of GPU memory, so both runs go alone, which also keeps their timing
+# clear of other tests.
+pcd_app_test(pcd_app_slow_but_progressing 0 "frames=2[34]/24 .*verdict=PASS"
+  --count 24 --period-ms 250 --timeout-seconds 2
 )
 pcd_app_test(pcd_app_timed_out 1 "timed out: no image for 1 s.*frames=[01]/2 .*verdict=FAIL"
   --width 4096 --height 4096 --point-size 5 --count 2 --period-ms 1 --timeout-seconds 1
@@ -377,6 +395,8 @@ set_tests_properties(
   pcd_clouds_xyz_setup
   pcd_clouds_mixed_setup
   pcd_clouds_empty_setup
+  pcd_looped_setup
+  pcd_looped_cleanup
   PROPERTIES LABELS "point_cloud_to_depth"
 )
 
