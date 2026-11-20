@@ -47,7 +47,9 @@ bilateral costs 0.08 ms at 1920x1080 on an RTX 5090.
 
 The operator runs once per image (`OnEach`). The temporal filter's history lives in the operator:
 a change of size or format, a restart, or a scene cut starts a new sequence. Host images are copied
-to the GPU, which is logged once with the bytes per frame.
+to the GPU, which is logged once with the bytes per frame. From pageable host memory the copy also
+holds up the operator's thread until CUDA has staged it; pinned host memory (`kDLCUDAHost`) does not,
+and device images need no copy.
 
 `DenoiseOpConfig`:
 
@@ -99,7 +101,7 @@ of their histories. RGBA8's alpha passes through.
 | Backend | Runs on | Spatial filter | Notes |
 | --- | --- | --- | --- |
 | `kCuda` (default) | The GPU | Any | Deterministic: the same frames give the same bytes |
-| `kVpi` | VPI's TNR on the VIC (Jetson Orin, Thor) or CUDA (`vpi.engine`); with `kAuto`, frames under 64x16, which the VIC refuses, on CUDA | None of its own to configure: `spatial` must be `kNone` (TNR filters spatially itself) and `temporal` true | MONO8, RGB8 and RGBA8 are converted to full-range BT.601 NV12 and back on the GPU (chroma subsampled, as TNR needs), odd sizes padded by a pixel. VPI's CUDA work runs on the operator's CUDA stream (VPI wraps it); the operator waits on the host twice a frame, for the scene-cut count before TNR and for TNR after it. A scene cut, found as on the cuda backend, restarts TNR |
+| `kVpi` | VPI's TNR on the VIC (Jetson Orin, Jetson Thor) or CUDA (`vpi.engine`); with `kAuto`, frames under 64x16, which the VIC refuses, on CUDA | None of its own to configure: `spatial` must be `kNone` (TNR filters spatially itself) and `temporal` true | MONO8, RGB8 and RGBA8 are converted to full-range BT.601 NV12 and back on the GPU (chroma subsampled, as TNR needs), odd sizes padded by a pixel. VPI's CUDA work runs on the operator's CUDA stream (VPI wraps it); the operator waits on the host twice a frame, for the scene-cut count before TNR and for TNR after it. A scene cut, found as on the cuda backend, restarts TNR |
 | `kAuto` | `kVpi` where VPI is built, its VIC runs TNR and `spatial` is `kNone` with `temporal`; `kCuda` otherwise. Chosen, and logged, when the operator starts: building the graph probes nothing, so a plain `holoscan::run(plan)`, which admits a process only while it has one thread, still starts | | On x86_64 always `kCuda`: VPI's TNR on CUDA gains less PSNR than the cuda backend and costs about as much |
 
 ## `ExposureFusionOp`
@@ -229,10 +231,10 @@ temporal filter:
 | Temporal + bilateral | +17.0 dB | +21.2 dB | +23.8 dB |
 | Temporal + non-local means | +21.6 dB | +20.4 dB | +22.0 dB |
 | vpi (TNR on CUDA, x86_64, indoor low light) | +7.7 dB | +6.8 dB | +7.5 dB |
-| vpi (TNR on the Orin's VIC) | +7.6 dB | +5.9 dB | +6.2 dB |
+| vpi (TNR on the VIC, Jetson Orin) | +7.6 dB | +5.9 dB | +6.2 dB |
 
 The scene is mostly flat patches, on which the bilateral filter excels; textured scenes gain less.
-The Orin gives the cuda backend's figures to the second decimal.
+Jetson Orin gives the cuda backend's figures to the second decimal.
 
 | What | Result |
 | --- | --- |
@@ -268,11 +270,15 @@ its log-average within 1e-5.
 
 Mean time per frame, from CUDA events around the call, RGB8 in and out (the vpi backend's time
 includes its conversions and its waits for VPI); `denoise_benchmark` measures it, over 100 frames on
-the x86_64 machine and 300 on the Orin, the better of two runs. The x86_64 machine has an RTX 5090,
-shared with other work during the runs; the Orin is a Jetson AGX Orin developer kit (64 GB) with
-JetPack 7.2 in MAXN, also running another CI job.
+the RTX 5090 and 300 on Jetson Orin, the better of two runs. Both machines were shared with other
+work during the runs (the RTX 5090 with other GPU jobs, Jetson Orin with another CI job).
 
-| Method | 1920x1080, RTX 5090 | 3840x2160, RTX 5090 | 1920x1080, Orin | 3840x2160, Orin |
+| | RTX 5090 | Jetson Orin |
+| --- | --- | --- |
+| System | x86_64, NVIDIA driver 595.99.02 | JetPack 7.2, power mode MAXN |
+| Software | Holoscan SDK 5.0.0, CUDA 13.2, VPI 4.1.4 (the repository's CI image) | The same image, built for aarch64 |
+
+| Method | 1920x1080, RTX 5090 | 3840x2160, RTX 5090 | 1920x1080, Jetson Orin | 3840x2160, Jetson Orin |
 | --- | --- | --- | --- | --- |
 | Bilateral | 0.076 ms | 0.294 ms | 1.62 ms | 6.39 ms |
 | Non-local means | 0.145 ms | 0.565 ms | 2.51 ms | 9.97 ms |
@@ -290,7 +296,7 @@ JetPack 7.2 in MAXN, also running another CI job.
 On the VIC the time is latency, not GPU load: the GPU only converts to and from NV12, and the VIC's
 own time varied from run to run (3.1 to 5.3 ms at 1920x1080, 9.4 to 21 ms at 3840x2160) while the
 other job ran. Where the GPU is busy with inference, the VIC keeps denoising off it; where latency
-matters most, the cuda backend is faster on the Orin too.
+matters most, the cuda backend is faster on Jetson Orin too.
 
 ## Requirements
 

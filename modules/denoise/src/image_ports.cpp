@@ -307,11 +307,17 @@ holoscan::expected<void, holoscan::Error> DeviceStaging::finish_copy(const holos
   }
   if (!logged_) {
     logged_ = true;
+    // From pageable memory, CUDA stages the copy before cudaMemcpy*Async returns,
+    // so the operator's thread waits for it; from pinned memory it does not.
+    const bool pageable = tensor.device().device_type != kDLCUDAHost;
     HOLOSCAN_LOG_INFO(
         "{}: input {} is in host memory and the operator reads CUDA device memory, so each frame "
-        "is copied host to device, {} bytes ({:.1f} MB) per frame; to avoid the copy, send CUDA "
+        "is copied host to device, {} bytes ({:.1f} MB) per frame{}; to avoid the copy, send CUDA "
         "device images",
-        op, port, bytes, static_cast<double>(bytes) / 1e6);
+        op, port, bytes, static_cast<double>(bytes) / 1e6,
+        pageable ? ", and from pageable memory the copy holds up the operator until CUDA has "
+                   "staged it (pinned memory would not)"
+                 : "");
   }
   return {};
 }

@@ -93,7 +93,7 @@ void validate_params(const DenoiseParams& params);
 // What Backend::kAuto's choice depends on.
 struct PlatformFacts {
   bool vpi_compiled{};  // This build has the vpi backend.
-  bool vic_tnr{};       // VPI can run TNR on the VIC (Jetson Orin and Thor).
+  bool vic_tnr{};       // VPI can run TNR on the VIC (Jetson Orin, Jetson Thor).
 };
 
 // Backend::kAuto's choice: vpi where it is compiled in, the VIC runs TNR and

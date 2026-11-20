@@ -51,7 +51,7 @@
         },
         {
           "name": "VIC",
-          "description": "The Video Image Compositor of Jetson Orin or Thor, which runs VPI's temporal noise reduction for the vpi backend when present. Elsewhere VPI runs it on CUDA.",
+          "description": "The Video Image Compositor of Jetson Orin or Jetson Thor, which runs VPI's temporal noise reduction for the vpi backend when present. Elsewhere VPI runs it on CUDA.",
           "required": false
         }
       ]
