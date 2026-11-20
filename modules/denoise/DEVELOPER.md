@@ -56,10 +56,14 @@ denoise/
   pixel's age: a new setting of the temporal filter must keep that estimate honest.
 - The tuning constants (`tuning::` in `denoise_params.hpp`) are shared by the kernels and the tests;
   the gains in the README come from `denoise_denoiser`'s output, which prints them.
-- The vpi backend waits on the host: VPI cannot wait for a CUDA stream it does not own. It keeps the
-  previous output locked for CUDA until the next frame has waited for the stream, as the conversion
-  may still read it. VPI's TNR needs NV12 of even size (and on the VIC at least 64x16), which the
-  backend pads to and converts.
+- The vpi backend's VPI stream wraps the caller's CUDA stream (`vpiStreamCreateWrapperCUDA`), so
+  VPI's CUDA work runs on the operator's stream. It still waits on the host twice a frame: before
+  TNR, because the changed-pixel count decides on the host whether TNR gets the previous frame (a
+  scene cut) and the VIC reads what the CUDA kernels wrote; after TNR (`vpiStreamSync`), because VPI
+  allows kernels launched directly on the wrapped stream only once its own work there has finished.
+  It keeps the previous output locked for CUDA until the next frame has waited for the stream, as
+  the conversion may still read it, and a frame that fails unlocks its input. VPI's TNR needs NV12
+  of even size (and on the VIC at least 64x16), which the backend pads to and converts.
 - Host memory reaches the GPU on the operator's stream; pinned host memory is held until the copy
   is done (`set_deallocation_stream`), and the first copy is logged once.
 - An operator has an optional port only when configured: an emit into an unconnected output fails,

@@ -12,9 +12,16 @@
 // locked for CUDA, converted into the output view. That output stays locked
 // until the next frame has waited for the stream, as the conversion may still
 // read it.
+//
+// The VPI stream wraps the caller's CUDA stream (vpiStreamCreateWrapperCUDA),
+// so VPI's CUDA work runs on it, in whatever Green Context it belongs to. The
+// two host waits stay: the changed-pixel count decides, on the host, whether
+// TNR gets the previous frame, and VPI may only be followed by kernels launched
+// directly on the wrapped stream once its own work there has finished.
 
 // VPI's C API.
 extern "C" {
+#include <vpi/CUDAInterop.h>
 #include <vpi/Image.h>
 #include <vpi/Status.h>
 #include <vpi/Stream.h>
@@ -23,6 +30,7 @@ extern "C" {
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -71,6 +79,31 @@ struct ImageDestroy {
 };
 using VpiImagePtr = std::unique_ptr<std::remove_pointer_t<VPIImage>, ImageDestroy>;
 
+// Unlocks an image locked for CUDA if the frame fails before it is unlocked,
+// once the stream that may still write it is done: a frame that throws must
+// not leave the image locked for every later frame.
+class LockGuard {
+ public:
+  LockGuard(VPIImage image, cudaStream_t stream) noexcept : image_(image), stream_(stream) {}
+  ~LockGuard() {
+    if (image_ == nullptr) return;
+    cudaStreamSynchronize(stream_);
+    vpiImageUnlock(image_);
+  }
+  LockGuard(const LockGuard&) = delete;
+  LockGuard& operator=(const LockGuard&) = delete;
+  // Unlocks it now, reporting a failure.
+  void unlock() {
+    VPIImage image = image_;
+    image_ = nullptr;
+    check_vpi(vpiImageUnlock(image), "vpiImageUnlock");
+  }
+
+ private:
+  VPIImage image_;
+  cudaStream_t stream_;
+};
+
 // The share of the noise variance left in TNR's output, for the scene cut test.
 constexpr float kOutputVariance = 0.25F;
 
@@ -92,7 +125,6 @@ class VpiDenoiser final : public Denoiser::Impl {
     check_vpi(vpiInitTemporalNoiseReductionParams(&tnr_params_), "TNR parameters");
     tnr_params_.preset = vpi_preset(options.preset);
     tnr_params_.strength = params.strength;
-    check_vpi(vpiStreamCreate(engine_ | VPI_BACKEND_CUDA, &stream_), "vpiStreamCreate");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&sigma_), sizeof(float)), "cudaMalloc");
     check_cuda(
         cudaMalloc(reinterpret_cast<void**>(&partials_), kNoiseBlocks * sizeof(std::uint64_t)),
@@ -106,7 +138,7 @@ class VpiDenoiser final : public Denoiser::Impl {
     // A conversion may still read the locked output; wait for every stream.
     cudaDeviceSynchronize();
     release_images();
-    if (stream_ != nullptr) vpiStreamDestroy(stream_);
+    if (stream_ != nullptr) vpiStreamDestroy(stream_);  // Before the CUDA stream it wraps goes.
     cudaFree(sigma_);
     cudaFree(partials_);
     cudaFree(changed_);
@@ -131,15 +163,19 @@ class VpiDenoiser final : public Denoiser::Impl {
   void process(const ImageView& input, const ImageView& output, cudaStream_t stream) override {
     const int width = input.width + (input.width & 1);
     const int height = input.height + (input.height & 1);
+    use_stream(stream);
     if (!sized_ || width != width_ || height != height_) allocate(width, height, stream);
 
     // The frame into TNR's input image, the noise level, the changed pixels.
     const Nv12 frame = lock(input_.get(), VPI_LOCK_WRITE);
+    LockGuard input_lock(input_.get(), stream);
     check_cuda(launch_to_nv12(input, frame, stream), "conversion to NV12");
     const SamplePlane luma{
         .data = frame.y.data, .pitch = frame.y.pitch, .width = width, .height = height};
     if (params_.noise_sigma > 0.0F) {
-      check_cuda(launch_set(sigma_, params_.noise_sigma, stream), "noise sigma");
+      // As on the cuda backend: below kMinSigma every frame would be a scene cut.
+      check_cuda(launch_set(sigma_, std::max(params_.noise_sigma, tuning::kMinSigma), stream),
+                 "noise sigma");
     } else {
       check_cuda(launch_noise_estimate(luma, partials_, tuning::kMinSigma, sigma_, stream),
                  "noise estimate");
@@ -160,7 +196,7 @@ class VpiDenoiser final : public Denoiser::Impl {
     }
     // VPI may read the images once our stream has written them.
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    check_vpi(vpiImageUnlock(input_.get()), "vpiImageUnlock");
+    input_lock.unlock();
     unlock_output();
     const auto pixels = static_cast<double>(width) * static_cast<double>(height);
     const bool cut =
@@ -183,6 +219,25 @@ class VpiDenoiser final : public Denoiser::Impl {
   }
 
  private:
+  // Wraps `stream` in the VPI stream, once per CUDA stream; the null stream
+  // gets a VPI stream of its own.
+  void use_stream(cudaStream_t stream) {
+    if (stream_ != nullptr && wrapped_ == stream) return;
+    if (stream_ != nullptr) {
+      check_vpi(vpiStreamSync(stream_), "vpiStreamSync");
+      vpiStreamDestroy(stream_);
+      stream_ = nullptr;
+    }
+    const std::uint64_t backends = engine_ | VPI_BACKEND_CUDA;
+    if (stream != nullptr) {
+      check_vpi(vpiStreamCreateWrapperCUDA(stream, backends, &stream_),
+                "vpiStreamCreateWrapperCUDA");
+    } else {
+      check_vpi(vpiStreamCreate(backends, &stream_), "vpiStreamCreate");
+    }
+    wrapped_ = stream;
+  }
+
   Nv12 lock(VPIImage image, VPILockMode mode) const {
     VPIImageData data{};
     check_vpi(vpiImageLockData(image, mode, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &data),
@@ -252,6 +307,7 @@ class VpiDenoiser final : public Denoiser::Impl {
   bool vic_required_{false};
   VPITNRParams tnr_params_{};
   VPIStream stream_{};
+  cudaStream_t wrapped_{};  // The CUDA stream stream_ wraps; null for VPI's own.
   VPIPayload payload_{};
   VpiImagePtr input_;
   std::array<VpiImagePtr, 2> outputs_;
