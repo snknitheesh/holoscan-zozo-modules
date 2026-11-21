@@ -13,7 +13,7 @@ raw stream to a file; `VideoDecoderOp` takes access units and emits images in de
 | Headers | `<holoscan/codec/...>` |
 | C++ namespace | `holoscan::codec` |
 | Debian package | `holoscan-codec` |
-| Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## Operators
 
@@ -26,12 +26,13 @@ raw stream to a file; `VideoDecoderOp` takes access units and emits images in de
 
 `VideoEncoderConfig` holds the `EncoderSettings` and the largest image size, which sizes the
 output (`max_width` x `max_height` x 1.5 bytes per access unit), an optional `output_path` for the
-raw stream, and `allow_resolution_change`:
+raw stream, `allow_resolution_change`, and `frames_per_stream` (see
+[End of stream](#end-of-stream)):
 
 | Setting | Default | |
 | --- | --- | --- |
 | `codec` | `kH264` | `kH264` or `kH265` (Main, 8-bit 4:2:0) |
-| `backend` | `kAuto` | See [Backends](#backends) |
+| `backend` | `kNvcodec` | `kNvcodec`, `kV4l2`, or `kAuto` (opt-in); see [Backends](#backends) |
 | `rate_control` | `kVbr` | `kCbr`, `kVbr` (peak `max_bitrate`, 0 for twice `bitrate`), or `kConstQp` |
 | `bitrate` | 8 000 000 | Bits per second, for `kCbr` and `kVbr` |
 | `qp` | 23 | The quantizer for `kConstQp`, 0 (best) to 51: the "CRF-like" quality setting, a fixed quality whose bitrate follows the content |
@@ -48,8 +49,12 @@ range, which NVENC also writes into the stream's VUI.
 Each `EncodedVideoFrame` ([schema](schemas/encoded_video_frame.fbs)) carries the image's header,
 unchanged, the codec, the image's width and height, the `pts` (the header's
 `capture_timestamp_ns`, else the sample's capture time, else the frame's index at `frame_rate`),
-whether it is a keyframe, its index in the stream, and the access unit as a uint8 tensor in host
-memory, start codes included. The sample keeps the image's capture time and frame id.
+whether it is a keyframe, its index in the stream, whether it ends the stream, and the access unit
+as a uint8 tensor in host memory, start codes included. The sample keeps the image's capture time
+and frame id. The `pts` orders the stream; only the header says when an image was captured.
+
+`start()` chooses the backend and opens the file; when either fails, it throws, and the run fails
+at startup rather than at its first frame.
 
 An odd side is encoded one pixel larger, the last row or column repeated, as 4:2:0 needs even
 sides; the message keeps the image's size and `VideoDecoderOp` crops back to it. A change of image
@@ -64,25 +69,49 @@ instead.
 | `bitstream` (input) | `EncodedVideoFrameT` | One access unit per sample, as `VideoEncoderOp` emits them; in host memory, or device memory at the cost of a copy (logged once) |
 | `image` (output) | `holoscan::schema::ImageT` | One image per decoded frame, in CUDA device memory |
 
-`VideoDecoderConfig` selects the backend, the `output_format` (RGB8, BGR8, RGBA8, BGRA8, or NV12 as
-one byte tensor with its plane layouts and `REC709` color space), the largest image, and
-`low_latency`. The decoder is built for the first access unit's codec, and again when the codec or
-the frame size changes. Access units before the first keyframe cannot be decoded and give nothing,
-nor does an empty access unit; both are counted and logged at stop. Each image has the access
-unit's width and height, its header, and its `pts` as `header.capture_timestamp_ns`, and the
-sample keeps the access unit's capture time and frame id.
+`VideoDecoderConfig` selects the backend (`kNvcodec` by default, as for the encoder), the
+`output_format` (RGB8, BGR8, RGBA8, BGRA8, or NV12 as one byte tensor with its plane layouts and
+`REC709` color space), the largest image, and `low_latency`. `start()` loads the backend's
+libraries and opens its devices, and fails the run when the backend can decode neither codec; the
+hardware session itself is built on the first keyframe, whose parameter sets give its size, and
+again when the codec or the frame size changes. Access units before the first keyframe cannot be
+decoded and give nothing (logged once, and counted at stop), nor does an empty access unit. A
+keyframe is an IDR, a CRA or BLA picture for H.265, or for H.264 a picture with a recovery point
+SEI message, as streams with intra refresh and open GOPs have, each with its parameter sets.
+
+Each image has its access unit's width and height and that access unit's header, unchanged: its
+capture time is the one the encoded image had (none, if it had none), never the `pts`. The sample
+keeps the access unit's capture time and frame id. Each decoded frame is converted (or, for NV12,
+copied) straight from the decoder's memory into the output image.
 
 With `low_latency` (the default), each image comes from the `compute()` of its own access unit,
 which needs a stream with one reference frame and no reordering, as `VideoEncoderOp` makes in its
-low-latency mode; turn it off for other streams, whose images then come some access units later.
-Jetson Orin's decoder gives the first images of a stream one or two access units late, then one per
-access unit; the operator emits up to four images in one `compute()` to catch up.
+low-latency mode. Turn it off for other streams, such as those with B-frames from other encoders:
+their images come some access units later, in display order, each with its own access unit's
+header, and the last ones with the access unit that ends the stream. The pts must then increase
+in the order the stream shows its frames, as presentation times do: Jetson Orin's decoder does
+not say which access unit a frame came from, so each frame takes the smallest pts still waiting. Jetson Orin's decoder gives
+the first images of a stream one or two access units late, then one per access unit. One
+`compute()` emits up to 4 images with `low_latency`, and up to 17 without (the 16 frames a stream
+may hold back, and its own), which sizes the output's pool (`max_images_per_compute` sets
+another bound). More, as Jetson Orin's decoder may hand out when it falls behind, are copied out
+of the decoder and emitted first in the next `compute()`s: none is dropped (logged once).
+
+### End of stream
+
+A decoder without `low_latency` holds frames back until later access units, or the end of the
+stream, release them. An access unit with `end_of_stream` set (data may be empty) ends the
+stream: `VideoDecoderOp` decodes it, emits every frame the decoder still holds, and starts again
+at the next keyframe. `VideoEncoderOp` sets it on the last access unit of each stream when
+`frames_per_stream` is not 0, and starts the next stream with a keyframe; a finite source sets it
+to its frame count, as the demo does. Without it, the frames still in the decoder when the run
+stops are lost, and `stop()` logs how many.
 
 The operators log their backend once, for example:
 
 ```text
-VideoEncoderOp: h264 on the nvcodec backend (NVENC on NVIDIA GeForce RTX 5090), which auto chose as the first backend that works here; vbr 8000000 bit/s, gop 30, preset fast, low latency
-VideoDecoderOp: h264 on the v4l2 backend (NVDEC through /dev/v4l2-nvdec, VIC through VPI), which auto chose as the first backend that works here
+VideoEncoderOp: h264 on the nvcodec backend (NVENC on <the GPU's name>), which auto chose as the first backend that works here; vbr 8000000 bit/s, gop 30, preset fast, low latency; the CPU waits for each frame's access unit, which is copied to the output in host memory
+VideoDecoderOp: h264 and h265 on the v4l2 backend (NVDEC through /dev/v4l2-nvdec, VIC through VPI), which auto chose as the first backend that works here; the CPU waits for each decoded frame before the decoder reuses its memory
 ```
 
 ## Backends
@@ -91,19 +120,26 @@ VideoDecoderOp: h264 on the v4l2 backend (NVDEC through /dev/v4l2-nvdec, VIC thr
 | --- | --- | --- | --- |
 | `kNvcodec` | x86_64 with an NVIDIA GPU; Jetson Thor (JetPack 7.2) | NVENC through the Video Codec SDK (`libnvidia-encode`), reading NV12 straight from device memory | NVDEC through the Video Codec SDK (`libnvcuvid`); each frame mapped in device memory and copied out |
 | `kV4l2` | Jetson Orin (JetPack 7.2) | NVENC through `/dev/v4l2-nvenc` and NVIDIA's libv4l2; each frame copied from device memory into the device's input buffer (pinned, so a DMA copy) | NVDEC through `/dev/v4l2-nvdec`; the block-linear frames laid out pitch-linear in device memory by the VIC, through VPI 4 |
-| `kAuto` | Any | The first of the two that works here, probed once | The same |
+| `kAuto` | Any | Opt-in: the first of the two that works here, probed once | The same |
+
+`kNvcodec` is the default, which works on x86_64 and Jetson Thor; on Jetson Orin, choose `kV4l2`,
+or `kAuto`, which the demo uses so that it runs everywhere. A backend that does not work here
+fails with why, and names the one that does, for example
+`no encoder for h264 (nvcodec): nvcodec: ...: cannot open shared object file; v4l2 works here:
+choose it, or auto`. There is no CPU or CUDA fallback for a GPU without the video engines: a
+software H.264 or H.265 encoder would bring its own licence and cost CPU cores per stream.
 
 Jetson Thor also has `/dev/v4l2-nvenc` and `/dev/v4l2-nvdec`, but there NVIDIA's V4L2 plugins are a
 layer over the Video Codec SDK with other buffer semantics, which the `kV4l2` backend does not
-drive: where `kNvcodec` works, `kV4l2` reports itself unavailable and Thor uses `kNvcodec`.
+drive: where `kNvcodec` works, `kV4l2` reports itself unavailable and Jetson Thor uses `kNvcodec`.
 
 The module links none of these libraries: it loads them at run time, so it builds and runs
 anywhere, and a backend whose libraries or devices are missing is reported as unavailable with the
 reason, for example
 `nvcodec: libnvidia-encode.so.1: libnvcuvid.so.1: cannot open shared object file` on Jetson Orin,
 whose GPU driver has no `libnvcuvid`. `probe_encoder_backends()` and `probe_decoder_backends()`
-list each backend's status and reason; an operator whose backend is unavailable fails its first
-frame with that reason.
+list each backend's status and reason; an operator whose backend is unavailable fails the run at
+startup with that reason.
 
 - **In a container**, the NVIDIA Container Toolkit mounts `libnvidia-encode` and `libnvcuvid` only
   when `NVIDIA_DRIVER_CAPABILITIES` includes `video` (or is `all`, as in the repository's CI
@@ -147,11 +183,26 @@ latency, 8 Mbit/s at 1080p and 20 Mbit/s at 2160p:
 | H.265 1920x1080 | 895 | 2120 | 190 | 418 | 50 to 152 | 43 to 81 |
 | H.265 3840x2160 | 467 | 629 | 124 | 274 | 30 to 37 | 22 to 31 |
 
-The Orin figures (AGX Orin 64 GB, MAXN) vary from run to run with the CPU and engine clocks,
-which JetPack scales on demand; the ranges are those of six runs, one of them in CI. Thor's are
-from its CI lane. Its V4L2 path costs a copy into
-the encoder's buffers on the way in, and a VIC conversion and a copy on the way out, with a poll of
-the device queues for each frame.
+The Jetson Orin figures (MAXN power mode) vary from run to run with the CPU and engine clocks,
+which JetPack scales on demand; the ranges are those of six runs, one of them in CI. Jetson Thor's
+are from its CI lane. The Jetson Orin V4L2 path costs a copy into the encoder's buffers on the way
+in, and a VIC conversion on the way out, with a poll of the device queues for each frame (see
+below). These figures were measured before the waits below were cut; they are not re-measured.
+
+### CPU waits and copies per frame
+
+| Path | CPU waits | Copies |
+| --- | --- | --- |
+| Encoder, `kNvcodec` | 1: `nvEncLockBitstream`, for the access unit (NVENC reads the frame after the CUDA stream's conversion, through `nvEncSetIOCudaStreams`; where the driver refuses that, 1 more, for the stream) | RGB to NV12 on the GPU; the access unit, a few kB to a few hundred kB, from NVENC to a vector and from it to the output loan, both on the host |
+| Encoder, `kV4l2` | 2: the copy into the device's buffer, on the CUDA stream after the conversion; polling (100 µs sleeps) for the access unit | RGB to NV12 on the GPU; the NV12 frame from device memory to the device's pinned input buffer; the access unit twice on the host, as above |
+| Encoder, host images | 1 more: the copy to the device, as the image's memory may be reused once `compute()` returns (logged once) | 1 host to device |
+| Decoder, `kNvcodec` | 1: the CUDA stream, after the frame's conversion into the output, before NVDEC's surface is unmapped | NV12 to the output format (or an NV12 copy) straight from NVDEC's surface into the output loan, on the GPU |
+| Decoder, `kV4l2` | 3: polling the device queues (100 µs sleeps), the VIC's block-linear to pitch-linear conversion (`vpiStreamSync`), the CUDA stream after the conversion into the output | The VIC conversion; then as for `kNvcodec` |
+| Decoder, access units in device memory | 1 more: the copy to the host, where the decoders read them (logged once) | 1 device to host |
+
+The operators name their waits in their first log line. `VideoDecoder::decode()` and `flush()`
+with a sink are the copy-free path the operator uses; the overloads that return a vector copy
+each frame once more into memory of the decoder's, reused by the next call.
 
 On the RTX 5090, encoding takes 1 to 3 % of the GPU's SMs (the color conversion) while NVENC runs
 at 32 % (1080p H.264) to 63 % (2160p H.265) of one engine's capacity; decoding takes 1 to 4 % of
@@ -184,6 +235,12 @@ graph.add_flow(decoder->image, display->image);
 compile_options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
     .operator_path = "decoder", .output_port = "image", .device = holoscan::DeviceId{0}});
 ```
+
+A graph that must not lose a frame runs on one worker, `graph.partition("name").include_all()`
+(see holoscan-messages' [Run a graph on one worker](../messages/README.md#run-a-graph-on-one-worker)): with a worker per operator, the encoder can
+run while the decoder's lossless queue is full, and fail on the refused emit. In real time, drop
+frames before the encoder, or hold the source back while too many frames are on their way, as the
+[demo](../../applications/codec/) does; never drop access units.
 
 The file is a raw Annex-B stream that `ffplay camera.h265` and most players open. Without a graph,
 `VideoEncoder`, `VideoDecoder` and `convert_from_nv12()` in `<holoscan/codec/video_codec.hpp>` do
@@ -224,18 +281,24 @@ Another project can also build the module with `add_subdirectory()` or `FetchCon
 `holoscan::codec` without `find_package()`; it then builds none of its tests unless
 `HOLOSCAN_CODEC_BUILD_TESTING` is `ON`.
 
-The tests generate their own frames. Those that need hardware skip (exit 77) where no backend can
-encode and decode, saying why:
+The tests generate their own frames, apart from two short streams with B-frames from other
+encoders in [`tests/data/`](tests/data/) (made from the test video by
+`make_reordered_streams.sh`) and the real-data test. Those that need hardware skip (exit 77) where
+no backend can encode and decode, saying why; in CI (`HOLOSCAN_CI_PLATFORM` set) they fail
+instead, and check that the lane's backend works: `kNvcodec` on x86_64 and Jetson Thor, `kV4l2`
+on Jetson Orin.
 
 | Test | Needs | Checks |
 | --- | --- | --- |
-| `codec_round_trip` | GPU with NVENC/NVDEC, or Jetson Orin | On every available backend, for H.264 and H.265: PSNR per rate-control setting (the table above); parameter sets on every keyframe and keyframes exactly every GOP; every frame back once, in order, with its pts, each one access unit after the next in low-latency mode; odd sizes cropped back; a size change in one decoder; access units before the first keyframe and empty ones; the smallest size; rejected settings |
-| `codec_operators` | The same | Both operators through the SDK's operator test harness: every input encoding in host and device memory, headers, frame ids and pts carried, keyframes, the raw file, RGB8, BGRA8 and NV12 output, an odd size, a size change (a new stream, or refused), empty and undecodable access units, bad configuration |
-| `codec_host` | Nothing | The Annex-B reader on hand-made H.264 and H.265 streams, settings and their names, the test video and PSNR; also built on its own from `tests/host/` by the hosted CI job |
+| `codec_round_trip` | GPU with NVENC/NVDEC, or Jetson Orin | On every available backend, for H.264 and H.265: PSNR per rate-control setting (the table above); parameter sets on every keyframe and keyframes exactly every GOP; every frame back once, in order, with its pts, each one access unit after the next in low-latency mode; odd sizes cropped back; a size change in one decoder; access units before the first keyframe and empty ones; the smallest size; streams with B-frames, every frame in display order with its own pts; frames handed to a sink without copies, an exception from the sink, and `end_stream()`; rejected settings |
+| `codec_operators` | The same | Both operators through the SDK's operator test harness: every input encoding in host and device memory, headers, frame ids and pts carried, keyframes, the raw file, RGB8, BGRA8 and NV12 output, an odd size, a size change (a new stream, or refused), empty and undecodable access units, streams with B-frames (each image with its own header), `frames_per_stream` and `end_of_stream` (every held frame handed out), no capture time made up, a backend that cannot run failing at startup, bad configuration |
+| `codec_real_data` | The same, and `HOLOSCAN_TEST_DATA` | The local recordings' RGB frames (`stereo-camera/<recording>/index.csv` and `rgb/`): every frame back with its own pts, at a mean PSNR of 37 dB or more with H.264 VBR at 8 Mbit/s, 35.5 dB with H.265 at QP 25, and 33.5 dB with H.264 CBR at 2 Mbit/s (measured on the RTX 5090: 39.9 to 42.4, 38.1 to 39.3, and 36.3 to 38.5 dB). Skipped when the variable is unset |
+| `codec_host` | Nothing | The Annex-B reader on hand-made H.264 and H.265 streams, recovery point SEI messages, settings and their names, the test video and PSNR; also built on its own from `tests/host/` by the hosted CI job |
 
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: it builds both operators and round-trips ten frames. Build it with the install
-prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
+installed package: it runs a graph on one worker (test video frames, `VideoEncoderOp`,
+`VideoDecoderOp`, a check) and passes when all ten frames come back in order with their headers.
+Build it with the install prefix on `CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
 

@@ -12,8 +12,9 @@ codec/
 ├── src/                        Operators, VideoEncoder/VideoDecoder, backends, CUDA kernels
 ├── pkg/holoscan-codec/         Debian packaging, entered when PKG_holoscan_codec is ON
 └── tests/
+    ├── data/                   Streams with B-frames from other encoders, and their script
     ├── host/                   SDK-free tests, also a project of their own
-    └── installed_consumer/     Uses the installed package
+    └── installed_consumer/     Uses the installed package, in a one-worker graph
 ```
 
 ## How it fits together
@@ -28,10 +29,25 @@ VideoDecoderOp ─► VideoDecoder ─► DecoderBackend: nvcodec_decoder.cpp | 
 - `VideoEncoder` owns the stream logic: it picks the backend (`probe_*` results are cached per
   direction and codec), rebuilds the session on a size change, places keyframes (`index % gop`),
   and checks each access unit with `bitstream.hpp`, repeating the parameter sets on a keyframe
-  that lacks them. Backends only encode one NV12 frame.
-- `VideoDecoder` skips access units until the first keyframe, tags each one with an id that maps
-  back to its pts, and copies each decoded frame into a buffer of its own, valid until the next
-  call; backends hand frames to a sink while they are mapped.
+  that lacks them. Backends only encode one NV12 frame, reading it after the work queued on the
+  caller's CUDA stream: NVENC through `nvEncSetIOCudaStreams`, the V4L2 encoder by copying on that
+  stream.
+- `VideoDecoder` skips access units until the first keyframe and tags each one with an id in
+  decode order. A stream with B-frames shows its frames in another order, and neither decoder
+  keeps its input timestamps with the frames then (both hand them out in input order). The
+  nvcodec backend tags each frame by its decode surface instead, set while its access unit is
+  parsed (`exact_ids()`), and the frame's id is looked up on its own. The V4L2 decoder has no
+  such handle: without low latency, each frame takes the smallest pts still waiting, as a decoder
+  shows frames in increasing presentation time; with low latency nothing is reordered and the id
+  is exact. Ids wait at most 64 deep. Backends hand frames to a sink while they are mapped and
+  wait for the CUDA stream before reusing them; `VideoDecoderOp` converts each one straight into
+  its output loan, the vector-returning calls copy it into a buffer of their own.
+- `VideoDecoderOp` gives the decoder each access unit's pts and keeps its header by that pts
+  (equal ones in arrival order); each frame comes out under its own access unit's header, never
+  under the pts, so a made-up pts never becomes a capture time. `end_of_stream` flushes the
+  decoder.
+- `VideoEncoder::end_stream()` restarts the frame count, so the next frame is an IDR; the V4L2
+  encoder places IDRs by its own count, so there the session is rebuilt.
 - NVENC needs the frame's chroma right after its luma at the same pitch: `VideoEncoder`'s NV12
   buffer is one allocation. NVENC's IDRs are forced per frame (`NV_ENC_PIC_FLAG_FORCEIDR`) with an
   infinite GOP; the V4L2 encoder's IDR interval is the GOP, which matches because every session
@@ -62,3 +78,5 @@ VideoDecoderOp ─► VideoDecoder ─► DecoderBackend: nvcodec_decoder.cpp | 
   `HOLOSCAN_CODEC_BUILD_TESTING` inside another project.
 - A new backend or setting needs a case in `codec_round_trip`; a new port or behavior of an
   operator, a case in `codec_operators`; a change to the Annex-B reader, a case in `codec_host`.
+- `tests/data/make_reordered_streams.sh` remakes the reordered streams (FFmpeg with libx264 and
+  libx265); their `.order` files list each access unit's display index in decode order.
