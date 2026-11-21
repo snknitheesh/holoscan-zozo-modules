@@ -3,7 +3,8 @@
 //
 // What Yolo26DetectionOp and Yolo26SegmentationOp share, and no user sees:
 // loading the model through HoloInfer, checking and staging the input image,
-// and ordering one frame's work after the previous one's. Not installed.
+// and ordering one frame's work after the previous one's. Not installed, and
+// not exported from the library either: the operators are its only users.
 
 #pragma once
 
@@ -28,6 +29,9 @@
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 #include <holoscan/yolo26/kernels.hpp>
 #include <holoscan/yolo26/letterbox.hpp>
+
+// Hidden, after the includes, so that only what this header declares is.
+#pragma GCC visibility push(hidden)
 
 namespace holoscan::yolo26::detail {
 
@@ -135,3 +139,5 @@ holoscan::expected<ImageView, holoscan::Error> image_input(const holoscan::schem
 void release_staging(void*& staging, std::size_t& staging_bytes) noexcept;
 
 }  // namespace holoscan::yolo26::detail
+
+#pragma GCC visibility pop

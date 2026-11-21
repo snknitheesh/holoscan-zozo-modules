@@ -22,7 +22,8 @@
 // (OnAligned), as Yolo26OverlayOp does.
 //
 // On a blocking edge, an output a busy consumer has no room for is such a
-// failure (kBackpressured): a lossless graph paces its source to what its
+// failure (kBackpressured): run a lossless graph on one worker
+// (graph.partition(name).include_all()), and pace its source to what its
 // consumers keep up with. For a live source, connect the input and every
 // output with holoscan::ConnectionOptions{.queue_policy =
 // holoscan::QueuePolicy::kDropOldest, .queue_depth = 1}: a full queue then
@@ -74,6 +75,10 @@ struct Yolo26DetectionConfig {
   // TensorRT's workspace limit while it builds the engine.
   std::size_t build_workspace_bytes{std::size_t{1} << 30U};
 };
+
+// validate_config() and prepare_engine() are also overloaded for
+// Yolo26SegmentationConfig: pass a named Yolo26DetectionConfig, since a bare
+// braced list such as {.model = path} fits both.
 
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const Yolo26DetectionConfig& config);

@@ -6,7 +6,13 @@
 // a sink checks each frame's detections against the scene's two known boxes. With
 // `segment`, Yolo26SegmentationOp runs the stub segmentation model instead, and the sink
 // also checks that each detection's mask and the label image cover its rectangle's
-// center and not the image's corner.
+// center and not the image's corner. When the package has its overlay component, the
+// detections also go through Yolo26OverlayOp (Yolo26SegmentationOverlayOp), whose layers a
+// sink counts. The graph is lossless and runs on one worker, which the consumer checks.
+//
+// Built with YOLO26_CONSUMER_API_1_0, it uses only what holoscan-yolo26 1.0 offered: the
+// detection operator and its overlay. Built against a later 1.x package, that keeps its
+// 1.0 users' code compiling and working.
 //
 // Usage: yolo26_consumer [detect|segment]
 
@@ -25,12 +31,14 @@
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/core/errors.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/managed_shutdown_signals.hpp>
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/run.hpp>
+#include <holoscan/core/run_session.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/time/realtime_clock.hpp>
@@ -38,7 +46,15 @@
 #include <holoscan/yolo26/stub_model.hpp>
 #include <holoscan/yolo26/synthetic_scene.hpp>
 #include <holoscan/yolo26/yolo26_detection_op.hpp>
+#if !YOLO26_CONSUMER_API_1_0
 #include <holoscan/yolo26/yolo26_segmentation_op.hpp>
+#endif
+#if YOLO26_CONSUMER_WITH_OVERLAY
+#include <holoscan/yolo26/yolo26_overlay_op.hpp>
+#if !YOLO26_CONSUMER_API_1_0
+#include <holoscan/yolo26/yolo26_segmentation_overlay_op.hpp>
+#endif
+#endif
 
 namespace {
 
@@ -51,6 +67,14 @@ constexpr int kInputSize = 640;
 constexpr int kCapacity = 16;
 constexpr std::uint32_t kFrames = 5;
 constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
+
+// Whether a send failed only because the consumers have no room yet: the emit was refused
+// (kBackpressured), or every slot of the output's pool is still held (kResourceExhausted).
+// The source sends the same frame again on its next tick.
+bool no_room_yet(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
 
 // kFrames RGB8 renderings of the synthetic scene in host memory, numbered from 1.
 class SceneSourceOp final : public holoscan::Operator<> {
@@ -87,6 +111,9 @@ class SceneSourceOp final : public holoscan::Operator<> {
     const std::array<std::int64_t, 3> shape{kHeight, kWidth, 3};
     auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
     if (!loan) {
+      if (no_room_yet(loan.error())) {
+        return {};
+      }
       return holoscan::make_unexpected(std::move(loan).error());
     }
     auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
@@ -111,9 +138,7 @@ class SceneSourceOp final : public holoscan::Operator<> {
       return {};
     }
     // A busy consumer refuses the frame; send it again on the next tick.
-    return emitted.error().code == holoscan::ErrorCode::kBackpressured
-               ? holoscan::expected<void, holoscan::Error>{}
-               : emitted;
+    return no_room_yet(emitted.error()) ? holoscan::expected<void, holoscan::Error>{} : emitted;
   }
 
   holoscan::Output<holoscan::schema::ImageT> image;
@@ -260,11 +285,46 @@ class TallyOp final : public holoscan::Operator<> {
   bool with_masks_;
 };
 
+#if YOLO26_CONSUMER_WITH_OVERLAY
+// Counts what arrives on one port: the overlay's images, or its label tensors.
+template <typename T>
+class CountOp final : public holoscan::Operator<> {
+ public:
+  explicit CountOp(std::shared_ptr<std::uint32_t> count) : count_(std::move(count)) {}
+
+  void setup(holoscan::OperatorSpec& spec) override { spec.input(in, "in"); }
+
+  [[nodiscard]] holoscan::Contract contract() const override {
+    holoscan::Contract result;
+    result.trigger(holoscan::OnEach{in});
+    return result;
+  }
+
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
+      holoscan::ExecutionContext& /*context*/) override {
+    auto received = in.receive();
+    if (!received) return holoscan::make_unexpected(std::move(received).error());
+    ++*count_;
+    return {};
+  }
+
+  holoscan::Input<T> in;
+
+ private:
+  std::shared_ptr<std::uint32_t> count_;
+};
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) try {
   const std::string_view task = argc > 1 ? std::string_view(argv[1]) : "detect";
-  if (argc > 2 || (task != "detect" && task != "segment")) {
+#if YOLO26_CONSUMER_API_1_0
+  const bool known_task = task == "detect";
+#else
+  const bool known_task = task == "detect" || task == "segment";
+#endif
+  if (argc > 2 || !known_task) {
     std::cerr << "usage: yolo26_consumer [detect|segment]\n";
     return 2;
   }
@@ -273,9 +333,8 @@ int main(int argc, char** argv) try {
   // its own, after which the SDK accepts no other way to manage the signals.
   auto signals = holoscan::ManagedShutdownSignals::create();
   if (!signals) {
-    std::cerr << "yolo26_consumer: cannot manage SIGINT and SIGTERM: "
+    std::cerr << "yolo26_consumer: warning: running without managed SIGINT/SIGTERM handling: "
               << holoscan::runtime_error_message(signals.error()) << '\n';
-    return 1;
   }
   holoscan::Graph graph{"yolo26_consumer"};
   auto source = graph.op<SceneSourceOp>("source");
@@ -283,6 +342,16 @@ int main(int argc, char** argv) try {
   auto sink = graph.op<TallyOp>("tally", tally, segment);
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   std::vector<const char*> ports{"boxes", "scores", "class_ids", "count"};
+  // The detector's outputs that every graph uses, and the label image when segmenting.
+  const holoscan::Output<holoscan::Tensor>* boxes = nullptr;
+  const holoscan::Output<holoscan::Tensor>* scores = nullptr;
+  const holoscan::Output<holoscan::Tensor>* class_ids = nullptr;
+  const holoscan::Output<holoscan::Tensor>* count = nullptr;
+  [[maybe_unused]] const holoscan::Output<holoscan::Tensor>* label_image = nullptr;
+  // Ctrl+C is taken once the run starts; the engine is built before it.
+  std::cout << "yolo26_consumer: preparing the TensorRT engine; Ctrl+C takes effect once it "
+               "is ready\n";
+#if !YOLO26_CONSUMER_API_1_0
   if (segment) {
     const y26::Yolo26SegmentationConfig config{
         .model = y26::write_stub_segmentation_model(std::filesystem::current_path(), kInputSize),
@@ -293,16 +362,19 @@ int main(int argc, char** argv) try {
         .max_image_height = kHeight};
     auto segmenter = graph.op<y26::Yolo26SegmentationOp>("detector", config);
     graph.add_flow(source->image, segmenter->image, lossless);
-    graph.add_flow(segmenter->boxes, sink->boxes, lossless);
-    graph.add_flow(segmenter->scores, sink->scores, lossless);
-    graph.add_flow(segmenter->class_ids, sink->class_ids, lossless);
-    graph.add_flow(segmenter->count, sink->count, lossless);
     graph.add_flow(segmenter->masks, sink->masks, lossless);
     graph.add_flow(segmenter->label_image, sink->label_image, lossless);
+    boxes = &segmenter->boxes;
+    scores = &segmenter->scores;
+    class_ids = &segmenter->class_ids;
+    count = &segmenter->count;
+    label_image = &segmenter->label_image;
     ports.insert(ports.end(), {"masks", "label_image"});
     // Build the TensorRT engine before the run, as the operator asks.
     y26::prepare_engine(config);
-  } else {
+  }
+#endif
+  if (!segment) {
     const y26::Yolo26DetectionConfig config{
         .model = y26::write_stub_model(std::filesystem::current_path(), kInputSize),
         .input_size = kInputSize,
@@ -310,12 +382,49 @@ int main(int argc, char** argv) try {
         .num_classes = y26::kStubClasses};
     auto detector = graph.op<y26::Yolo26DetectionOp>("detector", config);
     graph.add_flow(source->image, detector->image, lossless);
-    graph.add_flow(detector->boxes, sink->boxes, lossless);
-    graph.add_flow(detector->scores, sink->scores, lossless);
-    graph.add_flow(detector->class_ids, sink->class_ids, lossless);
-    graph.add_flow(detector->count, sink->count, lossless);
+    boxes = &detector->boxes;
+    scores = &detector->scores;
+    class_ids = &detector->class_ids;
+    count = &detector->count;
     y26::prepare_engine(config);
   }
+  graph.add_flow(*boxes, sink->boxes, lossless);
+  graph.add_flow(*scores, sink->scores, lossless);
+  graph.add_flow(*class_ids, sink->class_ids, lossless);
+  graph.add_flow(*count, sink->count, lossless);
+#if YOLO26_CONSUMER_WITH_OVERLAY
+  // The overlay draws every frame's layers, which two sinks count.
+  auto drawn = std::make_shared<std::uint32_t>(0U);
+  auto labelled = std::make_shared<std::uint32_t>(0U);
+  auto images = graph.op<CountOp<holoscan::schema::ImageT>>("overlay_images", drawn);
+  auto labels = graph.op<CountOp<holoscan::Tensor>>("overlay_labels", labelled);
+  const auto draw = [&](auto& overlay) {
+    graph.add_flow(*boxes, overlay->boxes, lossless);
+    graph.add_flow(*scores, overlay->scores, lossless);
+    graph.add_flow(*class_ids, overlay->class_ids, lossless);
+    graph.add_flow(*count, overlay->count, lossless);
+    graph.add_flow(overlay->overlay, images->in, lossless);
+    graph.add_flow(overlay->labels, labels->in, lossless);
+  };
+#if !YOLO26_CONSUMER_API_1_0
+  if (segment) {
+    auto overlay = graph.op<y26::Yolo26SegmentationOverlayOp>(
+        "overlay", y26::Yolo26SegmentationOverlayConfig{
+                       .width = kWidth, .height = kHeight, .max_detections = kCapacity});
+    draw(overlay);
+    graph.add_flow(*label_image, overlay->label_image, lossless);
+  }
+#endif
+  if (!segment) {
+    auto overlay = graph.op<y26::Yolo26OverlayOp>(
+        "overlay",
+        y26::Yolo26OverlayConfig{.width = kWidth, .height = kHeight, .max_detections = kCapacity});
+    draw(overlay);
+  }
+#endif
+  // A lossless graph on one worker: every operator of the graph, one at a time. Across
+  // workers a full blocking queue refuses what is sent to it (see holoscan-messages' README).
+  graph.partition("yolo26_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // The outputs are in GPU memory, on device 0.
@@ -325,19 +434,45 @@ int main(int argc, char** argv) try {
         .operator_path = "detector", .output_port = port, .device = holoscan::DeviceId{0}});
   }
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
+  // Warnings on an accepted plan, as well as the reasons for a rejected one.
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
+  }
   if (!plan.ok()) {
-    std::cerr << plan.json() << '\n';
     return 1;
   }
-  // The run adopts the signal domain.
-  if (const int status = holoscan::run(plan); status != 0) {
-    std::cerr << "yolo26_consumer: run failed with " << status << '\n';
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "yolo26_consumer: workers=" << workers << '\n';
+  if (workers != 1U) {
+    std::cerr << "yolo26_consumer: the graph should run on one worker\n";
     return 1;
   }
-  const bool passed = tally->frames == kFrames && tally->frames_matching_truth == kFrames;
+  auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
+  if (!session.wait_for(std::chrono::seconds{240})) {
+    std::cerr << "yolo26_consumer: timed out\n";
+    session.request_stop();
+    session.wait();
+  }
+  if (!session.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
+  }
+  if (signals) {
+    if (auto closed = signals->close(); !closed) {
+      std::cerr << "yolo26_consumer: warning: closing the signal domain failed: "
+                << holoscan::runtime_error_message(closed.error()) << '\n';
+    }
+  }
+  bool passed = session.termination() == holoscan::RunTermination::kRequestedCompleted &&
+                session.diagnostics().empty() && tally->frames == kFrames &&
+                tally->frames_matching_truth == kFrames;
   std::cout << "yolo26_consumer: " << task << " frames=" << tally->frames
-            << " matching_truth=" << tally->frames_matching_truth << '\n'
-            << "yolo26_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
+            << " matching_truth=" << tally->frames_matching_truth << '\n';
+#if YOLO26_CONSUMER_WITH_OVERLAY
+  // The overlay may still be drawing the last frame when the tally completes the run.
+  std::cout << "yolo26_consumer: overlay images=" << *drawn << " labels=" << *labelled << '\n';
+  passed = passed && *drawn + 1U >= kFrames && *labelled + 1U >= kFrames;
+#endif
+  std::cout << "yolo26_consumer: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 1;
 } catch (const std::exception& error) {
   std::cerr << "yolo26_consumer: error: " << error.what() << '\n';

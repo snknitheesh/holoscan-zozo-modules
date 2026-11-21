@@ -3,10 +3,13 @@
 
 #include "detection_report_op.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -320,11 +323,31 @@ holoscan::expected<void, holoscan::Error> DetectionReportOp::fetch_masks(
   if (auto fetched = fetch(labels_tensor, label_shape, context.cuda_stream(), m.labels); !fetched) {
     return fetched;
   }
-  if (auto fetched = fetch(masks_tensor, mask_shape, context.cuda_stream(), m.masks); !fetched) {
-    return fetched;
+  // Only the detections' masks, the first `detections` slots of the tensor,
+  // not all max_detections of them.
+  const std::span<const std::int64_t> actual = masks_tensor.shape_span();
+  const DLDataType dtype = masks_tensor.dtype();
+  if (dtype.code != kDLUInt || dtype.bits != 8U || dtype.lanes != 1U ||
+      !std::equal(actual.begin(), actual.end(), mask_shape.begin(), mask_shape.end()) ||
+      !masks_tensor.is_contiguous()) {
+    return holoscan::make_unexpected(invalid("unexpected masks tensor type or shape"));
   }
-  // Only the detections' masks are needed past here.
   m.masks.resize(detections * static_cast<std::size_t>(m.width) * m.height);
+  if (!m.masks.empty()) {
+    if (auto ready = masks_tensor.synchronize_for_host(); !ready) {
+      return ready;
+    }
+    if (masks_tensor.device().device_type == kDLCUDA) {
+      if (const cudaError_t status = cudaMemcpy(m.masks.data(), masks_tensor.data(), m.masks.size(),
+                                                cudaMemcpyDeviceToHost);
+          status != cudaSuccess) {
+        return holoscan::make_unexpected(
+            invalid(std::string("copying the masks: ") + cudaGetErrorString(status)));
+      }
+    } else {
+      std::memcpy(m.masks.data(), masks_tensor.data(), m.masks.size());
+    }
+  }
   masks_ = std::move(m);
   return {};
 }

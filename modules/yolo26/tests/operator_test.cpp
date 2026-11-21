@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -242,6 +243,33 @@ void check_rejects_settings() {
   VERIFY(!rejects([](auto&) {}));
 }
 
+// The same frames with and without CUDA graphs: HoloInfer's replay of the
+// inference changes no output byte.
+void check_cuda_graphs_change_nothing() {
+  const auto outputs = [](bool cuda_graphs) {
+    Yolo26DetectionConfig config = stub_config();
+    config.cuda_graphs = cuda_graphs;
+    prepare_engine(config);
+    auto h = holoscan::testing::create_operator_test<Yolo26DetectionOp>(config);
+    for (std::uint32_t f = 0; f < 3; ++f) {
+      h.push("image", scene_image(make_scene(1280, 720, f * 9U), PixelFormat::kRgb8));
+    }
+    declare_outputs(h);
+    const auto result = h.run();
+    VERIFY_MSG(result.ok(), result.describe_failure());
+    std::vector<std::vector<std::byte>> bytes;
+    for (const char* name : kOutputs) {
+      for (const auto& snapshot : result.snapshots<holoscan::Tensor>(name)) {
+        bytes.push_back(snapshot.bytes());
+      }
+    }
+    return bytes;
+  };
+  const auto with_graphs = outputs(true);
+  VERIFY(with_graphs.size() == 3U * std::size(kOutputs));
+  VERIFY(with_graphs == outputs(false));
+}
+
 #if HOLOSCAN_YOLO26_WITH_OVERLAY
 // `values` as a host tensor of `shape` and `dtype`.
 template <typename T>
@@ -373,6 +401,11 @@ int main(int argc, char** argv) {
   }
   yd::g_directory = argv[1];
   std::filesystem::create_directories(yd::g_directory);
+  // Build the stub's engines before any run, as the operator asks: a Jetson
+  // can take longer than the harness lets a run start.
+  for (const int size : {640, 320}) {
+    yd::prepare_engine(yd::stub_config(size));
+  }
   using yd::PixelFormat;
   using yd::test::Memory;
   std::vector<yd::test::TestCase> cases{
@@ -392,6 +425,7 @@ int main(int argc, char** argv) {
       {"rejects unusable images", yd::check_rejects_images},
       {"rejects unusable models", yd::check_rejects_models},
       {"rejects unusable settings", yd::check_rejects_settings},
+      {"CUDA graphs change no output", yd::check_cuda_graphs_change_nothing},
   };
 #if HOLOSCAN_YOLO26_WITH_OVERLAY
   cases.push_back({"overlay boxes and labels", yd::check_overlay});

@@ -9,14 +9,14 @@ and labels, drawn over them, and HoloViz can render the same offscreen, where ev
 checked. It uses the installed module the way any other project would:
 `find_package(holoscan-yolo26)`.
 
-> **The models are AGPL-3.0.** YOLO26 and YOLO26-seg weights and the Ultralytics software that exports them are
-> licensed under the
-> [GNU Affero General Public License v3.0](https://github.com/ultralytics/ultralytics/blob/main/LICENSE)
-> (or an Ultralytics Enterprise License). Neither is part of this repository, which is Apache-2.0
-> and contains no Ultralytics code or weights. They are downloaded and exported separately, on your
-> machine, by the module's `prepare_model.py` (see "Prepare the model" below); the terms that apply
-> to using and distributing the model and anything built with it are yours to review. The tests and
-> the `ci` mode need neither: they use the module's stand-in models.
+> **The models are AGPL-3.0.** YOLO26 and YOLO26-seg weights and the Ultralytics software that
+> exports them are licensed under the [GNU Affero General Public License
+> v3.0](https://github.com/ultralytics/ultralytics/blob/main/LICENSE) (or an Ultralytics Enterprise
+> License). Neither is part of this repository, which is Apache-2.0 and contains no Ultralytics code
+> or weights. They are downloaded and exported separately, on your machine, by the module's
+> `prepare_model.py` (see "Prepare the model" below); the terms that apply to using and distributing
+> the model and anything built with it are yours to review. The tests and the `ci` mode need
+> neither: they use the module's stand-in models.
 
 ```mermaid
 flowchart LR
@@ -43,8 +43,9 @@ Videos of the demo on synthetic input and on real input go in [tests/video](test
 ## Prepare the model
 
 The `demo`, `files` and `camera` modes and the real-model tests need YOLO26n exported to ONNX with
-its end-to-end head (and the `segmentation` modes YOLO26n-seg), and the COCO validation image `000000039769.jpg` (subject to the COCO terms of
-use, on the Terms of Use page at [cocodataset.org](https://cocodataset.org/)). The module's
+its end-to-end head (and the `segmentation` modes YOLO26n-seg), and the COCO validation image
+`000000039769.jpg` (subject to the COCO terms of use, on the Terms of Use page at
+[cocodataset.org](https://cocodataset.org/)). The module's
 [`prepare_model.py`](../../modules/yolo26/tools/prepare_model.py) downloads and checks both, and
 exports the model with the Ultralytics `yolo` command, which you install in a virtual environment of
 its own; its README explains the steps and their risks. From the repository root:
@@ -59,8 +60,10 @@ python3 modules/yolo26/tools/prepare_model.py --output data/yolo26_detection --t
 ```
 
 This writes `data/yolo26_detection/yolo26n.onnx`, `yolo26n.labels.txt`, `yolo26n-seg.onnx`,
-`yolo26n-seg.labels.txt` and `images/000000039769.jpg`, where the modes and the tests look for them. Copy your own JPEG or PPM
-images into `data/yolo26_detection/images` for the `files` mode.
+`yolo26n-seg.labels.txt` and `images/000000039769.jpg`, where the modes look for them. Copy your own
+JPEG or PPM images into `data/yolo26_detection/images` for the `files` mode. The real-model tests
+look in `$HOLOSCAN_TEST_DATA/yolo26_detection` instead: run the same commands with
+`--output "$HOLOSCAN_TEST_DATA/yolo26_detection"`, or copy the folder there.
 
 ## Build and run
 
@@ -107,7 +110,7 @@ yolo26_detection: verdict=PASS
 The latency is the time from a frame's capture by the source to its detections on the host,
 including the JPEG decode; the first frame's includes the warm-up. The first run builds the TensorRT
 engine from the ONNX file, which takes 10 to 30 s, and caches it beside the file; later runs start
-in seconds.
+in seconds. The engine is built before the run starts, and Ctrl+C takes effect once it is ready.
 
 `--model stub` writes and uses the module's stand-in model: an ONNX network with the inputs and
 outputs of an end-to-end YOLO26 export that "detects", from the pixels, red (class 0) and blue
@@ -121,8 +124,9 @@ the expected detections found. A gap in the frame ids fails the run (but for the
 [Lossless or real time](#lossless-or-real-time)), as does a run over files with
 nothing expected and no detection at all, which most likely means a wrong model, input size or
 threshold. Then comes a `verdict`: `PASS`, `FAIL`, or `STOPPED` when an interrupt or a closed window
-ends the run early. It exits 0 on `PASS`, or on `STOPPED` for a camera run without `--count`; 2 for
-invalid options, a missing camera among them; else 1.
+ends the run early. It exits 0 on `PASS`, or on `STOPPED` for a camera run without `--count` that
+reported a frame; 2 for invalid options, a missing camera among them; else 1. A run that gets no
+result for `--timeout-seconds` is stopped, and the process exits 1 if it does not stop within 10 s.
 
 ### Segmentation
 
@@ -151,9 +155,10 @@ covers it. The run prints `masks: missed=... min_iou=... label_errors=...`. Writ
 window, for synthetic RGB8 frames with the stub model, in either task. Each render is checked: it
 must show some frame of the run, found from where its boxes are, with each rectangle's box in its
 class's color at its left edge and, at its center, the frame's color, blended with the class color
-at the masks' opacity when segmenting. The run prints `renders=N renders_matched=N`, and fails
-unless every render matched. With `--image-dir`, the renders are written there too, as
-`render_NNNN.ppm`.
+at the masks' opacity when segmenting; and just inside and just outside each rectangle's left and
+right edges, the same frame's video, so that video a frame behind its boxes fails. The run prints
+`renders=N renders_matched=N`, and fails unless every render matched. With `--image-dir`, the
+renders are written there too, as `render_NNNN.ppm`.
 
 `--expect FILE` lists detections that named image files must yield, as lines of
 `image,class_id,x1,y1,x2,y2`, each matched by a detection of the class with an IoU of at least
@@ -165,21 +170,26 @@ option. `-DYOLO26_DETECTION_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
 ### Lossless or real time
 
 Synthetic frames and files are lossless: every frame is detected and reported, in order, over
-blocking edges. They go one at a time: the source sends a frame only once the reporter is done with
-the one before, so none is lost however long the reporter takes, to write an image say, and
-`--period-ms` is the shortest time between frames. The reporter's count of frames done is the
-signal; it cannot reach the source as data, over an edge, because the SDK refuses a graph with a
-cycle.
+blocking edges, and the whole graph runs on one worker (`graph.partition(...).include_all()`), one
+operator at a time, as a lossless graph must (see the module's
+[Lossless or real time](../../modules/yolo26/README.md#lossless-or-real-time)); `--compile-only
+true` prints the plan's `workers=1`. Frames go one at a time: the source sends a frame only once
+the reporter is done with the one before, so none is lost however long the reporter takes, to
+write an image say, and `--period-ms` is the shortest time between frames. The reporter's count of
+frames done is the signal; it cannot reach the source as data, over an edge, because the SDK
+refuses a graph with a cycle. A frame the detector has no room for yet (`kBackpressured`, or
+`kResourceExhausted` on its allocation) goes again on the source's next tick.
 
 The camera runs in real time. The camera to the detector, and the detector to the reporter, the
 overlay and the window, are depth-1 drop-oldest edges: a full queue drops its oldest sample rather
 than refusing the new one. The detector never waits for a slower consumer, takes the newest frame
 when the camera is faster, and a slow consumer finds the newest detections waiting when it is done.
 Frames passed over are counted as `skipped`, not as gaps, and a run with `--count N` ends with frame
-`N`'s detections. The reporter's images (with `--image-dir`) and the window's video keep the four
-newest frames instead of one, so that a frame is still queued when its detections arrive, a
-detector's latency later, to be paired with them. The window, with `--display true`, is real time
-in either mode.
+`N`'s detections. Two drop-oldest edges are deeper than one: the reporter's images (with
+`--image-dir`) and the window's video keep the four newest frames, so that a frame is still queued
+when its detections arrive, a detector's latency later, to be paired with them. The window, with
+`--display true`, is real time in either mode. The camera's graph is left to the SDK's automatic
+partitioning, several workers, so that its stages overlap.
 
 ### Webcam
 
@@ -203,12 +213,13 @@ without a window.
 
 ## Performance
 
-On an RTX 5090 (shared with another process) with SDK 5.0.0, CUDA 13.2 and
-TensorRT 10.16, for YOLO26n at 640 on the 640x480 COCO image, it takes a median of 1.27 ms from
-capture to detections on the host with the FP32 engine, and 0.96 ms with FP16, the source's JPEG
-decode included. The module's README compares detection and segmentation (`--task segment` with
-YOLO26n-seg) on the RTX 5090 and on a Jetson AGX Orin. The module's README breaks down the GPU work per frame, measured with Nsight
-Systems over 300 frames, tracing CUDA graph nodes, from:
+On an RTX 5090 (shared with another process) with SDK 5.0.0, CUDA 13.2 and TensorRT 10.16, for
+YOLO26n at 640 on the 640x480 COCO image, it takes a median of 1.27 ms from capture to detections
+on the host with the FP32 engine, and 0.96 ms with FP16, the source's JPEG decode included. In a
+later run on the same, again shared, GPU (median of 280 frames), YOLO26n-seg with `--task segment`
+took 1.37 ms with FP32 and 1.00 ms with FP16, against 1.39 ms and 0.95 ms for YOLO26n in that run.
+The module's README breaks down the GPU work per frame, for detection and segmentation, measured
+with Nsight Systems, tracing CUDA graph nodes, from:
 
 ```bash
 nsys profile -t cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o yolo26 \
@@ -224,21 +235,25 @@ With `-DBUILD_TESTING=ON`, `ctest` checks:
   files that a fixture writes: every encoding, GPU and host memory, wide, tall and small frames,
   another input size, FP16 engines, engine files, image output, expected detections, and the exit
   status and verdict of failed, stopped and invalid runs, a run without managed signal handling, a
-  missing camera, and the display graph.
+  missing camera, and the display graph; and that every lossless graph, with image output, files,
+  the display or offscreen renders, compiles to one worker.
 - Segmentation with the stub segmentation model, in the same encodings, memory, shapes and input
   sizes, with every mask and the label image checked; the masks drawn into files and printed for
-  image files; too small a capacity and too high a mask threshold failing the run; and the
-  segmentation display graph.
+  image files; FP16 engines; too small a capacity and too high a mask threshold failing the run;
+  and the segmentation display graph.
 - Offscreen HoloViz renders, detecting and segmenting, each render checked against the frame it
-  shows.
-- The real-time edges with a consumer ten times slower than the source: the run completes without a
-  failure, the detector keeps the source's pace, and the consumer gets the newest detections,
-  ending with the last frame's.
+  shows; and, without a GPU, that the check fails a render whose video is a frame behind or ahead
+  of its boxes.
+- The real-time edges with a consumer ten times slower than the source, detecting and segmenting:
+  the run completes without a failure, the detector keeps the source's pace, and the consumer gets
+  the newest detections (and their masks), ending with the last frame's.
 - With the real model, the two cats and the remote that the Ultralytics predictor finds in the COCO
   image, in RGB8 and BGR8, with an FP16 engine and looped; and with YOLO26n-seg, the cats, the
   remote and the couch that its predictor finds, with masks of the sizes it gives, with FP32 and
-  FP16 engines. These run when the models have been prepared in `data/yolo26_detection`, and are
-  reported as skipped otherwise; point them elsewhere with `-DYOLO26_DATA_DIR=/path/to/prepared`.
+  FP16 engines. These run when the models, their labels and the image have been prepared in
+  `$HOLOSCAN_TEST_DATA/yolo26_detection`, and are reported as skipped otherwise, or when
+  `HOLOSCAN_TEST_DATA` is not set; point them at another folder, such as `data/yolo26_detection`,
+  with `-DYOLO26_DATA_DIR=/path/to/prepared`.
 - Without a GPU: the expectation and label files, image headers, PPM files and box drawing; and,
   also built on its own from `tests/host/` by the hosted CI job, the webcam's YUYV conversion.
 

@@ -29,6 +29,12 @@ constexpr std::array<Rgb, 2> kClassColors{{{230, 25, 75}, {60, 180, 75}}};
 constexpr int kTolerance = 4;
 // How far a drawn box edge may lie from its rectangle's, in pixels.
 constexpr int kEdgeSlack = 3;
+// How far from a rectangle's edge the video is sampled, in pixels: past the
+// 2 px box line wherever kEdgeSlack puts it, and short of the 7 or more pixels
+// a rectangle moves from one frame to the next.
+constexpr int kVideoProbe = 5;
+// The synthetic frames' background.
+constexpr Rgb kBackground{40, 40, 40};
 
 holoscan::Error invalid(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "RenderCheckOp: " + message};
@@ -43,7 +49,57 @@ bool near(const std::uint8_t* rgba, const Rgb& want) {
   return true;
 }
 
+// `color` blended with `over` at opacity `alpha`, as HoloViz blends a layer.
+Rgb blend(const Rgb& color, const Rgb& over, double alpha) {
+  Rgb out{};
+  for (std::size_t k = 0; k < 3; ++k) {
+    out[k] = static_cast<int>(std::lround(color[k] * (1.0 - alpha) + over[k] * alpha));
+  }
+  return out;
+}
+
 }  // namespace
+
+bool render_shows(std::span<const std::uint8_t> rgba, int width, int height, std::uint32_t frame,
+                  bool masks, std::uint8_t mask_alpha) {
+  if (frame == 0 || rgba.size() != static_cast<std::size_t>(width) * height * 4U) {
+    return false;
+  }
+  const auto at = [&](int x, int y) {
+    return rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+  };
+  const double alpha = masks ? mask_alpha / 255.0 : 0.0;
+  const holoscan::yolo26::SyntheticScene scene =
+      holoscan::yolo26::make_scene(width, height, frame - 1U);
+  for (std::size_t c = 0; c < kClassColors.size(); ++c) {
+    const auto& rect = scene.rects[c];
+    const int cy = (rect.y0 + rect.y1) / 2;
+    // A box edge near the rectangle's left edge.
+    bool edge = false;
+    for (int x = std::max(rect.x0 - kEdgeSlack, 0);
+         x <= std::min(rect.x0 + kEdgeSlack, width - 1) && !edge; ++x) {
+      edge = near(at(x, cy), kClassColors[c]);
+    }
+    // At the center, the frame's color under the mask.
+    const Rgb color{rect.rgb[0], rect.rgb[1], rect.rgb[2]};
+    if (!edge || !near(at((rect.x0 + rect.x1) / 2, cy), blend(color, kClassColors[c], alpha))) {
+      return false;
+    }
+    // Next to the edges, the same frame's video: its color inside, the
+    // background outside. A mask's edge can be a few pixels off its
+    // rectangle's, so either side may or may not be under the mask.
+    const auto video = [&](int x, const Rgb& want) {
+      return x < 0 || x >= width || near(at(x, cy), want) ||
+             near(at(x, cy), blend(want, kClassColors[c], alpha));
+    };
+    const int last = rect.x1 - 1;
+    if (!video(rect.x0 + kVideoProbe, color) || !video(last - kVideoProbe, color) ||
+        !video(rect.x0 - kVideoProbe, kBackground) || !video(last + kVideoProbe, kBackground)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 RenderCheckOp::RenderCheckOp(RenderCheckConfig config) : config_(std::move(config)) {
   if (!config_.report || config_.width < 1 || config_.height < 1) {
@@ -101,37 +157,9 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
           holoscan::Error{holoscan::ErrorCode::kFailure, error.what()});
     }
   }
-  const auto at = [&](int x, int y) {
-    return pixels_.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
-  };
-  const double alpha = config_.masks ? config_.mask_alpha / 255.0 : 0.0;
-  // Some frame's two rectangles: a box edge near each one's left edge, and
-  // the center as the overlay leaves it.
-  const auto shows = [&](std::uint32_t frame) {
-    const holoscan::yolo26::SyntheticScene scene =
-        holoscan::yolo26::make_scene(width, height, frame - 1U);
-    for (std::size_t c = 0; c < kClassColors.size(); ++c) {
-      const auto& rect = scene.rects[c];
-      const int cy = (rect.y0 + rect.y1) / 2;
-      bool edge = false;
-      for (int x = std::max(rect.x0 - kEdgeSlack, 0);
-           x <= std::min(rect.x0 + kEdgeSlack, width - 1) && !edge; ++x) {
-        edge = near(at(x, cy), kClassColors[c]);
-      }
-      Rgb center{};
-      for (std::size_t k = 0; k < 3; ++k) {
-        center[k] =
-            static_cast<int>(std::lround(rect.rgb[k] * (1.0 - alpha) + kClassColors[c][k] * alpha));
-      }
-      if (!edge || !near(at((rect.x0 + rect.x1) / 2, cy), center)) {
-        return false;
-      }
-    }
-    return true;
-  };
   bool matched = false;
   for (std::uint32_t frame = 1; frame <= config_.frames && !matched; ++frame) {
-    matched = shows(frame);
+    matched = render_shows(pixels_, width, height, frame, config_.masks, config_.mask_alpha);
   }
   if (matched) {
     ++report.matched;

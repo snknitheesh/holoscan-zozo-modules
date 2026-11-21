@@ -15,11 +15,14 @@
 // it must reject. And, when it is built, Yolo26SegmentationOverlayOp: masks
 // filled in their class's color, boxes and labels over them.
 //
-// With --real MODEL, the real YOLO26 segmentation model instead, on rendered
-// stop signs: the sign must be found, and its mask must overlap the octagon
-// by an IoU of at least 0.9. Exits 77, a skip, when MODEL does not exist.
+// With --real, the real YOLO26 segmentation model instead, on rendered stop
+// signs: the sign must be found, and its mask must overlap the octagon by an
+// IoU of at least 0.9. The model is MODEL when it is given and not empty,
+// otherwise $HOLOSCAN_TEST_DATA/yolo26_detection/yolo26n-seg.onnx. Exits 77, a
+// skip, when HOLOSCAN_TEST_DATA is needed and not set, or the model does not
+// exist.
 //
-// Usage: yolo26_segmentation_op_test DIR [--real MODEL]
+// Usage: yolo26_segmentation_op_test DIR [--real [MODEL]]
 
 #include <cuda_runtime_api.h>
 
@@ -29,9 +32,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
@@ -400,7 +405,43 @@ void check_rejects_settings() {
   VERIFY(rejects([](auto& c) { c.max_image_width = 0; }));
   VERIFY(rejects([](auto& c) { c.max_image_height = kMaxImageSide + 1; }));
   VERIFY(rejects([](auto& c) { c.build_workspace_bytes = 1024; }));
+  // More masks per frame than kMaxMasksBytes: 1024 of 1920 x 1080 is 2 GiB.
+  VERIFY(rejects([](auto& c) { c.max_detections = kMaxSegmentationDetections; }));
+  VERIFY(!rejects([](auto& c) {
+    c.max_detections = 512;
+    c.max_image_width = 1024;
+    c.max_image_height = 2048;
+  }));
   VERIFY(!rejects([](auto&) {}));
+}
+
+// The same frames with and without CUDA graphs: HoloInfer's replay of the
+// inference changes no output byte, masks and label image included.
+void check_cuda_graphs_change_nothing() {
+  const auto outputs = [](bool cuda_graphs) {
+    Yolo26SegmentationConfig config = stub_config();
+    config.cuda_graphs = cuda_graphs;
+    config.max_image_width = 640;
+    config.max_image_height = 480;
+    prepare_engine(config);
+    auto h = holoscan::testing::create_operator_test<Yolo26SegmentationOp>(config);
+    for (std::uint32_t f = 0; f < 3; ++f) {
+      h.push("image", scene_image(make_scene(640, 480, f * 9U), PixelFormat::kRgb8));
+    }
+    declare_outputs(h, 3);
+    const auto result = h.run();
+    VERIFY_MSG(result.ok(), result.describe_failure());
+    std::vector<std::vector<std::byte>> bytes;
+    for (const char* name : kOutputs) {
+      for (const auto& snapshot : result.snapshots<holoscan::Tensor>(name)) {
+        bytes.push_back(snapshot.bytes());
+      }
+    }
+    return bytes;
+  };
+  const auto with_graphs = outputs(true);
+  VERIFY(with_graphs.size() == 3U * std::size(kOutputs));
+  VERIFY(with_graphs == outputs(false));
 }
 
 // The real model on rendered stop signs, in RGB8 from host memory.
@@ -574,14 +615,23 @@ void check_overlay_empty_and_mismatch() {
 
 int main(int argc, char** argv) {
   namespace yd = holoscan::yolo26;
-  if (argc != 2 && !(argc == 4 && std::string_view(argv[2]) == "--real")) {
-    std::cerr << "usage: " << argv[0] << " DIR [--real MODEL]\n";
+  const bool real = argc >= 3 && std::string_view(argv[2]) == "--real";
+  if (argc != 2 && !(real && argc <= 4)) {
+    std::cerr << "usage: " << argv[0] << " DIR [--real [MODEL]]\n";
     return 2;
   }
   yd::g_directory = argv[1];
   std::filesystem::create_directories(yd::g_directory);
-  if (argc == 4) {
-    return yd::run_real(argv[3]);
+  if (real) {
+    if (argc == 4 && *argv[3] != '\0') {
+      return yd::run_real(argv[3]);
+    }
+    const char* data = std::getenv("HOLOSCAN_TEST_DATA");
+    if (data == nullptr || *data == '\0') {
+      std::cout << "skipped: HOLOSCAN_TEST_DATA is not set\n";
+      return 77;
+    }
+    return yd::run_real(std::filesystem::path(data) / "yolo26_detection" / "yolo26n-seg.onnx");
   }
   // Build the stub's engines before any run, as the operator asks: a Jetson
   // can take longer than the harness lets a run start.
@@ -605,6 +655,7 @@ int main(int argc, char** argv) {
       {"thresholds and capacity", yd::check_thresholds_and_capacity},
       {"rejects unusable images and models", yd::check_rejects},
       {"rejects unusable settings", yd::check_rejects_settings},
+      {"CUDA graphs change no output", yd::check_cuda_graphs_change_nothing},
   };
 #if HOLOSCAN_YOLO26_WITH_OVERLAY
   cases.push_back({"overlay masks, boxes and labels", yd::check_overlay});

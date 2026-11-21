@@ -23,8 +23,9 @@ constexpr const char* kOp = "Yolo26SegmentationOp";
 
 // What the model must give, for the errors of one that gives something else.
 std::string expected_outputs() {
-  return "[1, N, 6 + M] end-to-end detections with M mask coefficients and [1, M, S/4, S/4] "
-         "prototype masks; export a YOLO26 segmentation model with nms=False";
+  return "[1, N, 6 + M] end-to-end detections with M mask coefficients and [1, M, h, w] "
+         "prototype masks (S/4 x S/4 for YOLO26); export a YOLO26 segmentation model with "
+         "nms=False";
 }
 
 using detail::kFloat32;
@@ -53,8 +54,8 @@ detail::ModelSettings model_settings(const Yolo26SegmentationConfig& config) {
 }  // namespace
 
 // The loaded model, what its outputs hold, and the GPU buffers and host
-// state each frame reuses.
-struct Yolo26SegmentationOp::Engine {
+// state each frame reuses. Hidden, as the model runtime it holds is.
+struct __attribute__((visibility("hidden"))) Yolo26SegmentationOp::Engine {
   std::unique_ptr<detail::LoadedModel> model;
   const float* rows{};
   const float* protos{};
@@ -123,6 +124,16 @@ void validate_config(const Yolo26SegmentationConfig& config) {
   }
   if (config.build_workspace_bytes < (std::size_t{1} << 24U)) {
     throw std::invalid_argument("build_workspace_bytes must be at least 16 MiB");
+  }
+  // The sides are at most kMaxImageSide and the detections 1024: no overflow.
+  const std::uint64_t masks_bytes = static_cast<std::uint64_t>(config.max_detections) *
+                                    static_cast<std::uint64_t>(config.max_image_width) *
+                                    static_cast<std::uint64_t>(config.max_image_height);
+  if (masks_bytes > kMaxMasksBytes) {
+    throw std::invalid_argument(
+        "max_detections x max_image_width x max_image_height is " + std::to_string(masks_bytes) +
+        " bytes of masks per frame, more than " + std::to_string(kMaxMasksBytes) +
+        "; lower max_detections or the largest image");
   }
 }
 
@@ -201,6 +212,12 @@ void Yolo26SegmentationOp::start() {
   const auto capacity = static_cast<std::size_t>(config_.max_detections);
   const std::size_t plane = static_cast<std::size_t>(engine->proto_width) *
                             static_cast<std::size_t>(engine->proto_height);
+  // One float per prototype pixel per detection, held for the run.
+  const std::size_t logits_bytes = capacity * plane * sizeof(float);
+  if (logits_bytes > kMaxMasksBytes) {
+    refuse("prototypes small enough for max_detections (" + std::to_string(logits_bytes) +
+           " bytes of mask logits, more than " + std::to_string(kMaxMasksBytes) + ")");
+  }
   const auto check = [](cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
       throw std::runtime_error(std::string(kOp) + ": " + what + ": " + cudaGetErrorString(status));
@@ -212,7 +229,7 @@ void Yolo26SegmentationOp::start() {
         "cudaMalloc");
   engine->coefficients = static_cast<float*>(coefficients);
   void* logits = nullptr;
-  check(cudaMalloc(&logits, capacity * plane * sizeof(float)), "cudaMalloc");
+  check(cudaMalloc(&logits, logits_bytes), "cudaMalloc");
   engine->logits = static_cast<float*>(logits);
   check(cudaEventCreateWithFlags(&engine->frame_done, cudaEventDisableTiming),
         "cudaEventCreateWithFlags");
@@ -220,11 +237,14 @@ void Yolo26SegmentationOp::start() {
   check(cudaHostAlloc(&passed, sizeof(std::int32_t), cudaHostAllocMapped), "cudaHostAlloc");
   engine->passed = static_cast<std::int32_t*>(passed);
   *engine->passed = 0;
+  const std::uint64_t pixels = static_cast<std::uint64_t>(config_.max_image_width) *
+                               static_cast<std::uint64_t>(config_.max_image_height);
   HOLOSCAN_LOG_INFO(
       "{}: {} ready, input [1, 3, {}, {}], {} output rows with {} mask coefficients, prototypes "
-      "{}x{}",
+      "{}x{}; per frame up to {} bytes of masks and {} of label image, and {} bytes of mask "
+      "logits for the run",
       kOp, name, config_.input_size, config_.input_size, engine->row_count, engine->mask_channels,
-      engine->proto_width, engine->proto_height);
+      engine->proto_width, engine->proto_height, capacity * pixels, pixels * 4U, logits_bytes);
   engine_ = std::move(engine);
 }
 

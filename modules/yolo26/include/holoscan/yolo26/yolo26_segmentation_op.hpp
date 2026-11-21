@@ -16,8 +16,9 @@
 // (yolo26n-seg and its larger siblings): input float32 [1, 3, S, S] RGB in
 // [0, 1]; outputs float32 [1, N, 6 + M], rows of [x1, y1, x2, y2, score,
 // class] in input pixels and M mask coefficients, best first, and float32
-// [1, M, S / 4, S / 4] prototype masks. Its engine is built and cached as for
-// Yolo26DetectionOp.
+// [1, M, h, w] prototype masks, M at most kMaxMaskChannels and each side at
+// most kMaxProtoSide (YOLO26 exports give S / 4 x S / 4). Its engine is built
+// and cached as for Yolo26DetectionOp.
 //
 // The six outputs carry the image's capture time and frame id, and go out as
 // Yolo26DetectionOp's do: pair them by capture time (OnAligned), as
@@ -49,6 +50,9 @@ namespace holoscan::yolo26 {
 
 // Most detections, and so masks, per image.
 inline constexpr int kMaxSegmentationDetections = 1024;
+// Largest masks output, max_detections x max_image_width x max_image_height
+// bytes; the runtime keeps a few of them in its pool.
+inline constexpr std::uint64_t kMaxMasksBytes = std::uint64_t{1} << 30U;
 
 struct Yolo26SegmentationConfig {
   // An .onnx segmentation model, whose engine is built and cached beside it,
@@ -62,15 +66,17 @@ struct Yolo26SegmentationConfig {
   // Capacity of the outputs, 1..kMaxSegmentationDetections: the number of
   // masks per image. Further detections are dropped, the lowest scores first,
   // and a warning says so once per run. The masks output holds
-  // max_detections x height x width bytes.
+  // max_detections x height x width bytes, at most kMaxMasksBytes for the
+  // largest image.
   int max_detections{32};
   // The model's class count; rows with another class value are dropped.
   int num_classes{80};
   // A pixel belongs to an instance when its mask probability, the sigmoid of
   // the mask value, exceeds this, in (0, 1). Ultralytics uses 0.5.
   float mask_threshold{0.5F};
-  // The largest image, which sizes the masks and label image outputs; a
-  // larger image fails its frame.
+  // The largest image, which sizes the masks and label image outputs. A
+  // larger image is an error, which fails the run: size these for the
+  // largest image the source gives.
   int max_image_width{1920};
   int max_image_height{1080};
   // The letterbox's border, as an 8-bit gray level.
@@ -82,6 +88,10 @@ struct Yolo26SegmentationConfig {
   // TensorRT's workspace limit while it builds the engine.
   std::size_t build_workspace_bytes{std::size_t{1} << 30U};
 };
+
+// validate_config() and prepare_engine() are overloaded for both operators'
+// configs: pass a named Yolo26SegmentationConfig, since a bare braced list
+// such as {.model = path} fits both and is ambiguous.
 
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const Yolo26SegmentationConfig& config);
@@ -109,7 +119,8 @@ class Yolo26SegmentationOp final : public holoscan::Operator<> {
       holoscan::ExecutionContext& context) override;
 
   // As Yolo26DetectionOp's: RGB8, BGR8, RGBA8 or BGRA8, in GPU memory on
-  // device 0 or in host memory; at most max_image_width x max_image_height.
+  // device 0 or in host memory; at most max_image_width x max_image_height,
+  // or the run fails.
   holoscan::Input<holoscan::schema::ImageT> image;
   // As Yolo26DetectionOp's: float32 [max_detections, 4] boxes in image
   // pixels, float32 [max_detections] scores, int32 [max_detections] classes,

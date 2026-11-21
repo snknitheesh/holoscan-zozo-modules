@@ -4,11 +4,14 @@
 // RenderCheckOp: receives HoloViz's offscreen renders of synthetic frames
 // with the stub model's detections drawn over them, and checks each one: it
 // must show some frame of the run with the boxes of that frame's red and
-// blue rectangles in their class colors, opaque, at their left edges; and at
+// blue rectangles in their class colors, opaque, at their left edges; at
 // each rectangle's center, the frame's color, or, with masks, the frame's
-// color blended with the class color at the masks' opacity. The boxes move
+// color blended with the class color at the masks' opacity; and, just inside
+// and just outside the rectangle's left and right edges, the same frame's
+// video: the rectangle's color inside, the background outside. The boxes move
 // several pixels from frame to frame, so the check finds which frame a render
-// shows from where they are.
+// shows from where they are, and a video a frame behind or ahead of its boxes
+// fails the edges' video.
 
 #pragma once
 
@@ -16,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <holoscan/core/errors.hpp>
@@ -48,6 +52,11 @@ struct RenderCheckConfig {
   // Write each render as `image_dir`/render_NNNN.ppm, if set.
   std::filesystem::path image_dir;
 };
+
+// Whether `rgba`, a width x height RGBA8 render, shows synthetic frame `frame`
+// (numbered from 1) with its boxes, as RenderCheckOp checks it.
+[[nodiscard]] bool render_shows(std::span<const std::uint8_t> rgba, int width, int height,
+                                std::uint32_t frame, bool masks, std::uint8_t mask_alpha);
 
 class RenderCheckOp final : public holoscan::Operator<> {
  public:

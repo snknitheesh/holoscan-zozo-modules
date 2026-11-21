@@ -61,14 +61,16 @@ set_tests_properties(
   PROPERTIES LABELS "yolo26;gpu" TIMEOUT 600
 )
 
-# The real YOLO26n-seg model on rendered stop signs. Skipped unless
-# tools/prepare_model.py --task segment has written the model here; the first run builds
-# and caches its engine beside it.
+# The real YOLO26n-seg model on rendered stop signs, from
+# $HOLOSCAN_TEST_DATA/yolo26_detection/yolo26n-seg.onnx, where
+# tools/prepare_model.py --task segment --output "$HOLOSCAN_TEST_DATA/yolo26_detection" writes
+# it; HOLOSCAN_YOLO26_SEG_MODEL overrides the path. Skipped when the variable is not set or
+# the model is missing. The first run builds and caches its engine beside it.
 set(
   HOLOSCAN_YOLO26_SEG_MODEL
-  "${PROJECT_SOURCE_DIR}/../../data/yolo26_detection/yolo26n-seg.onnx"
+  ""
   CACHE FILEPATH
-  "The YOLO26 segmentation model for the real-model test"
+  "The YOLO26 segmentation model for the real-model test, instead of the one in $HOLOSCAN_TEST_DATA"
 )
 add_test(
   NAME yolo26_segmentation_real

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -57,8 +59,8 @@ holoscan::Error invalid(std::string_view op, const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, std::string(op) + ": " + message};
 }
 
-// Copies a packed tensor of `shape` and element type T to `out`, waiting for
-// its producer.
+// Queues a copy of a packed tensor of `shape` and element type T to `out` on
+// `stream`, after its producer's work; `out` is complete once `stream` is.
 template <typename T>
 Result fetch(std::string_view op, const holoscan::Tensor& tensor,
              std::span<const std::int64_t> shape, ::cuda::stream_ref stream, std::vector<T>& out) {
@@ -74,7 +76,7 @@ Result fetch(std::string_view op, const holoscan::Tensor& tensor,
     elements *= static_cast<std::size_t>(extent);
   }
   out.resize(elements);
-  return tensor.copy_to_host(out.data(), out.size() * sizeof(T), stream);
+  return tensor.copy_to_host_async(out.data(), out.size() * sizeof(T), stream);
 }
 
 // Draws the 2 px wide outline of the box from (x1, y1) to (x2, y2), in image
@@ -170,7 +172,7 @@ Result draw_and_emit(holoscan::ExecutionContext& context, const Drawing& drawing
                      holoscan::Output<holoscan::Tensor>& labels,
                      holoscan::Output<holoscan::schema::ImageT>& overlay) {
   // One small copy each to the host, at most `capacity` rows, and the label
-  // image.
+  // image, all queued on the operator's stream, then one wait for them.
   const std::int64_t capacity = drawing.capacity;
   const int width = drawing.width;
   const int height = drawing.height;
@@ -178,6 +180,16 @@ Result draw_and_emit(holoscan::ExecutionContext& context, const Drawing& drawing
   const std::array<std::int64_t, 2> box_shape{capacity, 4};
   const std::array<std::int64_t, 1> row_shape{capacity};
   std::vector<std::int32_t> counted;
+  // Waits for the queued copies on every way out, so none writes to memory
+  // that is gone; the normal way out waits below and checks the result.
+  struct WaitForCopies {
+    cudaStream_t stream;
+    ~WaitForCopies() {
+      if (stream != nullptr) {
+        (void)cudaStreamSynchronize(stream);
+      }
+    }
+  } wait_for_copies{context.cuda_stream().get()};
   for (auto fetched :
        {fetch(drawing.op, count_sample.data, one, context.cuda_stream(), counted),
         fetch(drawing.op, boxes_sample.data, box_shape, context.cuda_stream(), boxes),
@@ -203,6 +215,15 @@ Result draw_and_emit(holoscan::ExecutionContext& context, const Drawing& drawing
       return fetched;
     }
   }
+  // Without a stream, each copy has completed already.
+  if (cudaStream_t stream = std::exchange(wait_for_copies.stream, nullptr); stream != nullptr) {
+    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(holoscan::Error{
+          holoscan::ErrorCode::kFailure,
+          std::string(drawing.op) +
+              ": copying the detections to the host: " + cudaGetErrorString(status)});
+    }
+  }
   const std::int32_t n = counted.front();
   if (n < 0 || n > capacity) {
     return holoscan::make_unexpected(invalid(drawing.op, "detection count out of range"));
@@ -210,12 +231,8 @@ Result draw_and_emit(holoscan::ExecutionContext& context, const Drawing& drawing
   const auto detections = static_cast<std::size_t>(n);
 
   // The image's capture time and frame id, so Holoviz draws these layers over
-  // their own image; unstamped detections are stamped now, since Holoviz
-  // selects layers by capture time.
-  holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(count_sample);
-  if (!count_sample.metadata.source_clock_id.valid()) {
-    emit.capture_time = context.activation_time();
-  }
+  // their own image. OnAligned admits only samples with a capture time.
+  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(count_sample);
 
   // Allocates a host tensor on `output` and has `fill` write it.
   const auto write =

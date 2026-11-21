@@ -49,8 +49,9 @@ detail::ModelSettings model_settings(const Yolo26DetectionConfig& config) {
 
 }  // namespace
 
-// The loaded model and its number of output rows.
-struct Yolo26DetectionOp::Engine {
+// The loaded model and its number of output rows. Hidden, as the model
+// runtime it holds is.
+struct __attribute__((visibility("hidden"))) Yolo26DetectionOp::Engine {
   std::unique_ptr<detail::LoadedModel> model;
   int rows{};
 };

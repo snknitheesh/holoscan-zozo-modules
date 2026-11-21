@@ -522,15 +522,20 @@ double percentile(std::vector<double> values, double fraction) {
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
 int execute(const Options& opts, SignalDomain& signals) {
-  y26::Yolo26DetectionConfig detection = detection_config(opts);
-  y26::Yolo26SegmentationConfig segmentation = segmentation_config(opts);
-  if (is_stub(opts)) {
-    // Written to the working directory, where its engine is cached beside it.
-    if (segment(opts)) {
-      segmentation.model =
+  // The selected task's settings; the stub is written to the working
+  // directory, where its engine is cached beside it.
+  std::optional<y26::Yolo26DetectionConfig> detection;
+  std::optional<y26::Yolo26SegmentationConfig> segmentation;
+  if (segment(opts)) {
+    segmentation = segmentation_config(opts);
+    if (is_stub(opts)) {
+      segmentation->model =
           y26::write_stub_segmentation_model(std::filesystem::current_path(), opts.input_size);
-    } else {
-      detection.model = y26::write_stub_model(std::filesystem::current_path(), opts.input_size);
+    }
+  } else {
+    detection = detection_config(opts);
+    if (is_stub(opts)) {
+      detection->model = y26::write_stub_model(std::filesystem::current_path(), opts.input_size);
     }
   }
   const int capacity = max_detections(opts);
@@ -541,11 +546,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   auto report = std::make_shared<app::DetectionReport>();
   // The camera runs in real time, the other sources losslessly (edges.hpp).
   const bool realtime = opts.source == Source::kCamera;
-  // Lossless, the synthetic and file sources send a frame only once the
-  // reporter is done with the one before. A blocking edge does not wait for
-  // room for long: it refuses a frame its consumer has no room for, and the
-  // detector cannot send a refused frame again. One frame in flight fits the
-  // depth of two that every input declares in its operator's setup(): the
+  // Lossless, the whole graph runs on one worker (below), and the synthetic
+  // and file sources send a frame only once the reporter is done with the one
+  // before. A blocking edge refuses a frame its consumer has no room for, and
+  // the detector cannot send a refused frame again. One frame in flight fits
+  // the depth of two that every input declares in its operator's setup(): the
   // frame being reported, which keeps its place until its compute() returns,
   // and the next. The reporter's count of frames done is the signal, read by
   // the source: an edge back from the reporter to the source would carry it
@@ -574,12 +579,12 @@ int execute(const Options& opts, SignalDomain& signals) {
     const holoscan::Output<holoscan::Tensor>* masks;
     const holoscan::Output<holoscan::Tensor>* label_image;
   } detector{};
-  if (segment(opts)) {
-    auto op = graph.op<y26::Yolo26SegmentationOp>("detector", segmentation);
+  if (segmentation) {
+    auto op = graph.op<y26::Yolo26SegmentationOp>("detector", *segmentation);
     detector = DetectorPorts{&op->image, &op->boxes, &op->scores,     &op->class_ids,
                              &op->count, &op->masks, &op->label_image};
   } else {
-    auto op = graph.op<y26::Yolo26DetectionOp>("detector", detection);
+    auto op = graph.op<y26::Yolo26DetectionOp>("detector", *detection);
     detector = DetectorPorts{&op->image, &op->boxes, &op->scores, &op->class_ids,
                              &op->count, nullptr,    nullptr};
   }
@@ -660,7 +665,10 @@ int execute(const Options& opts, SignalDomain& signals) {
           .width = width, .height = height, .format = viz::ImageFormat::kR8G8B8A8Unorm};
     }
     // Draw when the boxes arrive, over the newest image, which is theirs;
-    // triggering on the image would draw the previous frame's boxes.
+    // triggering on the image would draw the previous frame's boxes. An image
+    // or label layer older than this is not drawn: four periods cover the
+    // detector's latency, as the four frames of recent_frames() do, and 250 ms
+    // keeps a fast source's layers from vanishing on one slow frame.
     const auto max_input_age =
         std::max(4 * std::chrono::milliseconds(opts.period_ms), std::chrono::milliseconds{250});
     auto visualizer =
@@ -731,6 +739,14 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (opts.source == Source::kFiles || (opts.source == Source::kSynthetic && !opts.host_input)) {
     on_gpu("source", "image");
   }
+  // A lossless graph runs on one worker, one operator at a time: across
+  // workers, a producer runs while its consumer's blocking queue is full, and
+  // what it sends is refused (see holoscan-messages' README). The camera's
+  // drop-oldest graph is left to the automatic partitioning, so that its
+  // stages overlap.
+  if (!realtime) {
+    graph.partition(std::string(kAppName)).include_all();
+  }
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   // Warnings on an accepted plan, as well as the reasons for a rejected one.
   if (!plan.diagnostics().empty()) {
@@ -740,7 +756,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -754,10 +770,14 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cerr << "; an interrupt ends the process without a report\n";
   }
   // Build the TensorRT engine now rather than in start(): see prepare_engine().
-  if (segment(opts)) {
-    y26::prepare_engine(segmentation);
+  // The signal domain takes SIGINT and SIGTERM to the run, which starts after.
+  std::cerr << kAppName
+            << ": preparing the TensorRT engine (a first build takes a while); Ctrl+C takes "
+               "effect once it is ready\n";
+  if (segmentation) {
+    y26::prepare_engine(*segmentation);
   } else {
-    y26::prepare_engine(detection);
+    y26::prepare_engine(*detection);
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
   // The run times out when no result arrives for this long. Before the first
@@ -785,6 +805,12 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (timed_out_after) {
     std::cerr << kAppName << ": timed out: no result for " << *timed_out_after << " s\n";
     session.request_stop();
+    // A run stuck in an operator, on a GPU that no longer answers say, may
+    // never stop: give up on it.
+    if (!session.wait_for(std::chrono::seconds{10})) {
+      std::cerr << kAppName << ": the run did not stop within 10 s; exiting\n" << std::flush;
+      std::_Exit(1);
+    }
   }
   session.wait();
   const holoscan::RunTermination termination = session.termination();
@@ -806,7 +832,7 @@ int execute(const Options& opts, SignalDomain& signals) {
 
   // A stop request (SIGINT, SIGTERM, a closed window) ends the run early;
   // that is not a failure, but not a pass either. For a live camera it is the
-  // normal end.
+  // normal end, once it has reported a frame.
   const bool stopped = !timed_out_after && termination == holoscan::RunTermination::kStopped;
   // Files with nothing to compare against and no detection at all most likely
   // mean a wrong model, input size or threshold; they do not pass.
@@ -872,7 +898,7 @@ int execute(const Options& opts, SignalDomain& signals) {
                 : stopped ? "STOPPED"
                           : "FAIL")
             << '\n';
-  return passed || (stopped && frames == 0) ? 0 : 1;
+  return passed || (stopped && frames == 0 && report->frames != 0) ? 0 : 1;
 }
 
 }  // namespace
