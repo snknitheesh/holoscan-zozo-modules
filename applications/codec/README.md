@@ -35,7 +35,7 @@ In a container, `NVIDIA_DRIVER_CAPABILITIES` must include `video` (the repositor
 | Option | Default | |
 | --- | --- | --- |
 | `--codec h264\|h265` | `h264` | |
-| `--backend auto\|nvcodec\|v4l2` | `auto` | The first that works here: NVENC/NVDEC on x86_64 and Thor, V4L2 on Orin |
+| `--backend auto\|nvcodec\|v4l2` | `auto` | The first that works here: NVENC/NVDEC on x86_64 and Jetson Thor, V4L2 on Jetson Orin. The demo opts in to `auto`; the module's default is `nvcodec` |
 | `--rate-control cbr\|vbr\|cqp` | `vbr` | |
 | `--bitrate BPS` | 8000000 | For `cbr` and `vbr` |
 | `--qp N` | 23 | For `cqp`, 0 (best) to 51 |
@@ -51,6 +51,8 @@ In a container, `NVIDIA_DRIVER_CAPABILITIES` must include `video` (the repositor
 | `--min-psnr DB` | 0 (off) | Fail on a decoded frame below this |
 | `--timeout-seconds N` | 60 | Fail when no frame comes for this long |
 | `--benchmark N` | off | Instead of the graph, time N frames of encoding and decoding at 1080p and 2160p for each codec, and print frames per second |
+| `--workers one\|auto` | `one` with `--count`, else `auto` | One worker for the whole graph, or the automatic partitioning |
+| `--compile-only true\|false` | `false` | Build and check the graph, print `plan=OK workers=N`, and exit |
 
 A finite run (`--count`) is lossless and checks every frame in order, and passes only when all of
 them came, every check held, and offscreen, when at least 80 % of the rendered frames show both
@@ -61,8 +63,19 @@ codec_demo: codec=h265 backend=v4l2 frames=60/60 keyframes=2 psnr_db: mean=38.23
 codec_demo: verdict=PASS
 ```
 
-The bitrate is at the encoder's planned 30 frames per second, whatever `--period-ms`. A run with a
-window is real time: frames the encoder is too busy for are skipped, never access units.
+The bitrate is at the encoder's planned 30 frames per second, whatever `--period-ms`. A finite
+run ends the stream after its last frame, so that with `--low-latency false` the decoder hands out
+the frames it still holds.
+
+Every run is lossless from the camera to the report, and the camera holds back: it skips a tick
+while 4 frames are on their way (20 with `--low-latency false`, as the decoder then holds frames
+back). So a run with a window keeps real time when the chain is slower than the camera (as Jetson
+Orin's decoder can be at high resolutions): frames are skipped at the camera, never access units,
+and no queue fills. A finite run runs on one worker; an endless one keeps the automatic
+partitioning. HoloViz shows the newest original no newer than the decoded frame, so the
+original's edge keeps the newest 8 frames (24 with `--low-latency false`) rather than 1, a
+deliberate exception to the newest-only rule for display edges; the other display edges keep the
+newest only.
 
 ## Modes
 
@@ -76,6 +89,9 @@ window is real time: frames the encoder is too busy for are skipped, never acces
 ## Tests
 
 `ctest` in the build folder runs the demo with H.265 at a constant QP, with H.264 at a constant
-bitrate on an odd frame size, and offscreen with every rendered frame checked, and checks that bad
-options are refused. Each needs a GPU with the video engines, or Jetson Orin; without one the demo
-exits 77 and the test is skipped.
+bitrate on an odd frame size, with a decoder that holds frames back (`--low-latency false`), and
+offscreen with every rendered frame checked, also with a camera faster than the chain; runs the
+endless graph's edges and automatic partitioning headless; checks that the finite graphs compile
+to one worker and the window graph compiles; and checks that bad options are refused. Each needs a
+GPU with the video engines, or Jetson Orin; without one the demo exits 77 and the test is skipped,
+except in CI, where it fails, as does a run whose `auto` picks another backend than the lane's.

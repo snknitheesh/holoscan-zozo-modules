@@ -6,6 +6,8 @@
 // one sent (PSNR), the bitrate and the order, and HoloViz shows the original and the decoded
 // frame side by side, in a window or offscreen.
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -54,9 +56,17 @@ namespace viz = holoscan::visualization;
 constexpr std::string_view kAppName = "codec_demo";
 
 enum class Display { kAuto, kWindow, kOffscreen, kNone };
+enum class Workers { kDefault, kOne, kAuto };
+
+// The demo opts in to auto, so that it runs on every platform the module does.
+hc::EncoderSettings default_settings() {
+  hc::EncoderSettings settings;
+  settings.backend = hc::Backend::kAuto;
+  return settings;
+}
 
 struct Options {
-  hc::EncoderSettings settings;
+  hc::EncoderSettings settings{default_settings()};
   hc::Backend decoder_backend{hc::Backend::kAuto};
   int width{1280};
   int height{720};
@@ -69,6 +79,9 @@ struct Options {
   std::uint32_t timeout_seconds{60};
   // Frames per measurement of the --benchmark mode; 0 runs the graph instead.
   std::uint32_t benchmark{0};
+  // One worker for a finite run, the automatic partitioning for an endless one, by default.
+  Workers workers{Workers::kDefault};
+  bool compile_only{false};
   bool help{false};
 };
 
@@ -162,6 +175,16 @@ Options parse_args(int argc, char** argv) {
       opts.benchmark = parse_number<std::uint32_t>(value, option);
     } else if (option == "--timeout-seconds") {
       opts.timeout_seconds = parse_number<std::uint32_t>(value, option);
+    } else if (option == "--workers") {
+      if (value != "one" && value != "auto") {
+        throw std::invalid_argument("--workers must be one or auto");
+      }
+      opts.workers = value == "one" ? Workers::kOne : Workers::kAuto;
+    } else if (option == "--compile-only") {
+      if (value != "true" && value != "false") {
+        throw std::invalid_argument("--compile-only requires true or false");
+      }
+      opts.compile_only = value == "true";
     } else {
       throw std::invalid_argument("unknown option: " + std::string(option));
     }
@@ -176,7 +199,8 @@ void usage(const char* argv0) {
          "Encoding:\n"
          "  --codec h264|h265          (default: h264)\n"
          "  --backend auto|nvcodec|v4l2\n"
-         "                             The hardware path (default: auto, the first that works)\n"
+         "                             The hardware path (default: auto, the first that works;\n"
+         "                             the module's own default is nvcodec)\n"
          "  --rate-control cbr|vbr|cqp (default: vbr)\n"
          "  --bitrate BPS              For cbr and vbr (default: 8000000)\n"
          "  --qp N                     For cqp, 0 (best) to 51 (default: 23)\n"
@@ -197,6 +221,10 @@ void usage(const char* argv0) {
          "  --render-file FILE         Offscreen: write the last rendered frame here (PPM)\n"
          "  --min-psnr DB              Fail on a decoded frame below this PSNR (default: 0, off)\n"
          "  --timeout-seconds N        Fail when no frame comes for N seconds (default: 60)\n"
+         "Graph:\n"
+         "  --workers one|auto         One worker for the whole graph, or the automatic\n"
+         "                             partitioning (default: one with --count, auto without)\n"
+         "  --compile-only true|false  Build and check the graph, print its workers, and exit\n"
          "Benchmark:\n"
          "  --benchmark N              Instead of the graph, time N frames of encoding and\n"
          "                             decoding at 1080p and 2160p for each codec, and print\n"
@@ -215,7 +243,7 @@ void validate(Options& opts) {
   if (opts.display == Display::kAuto) {
     opts.display = display_available() ? Display::kWindow : Display::kNone;
   }
-  if (opts.display == Display::kWindow && !display_available()) {
+  if (opts.display == Display::kWindow && !display_available() && !opts.compile_only) {
     throw std::invalid_argument(
         "a window needs a display server; set DISPLAY or use --display "
         "offscreen or none");
@@ -247,9 +275,15 @@ std::string encoder_backend(const hc::EncoderSettings& settings) {
                            " here: " + reasons);
 }
 
-// Every sample, in order: a full queue holds back its producer.
-holoscan::ConnectionOptions lossless() {
-  return {.queue_policy = holoscan::QueuePolicy::kBlocking, .queue_depth = 8U};
+// Frames the source may have out at once: it skips a tick while this many are not yet reported,
+// so that no queue after it fills, in a finite run or in real time. A decoder without low latency
+// holds frames back, up to the 16 a stream may keep for reordering, which must not stall it.
+constexpr std::uint32_t kInFlight = 4;
+constexpr std::uint32_t kInFlightReordering = 20;
+
+// Every sample, in order. The source's pacing keeps these queues from filling.
+holoscan::ConnectionOptions lossless(std::uint32_t in_flight) {
+  return {.queue_policy = holoscan::QueuePolicy::kBlocking, .queue_depth = in_flight + 4U};
 }
 
 // Only the newest sample.
@@ -257,9 +291,10 @@ holoscan::ConnectionOptions newest() {
   return {.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 1U};
 }
 
-// The newest few, for a consumer that pairs samples by capture time.
-holoscan::ConnectionOptions recent() {
-  return {.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 8U};
+// The newest few: HoloViz shows the newest original no newer than the decoded frame, which is up
+// to `in_flight` frames behind the source, so this edge keeps that many and a few more.
+holoscan::ConnectionOptions recent(std::uint32_t in_flight) {
+  return {.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = in_flight + 4U};
 }
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
@@ -267,35 +302,67 @@ using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holosc
 // The exit status that tells CTest a test was skipped.
 constexpr int kSkipped = 77;
 
+// In CI (HOLOSCAN_CI_PLATFORM set), the backend the lane must run: nvcodec on x86_64 and on
+// Jetson Thor (compute capability 10 or later), v4l2 on Jetson Orin. Empty elsewhere.
+std::optional<std::string> ci_backend() {
+  const char* platform = std::getenv("HOLOSCAN_CI_PLATFORM");
+  if (platform == nullptr || *platform == '\0') {
+    return std::nullopt;
+  }
+  int device = 0;
+  cudaDeviceProp properties{};
+  const bool orin =
+      std::string_view(platform) == "jetson" && cudaGetDevice(&device) == cudaSuccess &&
+      cudaGetDeviceProperties(&properties, device) == cudaSuccess && properties.major < 10;
+  return std::string(hc::backend_name(orin ? hc::Backend::kV4l2 : hc::Backend::kNvcodec));
+}
+
 int execute(const Options& opts, SignalDomain& signals) {
-  std::string backend;
-  try {
-    backend = encoder_backend(opts.settings);
-  } catch (const std::runtime_error& error) {
-    std::cout << kAppName << ": SKIPPED: " << error.what() << '\n';
-    return kSkipped;
+  // --compile-only touches no hardware: the operators choose their backend when they start.
+  std::string backend = "none";
+  const std::optional<std::string> required = opts.compile_only ? std::nullopt : ci_backend();
+  if (!opts.compile_only) {
+    try {
+      backend = encoder_backend(opts.settings);
+    } catch (const std::runtime_error& error) {
+      if (required) {
+        // A CI runner that lost its encoder fails rather than reports a skip.
+        std::cout << kAppName << ": FAIL: HOLOSCAN_CI_PLATFORM is set, but " << error.what()
+                  << '\n';
+        return 1;
+      }
+      std::cout << kAppName << ": SKIPPED: " << error.what() << '\n';
+      return kSkipped;
+    }
+  }
+  if (required && opts.settings.backend == hc::Backend::kAuto && backend != *required) {
+    std::cout << kAppName << ": FAIL: auto picked " << backend << ", but this CI lane runs "
+              << *required << '\n';
+    return 1;
   }
   const std::uint32_t frames = opts.count.value_or(0);
-  // A finite run checks every frame, in order; an endless one runs in real time.
+  // A finite run checks every frame and ends the stream after the last, so that a decoder without
+  // low latency hands out the frames it still holds; an endless one runs in real time.
   const bool finite = frames != 0;
+  const std::uint32_t in_flight = opts.settings.low_latency ? kInFlight : kInFlightReordering;
   auto report = std::make_shared<app::CodecReport>();
   const bool render = opts.display != Display::kNone;
 
   holoscan::Graph graph{std::string(kAppName)};
   auto source = graph.op<app::TestSourceOp>(
-      "source",
-      app::TestSourceConfig{.width = opts.width,
-                            .height = opts.height,
-                            .count = frames,
-                            .period = std::chrono::milliseconds(opts.period_ms),
-                            .done = finite ? std::shared_ptr<const std::atomic<std::uint32_t>>(
-                                                 report, &report->frames)
-                                           : nullptr});
+      "source", app::TestSourceConfig{.width = opts.width,
+                                      .height = opts.height,
+                                      .count = frames,
+                                      .period = std::chrono::milliseconds(opts.period_ms),
+                                      .done = std::shared_ptr<const std::atomic<std::uint32_t>>(
+                                          report, &report->frames),
+                                      .in_flight = in_flight});
   auto encoder =
       graph.op<hc::VideoEncoderOp>("encoder", hc::VideoEncoderConfig{.settings = opts.settings,
                                                                      .max_width = opts.width,
                                                                      .max_height = opts.height,
-                                                                     .output_path = opts.output});
+                                                                     .output_path = opts.output,
+                                                                     .frames_per_stream = frames});
   auto decoder = graph.op<hc::VideoDecoderOp>(
       "decoder", hc::VideoDecoderConfig{.backend = opts.decoder_backend,
                                         .output_format = hc::PixelFormat::kRgb8,
@@ -310,14 +377,16 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                                     .backend = backend,
                                                                     .expected_frames = frames,
                                                                     .min_psnr = opts.min_psnr,
-                                                                    .lossless = finite,
+                                                                    .lossless = true,
                                                                     .text = render});
-  // Frames may be skipped before the encoder in real time; never after it, where every access
-  // unit is needed to decode the next.
-  graph.add_flow(source->image, encoder->image, finite ? lossless() : newest());
-  graph.add_flow(encoder->bitstream, decoder->bitstream, lossless());
-  graph.add_flow(encoder->bitstream, reporter->bitstream, finite ? lossless() : recent());
-  graph.add_flow(decoder->image, reporter->decoded, finite ? lossless() : recent());
+  // Lossless from the source to the report, in real time too: every access unit is needed to
+  // decode the next, and a frame the report never sees would hold the source back for good. In
+  // real time the source skips a tick instead while the chain is behind (on a slow decoder, for
+  // example), so no queue fills and no emit is refused.
+  graph.add_flow(source->image, encoder->image, lossless(in_flight));
+  graph.add_flow(encoder->bitstream, decoder->bitstream, lossless(in_flight));
+  graph.add_flow(encoder->bitstream, reporter->bitstream, lossless(in_flight));
+  graph.add_flow(decoder->image, reporter->decoded, lossless(in_flight));
 
   if (render) {
     const auto width = static_cast<std::uint32_t>(opts.width);
@@ -350,7 +419,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     graph.add_flow(decoder->image, visualizer->image_layer_input(0), newest());
     // HoloViz shows the newest original no newer than the decoded frame: keep a few, so that the
     // decoded frame's own original is still there when it arrives.
-    graph.add_flow(source->image, visualizer->image_layer_input(1), recent());
+    graph.add_flow(source->image, visualizer->image_layer_input(1), recent(in_flight));
     graph.add_flow(reporter->stats, visualizer->tensor_layer_input(2), newest());
     if (opts.display == Display::kOffscreen) {
       auto checker = graph.op<app::RenderCheckOp>(
@@ -361,6 +430,14 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                  .image_file = opts.render_file});
       graph.add_flow(visualizer->output(), checker->rendered, newest());
     }
+  }
+  // A finite run on one worker: with a worker per operator, a producer can run while its
+  // consumer's lossless queue is full, and fail on the refused emit. An endless run, which mostly
+  // shows a window, keeps the automatic partitioning; the source's pacing keeps it lossless.
+  const bool one_worker =
+      opts.workers == Workers::kOne || (opts.workers == Workers::kDefault && finite);
+  if (one_worker) {
+    graph.partition(std::string(kAppName)).include_all();
   }
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
@@ -383,6 +460,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (!plan.ok()) {
     return 1;
+  }
+  if (opts.compile_only) {
+    // The workers the graph runs on, one per partition with operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
+    return 0;
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
   // The run fails when no frame comes for this long; the first one also waits for the sessions.
@@ -436,7 +518,7 @@ int execute(const Options& opts, SignalDomain& signals) {
       static_cast<double>(std::max<std::uint32_t>(done, 1U)) / opts.settings.frame_rate;
   std::cout << std::fixed << std::setprecision(2) << kAppName
             << ": codec=" << hc::codec_name(opts.settings.codec) << " backend=" << backend
-            << " frames=" << done;
+            << " workers=" << plan.scheduler_plan().worker_count << " frames=" << done;
   if (frames != 0) std::cout << '/' << frames;
   std::cout << " keyframes=" << report->keyframes;
   if (done != 0) {
