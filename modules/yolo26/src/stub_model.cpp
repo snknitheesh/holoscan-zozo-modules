@@ -150,11 +150,13 @@ Message float_value(std::string_view name, std::initializer_list<std::int64_t> d
   return value;
 }
 
-// The fixed low-score rows that follow the two detections.
-std::vector<float> filler_rows(int size) {
+// The fixed low-score rows that follow the two detections, each followed by
+// `mask_channels` coefficients that pick the last prototype, which is -1
+// everywhere, so their masks are empty.
+std::vector<float> filler_rows(int size, int mask_channels) {
   std::vector<float> rows;
   const int count = kStubRows - kStubClasses;
-  rows.reserve(static_cast<std::size_t>(count) * 6U);
+  rows.reserve(static_cast<std::size_t>(count) * static_cast<std::size_t>(6 + mask_channels));
   for (int i = 0; i < count; ++i) {
     const float x = static_cast<float>((i * 37) % (size / 2));
     const float y = static_cast<float>((i * 53) % (size / 2));
@@ -163,21 +165,29 @@ std::vector<float> filler_rows(int size) {
         {x, y, x + static_cast<float>(size) / 4.0F, y + static_cast<float>(size) / 4.0F,
          kStubMaxFillerScore * static_cast<float>(count - i) / static_cast<float>(count + 1),
          static_cast<float>(i % kStubClasses)});
+    for (int m = 0; m < mask_channels; ++m) {
+      rows.push_back(m == mask_channels - 1 ? 1.0F : 0.0F);
+    }
   }
   return rows;
 }
 
-}  // namespace
-
-std::string stub_model_onnx(int size) {
+void check_size(int size) {
   if (size < kMinInputSize || size > kMaxInputSize) {
     throw std::invalid_argument("stub model input size must be " + std::to_string(kMinInputSize) +
                                 ".." + std::to_string(kMaxInputSize));
   }
+}
+
+// The model for `size`, with the prototype masks and coefficients of a
+// segmentation model when `mask_channels` is positive.
+std::string stub_onnx(int size, int mask_channels) {
+  const bool segmentation = mask_channels > 0;
+  const int fields = 6 + mask_channels;
   Message graph;
   // GraphProto: node = 1, name = 2, initializer = 5, input = 11, output = 12.
   graph.bytes(2, "yolo26_stub");
-  const std::vector<Message> initializers{
+  std::vector<Message> initializers{
       int64_tensor("channel_axis", {1}),
       int64_tensor("red_start", {0}),
       int64_tensor("red_end", {1}),
@@ -196,8 +206,23 @@ std::string stub_model_onnx(int size) {
       float_scalar("class_score_1", kStubScores[1]),
       tensor("class_0", {1, 1, 1}, kFloat, raw(std::vector<float>{0.0F})),
       tensor("class_1", {1, 1, 1}, kFloat, raw(std::vector<float>{1.0F})),
-      tensor("filler", {1, kStubRows - kStubClasses, 6}, kFloat, raw(filler_rows(size))),
+      tensor("filler", {1, kStubRows - kStubClasses, fields}, kFloat,
+             raw(filler_rows(size, mask_channels))),
   };
+  if (segmentation) {
+    // Class c's coefficients pick prototype c; the other prototypes are -1.
+    for (int c = 0; c < kStubClasses; ++c) {
+      std::vector<float> coefficients(static_cast<std::size_t>(mask_channels), 0.0F);
+      coefficients[static_cast<std::size_t>(c)] = 1.0F;
+      initializers.push_back(tensor("coefficients_" + std::to_string(c), {1, 1, mask_channels},
+                                    kFloat, raw(coefficients)));
+    }
+    initializers.push_back(
+        tensor("other_prototype", {1, 1, 1, 1}, kFloat, raw(std::vector<float>{-1.0F})));
+    initializers.push_back(int64_tensor(
+        "other_prototypes_shape",
+        {1, mask_channels - kStubClasses, size / kStubProtoStride, size / kStubProtoStride}));
+  }
   for (const Message& initializer : initializers) {
     graph.message(5, initializer);
   }
@@ -244,15 +269,36 @@ std::string stub_model_onnx(int size) {
         node("Concat",
              {name("columns") + "_low", name("rows") + "_low", name("columns") + "_high",
               name("rows") + "_high", name("score"), "class_" + c},
-             name("detection"), {int_attribute("axis", 2)}));
+             name(segmentation ? "box" : "detection"), {int_attribute("axis", 2)}));
+    if (segmentation) {
+      nodes.push_back(node("Concat", {name("box"), name("coefficients")}, name("detection"),
+                           {int_attribute("axis", 2)}));
+      // Prototype c: the channel's excess over green, averaged over each
+      // stride x stride cell, less one half; positive where the class's
+      // pixels dominate the cell.
+      nodes.push_back(node("AveragePool", {name("excess")}, name("pooled"),
+                           {ints_attribute("kernel_shape", {kStubProtoStride, kStubProtoStride}),
+                            ints_attribute("strides", {kStubProtoStride, kStubProtoStride})}));
+      nodes.push_back(node("Sub", {name("pooled"), "half"}, name("prototype")));
+    }
   }
   nodes.push_back(node("Concat", {"detection_0", "detection_1", "filler"}, "output0",
                        {int_attribute("axis", 1)}));
+  if (segmentation) {
+    nodes.push_back(
+        node("Expand", {"other_prototype", "other_prototypes_shape"}, "other_prototypes"));
+    nodes.push_back(node("Concat", {"prototype_0", "prototype_1", "other_prototypes"}, "output1",
+                         {int_attribute("axis", 1)}));
+  }
   for (const Message& n : nodes) {
     graph.message(1, n);
   }
   graph.message(11, float_value("images", {1, 3, size, size}));
-  graph.message(12, float_value("output0", {1, kStubRows, 6}));
+  graph.message(12, float_value("output0", {1, kStubRows, fields}));
+  if (segmentation) {
+    const std::int64_t side = size / kStubProtoStride;
+    graph.message(12, float_value("output1", {1, mask_channels, side, side}));
+  }
 
   // ModelProto: ir_version = 1, producer_name = 2, graph = 7, opset_import =
   // 8 { domain = 1, version = 2 }.
@@ -263,9 +309,9 @@ std::string stub_model_onnx(int size) {
   return model.str();
 }
 
-std::filesystem::path write_stub_model(const std::filesystem::path& directory, int size) {
-  const std::string bytes = stub_model_onnx(size);
-  const std::filesystem::path path = directory / ("yolo26_stub_" + std::to_string(size) + ".onnx");
+// Writes `bytes` to `path` unless it already holds them; see write_stub_model().
+std::filesystem::path write_model(const std::filesystem::path& path, const std::string& bytes) {
+  const std::filesystem::path directory = path.parent_path();
   {
     std::ifstream existing(path, std::ios::binary);
     if (existing) {
@@ -296,6 +342,29 @@ std::filesystem::path write_stub_model(const std::filesystem::path& directory, i
     throw std::runtime_error("cannot write the stub model to " + path.string());
   }
   return path;
+}
+
+}  // namespace
+
+std::string stub_model_onnx(int size) {
+  check_size(size);
+  return stub_onnx(size, 0);
+}
+
+std::string stub_segmentation_model_onnx(int size) {
+  check_size(size);
+  return stub_onnx(size, kStubMaskChannels);
+}
+
+std::filesystem::path write_stub_model(const std::filesystem::path& directory, int size) {
+  return write_model(directory / ("yolo26_stub_" + std::to_string(size) + ".onnx"),
+                     stub_model_onnx(size));
+}
+
+std::filesystem::path write_stub_segmentation_model(const std::filesystem::path& directory,
+                                                    int size) {
+  return write_model(directory / ("yolo26_seg_stub_" + std::to_string(size) + ".onnx"),
+                     stub_segmentation_model_onnx(size));
 }
 
 }  // namespace holoscan::yolo26

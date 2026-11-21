@@ -5,14 +5,29 @@
 # its combined output matches EXPECT_OUTPUT. CTest's own PASS_REGULAR_EXPRESSION
 # would ignore the exit status.
 #
-#   cmake -DEXPECT_EXIT=2 -DEXPECT_OUTPUT=regex [-DMAKE_DIRECTORY=dir]
+#   cmake -DEXPECT_EXIT=2 -DEXPECT_OUTPUT=regex [-DMAKE_DIRECTORY=dir] [-DDATA_DIR=dir]
 #         [-DSKIP_UNLESS_EXISTS=path1|path2] -P run_and_match.cmake -- command [args...]
 #
 # MAKE_DIRECTORY is created first, for a test that needs one in its way. When a
 # path in SKIP_UNLESS_EXISTS is missing, the script exits with status 77, which
 # the test's SKIP_RETURN_CODE reports as skipped: for data prepared separately.
-# The paths are separated by |, as a ; would split the test's command.
+# The paths are separated by |, as a ; would split the test's command. With
+# DATA_DIR, every @DATA@ in SKIP_UNLESS_EXISTS and in the command's arguments is
+# that folder, or, when DATA_DIR is empty, $HOLOSCAN_TEST_DATA/yolo26_detection,
+# found when the test runs; then an unset HOLOSCAN_TEST_DATA exits with 77 too.
 
+if(DEFINED DATA_DIR)
+  if(DATA_DIR STREQUAL "")
+    if("$ENV{HOLOSCAN_TEST_DATA}" STREQUAL "")
+      message("skipped: HOLOSCAN_TEST_DATA is not set")
+      cmake_language(EXIT 77)
+    endif()
+    set(DATA_DIR "$ENV{HOLOSCAN_TEST_DATA}/yolo26_detection")
+  endif()
+  if(DEFINED SKIP_UNLESS_EXISTS)
+    string(REPLACE "@DATA@" "${DATA_DIR}" SKIP_UNLESS_EXISTS "${SKIP_UNLESS_EXISTS}")
+  endif()
+endif()
 if(DEFINED SKIP_UNLESS_EXISTS)
   string(REPLACE "|" ";" _paths "${SKIP_UNLESS_EXISTS}")
   foreach(_path IN LISTS _paths)
@@ -41,6 +56,9 @@ foreach(_index RANGE ${_last})
 endforeach()
 if(NOT _command)
   message(FATAL_ERROR "run_and_match: no command after --")
+endif()
+if(DEFINED DATA_DIR)
+  list(TRANSFORM _command REPLACE "@DATA@" "${DATA_DIR}")
 endif()
 
 if(DEFINED MAKE_DIRECTORY)
