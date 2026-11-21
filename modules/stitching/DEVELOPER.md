@@ -17,11 +17,11 @@ stitching/
 
 | Header | What it has | Needs |
 | --- | --- | --- |
-| `camera_rig.hpp` | `Camera`, `CameraRig`, distortion, `mount()`, rig files | Nothing |
+| `camera_rig.hpp` | `Camera` (a `messages::CameraInfo` and its pose), `CameraRig`, the checks of a camera_info, the lens models, `mount()` | holoscan-messages' `camera_info.hpp` (no SDK) |
 | `projection.hpp` | `OutputGeometry`, the projections, pixel and rig point mappings | Nothing |
 | `remap.hpp` | The CPU reference: tables, blend, overlap statistics, gains, `resolution_map()` | Nothing |
 | `stitcher.hpp` | `Stitcher`, the GPU engine | CUDA runtime |
-| `stitch_op.hpp` | `StitchOp`, `StitchConfig` | SDK |
+| `stitch_op.hpp` | `StitchOp`, `StitchConfig` | SDK, holoscan-messages |
 | `synthetic_world.hpp` | The tests' world, rigs, renders and comparison | CUDA runtime |
 
 ## Build and package boundary
@@ -34,9 +34,9 @@ stitching/
 | Include root | `include/`, installed to `<prefix>/include` |
 | Package | `<prefix>/lib/cmake/holoscan-stitching/holoscan-stitching-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-stitching)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
-| Debian package | `holoscan-stitching`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Debian package | `holoscan-stitching`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages (>= 1.0.0, << 2)` |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, holoscan-messages 1.x (linked publicly: `StitchOp`'s ports carry its `CameraInfo`; the config re-finds it) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 | Test labels | `stitching` and `gpu`, or `stitching` and `host` |
 
 ## Conventions
@@ -53,18 +53,29 @@ stitching/
   so the kernels read `BlendParams` from the parameter space instead of copying it to local memory.
 - The overlap statistics are integer sums, so the gains (and so the output) do not depend on the
   order of the GPU's atomic additions.
-- An operator has a port only when configured: `StitchOp` declares `image_<i>` for the rig's
-  cameras only; an unconnected input is never satisfied.
+- An operator has a port only when configured: `StitchOp` declares `image_<i>` and
+  `camera_info_<i>` for the configured cameras only; an unconnected input is never satisfied.
+- Calibration comes only from `CameraInfo` (the ROS `camera_info` files, through holoscan-messages);
+  the configuration holds only what those files lack, each camera's pose. The camera info contract
+  is `messages::camera_info_contract()`'s, written out in `StitchOp::contract()` for N camera info
+  inputs and a capture time window, which the helper (one camera info input, a 0 ns window) does not
+  take. The tables are built in `compute()` when a calibration arrives or changes, never per frame.
+- The tests' and demo's graphs whose every frame is checked run on one worker
+  (`include_all()`), with a test that the plan has one.
 - `synthetic_world` renders in float: it is the test's camera, not the code under test.
 - A new projection or blend option needs a case in `stitching_stitcher` (against the truth and the
   CPU reference) and in `stitching_reference`; a new port or behaviour of `StitchOp`, a case in
-  `stitching_operator`; a new calibration field, a case in `stitching_calibration`.
+  `stitching_operator`; a new lens model or calibration check, a case in `stitching_calibration`.
+- `stitching_real_data` reads the local recordings from `$HOLOSCAN_TEST_DATA` (a folder holding
+  `stereo-camera/<clip>/` with `left.yaml`, `right.yaml`, `rgb.yaml`, `index.csv` and PGM eyes) and
+  is skipped without it; CI runs only synthetic data.
 
 ## Benchmark
 
 `stitching_benchmark`, built with the tests, times the tables and each frame for four 1280x720
-fisheye cameras into a 1024x1024 bird's-eye view and 4096x1024 panoramas, and prints the table of
-the README's Performance section:
+fisheye cameras into a 1024x1024 bird's-eye view and 4096x1024 panoramas, frames queued back to
+back and each alone, and prints the table of the README's Performance section. Run it on an idle
+GPU: another process's work on the GPU inflates both.
 
 ```bash
 build/stitching/tests/stitching_benchmark

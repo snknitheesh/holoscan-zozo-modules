@@ -7,8 +7,15 @@ checkered cylindrical wall that moves with it. One `StitchOp` makes a 1024x1024 
 the ground 5.5 m around the vehicle; another a 4096x1024 cylindrical panorama of the wall, seen
 from 1 m above the vehicle's centre. HoloViz shows both and the four cameras, in a window or
 rendered offscreen into CUDA memory. Headless and offscreen, every output is checked against the
-ground truth rendered directly from the world. It uses the installed module the way any other
-project would: `find_package(holoscan-stitching)`.
+ground truth rendered directly from the world.
+
+The stitchers get each camera's calibration the way a real rig gives it: for every run the demo
+writes the four cameras' ROS `camera_info` files into a fresh private temporary folder (removed
+however the run ends), and a `CameraInfoSourceOp` of [holoscan-messages](../../modules/messages/)
+per camera reads its file and sends the `CameraInfo` to both stitchers. Only each camera's pose on
+the vehicle, which a `camera_info` file does not hold, is in the stitchers' configuration. It uses
+the installed modules the way any other project would: `find_package(holoscan-messages)` and
+`find_package(holoscan-stitching)`.
 
 ![An offscreen render: the bird's-eye view, the four cameras and the panorama](images/offscreen_render.png)
 
@@ -21,14 +28,14 @@ cameras' view it is black.
 
 ## Requirements
 
-- holoscan-stitching, installed (see [its README](../../modules/stitching/README.md)), and what it
-  needs: Holoscan SDK 5.0 with Core, Sensor I/O and Visualization, CUDA 13, CMake 4.0 or later and a
-  C++20 compiler.
+- holoscan-messages and holoscan-stitching, installed (see
+  [its README](../../modules/stitching/README.md)), and what they need: Holoscan SDK 5.0 with Core,
+  Sensor I/O and Visualization, CUDA 13, CMake 4.0 or later and a C++20 compiler.
 - A display for the window; the offscreen and headless modes need none.
 
 ## Build and run
 
-From the repository root, after installing the module into `install/`:
+From the repository root, after installing both modules into `install/`:
 
 ```bash
 cmake -S applications/stitching -B build/stitching_app -G Ninja \
@@ -40,8 +47,7 @@ build/stitching_app/stitching --count 30 --period-ms 10 --exposure true \
   --camera-gains 1,0.85,1.15,0.95 --display none                                     # ci mode
 ```
 
-`--help` lists the options: a rig file to render instead of the built-in rig (`--rig`), the
-cameras' size and exposures, the outputs' sizes, the blend (`feather` or `hard_seam`, with a
+`--help` lists the options: the cameras' size and exposures, the outputs' sizes, the blend (`feather` or `hard_seam`, with a
 feather cap), exposure compensation, and `--image-dir DIR` to write each offscreen render as a PPM
 file. `-DSTITCHING_APP_ENABLE_VISUALIZATION=OFF` builds it without HoloViz.
 
@@ -50,11 +56,21 @@ The modes in [metadata.json](metadata.json) are the three commands above:
 | Mode | What it does |
 | --- | --- |
 | `window` | Live, at 30 frames per second until the window is closed. Every edge keeps only the newest frame (`QueuePolicy::kDropOldest`, depth 1), so a slow display never holds back the cameras. Nothing is checked. |
-| `offscreen` | HoloViz renders into CUDA memory instead of a window. Every frame's outputs are checked, and every render must show a picture in each of its six tiles. |
+| `offscreen` | HoloViz renders into CUDA memory instead of a window. Every frame's outputs are checked, and every render must show a picture in each of its six tiles. HoloViz renders when the bird's-eye view arrives, with the newest of the other images, so the first render is the second frame's: offscreen needs `--count 2` or more. |
 | `ci` | Headless and finite, the check CI runs: 30 frames of the moving rig, its cameras at different exposures, with exposure compensation, both outputs checked. |
 
-Outside the window, the cameras keep one frame in flight: they send the next once the last one's
-outputs are checked, so nothing is dropped.
+Outside the window, every frame is checked, so the graph runs on one worker
+(`graph.partition(...).include_all()`, as the messages module's README advises; `--compile-only true`
+prints `workers=1`), and the cameras keep one frame in flight: they send the next once the last
+one's outputs are checked. A camera whose image the stitchers cannot take yet (a full queue or
+output pool) sends the same frame again on the next tick, after the images of it that went, so
+nothing is dropped. The cameras skip their first tick, so that the camera info, sent when the run
+starts, comes first. The window keeps the automatic partitioning.
+
+Per frame, the checks copy the two outputs and their truths (40 MiB) to pinned host buffers made at
+start, on their operator's CUDA stream, and wait once; offscreen, each render (10 MiB) once more.
+The stitchers themselves copy and wait for nothing: the cameras' images are in device memory. The
+window mode checks nothing and copies nothing.
 
 ## The checks
 
@@ -71,8 +87,8 @@ frame passes when, for each output:
 | Largest corner error, stitch against truth | 1 px (1.5 with hard seams) | 1 px (1.5 with hard seams) |
 | Ratio of the means, off 1 by at most | 0.02 (0.1 with compensation) | 0.02 (0.1 with compensation) |
 
-Corners are refined in both images as OpenCV's `cornerSubPix` does, where the cameras resolve at
-least a quarter of a camera pixel per output pixel: on the bird's-eye view's far edges a camera
+Corners are refined to sub-pixel precision in both images (the point every gradient around it is
+orthogonal to), where the cameras resolve at least a quarter of a camera pixel per output pixel: on the bird's-eye view's far edges a camera
 pixel spans up to seven output pixels, and no stitch can place a corner there to one. A hard seam
 through a corner joins two cameras' differently blurred halves, which moves it by up to about 1.2
 pixels. Without compensation, cameras at different exposures fail the brightness check (a test
@@ -80,8 +96,9 @@ makes sure of that).
 
 ## Output
 
-A headless or offscreen run prints the worst of every frame's comparisons and `PASS` or `FAIL`. It
-exits 0 on `PASS`, 2 for invalid options, else 1:
+A headless or offscreen run prints the worst of every frame's comparisons and `PASS` or `FAIL`,
+with the first failure or what else ended the run when it fails. It exits 0 on `PASS`, 2 for
+invalid options, else 1; the window, 0 when closed or interrupted:
 
 ```text
 stitching: 4 cameras, birds_eye 1024x1024, cylindrical 4096x1024, blend feather with exposure compensation
@@ -89,11 +106,12 @@ stitching: frames=30/30 birds_eye: psnr>=28.099 coverage>=0.969 corners>=273 cor
 stitching: verdict=PASS
 ```
 
-That is the `ci` mode on x86_64 (GeForce RTX 5090).
+That is the `ci` mode on x86_64 (RTX 5090).
 
 ## Tests
 
 `ctest` in the build folder runs the demo headless with feathering, with exposure compensation and
 with hard seams, every output checked; checks that different exposures without compensation fail;
-runs it offscreen, every render checked; compiles the window graph; and checks that bad options
-exit with a usage error.
+runs it offscreen with 10 frames and with 2, every render checked; checks that the headless and
+offscreen graphs run on one worker; compiles the window graph; and checks that bad options (one
+offscreen frame, an old `--rig` option among them) exit with a usage error.
