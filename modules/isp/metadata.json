@@ -1,0 +1,65 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-isp",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "A GPU image signal processor for raw camera frames: Bayer mosaics of any pattern, 8 to 16 bits or packed MIPI RAW10/RAW12, through black level, lens shading, white balance (manual, gray world or white patch), bilinear or Malvar-He-Cutler demosaic, sharpening, a colour matrix and a tone curve to display-ready RGB, with histograms, mean levels and an auto-exposure suggestion. CUDA kernels, with a bit-exact CPU backend.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::isp"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Image Signal Processing",
+      "Camera",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/isp",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "IspOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, for the cuda backend. The cpu backend runs without one."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-isp",
+      "install_commands": [
+        "sudo apt install ./holoscan-isp_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
