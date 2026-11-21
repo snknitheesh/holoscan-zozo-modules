@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Writes a small recording of the module's synthetic scene in the recording
-// format the demo reads: calibration.json, index.csv, 8-bit PGM eyes and 16-bit
-// big-endian PGM depth in millimeters, 0 where the right eye does not see the
-// point. Its depth is the scene's truth, so the demo's camera-depth check has a
-// known answer without any real data.
+// format the demo reads: the pair's camera_info files left.yaml and right.yaml,
+// depth.yaml, index.csv, 8-bit PGM images and 16-bit big-endian PGM depth in
+// millimeters, 0 where the right camera does not see the point. Its depth is the scene's truth, so
+// the demo's camera-depth check has a known answer without any real data.
 //
 //   write_test_recording <folder> <frames> <width> <height>
 
@@ -23,8 +23,10 @@
 #include <vector>
 
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 
 namespace sd = holoscan::foundation_stereo;
+namespace hm = holoscan::messages;
 
 namespace {
 
@@ -54,24 +56,11 @@ int main(int argc, char** argv) try {
   for (const char* part : {"left", "right", "depth"}) {
     std::filesystem::create_directories(folder / part);
   }
-  const sd::SyntheticScene first = sd::make_scene(0, width, height);
-  std::ofstream calibration(folder / "calibration.json");
-  calibration << std::setprecision(17) << "{\n  \"version\": 1,\n"
-              << "  \"camera\": {\"name\": \"Synthetic\", \"serial\": \"0\"},\n"
-              << "  \"rectified\": true,\n";
-  for (const char* eye : {"left", "right", "depth"}) {
-    calibration << "  \"" << eye << "\": {\"width\": " << width << ", \"height\": " << height
-                << ", \"fx\": " << first.focal << ", \"fy\": " << first.focal
-                << ", \"cx\": " << first.cx << ", \"cy\": " << first.cy
-                << ", \"distortion\": {\"model\": \"none\", \"coefficients\": []}";
-    if (std::string(eye) == "depth") {
-      calibration << ", \"from_left\": {\"rotation\": [1, 0, 0, 0, 1, 0, 0, 0, 1], "
-                     "\"translation\": [0, 0, 0]}, \"scale\": 0.001";
-    }
-    calibration << "},\n";
-  }
-  calibration << "  \"right_from_left\": {\"rotation\": [1, 0, 0, 0, 1, 0, 0, 0, 1], "
-              << "\"translation\": [" << -first.baseline << ", 0, 0]}\n}\n";
+  const hm::StereoCameraInfo camera_info = sd::scene_camera_info(sd::make_scene(0, width, height));
+  hm::write_stereo_camera_info_yaml(camera_info, folder / "left.yaml", folder / "right.yaml");
+  hm::CameraInfo depth_camera = camera_info.left;
+  depth_camera.header.frame_id = "depth";
+  hm::write_camera_info_yaml(depth_camera, folder / "depth.yaml");
   std::ofstream index(folder / "index.csv");
   index << "frame,timestamp_ns,device_sequence,left,right,rgb,depth\n";
 

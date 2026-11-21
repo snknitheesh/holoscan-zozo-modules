@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# The Stereo Disparity demo, built against the INSTALLED holoscan-foundation-stereo
-# package, as any other project would use it: put the module's install prefix on
-# CMAKE_PREFIX_PATH.
+# The Foundation Stereo demo, built against the INSTALLED holoscan-foundation-stereo and
+# holoscan-messages packages, as any other project would use them: put the modules' install
+# prefix on CMAKE_PREFIX_PATH.
 cmake_minimum_required(VERSION 4.0)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to compile")
@@ -23,6 +23,7 @@ if(BUILD_TESTING)
   list(APPEND _holoscan_components testing)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(holoscan-foundation-stereo 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
@@ -30,6 +31,7 @@ find_package(CUDAToolkit REQUIRED)
 add_library(foundation_stereo_recording STATIC src/recording.cpp)
 target_compile_features(foundation_stereo_recording PUBLIC cxx_std_20)
 target_include_directories(foundation_stereo_recording PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(foundation_stereo_recording PUBLIC holoscan::messages)
 
 # The sources, the reporter and the color map.
 add_library(
@@ -54,6 +56,7 @@ target_link_libraries(
   PUBLIC
     foundation_stereo_recording
     holoscan::foundation_stereo
+    holoscan::messages
     holoscan::core
     holoscan::sensor_io
     CUDA::cudart

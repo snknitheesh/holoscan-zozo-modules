@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Foundation Stereo: a stereo source (the module's synthetic scene with known
-// disparity, or a recorded camera clip) feeds FoundationStereoOp, whose
+// disparity, or a recorded camera clip) and the pair's calibration, read from
+// ROS camera_info files by CameraInfoSourceOp, feed FoundationStereoOp, whose
 // disparity a reporter checks against the scene's truth, the camera's own
 // depth, or, with the stub model, the CPU reference of the operator's chain;
 // HoloViz can show the left image beside the colorized disparity.
+
+#include <stdlib.h>
 
 #include <algorithm>
 #include <array>
@@ -37,10 +40,15 @@
 #include <holoscan/core/managed_shutdown_signals.hpp>
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
+#include <holoscan/foundation_stereo/camera_info.hpp>
 #include <holoscan/foundation_stereo/foundation_stereo_op.hpp>
 #include <holoscan/foundation_stereo/stub_model.hpp>
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/time/realtime_clock.hpp>
 #if FOUNDATION_STEREO_ENABLE_VISUALIZATION
 #include <holoscan/visualization/holoviz_op.hpp>
@@ -56,6 +64,7 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 namespace fs = holoscan::foundation_stereo;
+namespace hm = holoscan::messages;
 namespace app = foundation_stereo_app;
 
 constexpr std::string_view kAppName = "foundation_stereo";
@@ -94,7 +103,7 @@ struct Options {
   // An .onnx model or a TensorRT engine; "stub" for the stub model.
   std::string model;
   bool fp16{true};
-  bool geometry_input{false};
+  bool cuda_graphs{true};
   bool invalidate_out_of_view{true};
   // Synthetic.
   int width{1280};
@@ -105,6 +114,8 @@ struct Options {
   std::optional<std::filesystem::path> recording;
   std::string clip;
   bool loop{false};
+  // Meters per unit of a recording's depth images, to compare with them.
+  std::optional<double> camera_depth_scale;
   double min_camera_coverage{0.2};
   std::optional<std::uint32_t> count;
   std::uint32_t period_ms{33};
@@ -163,7 +174,7 @@ Options parse_args(int argc, char** argv) {
        }},
       {"--model", [&](std::string_view value, std::string_view) { opts.model = value; }},
       {"--fp16", flag(opts.fp16)},
-      {"--geometry-input", flag(opts.geometry_input)},
+      {"--cuda-graphs", flag(opts.cuda_graphs)},
       {"--invalidate-out-of-view", flag(opts.invalidate_out_of_view)},
       {"--width", number(opts.width)},
       {"--height", number(opts.height)},
@@ -173,6 +184,12 @@ Options parse_args(int argc, char** argv) {
        [&](std::string_view value, std::string_view) { opts.recording = std::string(value); }},
       {"--clip", [&](std::string_view value, std::string_view) { opts.clip = value; }},
       {"--loop", flag(opts.loop)},
+      {"--camera-depth-scale",
+       [&](std::string_view value, std::string_view option) {
+         double scale = 0.0;
+         parse_number(value, option, scale);
+         opts.camera_depth_scale = scale;
+       }},
       {"--min-camera-coverage", number(opts.min_camera_coverage)},
       {"--count",
        [&](std::string_view value, std::string_view option) {
@@ -219,9 +236,11 @@ void usage(const char* argv0) {
          "Model:\n"
          "  --model PATH|stub          A Fast-FoundationStereo .onnx model (its TensorRT engine\n"
          "                             is built and cached beside it) or engine, or stub for\n"
-         "                             the module's stub model, written to the working\n"
-         "                             directory and checked against its CPU reference\n"
+         "                             the module's stub model, written to\n"
+         "                             $XDG_CACHE_HOME/holoscan-foundation-stereo (default\n"
+         "                             ~/.cache/...) and checked against its CPU reference\n"
          "  --fp16 true|false          Build the engine with FP16 (default: true)\n"
+         "  --cuda-graphs true|false   Replay the inference as a CUDA graph (default: true)\n"
          "  --invalidate-out-of-view true|false  Zero pixels matched left of the right\n"
          "                             image (default: true)\n"
          "Input:\n"
@@ -233,15 +252,16 @@ void usage(const char* argv0) {
          "  --width N --height N       Synthetic image size (default: 1280x720)\n"
          "  --color true|false         Synthetic RGB8, or MONO8 (default: true)\n"
          "  --device-input true|false  Synthetic frames in GPU memory (default: true)\n"
-         "  --recording DIR            A recording's folder (calibration.json, index.csv, PGM)\n"
+         "  --recording DIR            A recording's folder (left.yaml and right.yaml, ROS\n"
+         "                             camera_info files; index.csv; PGM images)\n"
          "  --clip NAME                Or a clip in $HOLOSCAN_TEST_DATA/stereo-camera/\n"
          "  --loop true|false          Start the recording over until --count frames\n"
-         "  --geometry-input true|false  Send the geometry with every frame instead of\n"
-         "                             configuring it (default: false)\n"
          "  --realtime true|false      Drop-oldest edges of depth 1, as for a live camera:\n"
          "                             frames the model cannot keep up with are dropped and\n"
          "                             counted (default: false, lossless)\n"
          "Checks and output:\n"
+         "  --camera-depth-scale X     Compare with the recording's depth images, X meters per\n"
+         "                             unit; needs depth.yaml describing the left camera\n"
          "  --min-camera-coverage X    Check accuracy against a recording's depth only when\n"
          "                             the camera has depth for this share of pixels\n"
          "                             (default: 0.2)\n"
@@ -289,8 +309,14 @@ void validate(const Options& opts) {
   if (!(opts.min_camera_coverage >= 0.0 && opts.min_camera_coverage <= 1.0)) {
     throw std::invalid_argument("--min-camera-coverage must be 0..1");
   }
-  if (opts.source == Source::kSynthetic && (opts.recording || !opts.clip.empty() || opts.loop)) {
-    throw std::invalid_argument("--recording, --clip and --loop apply to --source recording");
+  if (opts.camera_depth_scale &&
+      !(std::isfinite(*opts.camera_depth_scale) && *opts.camera_depth_scale > 0.0)) {
+    throw std::invalid_argument("--camera-depth-scale must be positive");
+  }
+  if (opts.source == Source::kSynthetic &&
+      (opts.recording || !opts.clip.empty() || opts.loop || opts.camera_depth_scale)) {
+    throw std::invalid_argument(
+        "--recording, --clip, --loop and --camera-depth-scale apply to --source recording");
   }
   if (!opts.snapshot.empty() && opts.display != DisplayMode::kOffscreen) {
     throw std::invalid_argument("--snapshot needs --display offscreen");
@@ -311,18 +337,25 @@ double ratio(std::uint64_t part, std::uint64_t whole) {
 // The run's line, and whether its results pass.
 bool print_report(const fs::FoundationStereoStats& stats, const app::DisparityReport& report,
                   std::uint32_t frames, const Options& opts) {
+  // The first frame, which also captures the CUDA graph, and the first
+  // frames' latency are shown apart: a short run's maximum would be theirs.
   const std::uint64_t timed = stats.timed_frames.load();
   const double gpu_ms = timed == 0 ? 0.0 : static_cast<double>(stats.gpu_ns_total) / 1e6 / timed;
+  const std::vector<float>& latency =
+      report.latency_ms.empty() ? report.warmup_latency_ms : report.latency_ms;
   std::cout << std::fixed << std::setprecision(2) << kAppName << ": model=" << stats.model_width
             << 'x' << stats.model_height << " frames=" << report.frames << '/' << frames
-            << " gpu_ms(mean/max)=" << gpu_ms << '/' << static_cast<double>(stats.gpu_ns_max) / 1e6
-            << " latency_ms(p50/p95)=" << percentile(report.latency_ms, 0.5) << '/'
-            << percentile(report.latency_ms, 0.95) << std::setprecision(0)
-            << " model_memory_mib=" << static_cast<double>(stats.model_bytes) / (1024.0 * 1024.0)
-            << std::setprecision(3) << " valid=" << ratio(report.valid_pixels, report.pixels);
-  // A real-time run may drop frames; a lossless one must not.
-  bool passed = opts.realtime ? report.frames > 0 && report.frames + report.frame_gaps >= frames
-                              : report.frames == frames && report.frame_gaps == 0;
+            << " gpu_ms(first,mean/max)=" << static_cast<double>(stats.gpu_ns_first) / 1e6 << ','
+            << gpu_ms << '/' << static_cast<double>(stats.gpu_ns_max) / 1e6
+            << " latency_ms(p50/p95)=" << percentile(latency, 0.5) << '/'
+            << percentile(latency, 0.95) << std::setprecision(0) << " free_memory_drop_mib="
+            << static_cast<double>(stats.model_bytes) / (1024.0 * 1024.0) << std::setprecision(3)
+            << " valid=" << ratio(report.valid_pixels, report.pixels);
+  // A real-time run may drop frames; a lossless one must not. Every depth
+  // must come with the left camera's camera info.
+  bool passed = (opts.realtime ? report.frames > 0 && report.frames + report.frame_gaps >= frames
+                               : report.frames == frames && report.frame_gaps == 0) &&
+                report.wrong_depth_cameras == 0;
   if (report.stub_checked) {
     std::cout << " stub_reference: pixels=" << report.stub_pixels << " wrong=" << report.stub_wrong
               << " worst_px=" << report.stub_worst;
@@ -360,8 +393,59 @@ bool print_report(const fs::FoundationStereoStats& stats, const app::DisparityRe
     }
   }
   if (report.frame_gaps != 0) std::cout << " dropped=" << report.frame_gaps;
+  if (report.wrong_depth_cameras != 0) {
+    std::cout << " wrong_depth_camera_info=" << report.wrong_depth_cameras;
+  }
   std::cout << '\n';
   return passed;
+}
+
+// A new folder for the synthetic scene's camera_info files, removed with
+// everything in it on every way out.
+class TemporaryFolder {
+ public:
+  TemporaryFolder() {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "foundation_stereo_XXXXXX").string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+      throw std::runtime_error("cannot create a folder in " +
+                               std::filesystem::temp_directory_path().string());
+    }
+    path_ = pattern;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+// Where `--model stub` writes the stub model, whose engine is cached beside
+// it: $XDG_CACHE_HOME/holoscan-foundation-stereo, ~/.cache/... without it,
+// or the temporary folder without a home; never the working directory, which
+// may be the source tree or a read-only install.
+std::filesystem::path stub_directory() {
+  std::filesystem::path base;
+  if (const char* cache = std::getenv("XDG_CACHE_HOME"); cache != nullptr && *cache != '\0') {
+    base = cache;
+  } else if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    base = std::filesystem::path(home) / ".cache";
+  } else {
+    base = std::filesystem::temp_directory_path();
+  }
+  const std::filesystem::path directory = base / "holoscan-foundation-stereo";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    throw std::runtime_error("cannot create " + directory.string() +
+                             " for the stub model: " + error.message());
+  }
+  return directory;
 }
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
@@ -379,17 +463,22 @@ int execute(const Options& opts, SignalDomain& signals) {
                                               .device = holoscan::DeviceId{0}});
   };
 
-  // The source, and the pair's geometry.
+  // The source, and the pair's camera_info files: a recording's own, or the
+  // synthetic scene's, written for this run.
   int width = opts.width;
   int height = opts.height;
   std::uint32_t frames = 0;
-  fs::StereoGeometry geometry;
-  std::optional<double> camera_depth_scale;
+  hm::StereoCameraInfo camera_info;
+  std::filesystem::path left_camera_info;
+  std::filesystem::path right_camera_info;
+  std::optional<TemporaryFolder> scene_files;
+  const std::optional<double> camera_depth_scale = opts.camera_depth_scale;
   const holoscan::Output<holoscan::schema::ImageT>* left_out = nullptr;
   const holoscan::Output<holoscan::schema::ImageT>* right_out = nullptr;
   const holoscan::Output<holoscan::schema::ImageT>* view_out = nullptr;
   const holoscan::Output<holoscan::schema::ImageT>* camera_depth_out = nullptr;
-  const holoscan::Output<fs::schema::StereoGeometryT>* geometry_out = nullptr;
+  const holoscan::Input<hm::schema::StereoCameraInfoT>* source_camera_info = nullptr;
+  const holoscan::Output<hm::schema::StereoCameraInfoT>* frame_camera_info = nullptr;
   const bool display_available =
       env_set("DISPLAY") || (env_set("WAYLAND_DISPLAY") && env_set("XDG_RUNTIME_DIR"));
   const bool offscreen = opts.display == DisplayMode::kOffscreen;
@@ -411,22 +500,22 @@ int execute(const Options& opts, SignalDomain& signals) {
       // A recording that cannot be read is a usage error.
       throw std::invalid_argument(error.what());
     }
-    const app::RecordingCalibration& calibration = recording.calibration;
-    width = calibration.width;
-    height = calibration.height;
-    geometry = app::recording_geometry(calibration);
-    camera_depth_scale = calibration.depth_scale;
-    std::cout << kAppName << ": recording " << recording.folder.string() << " ("
-              << calibration.camera << ") " << width << 'x' << height << ", "
-              << recording.frames.size() << " frames, fx=" << std::setprecision(2) << std::fixed
-              << calibration.fx << " px, baseline=" << 1000.0 * calibration.baseline << " mm"
+    camera_info = recording.camera_info;
+    left_camera_info = recording.left_camera_info;
+    right_camera_info = recording.right_camera_info;
+    width = static_cast<int>(camera_info.left.width);
+    height = static_cast<int>(camera_info.left.height);
+    std::cout << kAppName << ": recording " << recording.folder.string() << ' ' << width << 'x'
+              << height << ", " << recording.frames.size() << " frames, "
+              << hm::camera_state_name(camera_info.left.state)
+              << " pair, fx=" << std::setprecision(2) << std::fixed << camera_info.left.fx
+              << " px, baseline=" << 1000.0 * camera_info.baseline << " mm"
               << (camera_depth_scale ? ", with the camera's depth" : "") << '\n';
     app::RecordingSourceConfig config{.recording = std::move(recording),
                                       .count = opts.count.value_or(0),
                                       .loop = opts.loop,
                                       .period = period,
                                       .depth = camera_depth_scale.has_value(),
-                                      .geometry = opts.geometry_input,
                                       .view = display};
     // Configurations are checked here, where a bad one is a usage error; the
     // graph reports a constructor's exception as its own failure.
@@ -437,11 +526,9 @@ int execute(const Options& opts, SignalDomain& signals) {
     right_out = &source->right;
     if (display) view_out = &source->view;
     if (camera_depth_scale) camera_depth_out = &source->depth;
-    if (opts.geometry_input) geometry_out = &source->geometry;
+    source_camera_info = &source->camera_info;
+    frame_camera_info = &source->stereo_camera_info;
   } else {
-    if (opts.geometry_input) {
-      throw std::invalid_argument("--geometry-input applies to --source recording");
-    }
     frames = opts.count.value_or(300);
     const app::SyntheticSourceConfig config{.width = width,
                                             .height = height,
@@ -451,7 +538,13 @@ int execute(const Options& opts, SignalDomain& signals) {
                                             .device_output = opts.device_input};
     app::validate_config(config);
     auto source = graph.op<app::SyntheticStereoSourceOp>("source", config);
-    geometry = fs::scene_geometry(fs::make_scene(0, width, height));
+    camera_info = fs::scene_camera_info(fs::make_scene(0, width, height));
+    scene_files.emplace();
+    left_camera_info = scene_files->path() / "left.yaml";
+    right_camera_info = scene_files->path() / "right.yaml";
+    hm::write_stereo_camera_info_yaml(camera_info, left_camera_info, right_camera_info);
+    source_camera_info = &source->camera_info;
+    frame_camera_info = &source->stereo_camera_info;
     left_out = &source->left;
     right_out = &source->right;
     // A color pair shows its left image; a MONO8 one the disparity alone.
@@ -461,19 +554,29 @@ int execute(const Options& opts, SignalDomain& signals) {
       on_gpu("source", "right");
     }
   }
+  // The camera the depth must come with: the rectified left camera.
+  std::optional<hm::CameraInfo> depth_camera;
+  if (camera_depth_scale) {
+    if (auto problem = fs::camera_info_problem(camera_info, width, height)) {
+      throw std::invalid_argument("the recording's camera info: " + *problem);
+    }
+    depth_camera = fs::depth_camera_info(camera_info);
+  }
 
-  // The model, its engine built before the graph runs.
+  // The model, its engine built before the graph runs. The source sends the
+  // camera info with every frame, and the operator takes each frame's own.
   fs::FoundationStereoConfig config{
-      .model = stub ? fs::write_stub_model(std::filesystem::current_path(), kStubWidth, kStubHeight)
+      .model = stub ? fs::write_stub_model(stub_directory(), kStubWidth, kStubHeight)
                     : std::filesystem::path(opts.model),
       .fp16 = opts.fp16,
-      .geometry_input = opts.geometry_input,
+      .cuda_graphs = opts.cuda_graphs,
+      .camera_info_input = {.timing = hm::CameraInfoTiming::kEveryFrame},
       .depth = camera_depth_scale.has_value(),
+      .depth_camera_info = camera_depth_scale.has_value(),
       .invalidate_out_of_view = opts.invalidate_out_of_view,
       .max_width = width,
       .max_height = height,
       .stats = std::make_shared<fs::FoundationStereoStats>()};
-  if (!opts.geometry_input) config.geometry = geometry;
   fs::validate_config(config);
   if (!opts.compile_only) {
     fs::prepare_engine(config);
@@ -489,6 +592,7 @@ int execute(const Options& opts, SignalDomain& signals) {
                                            .width = width,
                                            .height = height,
                                            .camera_depth_scale = camera_depth_scale,
+                                           .depth_camera = depth_camera,
                                            .color = opts.color};
   if (stub && !recorded) {
     report_config.stub_model_size = std::array<int, 2>{kStubWidth, kStubHeight};
@@ -497,6 +601,14 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   auto reporter = graph.op<app::DisparityReportOp>("report", std::move(report_config));
 
+  // The calibration, read from the files (again when the run starts) and sent
+  // every second to the source, which waits for it before its first frame and
+  // sends it with every frame.
+  auto camera_info_source = graph.op<hm::CameraInfoSourceOp>(
+      "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = left_camera_info,
+                                                .right_camera_info_path = right_camera_info});
+  graph.add_flow(camera_info_source->stereo_camera_info, *source_camera_info,
+                 hm::latest_camera_info_connection());
   // Lossless edges for the checks; drop-oldest ones of depth 1 for a live
   // source, so the model always takes the newest pair and never holds back
   // the source.
@@ -505,13 +617,14 @@ int execute(const Options& opts, SignalDomain& signals) {
           ? holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kDropOldest,
                                         .queue_depth = 1U}
           : holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kBlocking};
+  graph.add_flow(*frame_camera_info, stereo->camera_info, edge);
   graph.add_flow(*left_out, stereo->left, edge);
   graph.add_flow(*right_out, stereo->right, edge);
-  if (geometry_out != nullptr) graph.add_flow(*geometry_out, stereo->geometry, edge);
   graph.add_flow(stereo->disparity, reporter->disparity, edge);
   on_gpu("stereo", "disparity");
   if (camera_depth_scale) {
     graph.add_flow(stereo->depth, reporter->depth, edge);
+    graph.add_flow(stereo->depth_camera_info, reporter->depth_camera_info, edge);
     graph.add_flow(*camera_depth_out, reporter->camera_depth, edge);
     on_gpu("stereo", "depth");
   }
@@ -559,6 +672,8 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                  .height = static_cast<int>(window_height),
                                                  .left_image = show_left,
                                                  .write = opts.snapshot});
+      // Best effort, as the display is: two slots, so that a frame rendered
+      // while the checker reads the one before is kept rather than replacing it.
       graph.add_flow(visualizer->output(), checker->frame,
                      holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kDropOldest,
                                                  .queue_depth = 2U});
@@ -566,7 +681,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     }
     // The color scale: up to the nearest the scene comes, 0.3 m from a camera,
     // or the stub's largest value.
-    const float near = recorded ? static_cast<float>(geometry.fx * geometry.baseline / 0.3)
+    const float near = recorded ? static_cast<float>(hm::fx_baseline(camera_info) / 0.3)
                        : stub   ? static_cast<float>(width) / kStubWidth * 56.0F
                                 : fs::max_scene_disparity(width);
     auto colors = graph.op<app::DisparityColorOp>(
@@ -589,6 +704,14 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 #endif
 
+  // A lossless graph on one worker (see the messages module's README, "Run a
+  // graph on one worker"). CameraInfoSourceOp is a second source, and the
+  // frames fan out to the reporter and the display, so the automatic
+  // partitioning would give them workers of their own; the model would then
+  // run while the reporter's lossless queue is full, and fail on the refused
+  // emit. A real-time graph, whose edges drop frames rather than wait, is
+  // left to the automatic partitioning, so that its stages overlap.
+  if (!opts.realtime) graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   // Warnings on an accepted plan, as well as the reasons for a rejected one.
@@ -599,7 +722,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.execution_lanes().size() << '\n';
     return 0;
   }
   if (!signals) {
@@ -618,9 +742,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   // the source has sent its last frame and the pipeline has drained.
   const auto source_done = std::chrono::milliseconds(1LL * frames * opts.period_ms) + 2000ms;
   const auto started = std::chrono::steady_clock::now();
+  bool stop_requested = false;  // By this function, to end a real-time run.
   while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
     if (opts.realtime && std::chrono::steady_clock::now() - started > source_done) {
       session.request_stop();
+      stop_requested = true;
       break;
     }
     std::this_thread::sleep_for(10ms);
@@ -648,9 +774,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
 
   // A stop request (SIGINT, SIGTERM, a closed window) is neither a pass nor a
-  // failure, except the one that ends a real-time run.
+  // failure, except the one this function makes to end a real-time run. A run
+  // that ends by itself (kCompleted) is checked like one the reporter ends.
   const bool completed = termination == holoscan::RunTermination::kRequestedCompleted ||
-                         (opts.realtime && termination == holoscan::RunTermination::kStopped);
+                         termination == holoscan::RunTermination::kCompleted ||
+                         (stop_requested && termination == holoscan::RunTermination::kStopped);
   const bool stopped =
       !timed_out && !completed && termination == holoscan::RunTermination::kStopped;
   bool passed =

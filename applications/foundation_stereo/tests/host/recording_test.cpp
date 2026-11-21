@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// The recording reader: calibration.json as the stereo camera recordings write
-// it, the geometry it gives, what it refuses, and 8- and 16-bit PGM images.
+// The recording reader: a recording's camera_info files and index as the
+// local recordings hold them, whether its depth is aligned with the left
+// image, what it refuses (images outside its folder among them), and 8- and
+// 16-bit PGM images.
 
 #include "recording.hpp"
 
@@ -12,78 +14,57 @@
 #include <stdexcept>
 #include <string>
 
+#include <holoscan/messages/camera_info_yaml.hpp>
+
 #include "test_support.hpp"
 
 namespace foundation_stereo_app {
 namespace {
 
+namespace hm = holoscan::messages;
 using test::throws;
 
-// A RealSense D585's calibration at 1280x720, as recorded.
-constexpr char kCalibration[] = R"({
-  "version": 1,
-  "camera": {
-    "name": "RealSense D585 Prototype",
-    "serial": "541522320091",
-    "settings": {"emitter_enabled": "true", "fps": "30"}
-  },
-  "rectified": true,
-  "left": {"width": 1280, "height": 720, "fx": 336.98760986328125, "fy": 336.98760986328125,
-           "cx": 674.053955078125, "cy": 355.81134033203125,
-           "distortion": {"model": "brown_conrady", "coefficients": [0, 0, 0, 0, 0]}},
-  "right": {"width": 1280, "height": 720, "fx": 336.98760986328125, "fy": 336.98760986328125,
-            "cx": 676.553955078125, "cy": 355.81134033203125,
-            "distortion": {"model": "brown_conrady", "coefficients": [0, 0, 0, 0, 0]}},
-  "right_from_left": {"rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
-                      "translation": [-0.094843290746212, 0, 0]},
-  "rgb": {"width": 1280, "height": 720, "fx": 331.4, "fy": 331.6, "cx": 702.4, "cy": 382.2,
-          "from_left": {"rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
-                        "translation": [-0.0476, 0.0004, -9.1e-05]}},
-  "depth": {"width": 1280, "height": 720, "fx": 336.98760986328125, "fy": 336.98760986328125,
-            "cx": 674.053955078125, "cy": 355.81134033203125,
-            "from_left": {"rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1], "translation": [0, 0, 0]},
-            "scale": 0.00045200000749900937}
-})";
-
-std::string replaced(const char* original, const std::string& from, const std::string& to) {
-  std::string text(original);
-  const std::size_t at = text.find(from);
-  if (at == std::string::npos) throw std::logic_error("no '" + from + "' to replace");
-  return text.replace(at, from.size(), to);
+// A rectified 1280x720 pair with a 95 mm baseline, laid out as the local
+// recordings' files are; generic intrinsics, with fractions that must survive
+// the files.
+hm::StereoCameraInfo rectified_pair() {
+  hm::CameraInfo left;
+  left.header.frame_id = "left";
+  left.width = 1280;
+  left.height = 720;
+  left.state = hm::CameraState::kRectified;
+  left.fx = 340.125;
+  left.fy = 340.125;
+  left.cx = 640.375;
+  left.cy = 359.625;
+  hm::CameraInfo right = left;
+  right.header.frame_id = "right";
+  hm::StereoCameraInfo pair;
+  pair.header.frame_id = "left";
+  pair.left = left;
+  pair.right = right;
+  pair.right_from_left.translation = {-0.095125, 0.0, 0.0};
+  pair.baseline = 0.095125;
+  return pair;
 }
 
-void check_calibration() {
-  const RecordingCalibration c = parse_calibration(kCalibration);
-  VERIFY(c.camera == "RealSense D585 Prototype 541522320091");
-  VERIFY(c.width == 1280 && c.height == 720);
-  VERIFY(c.fx == 336.98760986328125 && c.cx == 674.053955078125);
-  VERIFY(c.right_cx == 676.553955078125);
-  VERIFY(c.baseline == 0.094843290746212);
-  VERIFY(c.depth_scale && *c.depth_scale == 0.00045200000749900937);
-}
-
-void check_refused_calibrations() {
-  const auto refuses = [](const std::string& json, const std::string& what) {
-    try {
-      (void)parse_calibration(json);
-      VERIFY_MSG(false, "refused: " + what);
-    } catch (const std::runtime_error& error) {
-      VERIFY_MSG(std::string(error.what()).find(what) != std::string::npos,
-                 "the error says '" + what + "': " + error.what());
-    }
-  };
-  refuses(replaced(kCalibration, "\"rectified\": true", "\"rectified\": false"), "not rectified");
-  refuses(replaced(kCalibration, "-0.094843290746212", "0.094843290746212"),
-          "to the left eye's right");
-  refuses(replaced(kCalibration, "\"fx\": 336.98760986328125, \"fy\"", "\"fy\""), "left.fx");
-  refuses(replaced(kCalibration, "\"right\": {\"width\": 1280", "\"right\": {\"width\": 640"),
-          "differ in size");
-  refuses(std::string(kCalibration).substr(0, 200), "JSON");
-  refuses("[1, 2", "JSON");
-  // Depth that is not aligned with the left eye is left out, not refused.
-  const RecordingCalibration unaligned = parse_calibration(
-      replaced(kCalibration, "\"translation\": [0, 0, 0]", "\"translation\": [0.01, 0, 0]"));
-  VERIFY(!unaligned.depth_scale.has_value());
+void check_same_pixels() {
+  const hm::StereoCameraInfo pair = rectified_pair();
+  hm::CameraInfo depth = pair.left;
+  depth.header.frame_id = "depth";
+  depth.state = hm::CameraState::kUndistorted;
+  VERIFY(same_pixels(depth, pair.left));
+  hm::CameraInfo other = depth;
+  other.cx += 1.0;
+  VERIFY(!same_pixels(other, pair.left));
+  other = depth;
+  other.width = 640;
+  VERIFY(!same_pixels(other, pair.left));
+  other = depth;
+  other.state = hm::CameraState::kRaw;
+  other.distortion_model = hm::DistortionModel::kPlumbBob;
+  other.coefficients = {0.1, 0.0, 0.0, 0.0, 0.0};
+  VERIFY(!same_pixels(other, pair.left));
 }
 
 void check_pgm() {
@@ -106,18 +87,50 @@ void check_recording_folder() {
       std::filesystem::temp_directory_path() / "foundation_stereo_recording_test";
   std::filesystem::remove_all(folder);
   std::filesystem::create_directories(folder);
-  std::ofstream(folder / "calibration.json") << kCalibration;
+  const hm::StereoCameraInfo pair = rectified_pair();
+  hm::write_stereo_camera_info_yaml(pair, folder / "left.yaml", folder / "right.yaml");
+  hm::CameraInfo depth = pair.left;
+  depth.header.frame_id = "depth";
+  hm::write_camera_info_yaml(depth, folder / "depth.yaml");
   std::ofstream(folder / "index.csv")
       << "frame,timestamp_ns,device_sequence,left,right,rgb,depth\n"
       << "0,1,31,left/000000.pgm,right/000000.pgm,rgb/000000.ppm,depth/000000.pgm\n"
       << "1,2,32,left/000001.pgm,right/000001.pgm,rgb/000001.ppm,\n";
-  const Recording recording = read_recording(folder);
+  Recording recording = read_recording(folder);
+  VERIFY(recording.left_camera_info == folder / "left.yaml");
+  VERIFY(recording.right_camera_info == folder / "right.yaml");
+  VERIFY(recording.camera_info.left.state == hm::CameraState::kRectified);
+  VERIFY(recording.camera_info.left.fx == pair.left.fx &&
+         recording.camera_info.baseline == pair.baseline);
+  VERIFY(recording.depth_aligned);
   VERIFY(recording.frames.size() == 2);
   VERIFY(recording.frames[0].left == folder / "left/000000.pgm");
   VERIFY(recording.frames[0].depth == folder / "depth/000000.pgm");
   VERIFY(recording.frames[1].frame == 1 && recording.frames[1].depth.empty());
+  // Depth of another camera is left out, not refused; so is no depth.yaml.
+  depth.cx += 10.0;
+  hm::write_camera_info_yaml(depth, folder / "depth.yaml");
+  VERIFY(!read_recording(folder).depth_aligned);
+  std::filesystem::remove(folder / "depth.yaml");
+  VERIFY(!read_recording(folder).depth_aligned);
+  // Images outside the recording's folder.
+  for (const char* outside : {"../000000.pgm", "/tmp/000000.pgm", "left/../../000000.pgm"}) {
+    std::ofstream(folder / "index.csv")
+        << "frame,left,right\n0," << outside << ",right/000000.pgm\n";
+    VERIFY_MSG(throws<std::runtime_error>([&] { (void)read_recording(folder); }),
+               std::string("refused: ") + outside);
+  }
+  // A bad index, a missing camera_info file, no folder.
   std::ofstream(folder / "index.csv") << "frame,left\n0,left/000000.pgm\n";
   VERIFY(throws<std::runtime_error>([&] { (void)read_recording(folder); }));
+  std::filesystem::remove(folder / "right.yaml");
+  try {
+    (void)read_recording(folder);
+    VERIFY_MSG(false, "a recording without right.yaml is refused");
+  } catch (const std::runtime_error& error) {
+    VERIFY_MSG(std::string(error.what()).find("right.yaml") != std::string::npos,
+               std::string("the error names right.yaml: ") + error.what());
+  }
   std::filesystem::remove_all(folder);
   VERIFY(throws<std::runtime_error>([&] { (void)read_recording(folder); }));
 }
@@ -128,8 +141,7 @@ void check_recording_folder() {
 int main() {
   using namespace foundation_stereo_app;  // NOLINT(build/namespaces)
   return test::run({
-      {"calibration", check_calibration},
-      {"refused calibrations", check_refused_calibrations},
+      {"depth aligned with the left image", check_same_pixels},
       {"PGM images", check_pgm},
       {"recording folder", check_recording_folder},
   });

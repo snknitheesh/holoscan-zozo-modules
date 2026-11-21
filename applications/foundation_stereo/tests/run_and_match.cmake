@@ -6,13 +6,16 @@
 # would ignore the exit status.
 #
 #   cmake -DEXPECT_EXIT=2 -DEXPECT_OUTPUT=regex [-DREQUIRE_ENV=variable]
-#         [-DSKIP_UNLESS_EXISTS=path1|path2] -P run_and_match.cmake -- command [args...]
+#         [-DSKIP_UNLESS_EXISTS=path1|path2] [-DCLIP_SUFFIX=suffix]
+#         -P run_and_match.cmake -- command [args...]
 #
 # When REQUIRE_ENV names an unset or empty variable, or a path in
 # SKIP_UNLESS_EXISTS is missing, the script runs nothing and exits with status
 # 77, which the test's SKIP_RETURN_CODE reports as skipped: for data prepared
 # separately. The paths are separated by |, as a ; would split the test's
-# command.
+# command. With CLIP_SUFFIX=<suffix>, the command gets `--clip <name>` for the
+# one recording in $HOLOSCAN_TEST_DATA/stereo-camera/ whose folder name ends in
+# it, so that the tests need not name the recordings' folders.
 
 if(DEFINED REQUIRE_ENV AND "$ENV{${REQUIRE_ENV}}" STREQUAL "")
   message("skipped: ${REQUIRE_ENV} is not set")
@@ -46,6 +49,20 @@ foreach(_index RANGE ${_last})
 endforeach()
 if(NOT _command)
   message(FATAL_ERROR "run_and_match: no command after --")
+endif()
+
+if(DEFINED CLIP_SUFFIX)
+  file(GLOB _clips LIST_DIRECTORIES true "$ENV{HOLOSCAN_TEST_DATA}/stereo-camera/*${CLIP_SUFFIX}")
+  list(LENGTH _clips _clip_count)
+  if(NOT _clip_count EQUAL 1)
+    message(
+      FATAL_ERROR
+      "run_and_match: ${_clip_count} recordings in $ENV{HOLOSCAN_TEST_DATA}/stereo-camera/ end in"
+      " ${CLIP_SUFFIX}; expected one"
+    )
+  endif()
+  get_filename_component(_clip "${_clips}" NAME)
+  list(APPEND _command --clip "${_clip}")
 endif()
 
 execute_process(

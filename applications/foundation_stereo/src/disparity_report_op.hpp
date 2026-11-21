@@ -3,8 +3,8 @@
 //
 // DisparityReportOp: the demo's sink. Counts frames, valid pixels and
 // latency; checks synthetic frames against the scene's truth, and a
-// recording's computed depth against the camera's own; and requests
-// completion once it has its frames.
+// recording's computed depth and its camera info against the camera's own;
+// and requests completion once it has its frames.
 
 #pragma once
 
@@ -23,6 +23,8 @@
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 namespace foundation_stereo_app {
@@ -33,13 +35,20 @@ inline constexpr double kErrorBin = 0.001;
 inline constexpr std::size_t kErrorBins = 1001;
 inline constexpr double kTruthBin = 0.01;
 inline constexpr std::size_t kTruthBins = 1001;
+// The first frames' latency also holds the CUDA graph's capture and first-use
+// allocations: it is kept apart.
+inline constexpr std::uint32_t kWarmupFrames = 2;
 
 // A run's results. Written by the reporter during the run and
 // read by main() after the run has stopped.
 struct DisparityReport {
   std::uint32_t frames{};
-  std::uint32_t frame_gaps{};     // Frames missing between two received ones.
-  std::vector<float> latency_ms;  // Capture to report, per frame.
+  // Frames missing before the first received one or between two of them.
+  std::uint32_t frame_gaps{};
+  // From capture to the disparity done on the GPU, per frame after the first
+  // kWarmupFrames, and for those.
+  std::vector<float> latency_ms;
+  std::vector<float> warmup_latency_ms;
   std::uint64_t pixels{};
   std::uint64_t valid_pixels{};
   // Synthetic truth: pixels both cameras see, those with a disparity, those
@@ -59,6 +68,8 @@ struct DisparityReport {
   std::uint64_t camera_pixels{};
   std::uint64_t both_pixels{};
   std::array<std::uint64_t, kErrorBins> error_bins{};
+  // Depth camera infos that were not the expected camera.
+  std::uint32_t wrong_depth_cameras{};
   // With the stub model: pixels compared with the CPU reference of the whole
   // chain, those off by more than the tolerance, and the largest difference.
   bool stub_checked{};
@@ -87,6 +98,9 @@ struct DisparityReportConfig {
   // Take the computed `depth` and the camera's `camera_depth` (MONO16, in
   // units of this scale, 0 where it has none) and compare them.
   std::optional<double> camera_depth_scale;
+  // With camera_depth_scale: the camera `depth_camera_info` must hold, headers
+  // aside.
+  std::optional<holoscan::messages::CameraInfo> depth_camera;
   // With the stub model: check each synthetic frame against the CPU
   // reference of the operator's chain for a stub of this input size,
   // relative tolerance `stub_tolerance`, from RGB8 (`color`) or MONO8 images.
@@ -97,7 +111,8 @@ struct DisparityReportConfig {
 
 class DisparityReportOp final : public holoscan::Operator<> {
  public:
-  // @throws std::invalid_argument without a report or `remaining`.
+  // @throws std::invalid_argument without a report or `remaining`, or with
+  // only one of camera_depth_scale and depth_camera.
   explicit DisparityReportOp(DisparityReportConfig config);
 
   void setup(holoscan::OperatorSpec& spec) override;
@@ -108,6 +123,7 @@ class DisparityReportOp final : public holoscan::Operator<> {
 
   holoscan::Input<holoscan::schema::ImageT> disparity;
   holoscan::Input<holoscan::schema::ImageT> depth;
+  holoscan::Input<holoscan::messages::schema::CameraInfoT> depth_camera_info;
   holoscan::Input<holoscan::schema::ImageT> camera_depth;
 
  private:

@@ -39,11 +39,9 @@ class DisparityColorOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument for an unusable config.
   explicit DisparityColorOp(DisparityColorConfig config);
-  ~DisparityColorOp() override;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
-  void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
@@ -54,7 +52,6 @@ class DisparityColorOp final : public holoscan::Operator<> {
 
  private:
   DisparityColorConfig config_;
-  cudaStream_t own_stream_{};
 };
 
 }  // namespace foundation_stereo_app

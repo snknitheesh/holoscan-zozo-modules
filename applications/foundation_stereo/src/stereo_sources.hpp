@@ -5,8 +5,15 @@
 // played back from its folder. Both emit a fixed number of frames on a clock,
 // then idle. Every part of a frame carries the same capture time and frame id
 // (counted from 1). A consumer still busy makes an emit fail with
-// kBackpressured; the source then sends the rest of the same frame on its
-// next tick, so lossless edges lose nothing.
+// kBackpressured, and an output whose pool consumers still hold makes an
+// allocation fail with kResourceExhausted; the source then sends the rest of
+// the same frame on its next tick, so lossless edges lose nothing.
+//
+// Both also take the pair's camera info from a CameraInfoSourceOp, hold their
+// first frame until it has come, and send it with every frame, first, on
+// `stereo_camera_info`, as a rectifier does: a matcher that takes it with
+// messages::CameraInfoTiming::kEveryFrame then has every frame's own, and
+// never skips one.
 
 #pragma once
 
@@ -22,12 +29,34 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
-#include <holoscan/foundation_stereo/geometry_message.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/stereo_camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
 #include "recording.hpp"
 
 namespace foundation_stereo_app {
+
+// A source's camera info: the newest one received, sent again with each frame.
+// Not thread-safe: one per source, used from compute().
+class FrameCameraInfo {
+ public:
+  // Takes this activation's camera info, if there is a new one.
+  // @return Whether a camera info has come; an error for one that is not valid.
+  [[nodiscard]] holoscan::expected<bool, holoscan::Error> update(
+      holoscan::Input<holoscan::messages::schema::StereoCameraInfoT>& port);
+  // Sends the newest camera info for the frame `emit` describes, stamped with
+  // its capture time. Call only after update() returned true.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> send(
+      holoscan::Output<holoscan::messages::schema::StereoCameraInfoT>& port,
+      const holoscan::EmitOptions& emit);
+  // Forgets the camera info, for a new run.
+  void reset() noexcept { latest_.reset(); }
+
+ private:
+  holoscan::messages::LatestCameraInfo<holoscan::messages::schema::StereoCameraInfoT> latest_;
+  holoscan::messages::schema::StereoCameraInfoT message_;
+};
 
 struct SyntheticSourceConfig {
   int width{1280};
@@ -57,6 +86,8 @@ class SyntheticStereoSourceOp final : public holoscan::Operator<> {
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
+  holoscan::Input<holoscan::messages::schema::StereoCameraInfoT> camera_info;
+  holoscan::Output<holoscan::messages::schema::StereoCameraInfoT> stereo_camera_info;
   holoscan::Output<holoscan::schema::ImageT> left;
   holoscan::Output<holoscan::schema::ImageT> right;
 
@@ -64,6 +95,7 @@ class SyntheticStereoSourceOp final : public holoscan::Operator<> {
   void release() noexcept;
 
   SyntheticSourceConfig config_;
+  FrameCameraInfo frame_camera_info_;
   std::uint32_t emitted_{};
   std::optional<holoscan::TimePoint> pending_capture_;
   std::uint32_t sent_{};
@@ -80,22 +112,17 @@ struct RecordingSourceConfig {
   bool loop{false};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
   // Also send each frame's depth image (MONO16, the recording's units) on
-  // `depth`, the pair's geometry on `geometry`, and the left eye as RGB8 gray
-  // on `view`, for a display.
+  // `depth`, which needs depth aligned with the left image; and the left
+  // image as RGB8 gray on `view`, for a display.
   bool depth{false};
-  bool geometry{false};
   bool view{false};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
 void validate_config(const RecordingSourceConfig& config);
 
-// The pair's geometry from a recording's calibration.
-[[nodiscard]] holoscan::foundation_stereo::StereoGeometry recording_geometry(
-    const RecordingCalibration& calibration);
-
 // A recording's frames, MONO8 left and right images in host memory, in order.
-// A file that cannot be read, or whose size is not the calibration's, fails
+// A file that cannot be read, or whose size is not the camera info's, fails
 // the run.
 class RecordingSourceOp final : public holoscan::Operator<> {
  public:
@@ -111,14 +138,16 @@ class RecordingSourceOp final : public holoscan::Operator<> {
   // Frames this source sends.
   [[nodiscard]] std::uint32_t total() const noexcept { return total_; }
 
+  holoscan::Input<holoscan::messages::schema::StereoCameraInfoT> camera_info;
+  holoscan::Output<holoscan::messages::schema::StereoCameraInfoT> stereo_camera_info;
   holoscan::Output<holoscan::schema::ImageT> left;
   holoscan::Output<holoscan::schema::ImageT> right;
   holoscan::Output<holoscan::schema::ImageT> depth;
-  holoscan::Output<holoscan::foundation_stereo::schema::StereoGeometryT> geometry;
   holoscan::Output<holoscan::schema::ImageT> view;
 
  private:
   RecordingSourceConfig config_;
+  FrameCameraInfo frame_camera_info_;
   std::uint32_t total_{};
   std::uint32_t emitted_{};
   std::optional<holoscan::TimePoint> pending_capture_;

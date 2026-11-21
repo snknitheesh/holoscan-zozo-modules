@@ -17,6 +17,7 @@
 #include <holoscan/foundation_stereo/model_input.hpp>
 #include <holoscan/foundation_stereo/reference.hpp>
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
+#include <holoscan/messages/conversion.hpp>
 
 namespace foundation_stereo_app {
 namespace {
@@ -84,6 +85,10 @@ DisparityReportOp::DisparityReportOp(DisparityReportConfig config) : config_(std
   if (!config_.report || !config_.remaining) {
     throw std::invalid_argument("DisparityReportOp needs a report and a completion counter");
   }
+  if (config_.camera_depth_scale.has_value() != config_.depth_camera.has_value()) {
+    throw std::invalid_argument(
+        "DisparityReportOp compares the camera's depth with its depth camera, both or neither");
+  }
 }
 
 void DisparityReportOp::setup(holoscan::OperatorSpec& spec) {
@@ -92,6 +97,7 @@ void DisparityReportOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(disparity, "disparity").queue_depth(kQueueDepth);
   if (config_.camera_depth_scale) {
     spec.input(depth, "depth").queue_depth(kQueueDepth);
+    spec.input(depth_camera_info, "depth_camera_info").queue_depth(kQueueDepth);
     spec.input(camera_depth, "camera_depth").queue_depth(kQueueDepth);
   }
 }
@@ -106,12 +112,14 @@ holoscan::Contract DisparityReportOp::contract() const {
   std::vector<holoscan::PortRef> ports{disparity};
   if (config_.camera_depth_scale) {
     ports.emplace_back(depth);
+    ports.emplace_back(depth_camera_info);
     ports.emplace_back(camera_depth);
   }
   result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
   result.input(disparity, holoscan::Exact{});
   if (config_.camera_depth_scale) {
     result.input(depth, holoscan::Exact{});
+    result.input(depth_camera_info, holoscan::Exact{});
     result.input(camera_depth, holoscan::Exact{});
   }
   return result;
@@ -129,6 +137,23 @@ holoscan::expected<void, holoscan::Error> DisparityReportOp::compute(
     return holoscan::make_unexpected(std::move(sample).error());
   }
   DisparityReport& report = *config_.report;
+  // Latency from capture to the disparity done on the GPU: wait for the work
+  // that wrote it, not for what the copy's stream may hold of later frames,
+  // when the frame has a capture time on this clock.
+  if (!sample->data.data) {
+    return holoscan::make_unexpected(invalid("disparity has no tensor"));
+  }
+  if (auto ready = sample->data.data->synchronize_for_host(); !ready) {
+    return ready;
+  }
+  const holoscan::SampleMetadata& metadata = sample->metadata;
+  const auto now = context.clock().now();
+  if (now && metadata.source_clock_id.valid() && metadata.source_clock_id == now->clock_id) {
+    const float latency =
+        static_cast<float>(now->timestamp_ns - metadata.capture_timestamp_ns) / 1e6F;
+    (report.frames < kWarmupFrames ? report.warmup_latency_ms : report.latency_ms)
+        .push_back(latency);
+  }
   int width = 0;
   int height = 0;
   if (auto fetched =
@@ -136,18 +161,11 @@ holoscan::expected<void, holoscan::Error> DisparityReportOp::compute(
       !fetched) {
     return fetched;
   }
-  // Latency from capture to the disparity on the host (the copy above waits
-  // for the GPU), when the frame has a capture time on this clock.
-  const holoscan::SampleMetadata& metadata = sample->metadata;
-  const auto now = context.clock().now();
-  if (now && metadata.source_clock_id.valid() && metadata.source_clock_id == now->clock_id) {
-    report.latency_ms.push_back(
-        static_cast<float>(now->timestamp_ns - metadata.capture_timestamp_ns) / 1e6F);
-  }
   const std::size_t pixels = disparity_.size();
-  // Sources number their frames from 1.
+  // Sources number their frames from 1: frames before the first received
+  // one, and between two, were dropped.
   const std::uint64_t frame_id = metadata.frame_id;
-  if (last_frame_id_ != 0 && frame_id > last_frame_id_ + 1U) {
+  if (frame_id > last_frame_id_ + 1U) {
     report.frame_gaps += static_cast<std::uint32_t>(frame_id - last_frame_id_ - 1U);
   }
   last_frame_id_ = frame_id;
@@ -164,6 +182,18 @@ holoscan::expected<void, holoscan::Error> DisparityReportOp::compute(
     auto camera_sample = camera_depth.receive();
     if (!camera_sample) {
       return holoscan::make_unexpected(std::move(camera_sample).error());
+    }
+    auto depth_camera_sample = depth_camera_info.receive();
+    if (!depth_camera_sample) {
+      return holoscan::make_unexpected(std::move(depth_camera_sample).error());
+    }
+    try {
+      holoscan::messages::CameraInfo depth_camera =
+          holoscan::messages::from_message(depth_camera_sample->data);
+      depth_camera.header = config_.depth_camera->header;
+      report.wrong_depth_cameras += depth_camera == *config_.depth_camera ? 0U : 1U;
+    } catch (const std::invalid_argument& error) {
+      return holoscan::make_unexpected(invalid(error.what()));
     }
     int depth_width = 0;
     int depth_height = 0;

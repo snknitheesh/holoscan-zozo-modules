@@ -15,11 +15,13 @@
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/conversion.hpp>
 
 namespace foundation_stereo_app {
 namespace {
 
-namespace sd = holoscan::foundation_stereo;
+namespace fs = holoscan::foundation_stereo;
 
 constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 constexpr DLDataType kUInt16{kDLUInt, 16U, 1U};
@@ -61,7 +63,9 @@ holoscan::Error cuda_failure(const char* what, cudaError_t status) {
 }
 
 // Records one part of a frame as sent, or that the consumer is busy (`blocked`,
-// to retry on the next tick); any other failure fails the run.
+// to retry on the next tick): a refused emit (kBackpressured), or an output
+// pool whose every slot is still held (kResourceExhausted), as the messages
+// module's README asks of a source. Any other failure fails the run.
 holoscan::expected<void, holoscan::Error> settle(holoscan::expected<void, holoscan::Error> sent,
                                                  std::uint32_t bit, std::uint32_t& sent_bits,
                                                  bool& blocked) {
@@ -69,7 +73,8 @@ holoscan::expected<void, holoscan::Error> settle(holoscan::expected<void, holosc
     sent_bits |= bit;
     return {};
   }
-  if (sent.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (sent.error().code == holoscan::ErrorCode::kBackpressured ||
+      sent.error().code == holoscan::ErrorCode::kResourceExhausted) {
     blocked = true;
     return {};
   }
@@ -79,13 +84,47 @@ holoscan::expected<void, holoscan::Error> settle(holoscan::expected<void, holosc
 constexpr std::uint32_t kSentLeft = 1U;
 constexpr std::uint32_t kSentRight = 2U;
 constexpr std::uint32_t kSentDepth = 4U;
-constexpr std::uint32_t kSentGeometry = 8U;
+constexpr std::uint32_t kSentCameraInfo = 8U;
 constexpr std::uint32_t kSentView = 16U;
+
+// A frame on every tick of `period`, with the newest camera info, if any.
+holoscan::Contract source_contract(
+    std::chrono::nanoseconds period,
+    const holoscan::Input<holoscan::messages::schema::StereoCameraInfoT>& camera_info) {
+  holoscan::Contract result;
+  result.trigger(holoscan::OnClock{.period = period});
+  result.input(camera_info, holoscan::LatestWithin{
+                                .max_age = holoscan::messages::CameraInfoInputOptions{}.max_age});
+  result.on_missing(camera_info, holoscan::SafeDefault{});
+  return result;
+}
 
 }  // namespace
 
+holoscan::expected<bool, holoscan::Error> FrameCameraInfo::update(
+    holoscan::Input<holoscan::messages::schema::StereoCameraInfoT>& port) {
+  auto info = latest_.update(port);
+  if (!info) {
+    return holoscan::make_unexpected(std::move(info).error());
+  }
+  if (*info == nullptr) {
+    return false;
+  }
+  if (latest_.changed()) {
+    message_ = holoscan::messages::to_message(**info);
+  }
+  return true;
+}
+
+holoscan::expected<void, holoscan::Error> FrameCameraInfo::send(
+    holoscan::Output<holoscan::messages::schema::StereoCameraInfoT>& port,
+    const holoscan::EmitOptions& emit) {
+  message_.header->capture_timestamp_ns = emit.capture_time ? emit.capture_time->timestamp_ns : 0;
+  return port.emit_ref(message_, emit);
+}
+
 void validate_config(const SyntheticSourceConfig& config) {
-  (void)sd::make_scene(0, config.width, config.height);  // Checks the size.
+  (void)fs::make_scene(0, config.width, config.height);  // Checks the size.
   if (config.count == 0 || config.period <= std::chrono::nanoseconds::zero()) {
     throw std::invalid_argument("the synthetic source needs a positive count and period");
   }
@@ -105,6 +144,8 @@ void SyntheticStereoSourceOp::setup(holoscan::OperatorSpec& spec) {
   const holoscan::MemoryKind memory =
       config_.device_output ? holoscan::MemoryKind::kCudaDevice : holoscan::MemoryKind::kHost;
   const std::uint32_t rank = config_.color ? 3U : 2U;
+  spec.input(camera_info, "camera_info");
+  spec.output(stereo_camera_info, "stereo_camera_info");
   spec.output(left, "left")
       .produces_tensor(tensor_spec(memory, kUInt8, rank, bytes))
       .payload_options(image_payload());
@@ -114,12 +155,11 @@ void SyntheticStereoSourceOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract SyntheticStereoSourceOp::contract() const {
-  holoscan::Contract result;
-  result.trigger(holoscan::OnClock{.period = config_.period});
-  return result;
+  return source_contract(config_.period, camera_info);
 }
 
 void SyntheticStereoSourceOp::start() {
+  frame_camera_info_.reset();
   emitted_ = 0;
   pending_capture_.reset();
   sent_ = 0U;
@@ -141,8 +181,12 @@ void SyntheticStereoSourceOp::release() noexcept {
 
 holoscan::expected<void, holoscan::Error> SyntheticStereoSourceOp::compute(
     holoscan::ExecutionContext& context) {
-  if (emitted_ >= config_.count) {
-    return {};  // Done: idle until the consumers request completion.
+  auto camera_info_came = frame_camera_info_.update(camera_info);
+  if (!camera_info_came) {
+    return holoscan::make_unexpected(std::move(camera_info_came).error());
+  }
+  if (emitted_ >= config_.count || !*camera_info_came) {
+    return {};  // Done, idle until the consumers request completion; or not started.
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
@@ -170,7 +214,7 @@ holoscan::expected<void, holoscan::Error> SyntheticStereoSourceOp::compute(
     }
     auto* pair = static_cast<std::uint8_t*>(scratch_);
     if (const cudaError_t status =
-            sd::render_scene(sd::make_scene(emitted_, config_.width, config_.height), channels,
+            fs::render_scene(fs::make_scene(emitted_, config_.width, config_.height), channels,
                              pair, pair + bytes, stream);
         status != cudaSuccess) {
       return holoscan::make_unexpected(cuda_failure("render_scene", status));
@@ -180,6 +224,13 @@ holoscan::expected<void, holoscan::Error> SyntheticStereoSourceOp::compute(
   const auto encoding =
       config_.color ? holoscan::schema::ImageEncoding_RGB8 : holoscan::schema::ImageEncoding_MONO8;
   bool blocked = false;
+  if ((sent_ & kSentCameraInfo) == 0U) {
+    if (auto settled = settle(frame_camera_info_.send(stereo_camera_info, emit), kSentCameraInfo,
+                              sent_, blocked);
+        !settled || blocked) {
+      return settled;
+    }
+  }
   for (int side = 0; side < 2; ++side) {
     const std::uint32_t bit = side == 0 ? kSentLeft : kSentRight;
     if ((sent_ & bit) != 0U) continue;
@@ -249,19 +300,11 @@ void validate_config(const RecordingSourceConfig& config) {
                                 std::to_string(config.recording.frames.size()) +
                                 " frames of the recording; add --loop true");
   }
-  if (config.depth && !config.recording.calibration.depth_scale) {
-    throw std::invalid_argument("the recording has no depth aligned with its left eye");
+  if (config.depth && !config.recording.depth_aligned) {
+    throw std::invalid_argument(
+        "the recording has no depth aligned with its left image (depth.yaml describing the "
+        "left camera)");
   }
-}
-
-sd::StereoGeometry recording_geometry(const RecordingCalibration& calibration) {
-  return sd::StereoGeometry{.fx = calibration.fx,
-                            .baseline = calibration.baseline,
-                            .width = calibration.width,
-                            .height = calibration.height,
-                            .cx = calibration.cx,
-                            .cy = calibration.cy,
-                            .doffs = calibration.right_cx - calibration.cx};
 }
 
 RecordingSourceOp::RecordingSourceOp(RecordingSourceConfig config) : config_(std::move(config)) {
@@ -271,9 +314,11 @@ RecordingSourceOp::RecordingSourceOp(RecordingSourceConfig config) : config_(std
 }
 
 void RecordingSourceOp::setup(holoscan::OperatorSpec& spec) {
-  const RecordingCalibration& calibration = config_.recording.calibration;
-  const std::uint64_t pixels = static_cast<std::uint64_t>(calibration.width) *
-                               static_cast<std::uint64_t>(calibration.height);
+  const holoscan::messages::CameraInfo& camera = config_.recording.camera_info.left;
+  const std::uint64_t pixels =
+      static_cast<std::uint64_t>(camera.width) * static_cast<std::uint64_t>(camera.height);
+  spec.input(camera_info, "camera_info");
+  spec.output(stereo_camera_info, "stereo_camera_info");
   spec.output(left, "left")
       .produces_tensor(tensor_spec(holoscan::MemoryKind::kHost, kUInt8, 2U, pixels))
       .payload_options(image_payload());
@@ -285,9 +330,6 @@ void RecordingSourceOp::setup(holoscan::OperatorSpec& spec) {
         .produces_tensor(tensor_spec(holoscan::MemoryKind::kHost, kUInt16, 2U, pixels * 2U))
         .payload_options(image_payload());
   }
-  if (config_.geometry) {
-    spec.output(geometry, "geometry");
-  }
   if (config_.view) {
     spec.output(view, "view")
         .produces_tensor(tensor_spec(holoscan::MemoryKind::kHost, kUInt8, 3U, pixels * 3U))
@@ -296,12 +338,11 @@ void RecordingSourceOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract RecordingSourceOp::contract() const {
-  holoscan::Contract result;
-  result.trigger(holoscan::OnClock{.period = config_.period});
-  return result;
+  return source_contract(config_.period, camera_info);
 }
 
 void RecordingSourceOp::start() {
+  frame_camera_info_.reset();
   emitted_ = 0;
   pending_capture_.reset();
   sent_ = 0U;
@@ -309,10 +350,15 @@ void RecordingSourceOp::start() {
 
 holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
     holoscan::ExecutionContext& context) {
-  if (emitted_ >= total_) {
-    return {};
+  auto camera_info_came = frame_camera_info_.update(camera_info);
+  if (!camera_info_came) {
+    return holoscan::make_unexpected(std::move(camera_info_came).error());
   }
-  const RecordingCalibration& calibration = config_.recording.calibration;
+  if (emitted_ >= total_ || !*camera_info_came) {
+    return {};  // Done, or not started.
+  }
+  const int width = static_cast<int>(config_.recording.camera_info.left.width);
+  const int height = static_cast<int>(config_.recording.camera_info.left.height);
   const RecordingFrame& frame =
       config_.recording.frames[emitted_ % config_.recording.frames.size()];
   if (!pending_capture_) {
@@ -331,10 +377,10 @@ holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
       return holoscan::make_unexpected(failure(error.what()));
     }
     for (const auto* pgm : {&left_pixels_, &right_pixels_, &depth_pixels_}) {
-      if (*pgm && ((*pgm)->width != calibration.width || (*pgm)->height != calibration.height)) {
-        return holoscan::make_unexpected(
-            failure("frame " + std::to_string(frame.frame) + ": an image is not " +
-                    std::to_string(calibration.width) + "x" + std::to_string(calibration.height)));
+      if (*pgm && ((*pgm)->width != width || (*pgm)->height != height)) {
+        return holoscan::make_unexpected(failure("frame " + std::to_string(frame.frame) +
+                                                 ": an image is not " + std::to_string(width) +
+                                                 "x" + std::to_string(height)));
       }
     }
     if (left_pixels_->max_value > 255 || right_pixels_->max_value > 255) {
@@ -344,14 +390,7 @@ holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
   const holoscan::EmitOptions emit{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U};
   bool blocked = false;
 
-  if (config_.geometry && (sent_ & kSentGeometry) == 0U) {
-    if (auto settled = settle(geometry.emit(sd::to_message(recording_geometry(calibration)), emit),
-                              kSentGeometry, sent_, blocked);
-        !settled || blocked) {
-      return settled;
-    }
-  }
-  const std::array<std::int64_t, 2> shape{calibration.height, calibration.width};
+  const std::array<std::int64_t, 2> shape{height, width};
   const auto send = [&](holoscan::Output<holoscan::schema::ImageT>& port, const Pgm& pgm,
                         bool sixteen,
                         std::uint32_t bit) -> holoscan::expected<void, holoscan::Error> {
@@ -378,12 +417,19 @@ holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
     }
     return settle(
         port.emit_tensor(std::move(*loan),
-                         image_descriptor(calibration.width, calibration.height,
+                         image_descriptor(width, height,
                                           sixteen ? holoscan::schema::ImageEncoding_MONO16
                                                   : holoscan::schema::ImageEncoding_MONO8),
                          emit),
         bit, sent_, blocked);
   };
+  if ((sent_ & kSentCameraInfo) == 0U) {
+    if (auto settled = settle(frame_camera_info_.send(stereo_camera_info, emit), kSentCameraInfo,
+                              sent_, blocked);
+        !settled || blocked) {
+      return settled;
+    }
+  }
   if (config_.depth && (sent_ & kSentDepth) == 0U) {
     if (auto sent = send(depth, *depth_pixels_, true, kSentDepth); !sent || blocked) {
       return sent;
@@ -401,8 +447,7 @@ holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
   }
   if (config_.view && (sent_ & kSentView) == 0U) {
     auto loan = view.allocate_tensor(holoscan::TensorLoanRequest{
-        .shape = std::array<std::int64_t, 3>{calibration.height, calibration.width, 3},
-        .dtype = kUInt8});
+        .shape = std::array<std::int64_t, 3>{height, width, 3}, .dtype = kUInt8});
     if (!loan) {
       return settle(holoscan::make_unexpected(std::move(loan).error()), kSentView, sent_, blocked);
     }
@@ -421,10 +466,9 @@ holoscan::expected<void, holoscan::Error> RecordingSourceOp::compute(
       return written;
     }
     if (auto settled =
-            settle(view.emit_tensor(std::move(*loan),
-                                    image_descriptor(calibration.width, calibration.height,
-                                                     holoscan::schema::ImageEncoding_RGB8),
-                                    emit),
+            settle(view.emit_tensor(
+                       std::move(*loan),
+                       image_descriptor(width, height, holoscan::schema::ImageEncoding_RGB8), emit),
                    kSentView, sent_, blocked);
         !settled || blocked) {
       return settled;

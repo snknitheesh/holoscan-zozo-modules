@@ -36,10 +36,9 @@ DisparityColorOp::DisparityColorOp(DisparityColorConfig config) : config_(std::m
   }
 }
 
-DisparityColorOp::~DisparityColorOp() { stop(); }
-
 void DisparityColorOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(disparity, "disparity").queue_depth(2U);
+  // The demo connects it with a depth-1 drop-oldest edge, which sets the queue.
+  spec.input(disparity, "disparity");
   const std::uint64_t bytes = static_cast<std::uint64_t>(config_.max_width) *
                               static_cast<std::uint64_t>(config_.max_height) * 4U;
   spec.output(image, "image")
@@ -63,14 +62,6 @@ holoscan::Contract DisparityColorOp::contract() const {
   holoscan::Contract result;
   result.trigger(holoscan::OnEach{disparity});
   return result;
-}
-
-void DisparityColorOp::stop() {
-  if (own_stream_ != nullptr) {
-    cudaStreamSynchronize(own_stream_);
-    cudaStreamDestroy(own_stream_);
-    own_stream_ = nullptr;
-  }
 }
 
 holoscan::expected<void, holoscan::Error> DisparityColorOp::compute(
@@ -100,21 +91,12 @@ holoscan::expected<void, holoscan::Error> DisparityColorOp::compute(
     return holoscan::make_unexpected(
         invalid("the disparity is larger than the configured maximum"));
   }
+  // The output is in device memory, so the runtime gives every activation a
+  // stream, and has ordered the disparity's producer before it.
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
-    if (own_stream_ == nullptr) {
-      if (cudaStreamCreateWithFlags(&own_stream_, cudaStreamNonBlocking) != cudaSuccess) {
-        own_stream_ = nullptr;
-        return holoscan::make_unexpected(
-            holoscan::Error{holoscan::ErrorCode::kFailure, "DisparityColorOp: cudaStreamCreate"});
-      }
-    }
-    stream = own_stream_;
-  }
-  if (tensor.has_readiness_stream_contract()) {
-    if (auto ready = tensor.synchronize_for_consumer_stream(stream); !ready) {
-      return holoscan::make_unexpected(std::move(ready).error());
-    }
+    return holoscan::make_unexpected(
+        holoscan::Error{holoscan::ErrorCode::kFailure, "DisparityColorOp: no CUDA stream"});
   }
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{height, width, 4}, .dtype = kUInt8});
@@ -132,9 +114,6 @@ holoscan::expected<void, holoscan::Error> DisparityColorOp::compute(
     return holoscan::make_unexpected(holoscan::Error{
         holoscan::ErrorCode::kFailure,
         std::string("DisparityColorOp: colorize_disparity: ") + cudaGetErrorString(status)});
-  }
-  if (stream == own_stream_) {
-    cudaStreamSynchronize(stream);
   }
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());

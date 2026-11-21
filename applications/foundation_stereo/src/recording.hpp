@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A small reader for stereo camera recordings, as the demo plays them: a
-// folder with calibration.json, index.csv, 8-bit PGM left and right images and
-// 16-bit PGM depth images (the format of the stereo-camera test recordings,
-// `$HOLOSCAN_TEST_DATA/stereo-camera/<clip>/`). Only what the demo needs is
-// read. No SDK, CUDA or GPU.
+// folder with the pair's ROS camera_info files left.yaml and right.yaml (and
+// depth.yaml when it has depth images), index.csv, 8-bit PGM left and right
+// images and 16-bit PGM depth images (the format of the local test
+// recordings, `$HOLOSCAN_TEST_DATA/stereo-camera/<clip>/`). Only what the
+// demo needs is read. No SDK, CUDA or GPU.
 
 #pragma once
 
@@ -15,22 +16,9 @@
 #include <string>
 #include <vector>
 
-namespace foundation_stereo_app {
+#include <holoscan/messages/camera_info.hpp>
 
-// What the demo takes from calibration.json.
-struct RecordingCalibration {
-  std::string camera;  // The camera's name and serial, for the log.
-  int width{};         // The eyes' size.
-  int height{};
-  double fx{};  // The left eye's, in pixels.
-  double cx{};  // The left eye's principal point.
-  double cy{};
-  double right_cx{};  // The right eye's principal point x.
-  double baseline{};  // Meters; the right eye sits this far to the left eye's right.
-  // The depth images, when the recording has them aligned with the left eye
-  // (the same size and intrinsics, no offset): meters per unit.
-  std::optional<double> depth_scale;
-};
+namespace foundation_stereo_app {
 
 struct RecordingFrame {
   std::uint64_t frame{};
@@ -41,19 +29,27 @@ struct RecordingFrame {
 
 struct Recording {
   std::filesystem::path folder;
-  RecordingCalibration calibration;
+  // The pair's camera_info files, and what they hold.
+  std::filesystem::path left_camera_info;
+  std::filesystem::path right_camera_info;
+  holoscan::messages::StereoCameraInfo camera_info;
+  // Whether the depth images are aligned with the left image: depth.yaml
+  // describes the left camera (the same size and intrinsics, no distortion).
+  bool depth_aligned{};
   std::vector<RecordingFrame> frames;
 };
 
-// Reads a recording's calibration and index; the images are read per frame.
+// Reads a recording's camera_info files and index; the images are read per
+// frame.
 // @throws std::runtime_error naming the file and what is wrong: a file that
-//         cannot be read or parsed, eyes that are not rectified, a right eye
-//         that is not to the left eye's right, or no frames.
+//         cannot be read or parsed, an image outside the folder (an absolute
+//         path or one through ..), or no frames.
 [[nodiscard]] Recording read_recording(const std::filesystem::path& folder);
 
-// The calibration from calibration.json's text.
-// @throws std::runtime_error as above.
-[[nodiscard]] RecordingCalibration parse_calibration(const std::string& json);
+// Whether a depth camera describes the left camera's pixels: the same size
+// and intrinsics, and no distortion.
+[[nodiscard]] bool same_pixels(const holoscan::messages::CameraInfo& depth,
+                               const holoscan::messages::CameraInfo& left);
 
 // An 8- or 16-bit binary PGM (P5); 16-bit samples are big-endian, as the
 // format says. Samples are returned as they are, widened to 16 bits.
