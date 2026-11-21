@@ -1,0 +1,44 @@
+holoscan-foundation-stereo
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-foundation-stereo uses the following NVIDIA software. It contains no
+Fast-FoundationStereo or FoundationStereo weights and no upstream code.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK, HoloInfer included; not
+redistributed.
+
+NVIDIA TensorRT and the CUDA Toolkit
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Under NVIDIA's licenses, installed with them. Used through the installed SDK and CUDA;
+not redistributed.
+
+THE MODELS ARE NOT PART OF THIS MODULE, AND THEIR LICENSES ARE NOT APACHE-2.0.
+tools/prepare_model.py (installed as share/holoscan-foundation-stereo/prepare_model.py)
+downloads or exports them on your machine:
+
+- C-Fast-FoundationStereo (https://huggingface.co/nvidia/c-fast-foundationstereo,
+  revision 53a84e28a368f37e699776250215fcb450d6a109), the default, which the script
+  downloads as an ONNX file, is governed by the NVIDIA Open Model Agreement
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/).
+  The agreement permits commercial use; its model card also calls the model "for research
+  and evaluation purposes only". If you distribute the model or a derivative of it, the
+  agreement asks you to include a copy of it and this attribution:
+  "Licensed by NVIDIA Corporation under the NVIDIA Open Model Agreement."
+
+- Fast-FoundationStereo (https://github.com/NVlabs/Fast-FoundationStereo, commit
+  476f4249561f7c79ca707326954f9255643412a6): its code and its research checkpoints are
+  Copyright (c) 2026-Present, NVIDIA Corporation & affiliates, under the NVIDIA License
+  in that repository's LICENSE.txt, which limits the work and any derivative works to
+  non-commercial use ("for research purposes only"). The script's export path runs that
+  code, which you clone or provide, with a Python environment you install yourself; a
+  model it exports from a research checkpoint, and possibly any model it exports with
+  that code, is subject to that license.
+
+FoundationStereo (https://github.com/NVlabs/FoundationStereo), the larger model
+Fast-FoundationStereo is distilled from, is not used.
+
+The terms that apply to a model you prepare, and to anything you build or distribute
+with it, are yours to review.

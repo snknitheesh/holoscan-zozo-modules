@@ -55,6 +55,11 @@ Other conventions:
 - Targets are exported in the `holoscan::` namespace, and code lives in `holoscan::<name>`.
 - The module's README covers its operators, requirements, build options, tests and the licenses of
   what it uses, and the module adds its row to the repository README.
+- A lossless graph, one whose every frame must arrive (`QueuePolicy::kBlocking` edges), runs on
+  one worker: its tests and its installed consumer call `graph.partition("<name>").include_all()`
+  and check that `plan.scheduler_plan().worker_count` is 1. Split across workers, a source runs
+  while its consumer's lossless queue is full, and its frame is refused; see
+  [Run a graph on one worker](messages/README.md#run-a-graph-on-one-worker).
 
 ## What the root build expects of a module
 

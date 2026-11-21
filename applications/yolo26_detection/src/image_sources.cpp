@@ -76,13 +76,16 @@ holoscan::schema::ImageEncoding encoding_of(PixelFormat format) {
   }
 }
 
-// What compute() returns after an emit: on success nothing more to do, the
-// frame is out; a consumer still busy with earlier frames makes the emit fail
-// with kBackpressured before anything is delivered, and the frame goes again
-// on the next tick; any other failure fails the run.
+// What compute() returns after an allocation or an emit: on success nothing
+// more to do, the frame is out. Consumers still busy with earlier frames make
+// an emit fail with kBackpressured before anything is delivered, or an
+// allocation with kResourceExhausted while every slot of the output's pool is
+// still held; the frame goes again on the next tick (the camera's is dropped).
+// Any other failure fails the run.
 Result settle(Result sent, bool& delivered) {
   delivered = static_cast<bool>(sent);
-  if (sent || sent.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (sent || sent.error().code == holoscan::ErrorCode::kBackpressured ||
+      sent.error().code == holoscan::ErrorCode::kResourceExhausted) {
     return {};
   }
   return sent;
@@ -157,7 +160,8 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{config_.height, config_.width, n}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool delivered = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), delivered);
   }
   if (config_.device_output) {
     cudaStream_t stream = context.cuda_stream().get();
@@ -272,7 +276,8 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{info.height, info.width, 3}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool delivered = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), delivered);
   }
   auto writer = loan->write(stream);
   if (!writer) {
@@ -517,13 +522,25 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
     }
   }
   // The frame's capture time on the graph's clock: now, less its age on the
-  // monotonic clock V4L2 stamps it with.
+  // monotonic clock V4L2 stamps it with. Both clocks are read together, the
+  // monotonic one either side of the graph's, so the age is measured from the
+  // same instant; a graph clock that cannot be read gives the activation time.
   holoscan::TimePoint captured = context.activation_time();
   if ((buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
-    timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    const std::int64_t age = (now.tv_sec - buffer.timestamp.tv_sec) * 1'000'000'000LL +
-                             (now.tv_nsec - buffer.timestamp.tv_usec * 1000LL);
+    const auto monotonic_ns = [] {
+      timespec now{};
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      return now.tv_sec * 1'000'000'000LL + now.tv_nsec;
+    };
+    const std::int64_t before = monotonic_ns();
+    const auto graph_now = context.clock().now();
+    const std::int64_t after = monotonic_ns();
+    if (graph_now) {
+      captured = *graph_now;
+    }
+    const std::int64_t read_at = graph_now ? before + (after - before) / 2 : before;
+    const std::int64_t age =
+        read_at - (buffer.timestamp.tv_sec * 1'000'000'000LL + buffer.timestamp.tv_usec * 1000LL);
     if (age > 0) {
       captured.timestamp_ns -= age;
     }

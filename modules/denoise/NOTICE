@@ -1,0 +1,28 @@
+holoscan-denoise
+Copyright (c) 2026 zozo
+Licensed under the Apache License, Version 2.0.
+
+holoscan-denoise uses the following software.
+
+Holoscan SDK (https://github.com/nvidia-holoscan/holoscan-sdk)
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Licensed under Apache-2.0. Linked from the installed SDK; not redistributed.
+
+NVIDIA VPI 4 (Vision Programming Interface), used by the optional vpi backend
+Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+Distributed by NVIDIA under its own license (the NVIDIA Software License Agreement).
+Linked from the installed library (libnvvpi4); not redistributed.
+
+The algorithms follow published work; the implementations are this module's own:
+
+- Exposure fusion: T. Mertens, J. Kautz and F. Van Reeth, "Exposure Fusion", Pacific
+  Graphics 2007, with the Laplacian pyramid of P. J. Burt and E. H. Adelson, "The
+  Laplacian Pyramid as a Compact Image Code", IEEE Transactions on Communications, 1983.
+- Tone mapping: E. Reinhard, M. Stark, P. Shirley and J. Ferwerda, "Photographic Tone
+  Reproduction for Digital Images", SIGGRAPH 2002 (the global operator).
+- Non-local means: A. Buades, B. Coll and J.-M. Morel, "A non-local algorithm for image
+  denoising", CVPR 2005.
+- Bilateral filter: C. Tomasi and R. Manduchi, "Bilateral Filtering for Gray and Color
+  Images", ICCV 1998.
+- Noise estimation: J. Immerkaer, "Fast Noise Variance Estimation", Computer Vision and
+  Image Understanding, 1996.
