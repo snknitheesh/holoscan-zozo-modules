@@ -44,10 +44,9 @@ The export follows the SAM 3 port in Hugging Face Transformers
 under Apache-2.0, which the tool calls in the user's environment; no code of it is
 copied here.
 
-SAM 3: Nicolas Carion, Laura Gustafson, Yuan-Ting Hu, Shoubhik Debnath, Ronghang Hu,
-Didac Suris, Chaitanya Ryali, Kalyan Vasudev Alwala, Haitham Khedr, Andrew Huang, et
-al. "SAM 3: Segment Anything with Concepts", arXiv:2511.16719, 2025.
-https://github.com/facebookresearch/sam3
+SAM 3 is described in "SAM 3: Segment Anything with Concepts", arXiv:2511.16719, 2025
+(https://arxiv.org/abs/2511.16719); its code is at https://github.com/facebookresearch/sam3.
+This acknowledges SAM as the SAM License asks of published work that uses it.
 
 The terms that apply to a model you export, and to anything you build or distribute
 with it, are yours to review.

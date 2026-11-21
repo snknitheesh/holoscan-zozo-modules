@@ -32,7 +32,7 @@ The [SAM 3 Segmentation demo](../../applications/sam3_segmentation/) runs both e
 | C++ namespace | `holoscan::sam3` |
 | Debian package | `holoscan-sam3` |
 | Model tool | `tools/prepare_model.py`, installed as `share/holoscan-sam3/prepare_model.py` |
-| Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## Operators
 
@@ -72,10 +72,17 @@ through a staging buffer, which the operator says once.
 | `cuda_graphs` | `true` | Let HoloInfer replay the inference as CUDA graphs |
 | `build_workspace_bytes` | 1 GiB | TensorRT's workspace limit while it builds an engine; SAM 3's FP32 encoder needs 4 GiB |
 
+The configuration is fixed when the operator is constructed: it has no parameters to set later
+(only the prompts change at run time, through `prompt_control`), and the constructor refuses an
+unusable one (`std::invalid_argument`, naming the field). The module has C++ only, no Python
+bindings. Its version follows semantic versioning for the source API, and the libraries' soname is
+its major version; build against the minor version you run with, as the configuration structs may
+gain fields.
+
 The constructor reads the prompt table and refuses a prompt whose text is not in it. Given ONNX
 files, HoloInfer builds TensorRT engines and caches them beside the files, named after the GPU, the
 TensorRT version and the settings, so later runs load them in seconds. Building SAM 3's engines
-takes under a minute on an RTX 5090 and about 8 minutes on a Jetson AGX Orin. The cache is not
+takes under a minute on an RTX 5090 and about 8 minutes on a Jetson Orin. The cache is not
 keyed on the files' contents: after exporting again, delete the `<name>.*.engine.*` files
 (`prepare_model.py` does). `start()` fails, naming the problem, when the encoder and decoder do
 not fit each other, the prompt table or the expected shapes.
@@ -344,7 +351,7 @@ SAM 3 segments real scenes, for which see the SAM 3 paper.
 SAM 3 at 1008x1008, measured with SDK 5.0.0, CUDA 13.2 and TensorRT 10.16 in the repository's CI
 image:
 
-| | RTX 5090 (x86_64) | Jetson AGX Orin (JetPack 7.2) |
+| | RTX 5090 (x86_64) | Jetson Orin (JetPack 7.2) |
 | --- | --- | --- |
 | Encoder, TensorRT alone, FP16 (`trtexec`, median) | 19.7 ms | 279 ms |
 | Decoder, per prompt, FP16 | 3.2 ms | 33 ms |
@@ -354,18 +361,19 @@ image:
 | The same, three prompts, FP32 | 142 ms | not measured |
 | GPU memory of a run, FP16 (FP32) | 1.6 GiB (7.3 GiB) | 1.0 to 2.3 GiB |
 
-**On a Jetson AGX Orin, SAM 3 runs at about 3 images per second.** The encoder, a ViT of about
+**On a Jetson Orin, SAM 3 runs at about 3 images per second.** The encoder, a ViT of about
 450 M parameters at 1008x1008, takes 279 ms in FP16, and each prompt 33 ms more; that suits
 occasional or offline segmentation there, not a live camera. On the RTX 5090 it runs at over 30
 images per second with a few prompts.
 
-The RTX 5090 was shared with an inference server while measured; the Orin was otherwise idle. The
-GPU memory is the drop in free memory during a run: the engines' weights (about 0.9 GiB in FP16),
-their activations (about 170 MiB each in FP16, 3.5 GiB for the FP32 encoder), and the operators'
-buffers. On the Orin, whose GPU shares the system's memory, it moves with everything else running,
-hence the range. Building the FP16 engines takes under a minute on the RTX 5090 and about 8 minutes
-on the Orin. On Jetson Thor, CI runs the stub model only, as no model is downloaded there; SAM 3's
-latency on Thor is not measured.
+The RTX 5090 was shared with an inference server while measured; the Jetson Orin was otherwise idle.
+The GPU memory is the drop in free memory during a run: the engines' weights (about 0.9 GiB in
+FP16), their activations (about 170 MiB each in FP16, 3.5 GiB for the FP32 encoder), and the
+operators' buffers. On the Jetson Orin, whose GPU shares the system's memory, it moves with
+everything else running, hence the range. Building the FP16 engines takes under a minute on the RTX
+5090 and about 8 minutes on the Jetson Orin. Every CI lane (RTX 5090, Jetson Thor and Jetson Orin)
+runs the stub model only, as no model is downloaded there; the numbers above were measured by hand,
+and SAM 3's latency on Jetson Thor is not measured.
 
 ## Toward tracking
 

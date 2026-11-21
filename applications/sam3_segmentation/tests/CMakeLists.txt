@@ -243,7 +243,7 @@ set_tests_properties(
 # The real SAM 3 on the synthetic scene: each prompt's best instance must cover its shape
 # with an IoU of at least 0.9, by text and by an exemplar box, and rendered offscreen.
 # Skipped (exit 77) unless prepare_model.py has written the export. The first run builds
-# and caches the engines, which takes minutes, and longer on a Jetson.
+# and caches the engines, which takes minutes, and longer on Jetson Orin and Jetson Thor.
 set(_model "${SAM3_SEGMENTATION_DATA_DIR}")
 function(sam3_real_test name output)
   add_test(

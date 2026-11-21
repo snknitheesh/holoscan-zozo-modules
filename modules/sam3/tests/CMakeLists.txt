@@ -37,7 +37,7 @@ add_test(
 )
 set_tests_properties(sam3_kernels sam3_operators PROPERTIES LABELS "sam3;gpu" TIMEOUT 900)
 # The engines are built beside the models, once per GPU and TensorRT version, which
-# takes minutes, and longer on a Jetson.
+# takes minutes, and longer on Jetson Orin and Jetson Thor.
 add_test(NAME sam3_real_model COMMAND sam3_real_model_test "${HOLOSCAN_SAM3_MODEL_DIR}")
 set_tests_properties(
   sam3_real_model
