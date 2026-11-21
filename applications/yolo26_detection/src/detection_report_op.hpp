@@ -2,17 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // DetectionReportOp: the application's sink. It takes each image's
-// detections from Yolo26DetectionOp, checks that frame ids run 1, 2, 3, ...
-// without a gap (in real time, that they go up), measures the time from
-// capture to detections on the host, and then, depending on the input:
+// detections from Yolo26DetectionOp, or detections and masks from
+// Yolo26SegmentationOp, checks that frame ids run 1, 2, 3, ... without a gap
+// (in real time, that they go up), measures the time from capture to
+// detections on the host, and then, depending on the input:
 //
 // - synthetic frames with the stub model: checks the detections against the
-//   frame's known ones;
-// - image files: prints each file's detections the first time it is seen,
-//   and checks the expected detections listed for it, if any.
+//   frame's known ones, and each mask against its rectangle and the label
+//   image against the masks;
+// - image files: prints each file's detections (and the size of each mask)
+//   the first time it is seen, and checks the expected detections listed for
+//   it, if any.
 //
-// It optionally takes the image too, to write it with its boxes drawn as a
-// PPM file, and asks the run to complete after its expected frames.
+// It optionally takes the image too, to write it with its boxes (and masks)
+// drawn as a PPM file, and asks the run to complete after its expected
+// frames.
 
 #pragma once
 
@@ -66,6 +70,13 @@ struct DetectionReport {
   std::uint64_t missed{};
   std::uint64_t extra{};
   float max_edge_error{};
+  // Segmentation against synthetic truth: masks that do not match their
+  // rectangle, the smallest mask IoU, and label image pixels that disagree
+  // with the masks.
+  bool masks_verified{};
+  std::uint64_t mask_misses{};
+  float min_mask_iou{1.0F};
+  std::uint64_t label_errors{};
   // Expected detections of image files, and how many were found.
   std::uint64_t expected{};
   std::uint64_t matched{};
@@ -74,7 +85,8 @@ struct DetectionReport {
   std::vector<double> latencies_ms;
 
   [[nodiscard]] bool passed() const noexcept {
-    return frame_gaps == 0 && (!verified || (missed == 0 && extra == 0)) && matched == expected;
+    return frame_gaps == 0 && (!verified || (missed == 0 && extra == 0)) &&
+           (!masks_verified || (mask_misses == 0 && label_errors == 0)) && matched == expected;
   }
 };
 
@@ -101,6 +113,8 @@ struct DetectionReportConfig {
   std::chrono::nanoseconds delay{};
   // The detector's capacity: the length of its outputs.
   int max_detections{300};
+  // Take Yolo26SegmentationOp's masks and label image too.
+  bool segmentation{false};
   // Check synthetic frames against their known detections.
   std::optional<SyntheticTruth> truth;
   // The images of a file source, frame f being files[(f - 1) % size]: named
@@ -134,8 +148,21 @@ class DetectionReportOp final : public holoscan::Operator<> {
   holoscan::Input<holoscan::Tensor> class_ids;
   holoscan::Input<holoscan::Tensor> count;
   holoscan::Input<holoscan::schema::ImageT> image;
+  // With `segmentation`.
+  holoscan::Input<holoscan::Tensor> masks;
+  holoscan::Input<holoscan::Tensor> label_image;
 
  private:
+  struct Masks {
+    int width{};
+    int height{};
+    std::vector<std::uint8_t> masks;
+    std::vector<std::int32_t> labels;
+  };
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> fetch_masks(
+      holoscan::ExecutionContext& context, const holoscan::Tensor& masks_tensor,
+      const holoscan::Tensor& labels_tensor, std::size_t detections);
+  void check_masks(const SyntheticScene& scene, const std::vector<BoxDetection>& detections);
   [[nodiscard]] holoscan::expected<void, holoscan::Error> process(
       holoscan::ExecutionContext& context);
   [[nodiscard]] holoscan::expected<void, holoscan::Error> write_image(
@@ -150,6 +177,8 @@ class DetectionReportOp final : public holoscan::Operator<> {
   std::vector<float> scores_;
   std::vector<std::int32_t> class_ids_;
   std::vector<std::uint8_t> pixels_;
+  // This frame's masks on the host, when something needs them.
+  std::optional<Masks> masks_;
 };
 
 }  // namespace yolo26_app

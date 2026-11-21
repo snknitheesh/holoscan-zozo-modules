@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare an end-to-end YOLO26 ONNX model for holoscan-yolo26's Yolo26DetectionOp.
+"""Prepare an end-to-end YOLO26 ONNX model for holoscan-yolo26's operators.
 
 The YOLO26 weights and the Ultralytics exporter are licensed under AGPL-3.0 and
 are not part of holoscan-yolo26 or its repository. This script downloads pinned
@@ -10,7 +10,10 @@ weights and checks their SHA-256 digest, runs the separately installed Ultralyti
 command to export them to ONNX with the NMS-free head, checks the export, and
 writes into the output directory:
 
-- <model>.onnx: input float32 [1, 3, S, S], output float32 [1, N, 6];
+- <model>.onnx: input float32 [1, 3, S, S]; for detection (--task detect, the
+  yolo26n..x models, for Yolo26DetectionOp), output float32 [1, N, 6]; for
+  instance segmentation (--task segment, the yolo26n-seg..x-seg models, for
+  Yolo26SegmentationOp), outputs float32 [1, N, 6 + M] and [1, M, S/4, S/4];
 - <model>.labels.txt: the class names, one per line;
 - images/000000039769.jpg: a COCO validation image, for the demo and its tests
   (skipped with --no-samples).
@@ -41,7 +44,14 @@ WEIGHTS_SHA256 = {
     "yolo26m": "401cea9ab23ad19246ff7744859816bc599f350e93c9dd30367b6f0a0745d0b7",
     "yolo26l": "9fe3c544f2b19bebad7ea41e76d7ad3d88b7c2f10d11d24430c5311f6b32db26",
     "yolo26x": "9fdd44a31c504547ffb81d2c6d9e6dac3493c8eaa8b0398d3f43bae6c7003e92",
+    "yolo26n-seg": "361fbfabab285c3237700b6bb91d7ecfa602cd945fffda8dbe1242829b71e73f",
+    "yolo26s-seg": "3da1d83e31caec96f9300eb4064f4f62882c133c7c264d63dfe61a7c197837a4",
+    "yolo26m-seg": "16b636f04e8fb6a325b3370f22dc5e5535ff473e384f4d041fd28d788f6ee9f5",
+    "yolo26l-seg": "636024306410afa1732692322fba57d22ea2b1c2f07613fcee131a93d7dd380c",
+    "yolo26x-seg": "92b3de0065766a17180d6219858717dc9d03cdce8a3ca9576c97fd75aabb64f3",
 }
+SEGMENTATION_SUFFIX = "-seg"
+DEFAULT_MODELS = {"detect": "yolo26n", "segment": "yolo26n-seg"}
 SAMPLE_IMAGES = {
     "000000039769.jpg": (
         "https://s3.amazonaws.com/images.cocodataset.org/val2017/000000039769.jpg",
@@ -49,6 +59,8 @@ SAMPLE_IMAGES = {
     ),
 }
 DOWNLOAD_TIMEOUT_SECONDS = 120
+# Yolo26SegmentationOp's limit on mask coefficients.
+MAX_MASK_CHANNELS = 64
 
 
 class PreparationError(RuntimeError):
@@ -57,10 +69,10 @@ class PreparationError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelInfo:
-    """What the operator needs to know about an exported model."""
+    """What the operators need to know about an exported model."""
 
     input_shape: list[int]
-    output_shape: list[int]
+    output_shapes: list[list[int]]
     names: list[str]
 
 
@@ -142,8 +154,8 @@ def read_model_info(path: Path) -> ModelInfo:
     initializers = {_string(tensor, 8) for tensor in _messages(graph, 5)}
     inputs = [v for v in _messages(graph, 11) if _string(v, 1) not in initializers]
     outputs = _messages(graph, 12)
-    if len(inputs) != 1 or len(outputs) != 1:
-        raise PreparationError(f"{path}: expected one input and one output")
+    if len(inputs) != 1 or len(outputs) not in (1, 2):
+        raise PreparationError(f"{path}: expected one input and one or two outputs")
     metadata = {}
     for entry in _messages(data, 14):
         metadata[_string(entry, 1)] = _string(entry, 2)
@@ -156,19 +168,45 @@ def read_model_info(path: Path) -> ModelInfo:
         if not isinstance(parsed, dict) or sorted(parsed) != list(range(len(parsed))):
             raise PreparationError(f"{path}: class names are not numbered 0..N-1")
         names = [str(parsed[i]) for i in range(len(parsed))]
-    return ModelInfo(_shape(inputs[0]), _shape(outputs[0]), names)
+    return ModelInfo(_shape(inputs[0]), [_shape(output) for output in outputs], names)
 
 
-def check_model(info: ModelInfo, imgsz: int) -> None:
-    """Reject a model the operator cannot run."""
+def check_model(info: ModelInfo, imgsz: int, task: str = "detect") -> None:
+    """Reject a model the task's operator cannot run."""
     if info.input_shape != [1, 3, imgsz, imgsz]:
         raise PreparationError(f"the model takes {info.input_shape}, not [1, 3, {imgsz}, {imgsz}]")
-    shape = info.output_shape
-    if len(shape) != 3 or shape[0] != 1 or shape[1] < 1 or shape[2] != 6:
+    shapes = info.output_shapes
+    if task == "detect":
+        if len(shapes) != 1 or not _is_rows(shapes[0]) or shapes[0][2] != 6:
+            raise PreparationError(
+                f"the model gives {_text(shapes)}, not end-to-end detections [1, N, 6]; "
+                "export it with nms=False (a segmentation model needs --task segment)"
+            )
+        return
+    side = imgsz // 4
+    rows = next((shape for shape in shapes if len(shape) == 3), [])
+    protos = next((shape for shape in shapes if len(shape) == 4), [])
+    channels = rows[2] - 6 if len(rows) == 3 else 0
+    if (
+        len(shapes) != 2
+        or not _is_rows(rows)
+        or channels < 1
+        or channels > MAX_MASK_CHANNELS
+        or protos != [1, channels, side, side]
+    ):
         raise PreparationError(
-            f"the model gives {shape}, not end-to-end detections [1, N, 6]; "
-            "export it with nms=False"
+            f"the model gives {_text(shapes)}, not end-to-end detections with M mask "
+            f"coefficients [1, N, 6 + M] and prototype masks [1, M, {side}, {side}]; export a "
+            "YOLO26 segmentation model (yolo26n-seg) with nms=False"
         )
+
+
+def _is_rows(shape: list[int]) -> bool:
+    return len(shape) == 3 and shape[0] == 1 and shape[1] >= 1
+
+
+def _text(shapes: list[list[int]]) -> str:
+    return " and ".join(str(shape) for shape in shapes)
 
 
 def sha256_of(path: Path) -> str:
@@ -232,16 +270,23 @@ def prepare_samples(output: Path) -> None:
 def parse_arguments(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export an end-to-end YOLO26 model to ONNX with the separately installed "
-            "Ultralytics command-line tool, and download a sample image."
+            "Export an end-to-end YOLO26 detection or segmentation model to ONNX with the "
+            "separately installed Ultralytics command-line tool, and download a sample image."
         )
     )
     parser.add_argument("--output", type=Path, required=True, help="destination directory")
     parser.add_argument(
+        "--task",
+        choices=sorted(DEFAULT_MODELS),
+        help=(
+            "detect, for Yolo26DetectionOp, or segment, for Yolo26SegmentationOp "
+            "(default: segment for a -seg model, otherwise detect)"
+        ),
+    )
+    parser.add_argument(
         "--model",
         choices=sorted(WEIGHTS_SHA256),
-        default="yolo26n",
-        help="pinned weights to download and export (default: yolo26n)",
+        help="pinned weights to download and export (default: yolo26n, or yolo26n-seg to segment)",
     )
     parser.add_argument(
         "--weights",
@@ -257,18 +302,32 @@ def parse_arguments(arguments: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(arguments)
 
 
+def resolve_task(arguments: argparse.Namespace) -> tuple[str, str]:
+    """The task, and the pinned model to download unless --weights is given."""
+    segmentation_model = (arguments.model or "").endswith(SEGMENTATION_SUFFIX)
+    task = arguments.task or ("segment" if segmentation_model else "detect")
+    if arguments.model and segmentation_model != (task == "segment"):
+        raise PreparationError(
+            f"--model {arguments.model} is "
+            + ("a segmentation" if segmentation_model else "a detection")
+            + f" model, not one for --task {task}"
+        )
+    return task, arguments.model or DEFAULT_MODELS[task]
+
+
 def prepare(arguments: argparse.Namespace) -> Path:
     """Prepare the model and samples; return the ONNX path."""
     if arguments.imgsz < 32 or arguments.imgsz > 4096 or arguments.imgsz % 32 != 0:
         raise PreparationError("--imgsz must be a multiple of 32 in 32..4096")
-    stem = arguments.weights.stem if arguments.weights else arguments.model
+    task, model = resolve_task(arguments)
+    stem = arguments.weights.stem if arguments.weights else model
     output: Path = arguments.output
     output.mkdir(parents=True, exist_ok=True)
     onnx = output / f"{stem}.onnx"
     labels = output / f"{stem}.labels.txt"
     reuse = onnx.is_file() and labels.is_file() and not arguments.force
     if reuse:
-        check_model(read_model_info(onnx), arguments.imgsz)
+        check_model(read_model_info(onnx), arguments.imgsz, task)
         print(f"prepare_model: {onnx} exists; pass --force to export it again", flush=True)
     else:
         yolo = shutil.which(arguments.yolo)
@@ -291,7 +350,7 @@ def prepare(arguments: argparse.Namespace) -> Path:
                 download(url, WEIGHTS_SHA256[stem], weights)
             exported = export(yolo, weights, arguments.imgsz, workdir)
             info = read_model_info(exported)
-            check_model(info, arguments.imgsz)
+            check_model(info, arguments.imgsz, task)
             if not info.names:
                 raise PreparationError("the export has no class names")
             # A TensorRT engine cached for an earlier export of the same name

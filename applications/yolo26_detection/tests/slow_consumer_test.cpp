@@ -9,19 +9,31 @@
 // must get the newest detections, each matching its own frame, ending with
 // the last frame's.
 //
+// The same with the stub segmentation model's Yolo26SegmentationOp, whose six
+// outputs, masks and label image included, go to the reporter over the same
+// edges: a plan that joins them must compile and run, and every mask the
+// reporter takes must be its own frame's.
+//
 // The checks count frames rather than time them: the source's period and the
 // reporter's delay are ten to one, the bounds two or three to one.
 //
-// Usage: yolo26_slow_consumer_test, in the folder where the stub model's
-// engine is cached.
+// The graph is the camera's real-time one, on the automatic partitioning, not
+// on one worker: there the reporter's 200 ms would hold back the detector too,
+// which is what the drop-oldest edges are there to prevent. Its one blocking
+// edge, to the counter, holds every frame of the run, so it never refuses one.
+//
+// Usage: yolo26_slow_consumer_test, in the folder where the stub models'
+// engines are cached.
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
@@ -38,6 +50,7 @@
 #include <holoscan/time/realtime_clock.hpp>
 #include <holoscan/yolo26/stub_model.hpp>
 #include <holoscan/yolo26/yolo26_detection_op.hpp>
+#include <holoscan/yolo26/yolo26_segmentation_op.hpp>
 
 #include "detection_report_op.hpp"
 #include "edges.hpp"
@@ -98,38 +111,61 @@ class CountingSinkOp final : public holoscan::Operator<> {
   std::shared_ptr<Counted> counted_;
 };
 
-void check_slow_consumer() {
+void check_slow_consumer(bool segment) {
   holoscan::Graph graph{"slow_consumer"};
   auto source = graph.op<SyntheticImageSourceOp>(
       "source", SyntheticImageSourceConfig{
                     .width = kWidth, .height = kHeight, .count = kFrames, .period = kPeriod});
-  const y26::Yolo26DetectionConfig detection{
-      .model = y26::write_stub_model(std::filesystem::current_path(), kInputSize),
-      .input_size = kInputSize,
-      .num_classes = y26::kStubClasses};
-  auto detector = graph.op<y26::Yolo26DetectionOp>("detector", detection);
   auto report = std::make_shared<DetectionReport>();
-  auto reporter = graph.op<DetectionReportOp>(
-      "report",
-      DetectionReportConfig{
-          .report = report,
-          .expected_frames = kFrames,
-          .realtime = true,
-          .delay = kSlow,
-          .truth = SyntheticTruth{.width = kWidth, .height = kHeight, .input_size = kInputSize}});
+  const auto reporter_config = [&](int capacity) {
+    return DetectionReportConfig{
+        .report = report,
+        .expected_frames = kFrames,
+        .realtime = true,
+        .delay = kSlow,
+        .max_detections = capacity,
+        .segmentation = segment,
+        .truth = SyntheticTruth{.width = kWidth, .height = kHeight, .input_size = kInputSize}};
+  };
   auto counted = std::make_shared<Counted>();
   auto counter = graph.op<CountingSinkOp>("counter", counted);
-
+  const holoscan::ConnectionOptions every_frame{.queue_policy = holoscan::QueuePolicy::kBlocking,
+                                                .queue_depth = kFrames};
+  std::vector<const char*> ports{"boxes", "scores", "class_ids", "count"};
   // The demo's real-time edges, as for the camera.
-  graph.add_flow(source->image, detector->image, newest());
-  connect_detections(graph, detector, reporter, newest());
-  graph.add_flow(detector->count, counter->count,
-                 holoscan::ConnectionOptions{.queue_policy = holoscan::QueuePolicy::kBlocking,
-                                             .queue_depth = kFrames});
+  std::function<void()> prepare;
+  if (segment) {
+    const y26::Yolo26SegmentationConfig config{
+        .model = y26::write_stub_segmentation_model(std::filesystem::current_path(), kInputSize),
+        .input_size = kInputSize,
+        .num_classes = y26::kStubClasses,
+        .max_image_width = kWidth,
+        .max_image_height = kHeight};
+    auto detector = graph.op<y26::Yolo26SegmentationOp>("detector", config);
+    auto reporter = graph.op<DetectionReportOp>("report", reporter_config(config.max_detections));
+    graph.add_flow(source->image, detector->image, newest());
+    connect_detections(graph, detector, reporter, newest());
+    graph.add_flow(detector->masks, reporter->masks, newest());
+    graph.add_flow(detector->label_image, reporter->label_image, newest());
+    graph.add_flow(detector->count, counter->count, every_frame);
+    ports.insert(ports.end(), {"masks", "label_image"});
+    prepare = [config] { y26::prepare_engine(config); };
+  } else {
+    const y26::Yolo26DetectionConfig config{
+        .model = y26::write_stub_model(std::filesystem::current_path(), kInputSize),
+        .input_size = kInputSize,
+        .num_classes = y26::kStubClasses};
+    auto detector = graph.op<y26::Yolo26DetectionOp>("detector", config);
+    auto reporter = graph.op<DetectionReportOp>("report", reporter_config(config.max_detections));
+    graph.add_flow(source->image, detector->image, newest());
+    connect_detections(graph, detector, reporter, newest());
+    graph.add_flow(detector->count, counter->count, every_frame);
+    prepare = [config] { y26::prepare_engine(config); };
+  }
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   holoscan::CompileOptions options;
-  for (const char* port : {"boxes", "scores", "class_ids", "count"}) {
+  for (const char* port : ports) {
     options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
         .operator_path = "detector", .output_port = port, .device = holoscan::DeviceId{0}});
   }
@@ -140,7 +176,7 @@ void check_slow_consumer() {
   if (!plan.ok()) {
     return;
   }
-  y26::prepare_engine(detection);
+  prepare();
   // Caller-managed signals: a test process leaves SIGINT and SIGTERM alone.
   auto session = holoscan::run_async(plan);
   session.wait();
@@ -170,11 +206,18 @@ void check_slow_consumer() {
   VERIFY(report->frame_gaps == 0 && report->last_frame_id == kFrames &&
          reported + report->skipped == kFrames);
   // Every set it took was one frame's own detections, all four outputs of
-  // the same frame.
+  // the same frame, and when segmenting, its own masks and label image.
   VERIFY(report->verified && report->missed == 0 && report->extra == 0);
+  if (segment) {
+    VERIFY(report->masks_verified && report->mask_misses == 0 && report->label_errors == 0);
+  }
 }
 
 }  // namespace
 }  // namespace yolo26_app
 
-int main() { return yolo26_app::test::run({{"slow_consumer", yolo26_app::check_slow_consumer}}); }
+int main() {
+  return yolo26_app::test::run(
+      {{"slow_consumer", [] { yolo26_app::check_slow_consumer(false); }},
+       {"slow_consumer_segment", [] { yolo26_app::check_slow_consumer(true); }}});
+}

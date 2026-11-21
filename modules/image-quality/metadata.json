@@ -1,0 +1,66 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-image-quality",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Per-frame image quality checks on the GPU, to flag frames downstream perception should not trust: blur and focus (variance of the Laplacian and Tenengrad, globally and per tile), exposure (luma mean, percentiles, clipped fractions, dynamic range), noise (MAD of a high-pass over flat pixels), frozen frames (hash and mean difference), lens obstruction (low-texture tiles over time) and color cast (gray world), as a metrics tensor, a flags bitfield, per-tile values and a HoloViz tile overlay.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::image_quality"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Image Quality",
+      "Camera Health",
+      "Monitoring",
+      "CUDA"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/image-quality",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "ImageQualityOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        }
+      ]
+    },
+    "dependencies": [],
+    "binary_packages": {
+      "debian": "holoscan-image-quality",
+      "install_commands": [
+        "sudo apt install ./holoscan-image-quality_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
