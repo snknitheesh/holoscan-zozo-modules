@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
@@ -23,6 +22,7 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/mono_depth/synthetic_scene.hpp>
 // clang-format groups these Linux headers with the SDK's; cpplint wants them first.
 #include <linux/videodev2.h>  // NOLINT(build/include_order)
@@ -79,22 +79,25 @@ holoscan::schema::ImageEncoding encoding_of(PixelFormat format) {
   }
 }
 
-// What compute() returns after an emit: on success nothing more to do, the
-// frame is out; a consumer still busy with earlier frames makes the emit fail
-// with kBackpressured before anything is delivered, and the frame goes again
-// on the next tick; any other failure fails the run.
+// Whether `error` says the consumers are still busy with earlier frames: an
+// emit fails with kBackpressured before anything is delivered, and an
+// allocation with kResourceExhausted while every slot of the output's pool is
+// still held, by frames the consumers have not finished with or by a frame
+// they refused.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
+}
+
+// What compute() returns after allocating and sending a frame: on success
+// nothing more to do, the frame is out; when the consumers are busy, the frame
+// goes again on the next tick; any other failure fails the run.
 Result settle(Result sent, bool& delivered) {
   delivered = static_cast<bool>(sent);
-  if (sent || sent.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (sent || consumers_busy(sent.error())) {
     return {};
   }
   return sent;
-}
-
-// Whether every frame out so far is done downstream, or nobody counts them.
-bool previous_done(const std::shared_ptr<const std::atomic<std::uint32_t>>& done,
-                   std::uint32_t emitted) {
-  return !done || done->load(std::memory_order_acquire) >= emitted;
 }
 
 holoscan::schema::ImageT descriptor(int width, int height, PixelFormat format) {
@@ -146,9 +149,6 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the run completes.
   }
-  if (!previous_done(config_.done, emitted_)) {
-    return {};  // Try again on the next tick.
-  }
   const int n = channels(config_.format);
   const std::size_t pitch = static_cast<std::size_t>(config_.width) * static_cast<std::size_t>(n);
   // A still scene is drawn once. The frame is captured when it is drawn,
@@ -166,7 +166,8 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{config_.height, config_.width, n}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool unused = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), unused);
   }
   if (config_.device_output) {
     cudaStream_t stream = context.cuda_stream().get();
@@ -180,6 +181,12 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
     }
     // From pageable memory the copy is staged before it returns, so the
     // pixels may change afterwards.
+    if (!copy_logged_) {
+      copy_logged_ = true;
+      HOLOSCAN_LOG_INFO(
+          "SyntheticImageSourceOp: each frame is drawn on the CPU and copied to the GPU from "
+          "pageable memory, a copy that waits until the driver has staged it");
+    }
     if (const cudaError_t status = cudaMemcpyAsync(writer->data_as<std::uint8_t>(), pixels_.data(),
                                                    pixels_.size(), cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
@@ -225,19 +232,29 @@ void validate_config(const ImageFileSourceConfig& config) {
   if (!config.loop && config.count > config.files.size()) {
     throw std::invalid_argument("--count exceeds the number of images; add --loop true");
   }
+  if (config.infos.size() != config.files.size()) {
+    throw std::invalid_argument("the file source needs each file's info (read_image_info())");
+  }
+  for (const ImageFileInfo& info : config.infos) {
+    if (info.width < 1 || info.height < 1 || info.width > kMaxImageSide ||
+        info.height > kMaxImageSide) {
+      throw std::invalid_argument("the file source's images must be 1.." +
+                                  std::to_string(kMaxImageSide) + " pixels a side");
+    }
+  }
 }
 
 ImageFileSourceOp::ImageFileSourceOp(ImageFileSourceConfig config) : config_(std::move(config)) {
   validate_config(config_);
-  for (const auto& file : config_.files) {
-    infos_.push_back(read_image_info(file));
-    max_bytes_ = std::max<std::uint64_t>(
-        max_bytes_, static_cast<std::uint64_t>(infos_.back().width) * infos_.back().height * 3U);
+  infos_ = config_.infos;
+  for (const ImageFileInfo& info : infos_) {
+    max_bytes_ = std::max<std::uint64_t>(max_bytes_,
+                                         static_cast<std::uint64_t>(info.width) * info.height * 3U);
   }
   total_ = config_.count == 0 ? static_cast<std::uint32_t>(config_.files.size()) : config_.count;
 }
 
-ImageFileSourceOp::~ImageFileSourceOp() = default;
+ImageFileSourceOp::~ImageFileSourceOp() { stop(); }
 
 void ImageFileSourceOp::setup(holoscan::OperatorSpec& spec) {
   spec.output(image, "image")
@@ -252,19 +269,40 @@ holoscan::Contract ImageFileSourceOp::contract() const {
 }
 
 void ImageFileSourceOp::start() {
+  stop();
   emitted_ = 0;
   pending_capture_.reset();
+  const bool any_jpeg = std::any_of(infos_.begin(), infos_.end(), [](const ImageFileInfo& info) {
+    return info.kind == ImageFileKind::kJpeg;
+  });
+  if (any_jpeg) {
+    decoder_ = std::make_unique<JpegDecoder>();
+    if (const cudaError_t status = cudaEventCreateWithFlags(&decoded_, cudaEventDisableTiming);
+        status != cudaSuccess) {
+      decoded_ = nullptr;
+      HOLOSCAN_LOG_ERROR("ImageFileSourceOp: cudaEventCreateWithFlags: {}",
+                         cudaGetErrorString(status));
+      throw std::runtime_error(std::string("ImageFileSourceOp: cudaEventCreateWithFlags: ") +
+                               cudaGetErrorString(status));
+    }
+  }
 }
 
-void ImageFileSourceOp::stop() { decoder_.reset(); }
+void ImageFileSourceOp::stop() {
+  // The last decode may still read the bytes it was given.
+  if (decoded_ != nullptr) {
+    cudaEventSynchronize(decoded_);
+    cudaEventDestroy(decoded_);
+    decoded_ = nullptr;
+  }
+  jpeg_.clear();
+  decoder_.reset();
+}
 
 holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= total_) {
     return {};
-  }
-  if (!previous_done(config_.done, emitted_)) {
-    return {};  // Try again on the next tick.
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
@@ -281,7 +319,8 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{info.height, info.width, 3}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool unused = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), unused);
   }
   auto writer = loan->write(stream);
   if (!writer) {
@@ -290,17 +329,28 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
   const std::size_t pitch = static_cast<std::size_t>(info.width) * 3U;
   try {
     if (info.kind == ImageFileKind::kJpeg) {
-      if (!decoder_) {
-        decoder_ = std::make_unique<JpegDecoder>();
+      if (!decoder_ || decoded_ == nullptr) {
+        return holoscan::make_unexpected(failure("ImageFileSourceOp: not started"));
       }
-      const std::vector<std::uint8_t> bytes = read_file(path);
-      const std::string error = decoder_->decode(bytes, info.width, info.height, config_.bgr,
+      // The previous decode may still read the bytes: wait for it (long done
+      // by now, a period later) before they are replaced.
+      if (!jpeg_logged_) {
+        jpeg_logged_ = true;
+        HOLOSCAN_LOG_INFO(
+            "ImageFileSourceOp: JPEG files are decoded on the GPU; each frame waits for the "
+            "previous decode before reading the next file");
+      }
+      if (const cudaError_t status = cudaEventSynchronize(decoded_); status != cudaSuccess) {
+        return holoscan::make_unexpected(
+            failure(path.string() + ": " + cudaGetErrorString(status)));
+      }
+      jpeg_ = read_file(path);
+      const std::string error = decoder_->decode(jpeg_, info.width, info.height, config_.bgr,
                                                  writer->data_as<std::uint8_t>(), pitch, stream);
       if (!error.empty()) {
         return holoscan::make_unexpected(failure(path.string() + ": " + error));
       }
-      // The decoder may still read `bytes`; wait before they go.
-      if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      if (const cudaError_t status = cudaEventRecord(decoded_, stream); status != cudaSuccess) {
         return holoscan::make_unexpected(
             failure(path.string() + ": " + cudaGetErrorString(status)));
       }
@@ -317,6 +367,12 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
         }
       }
       // Copied from pageable memory: staged before the call returns.
+      if (!ppm_logged_) {
+        ppm_logged_ = true;
+        HOLOSCAN_LOG_INFO(
+            "ImageFileSourceOp: PPM files are read on the CPU and copied to the GPU from pageable "
+            "memory, a copy that waits until the driver has staged it");
+      }
       if (const cudaError_t status = cudaMemcpyAsync(writer->data_as<std::uint8_t>(), rgb.data(),
                                                      rgb.size(), cudaMemcpyHostToDevice, stream);
           status != cudaSuccess) {
@@ -460,14 +516,28 @@ holoscan::Contract CameraSourceOp::contract() const {
 
 void CameraSourceOp::start() {
   release();
-  fd_ = open_camera(config_, pitch_);
-  emitted_ = 0;
+  // Every failure is logged with its cause before it is thrown.
+  const auto fail = [this](const std::string& what) {
+    const std::string message =
+        "CameraSourceOp: " + config_.device.string() + ": " + what + ": " + std::strerror(errno);
+    HOLOSCAN_LOG_ERROR("{}", message);
+    release();
+    throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, message};
+  };
+  try {
+    fd_ = open_camera(config_, pitch_);
+  } catch (const std::exception& error) {
+    HOLOSCAN_LOG_ERROR("CameraSourceOp: {}", error.what());
+    throw;
+  }
+  first_sequence_.reset();
+  last_id_ = 0;
   v4l2_requestbuffers request{};
   request.count = kCameraBuffers;
   request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   request.memory = V4L2_MEMORY_MMAP;
   if (xioctl(fd_, VIDIOC_REQBUFS, &request) != 0 || request.count == 0) {
-    throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, "VIDIOC_REQBUFS failed"};
+    fail("VIDIOC_REQBUFS failed");
   }
   for (std::uint32_t i = 0; i < request.count; ++i) {
     v4l2_buffer buffer{};
@@ -475,21 +545,21 @@ void CameraSourceOp::start() {
     buffer.memory = V4L2_MEMORY_MMAP;
     buffer.index = i;
     if (xioctl(fd_, VIDIOC_QUERYBUF, &buffer) != 0) {
-      throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, "VIDIOC_QUERYBUF failed"};
+      fail("VIDIOC_QUERYBUF failed");
     }
     void* data =
         mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buffer.m.offset);
     if (data == MAP_FAILED) {
-      throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, "mmap of a camera buffer failed"};
+      fail("mmap of a camera buffer failed");
     }
     buffers_.push_back({data, buffer.length});
     if (xioctl(fd_, VIDIOC_QBUF, &buffer) != 0) {
-      throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, "VIDIOC_QBUF failed"};
+      fail("VIDIOC_QBUF failed");
     }
   }
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (xioctl(fd_, VIDIOC_STREAMON, &type) != 0) {
-    throw holoscan::RuntimeError{holoscan::ErrorCode::kFailure, "VIDIOC_STREAMON failed"};
+    fail("VIDIOC_STREAMON failed");
   }
 }
 
@@ -506,7 +576,7 @@ void CameraSourceOp::stop() {
 
 holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
     holoscan::ExecutionContext& context) {
-  if (config_.count != 0 && emitted_ >= config_.count) {
+  if (config_.count != 0 && last_id_ >= config_.count) {
     return {};
   }
   v4l2_buffer buffer{};
@@ -519,18 +589,27 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
     return holoscan::make_unexpected(failure("VIDIOC_DQBUF: " + std::string(std::strerror(errno))));
   }
   // Frames that queued up while we were busy are stale: keep only the newest.
+  // Their sequence numbers leave a gap, which the reporter counts.
   for (v4l2_buffer newer = buffer; xioctl(fd_, VIDIOC_DQBUF, &newer) == 0; buffer = newer) {
     if (xioctl(fd_, VIDIOC_QBUF, &buffer) != 0) {
       return holoscan::make_unexpected(
           failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
     }
   }
-  // The frame's capture time on the graph's clock: now, less its age on the
-  // monotonic clock V4L2 stamps it with.
-  holoscan::TimePoint captured = context.activation_time();
+  // The frame's id: the camera's frame count since this run's first frame,
+  // from 1, so that every frame not sent leaves a gap.
+  if (!first_sequence_) {
+    first_sequence_ = buffer.sequence;
+  }
+  const std::uint64_t id = static_cast<std::uint32_t>(buffer.sequence - *first_sequence_) + 1U;
+  // The frame's capture time on the graph's clock: the graph clock's now,
+  // less the frame's age on the monotonic clock V4L2 stamps it with, both
+  // clocks read at the same moment.
+  const auto graph_now = context.clock().now();
+  timespec now{};
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  holoscan::TimePoint captured = graph_now ? *graph_now : context.activation_time();
   if ((buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
-    timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
     const std::int64_t age = (now.tv_sec - buffer.timestamp.tv_sec) * 1'000'000'000LL +
                              (now.tv_nsec - buffer.timestamp.tv_usec * 1000LL);
     if (age > 0) {
@@ -552,20 +631,20 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
              !committed) {
     emitted = committed;
   } else {
-    emitted = image.emit_tensor(
-        std::move(*loan), descriptor(config_.width, config_.height, PixelFormat::kRgb8),
-        holoscan::EmitOptions{.capture_time = captured, .frame_id = emitted_ + 1U});
+    emitted = image.emit_tensor(std::move(*loan),
+                                descriptor(config_.width, config_.height, PixelFormat::kRgb8),
+                                holoscan::EmitOptions{.capture_time = captured, .frame_id = id});
   }
   // The buffer goes back to the camera whatever happened to the frame.
   if (xioctl(fd_, VIDIOC_QBUF, &buffer) != 0) {
     return holoscan::make_unexpected(failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
   }
-  // A live frame is not worth waiting for: on a blocking edge, drop one the
-  // estimator has no room for.
+  // A live frame is not worth waiting for: one the consumers have no room
+  // for is dropped, and its id is a gap the reporter counts as skipped.
   bool delivered = false;
   const Result result = settle(emitted, delivered);
   if (delivered) {
-    ++emitted_;
+    last_id_ = id;
   }
   return result;
 }

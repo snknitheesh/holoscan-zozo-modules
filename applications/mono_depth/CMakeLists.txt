@@ -16,6 +16,7 @@ if(MONO_DEPTH_ENABLE_VISUALIZATION)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(holoscan-mono-depth 1.0 REQUIRED CONFIG)
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
 # The image sources (synthetic, files, V4L2 camera), the image files, the reporter and
@@ -32,7 +33,7 @@ target_compile_features(mono_depth_ops PUBLIC cxx_std_20)
 target_include_directories(mono_depth_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   mono_depth_ops
-  PUBLIC holoscan::mono_depth holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::mono_depth holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
   PRIVATE CUDA::nvjpeg
 )
 

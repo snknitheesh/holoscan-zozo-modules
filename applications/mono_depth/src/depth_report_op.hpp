@@ -16,8 +16,13 @@
 //   seen.
 //
 // It takes the metric depth too when the estimator gives it, checked against
-// the reference as well, and optionally the colorized depth, to write it as a
-// PPM file, and asks the run to complete after its expected frames.
+// the reference as well, with the depth's camera info, checked against the
+// depth's size and capture time (and the synthetic camera, when given), and
+// optionally the colorized depth, to write it as a PPM file, and asks the run
+// to complete after its expected frames.
+//
+// CPU waits and copies: each output it takes is copied to the host, which
+// waits for the copy (it says so once).
 
 #pragma once
 
@@ -27,6 +32,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <holoscan/core/errors.hpp>
@@ -35,6 +41,8 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/mono_depth/mono_depth_op.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 
@@ -50,6 +58,11 @@ struct DepthReport {
   // In real time: the frames passed over for newer ones, and the last id seen.
   std::uint64_t skipped{};
   std::uint64_t last_frame_id{};
+  // With metric depth: the frames before the first camera info, which the
+  // estimator skips, and the depth camera infos checked and found wrong.
+  std::uint64_t before_camera_info{};
+  std::uint32_t camera_info_checked{};
+  std::uint32_t camera_info_failed{};
   // The stub's reference: frames checked, frames off by more than the
   // tolerance, and the largest error, relative to max(1, |value|).
   std::uint32_t reference_checked{};
@@ -71,7 +84,8 @@ struct DepthReport {
   std::vector<double> latencies_ms;
 
   [[nodiscard]] bool passed() const noexcept {
-    return frame_gaps == 0 && reference_failed == 0 && ordering_failed == 0;
+    return frame_gaps == 0 && reference_failed == 0 && ordering_failed == 0 &&
+           camera_info_failed == 0;
   }
 };
 
@@ -89,11 +103,12 @@ struct DepthReportConfig {
   // was busy are passed over and counted as skipped.
   bool realtime{false};
   // Time spent on each frame on top of the work: a stand-in, in tests, for a
-  // consumer slower than the source.
+  // consumer slower than the source. At most kMaxReportDelay; a stop request
+  // ends it.
   std::chrono::nanoseconds delay{};
   Verify verify{Verify::kNone};
   // The estimator's settings, which the reference follows; its metric depth
-  // is taken when it gives one.
+  // and depth camera info are taken when it gives them.
   holoscan::mono_depth::MonoDepthConfig estimator;
   // kReference: the largest error accepted, relative to max(1, |value|).
   float tolerance{2e-5F};
@@ -111,7 +126,15 @@ struct DepthReportConfig {
   // Declare the `colorized` input and write each frame's colorized depth as
   // `image_dir`/depth_NNNNNN.ppm, numbered by frame id.
   std::filesystem::path image_dir;
+  // The camera the depth camera info must describe (the synthetic one), when
+  // known; else only its size is checked.
+  std::optional<holoscan::messages::CameraInfo> camera;
+  // Frames the estimator may skip before the first camera info: lossless, the
+  // first frame may come before it, and the run completes at the last id.
+  std::uint32_t allowed_before_camera_info{};
 };
+
+inline constexpr std::chrono::seconds kMaxReportDelay{10};
 
 class DepthReportOp final : public holoscan::Operator<> {
  public:
@@ -127,8 +150,10 @@ class DepthReportOp final : public holoscan::Operator<> {
 
   // MonoDepthOp's depth.
   holoscan::Input<holoscan::schema::ImageT> depth;
-  // MonoDepthOp's metric depth; declared when it gives one.
+  // MonoDepthOp's metric depth and depth camera info; declared when it gives
+  // them.
   holoscan::Input<holoscan::schema::ImageT> metric_depth;
+  holoscan::Input<holoscan::messages::schema::CameraInfoT> depth_camera_info;
   // The image the estimator saw; declared for kReference only.
   holoscan::Input<holoscan::schema::ImageT> image;
   // MonoDepthOp's colorized depth; declared with `image_dir` only.
@@ -144,6 +169,8 @@ class DepthReportOp final : public holoscan::Operator<> {
   std::vector<float> depth_;
   std::vector<float> meters_;
   std::vector<std::uint8_t> pixels_;
+  std::vector<std::uint8_t> rgba_;
+  bool copy_logged_{};
 };
 
 }  // namespace mono_depth_app

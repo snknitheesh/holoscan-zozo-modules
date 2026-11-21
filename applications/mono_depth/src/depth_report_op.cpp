@@ -17,9 +17,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/mono_depth/image_fit.hpp>
 #include <holoscan/mono_depth/reference.hpp>
 #include <holoscan/mono_depth/synthetic_scene.hpp>
@@ -51,12 +54,13 @@ std::optional<PixelFormat> pixel_format(holoscan::schema::ImageEncoding encoding
   }
 }
 
-// Copies an image's packed tensor of `channels` bytes per pixel, or floats
-// when T is float, to `out`; returns its width and height.
+// Copies an image's packed tensor of `channels` uint8 values per pixel, or
+// float32 when T is float, to `out`; returns its width and height.
 template <typename T>
 holoscan::expected<std::pair<int, int>, holoscan::Error> fetch(
     const holoscan::schema::ImageT& image, int channels, ::cuda::stream_ref stream,
     std::vector<T>& out) {
+  static_assert(std::is_same_v<T, float> || std::is_same_v<T, std::uint8_t>);
   if (!image.data) {
     return holoscan::make_unexpected(invalid("an image has no tensor"));
   }
@@ -64,7 +68,11 @@ holoscan::expected<std::pair<int, int>, holoscan::Error> fetch(
   const std::span<const std::int64_t> shape = tensor.shape_span();
   const bool rank_ok =
       channels == 1 ? shape.size() == 2 : shape.size() == 3 && shape[2] == channels;
-  if (!rank_ok || !tensor.is_contiguous() || tensor.dtype().bits != sizeof(T) * 8U) {
+  const DLDataType dtype = tensor.dtype();
+  const DLDataType want =
+      std::is_same_v<T, float> ? DLDataType{kDLFloat, 32, 1} : DLDataType{kDLUInt, 8, 1};
+  if (!rank_ok || !tensor.is_contiguous() || dtype.code != want.code || dtype.bits != want.bits ||
+      dtype.lanes != want.lanes) {
     return holoscan::make_unexpected(invalid("an image is not packed as expected"));
   }
   const int height = static_cast<int>(shape[0]);
@@ -88,8 +96,9 @@ DepthReportOp::DepthReportOp(DepthReportConfig config) : config_(std::move(confi
   if (!config_.report) {
     throw std::invalid_argument("DepthReportOp needs a report");
   }
-  if (config_.delay < std::chrono::nanoseconds::zero()) {
-    throw std::invalid_argument("DepthReportOp: delay must not be negative");
+  if (config_.delay < std::chrono::nanoseconds::zero() || config_.delay > kMaxReportDelay) {
+    throw std::invalid_argument("DepthReportOp: delay must be 0.." +
+                                std::to_string(kMaxReportDelay.count()) + " s");
   }
   if (config_.verify == Verify::kOrdering) {
     (void)md::make_depth_scene(config_.scene_width, config_.scene_height, 0);
@@ -102,6 +111,7 @@ void DepthReportOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(depth, "depth").queue_depth(2U);
   if (md::gives_metric_depth(config_.estimator)) {
     spec.input(metric_depth, "metric_depth").queue_depth(2U);
+    spec.input(depth_camera_info, "depth_camera_info").queue_depth(2U);
   }
   if (config_.verify == Verify::kReference) {
     spec.input(image, "image").queue_depth(2U);
@@ -117,6 +127,7 @@ holoscan::Contract DepthReportOp::contract() const {
   const bool metric = md::gives_metric_depth(config_.estimator);
   if (metric) {
     ports.emplace_back(metric_depth);
+    ports.emplace_back(depth_camera_info);
   }
   if (config_.verify == Verify::kReference) {
     ports.emplace_back(image);
@@ -133,6 +144,7 @@ holoscan::Contract DepthReportOp::contract() const {
   result.input(depth, holoscan::Exact{});
   if (metric) {
     result.input(metric_depth, holoscan::Exact{});
+    result.input(depth_camera_info, holoscan::Exact{});
   }
   if (config_.verify == Verify::kReference) {
     result.input(image, holoscan::Exact{});
@@ -166,6 +178,11 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
   if (!depth_sample) {
     return holoscan::make_unexpected(std::move(depth_sample).error());
   }
+  if (!copy_logged_) {
+    copy_logged_ = true;
+    HOLOSCAN_LOG_INFO(
+        "DepthReportOp: each output it checks is copied to the host, which waits for the copy");
+  }
   auto size = fetch(depth_sample->data, 1, context.cuda_stream(), depth_);
   if (!size) {
     return holoscan::make_unexpected(std::move(size).error());
@@ -181,10 +198,14 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
     report.latencies_ms.push_back(
         static_cast<double>(now->timestamp_ns - metadata.capture_timestamp_ns) * 1e-6);
   }
-  // Sources number their frames from 1; the depth keeps its image's.
+  // Sources number their frames from 1; the depth keeps its image's. The
+  // estimator skips the frames before the first camera info: lossless, at
+  // most allowed_before_camera_info of them, at the start.
   const std::uint64_t frame_id = metadata.frame_id;
   if (config_.realtime && frame_id > last_frame_id_) {
     report.skipped += frame_id - last_frame_id_ - 1U;
+  } else if (seen_ == 0 && frame_id > 1U && frame_id <= 1U + config_.allowed_before_camera_info) {
+    report.before_camera_info = frame_id - 1U;
   } else if (frame_id != last_frame_id_ + 1U) {
     ++report.frame_gaps;
   }
@@ -209,6 +230,32 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
     const std::array<float, 2> meters = md::reference_range(meters_);
     report.min_meters = std::min(report.min_meters, meters[0]);
     report.max_meters = std::max(report.max_meters, meters[1]);
+    // The depth's camera: of its size, with its capture time, and the
+    // synthetic camera when that is known.
+    auto info_sample = depth_camera_info.receive();
+    if (!info_sample) {
+      return holoscan::make_unexpected(std::move(info_sample).error());
+    }
+    holoscan::messages::CameraInfo info;
+    try {
+      info = holoscan::messages::from_message(info_sample->data);
+    } catch (const std::invalid_argument& error) {
+      return holoscan::make_unexpected(invalid(error.what()));
+    }
+    bool matches = static_cast<int>(info.width) == width &&
+                   static_cast<int>(info.height) == height &&
+                   info.header.capture_timestamp_ns == metadata.capture_timestamp_ns;
+    if (config_.camera) {
+      // The calibration, and the camera's frame id; the rest of the header is
+      // the sender's.
+      holoscan::messages::CameraInfo want = *config_.camera;
+      want.header = info.header;
+      matches = matches && info == want && info.header.frame_id == config_.camera->header.frame_id;
+    }
+    ++report.camera_info_checked;
+    if (!matches) {
+      ++report.camera_info_failed;
+    }
   }
 
   if (config_.verify == Verify::kReference) {
@@ -289,8 +336,7 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
     if (!color) {
       return holoscan::make_unexpected(std::move(color).error());
     }
-    std::vector<std::uint8_t> rgba;
-    auto color_size = fetch(color->data, 4, context.cuda_stream(), rgba);
+    auto color_size = fetch(color->data, 4, context.cuda_stream(), rgba_);
     if (!color_size) {
       return holoscan::make_unexpected(std::move(color_size).error());
     }
@@ -298,7 +344,7 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
     try {
       write_ppm(config_.image_dir / ("depth_" + numbered(frame_id) + ".ppm"), color_width,
                 color_height,
-                to_rgb(rgba.data(), static_cast<std::size_t>(color_width) * 4U, color_width,
+                to_rgb(rgba_.data(), static_cast<std::size_t>(color_width) * 4U, color_width,
                        color_height, PixelFormat::kRgba8));
     } catch (const std::exception& error) {
       return holoscan::make_unexpected(
@@ -307,13 +353,18 @@ holoscan::expected<void, holoscan::Error> DepthReportOp::process(
     ++report.files_written;
   }
 
-  if (config_.delay > std::chrono::nanoseconds::zero()) {
-    std::this_thread::sleep_for(config_.delay);
+  // The delay, in short steps that a stop request ends.
+  const auto until = std::chrono::steady_clock::now() + config_.delay;
+  for (auto now = std::chrono::steady_clock::now();
+       now < until && !context.cancellation().stop_requested();
+       now = std::chrono::steady_clock::now()) {
+    std::this_thread::sleep_for(
+        std::min<std::chrono::steady_clock::duration>(until - now, std::chrono::milliseconds{10}));
   }
   ++seen_;
   report.frames.fetch_add(1U);
-  const bool last =
-      config_.realtime ? frame_id >= config_.expected_frames : seen_ == config_.expected_frames;
+  // The last frame's id; lossless, no frame comes after it.
+  const bool last = frame_id >= config_.expected_frames;
   if (config_.expected_frames != 0 && last) {
     context.request_completion();
   }

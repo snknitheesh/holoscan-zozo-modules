@@ -13,7 +13,8 @@
 //   consumer, and when the camera is faster than the estimator, it takes the
 //   newest frame.
 //
-// The display is real time in either mode.
+// The display drops its oldest sample in either mode, and never holds the
+// estimator back.
 
 #pragma once
 
@@ -32,11 +33,14 @@ inline holoscan::ConnectionOptions newest() {
   return {.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 1U};
 }
 
-// The newest few frames, for a consumer that pairs a frame with its depth by
-// capture time: the frame must still be queued when its depth arrives, an
-// estimator's latency later, and with one slot a faster camera would already
-// have replaced it. Four frames cover an estimator up to three camera periods
-// behind; one further behind costs a skipped pair, not a stall.
+// The newest few frames, for a consumer on another worker than the estimator
+// that pairs a frame with its depth by capture time (HoloViz, and the
+// reporter in real time): the frame must still be queued when its depth
+// arrives, an estimator's latency later, and with one slot a faster source
+// would already have replaced it. Four frames cover an estimator up to three
+// source periods behind; one further behind costs a skipped pair, not a
+// stall. It is the one exception to "drop-oldest edges keep one sample", for
+// the image a consumer pairs only, never on the estimator's own path.
 inline holoscan::ConnectionOptions recent_frames() {
   return {.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 4U};
 }

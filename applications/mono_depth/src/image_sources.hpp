@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Image sources for the application: synthetic frames of a scene with known
-// depth, and a list of JPEG or PPM files. Both emit a fixed
-// number of frames on a clock, numbered from 1, then idle. A frame that a
-// busy consumer pushes back is sent again on the next tick with its original
-// capture time. Given the count of frames done downstream, they also hold
-// each frame until the one before it is done. And a V4L2 webcam, for real
-// time: connected with only the newest frame kept, it is never held back.
+// depth, and a list of JPEG or PPM files. Both emit a fixed number of frames
+// on a clock, numbered from 1, then idle. A frame that busy consumers push
+// back (an emit refused with kBackpressured, or no free slot in the output's
+// pool, kResourceExhausted) is sent again on the next tick with its original
+// capture time; on one worker, as the lossless graphs run, the consumers then
+// catch up between ticks. And a V4L2 webcam, for real time: connected with
+// only the newest frame kept, it is never held back.
 
 #pragma once
 
-#include <atomic>
+#include <cuda_runtime_api.h>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -47,9 +49,6 @@ struct SyntheticImageSourceConfig {
   bool device_output{true};
   // Emit frame 0 of the scene every time, as a still camera of a still scene.
   bool still{false};
-  // When set, the count of frames done downstream: a frame goes out only
-  // once it has reached the number of frames out, so one at a time.
-  std::shared_ptr<const std::atomic<std::uint32_t>> done;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -75,10 +74,15 @@ class SyntheticImageSourceOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> pixels_;
   std::uint32_t emitted_{};
   std::optional<holoscan::TimePoint> pending_capture_;
+  bool copy_logged_{};
 };
 
 struct ImageFileSourceConfig {
   std::vector<std::filesystem::path> files;
+  // Each file's kind and size, as read_image_info() gives them, read once by
+  // the application: the SDK constructs the operator more than once, and
+  // reading the files in each would repeat the work and its failures.
+  std::vector<ImageFileInfo> infos;
   // Frames to emit; 0 emits every file once.
   std::uint32_t count{0};
   // Start over after the last file until `count` frames are out.
@@ -86,8 +90,6 @@ struct ImageFileSourceConfig {
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
   // Emit BGR8 rather than RGB8.
   bool bgr{false};
-  // As for SyntheticImageSourceConfig.
-  std::shared_ptr<const std::atomic<std::uint32_t>> done;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -97,9 +99,7 @@ void validate_config(const ImageFileSourceConfig& config);
 // memory as RGB8 (or BGR8): JPEG files with nvJPEG, PPM files on the host.
 class ImageFileSourceOp final : public holoscan::Operator<> {
  public:
-  // Reads every file's header to size the output.
-  // @throws std::invalid_argument if `config` is not valid, or
-  // std::runtime_error for a file it cannot use.
+  // @throws std::invalid_argument if `config` is not valid.
   explicit ImageFileSourceOp(ImageFileSourceConfig config);
   ~ImageFileSourceOp() override;
 
@@ -123,13 +123,19 @@ class ImageFileSourceOp final : public holoscan::Operator<> {
   std::uint32_t emitted_{};
   std::optional<holoscan::TimePoint> pending_capture_;
   std::unique_ptr<JpegDecoder> decoder_;
+  // The JPEG bytes the decoder reads on the GPU stream, kept until the event
+  // after the decode has passed: the next frame waits for it, not this one.
+  std::vector<std::uint8_t> jpeg_;
+  cudaEvent_t decoded_{};
+  bool jpeg_logged_{};
+  bool ppm_logged_{};
 };
 
 struct CameraSourceConfig {
   std::filesystem::path device{"/dev/video0"};
   int width{640};
   int height{480};
-  // Frames to emit; 0 runs until the application is stopped.
+  // The camera's frames to run for; 0 runs until the application is stopped.
   std::uint32_t count{0};
 };
 
@@ -139,8 +145,11 @@ struct CameraSourceConfig {
 void check_camera(const CameraSourceConfig& config);
 
 // RGB8 frames in host memory from a V4L2 camera offering YUYV at the
-// requested size, numbered from 1 and stamped with their capture time. Only
-// the camera's newest frame goes out. Connect it with drop-oldest edges
+// requested size, stamped with their capture time and numbered by the
+// camera's own frame count from 1, so that every frame the camera captured
+// and the demo did not show (passed over for a newer one here, or refused by
+// a busy consumer) leaves a gap the reporter counts as skipped. Only the
+// camera's newest frame goes out. Connect it with drop-oldest edges
 // (edges.hpp), so that a frame arriving while the estimator is busy replaces
 // the one waiting; on a blocking edge, a frame the estimator has no room for
 // is dropped here.
@@ -173,7 +182,10 @@ class CameraSourceOp final : public holoscan::Operator<> {
   int fd_{-1};
   std::size_t pitch_{};
   std::vector<Mapping> buffers_;
-  std::uint32_t emitted_{};
+  // The camera's sequence number of its first frame this run, and the id of
+  // the newest frame sent.
+  std::optional<std::uint32_t> first_sequence_;
+  std::uint64_t last_id_{};
 };
 
 }  // namespace mono_depth_app

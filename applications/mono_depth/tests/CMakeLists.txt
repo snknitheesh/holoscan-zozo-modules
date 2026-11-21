@@ -19,8 +19,9 @@ target_link_libraries(mono_depth_make_test_images PRIVATE mono_depth_ops CUDA::n
 add_library(mono_depth_spawn_thread_preload SHARED spawn_thread_preload.cpp)
 
 # Runs the demo through run_and_match.cmake, which checks its exit status as well as its
-# output: mono_depth_app_test(<name> <exit status> <output regex> <arguments>...). It runs
-# in this directory, where `--model stub` writes the stub model and its engines are cached.
+# output: mono_depth_app_test(<name> <exit status> <output regex> <arguments>...). Every
+# test's XDG_CACHE_HOME is cache/ here, where `--model stub` writes the stub model and its
+# engines are cached (see the end of this file).
 set(_run_and_match "${CMAKE_CURRENT_SOURCE_DIR}/run_and_match.cmake")
 function(mono_depth_app_test name status output)
   add_test(
@@ -67,10 +68,17 @@ mono_depth_app_test(mono_depth_app_small 0 "reference: checked=10 ${_checked}"
 mono_depth_app_test(mono_depth_app_large 0 "reference: checked=5 ${_checked}"
   ${_stub} --count 5 --width 1920 --height 1200
 )
-mono_depth_app_test(mono_depth_app_metric 0 "meters=[0-9.]+\\.\\.[0-9.]+ reference: checked=10 ${_checked}"
+# Metric depth takes the synthetic camera from a camera_info file written for the run,
+# through CameraInfoSourceOp; the depth's camera info must be that camera, with every
+# frame's capture time. A first frame before the first camera info is skipped.
+set(
+  _metric
+  "meters=[0-9.]+\\.\\.[0-9.]+ before_camera_info=([01]) camera_info: checked=(9|10) failed=0"
+)
+mono_depth_app_test(mono_depth_app_metric 0 "frames=(9|10)/10 .*${_metric} reference: checked=(9|10) ${_checked}"
   ${_stub} --count 10 --metric-scale 0.4 --metric-shift 0.1
 )
-mono_depth_app_test(mono_depth_app_metric_model 0 "meters=[0-9.]+\\.\\.[0-9.]+ reference: checked=10 ${_checked}"
+mono_depth_app_test(mono_depth_app_metric_model 0 "frames=(9|10)/10 .*${_metric} reference: checked=(9|10) ${_checked}"
   ${_stub} --count 10 --model-output metric
 )
 set_tests_properties(
@@ -121,7 +129,7 @@ set(_files "${CMAKE_CURRENT_BINARY_DIR}/test_images")
 add_test(NAME mono_depth_images_setup COMMAND mono_depth_make_test_images "${_files}")
 set_tests_properties(mono_depth_images_setup PROPERTIES FIXTURES_SETUP mono_depth_images)
 mono_depth_app_test(mono_depth_app_files 0
-  "scene_0\\.jpg: 1280x720 inverse depth [0-9.]+\\.\\.[0-9.]+\nmono_depth: scene_1\\.ppm: 333x500 .*scene_2\\.JPEG: 500x333 .*frames=3/3 .*reference: checked=3 ${_checked}"
+  "scene_0\\.jpg: 1280x720 inverse depth [0-9.]+\\.\\.[0-9.]+\n.*mono_depth: scene_1\\.ppm: 333x500 .*scene_2\\.JPEG: 500x333 .*frames=3/3 .*reference: checked=3 ${_checked}"
   ${_stub} --source files --images "${_files}"
 )
 mono_depth_app_test(mono_depth_app_files_bgr8_loop 0 "frames=7/7 .*reference: checked=7 ${_checked}"
@@ -149,13 +157,24 @@ set_tests_properties(
 )
 
 # HoloViz renders each image beside its colorized depth offscreen, into CUDA memory; with
-# the stub model and a still scene, every rendered frame is checked against the known one.
+# the stub model, every rendered frame is checked against the frame it shows, for a still
+# scene and a moving one, where a depth shown beside another frame's image fails the
+# check. The moving scene's period leaves the check, which draws each expected frame on
+# the CPU on the display's worker, time to keep up on Jetson Orin.
 set(_render "${CMAKE_CURRENT_BINARY_DIR}/render.ppm")
 mono_depth_app_test(mono_depth_app_offscreen 0
   "rendered=[1-9][0-9]* render: checked=[1-9][0-9]* failed=0 .*verdict=PASS"
   ${_stub} --count 20 --period-ms 20 --still true --display offscreen --render-file "${_render}"
 )
-set_tests_properties(mono_depth_app_offscreen PROPERTIES FIXTURES_REQUIRED mono_depth_stub)
+mono_depth_app_test(mono_depth_app_offscreen_moving 0
+  "rendered=[1-9][0-9]* render: checked=[1-9][0-9]* failed=0 .*verdict=PASS"
+  ${_stub} --count 10 --period-ms 250 --display offscreen
+)
+set_tests_properties(
+  mono_depth_app_offscreen
+  mono_depth_app_offscreen_moving
+  PROPERTIES FIXTURES_REQUIRED mono_depth_stub
+)
 
 # A file that is no model fails before the run starts, when its engine is built.
 set(_junk "${CMAKE_CURRENT_BINARY_DIR}/junk.onnx")
@@ -188,6 +207,17 @@ mono_depth_app_test(mono_depth_app_rejects_color_range 2 "^error: color_range mu
 mono_depth_app_test(mono_depth_app_rejects_render_file 2 "^error: --render-file needs --display"
   ${_stub} --render-file x.ppm
 )
+mono_depth_app_test(mono_depth_app_rejects_report_delay 2 "^error: --report-delay-ms must be"
+  ${_stub} --report-delay-ms 20000
+)
+mono_depth_app_test(mono_depth_app_rejects_camera_info_without_metric 2
+  "^error: --camera-info goes with metric depth" ${_stub} --source files
+  --images "${CMAKE_CURRENT_SOURCE_DIR}" --camera-info "${_junk}"
+)
+mono_depth_app_test(mono_depth_app_rejects_metric_files_without_camera_info 2
+  "^error: metric depth needs the camera" ${_stub} --source files
+  --images "${_files}" --metric-scale 1
+)
 mono_depth_app_test(mono_depth_app_rejects_small_frames 2 "^error: synthetic images must be"
   ${_stub} --width 16
 )
@@ -205,12 +235,33 @@ mono_depth_app_test(mono_depth_app_rejects_missing_camera 2 "^error: cannot open
   ${_stub} --source camera --device /dev/video99
 )
 mono_depth_app_test(mono_depth_app_help 0 "^Usage: .*--model PATH\\|stub" --help)
-# Only the plan's verdict: an accepted plan has no warnings.
-mono_depth_app_test(mono_depth_app_compile_only 0 "^mono_depth: plan=OK\n*$"
-  ${_stub} --compile-only true
+# Only the plan's verdict: an accepted plan has no warnings. The lossless graphs run on one
+# worker: the ci mode's, with metric depth and its camera info source, and with files. With
+# a window or offscreen, the display (HoloViz and the render check, drop-oldest edges only)
+# runs on a second worker, and the frames on the first; with metric depth, which the SDK
+# does not split so, all on one.
+mono_depth_app_test(mono_depth_app_compile_only 0 "^mono_depth: plan=OK workers=1\n*$"
+  ${_stub} --count 30 --period-ms 5 --encoding bgr8 --compile-only true
 )
-mono_depth_app_test(mono_depth_app_window_plan 0 "^mono_depth: plan=OK\n*$"
+mono_depth_app_test(mono_depth_app_metric_plan 0 "^mono_depth: plan=OK workers=1\n*$"
+  ${_stub} --metric-scale 0.4 --compile-only true
+)
+mono_depth_app_test(mono_depth_app_window_plan 0 "^mono_depth: plan=OK workers=2\n*$"
   ${_stub} --display window --compile-only true
+)
+mono_depth_app_test(mono_depth_app_offscreen_plan 0 "^mono_depth: plan=OK workers=2\n*$"
+  ${_stub} --display offscreen --compile-only true
+)
+mono_depth_app_test(mono_depth_app_metric_offscreen_plan 0 "^mono_depth: plan=OK workers=1\n*$"
+  ${_stub} --metric-scale 0.4 --display offscreen --compile-only true
+)
+mono_depth_app_test(mono_depth_app_files_plan 0 "^mono_depth: plan=OK workers=1\n*$"
+  ${_stub} --source files --images "${_files}" --compile-only true
+)
+set_tests_properties(
+  mono_depth_app_files_plan
+  mono_depth_app_rejects_metric_files_without_camera_info
+  PROPERTIES FIXTURES_REQUIRED mono_depth_images
 )
 
 # A stop request ends the run early with its own verdict, and the warning it leaves is
@@ -255,7 +306,7 @@ set_tests_properties(
 # rank the pixels as the true depth does, Spearman's correlation at least 0.85, and the
 # near panel, the sphere and the far wall in that order. Letterboxed and stretched, and
 # rendered offscreen. Skipped (exit 77) unless prepare_model.py has written the model. The
-# first run builds and caches the engine, which takes minutes on a Jetson.
+# first run builds and caches the engine, which takes minutes on Jetson Thor and Orin.
 set(_model "${MONO_DEPTH_DATA_DIR}/depth_anything_v2_small_518x518.onnx")
 function(mono_depth_real_test name output)
   add_test(
@@ -288,7 +339,12 @@ foreach(_test IN LISTS _tests)
     set_tests_properties(${_test} PROPERTIES TIMEOUT 600)
   endif()
 endforeach()
-set_tests_properties(${_tests} PROPERTIES LABELS "mono_depth_app;gpu")
+set_tests_properties(
+  ${_tests}
+  PROPERTIES
+    LABELS "mono_depth_app;gpu"
+    ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/cache"
+)
 
 # The SDK-free tests, which the hosted CI job also builds on their own.
 add_subdirectory(host)

@@ -58,6 +58,9 @@
     "dependencies": {
       "modules": [
         {
+          "name": "messages"
+        },
+        {
           "name": "mono-depth"
         }
       ]
@@ -65,7 +68,7 @@
     "default_mode": "demo",
     "modes": {
       "demo": {
-        "description": "Depth of 300 frames of the synthetic scene with Depth Anything V2 Small, each checked against the scene's true depth, with latency and GPU memory; shown in a HoloViz window when there is a display.",
+        "description": "Depth of 300 frames of the synthetic scene with Depth Anything V2 Small, each checked against the scene's true depth, with latency and GPU memory; headless (add --display window to show it).",
         "run": {
           "command": "\"<holohub_app_bin>/mono_depth\" --model \"<holohub_data_dir>/mono_depth/depth_anything_v2_small_518x518.onnx\" --count 300 --period-ms 10",
           "workdir": "holohub_app_bin"

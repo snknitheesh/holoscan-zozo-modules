@@ -4,20 +4,24 @@
 // Mono Depth: images in, depth out, on the GPU. A source (a synthetic scene
 // with known depth, JPEG and PPM files, or a webcam) feeds MonoDepthOp, whose
 // depth a reporter checks, times and optionally writes as colorized PPM
-// files. HoloViz can show each image beside its colorized depth, in a window
-// or rendered offscreen, where the rendering is checked.
+// files. With metric depth, CameraInfoSourceOp sends the camera, from a
+// camera_info file (written at run time for the synthetic scene). HoloViz
+// can show each image beside its colorized depth, in a window or rendered
+// offscreen, where the rendering is checked.
 
 #include <cuda_runtime_api.h>
+#include <stdlib.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -39,6 +43,10 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/mono_depth/image_fit.hpp>
 #include <holoscan/mono_depth/mono_depth_op.hpp>
 #include <holoscan/mono_depth/reference.hpp>
@@ -59,10 +67,14 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 namespace app = mono_depth_app;
+namespace hm = holoscan::messages;
 namespace md = holoscan::mono_depth;
 
 constexpr std::string_view kAppName = "mono_depth";
 constexpr std::string_view kStubModel = "stub";
+// How long a run may take to stop once asked to, before the demo gives up on
+// it: a stage that never returns would otherwise hold the process forever.
+constexpr std::chrono::seconds kStopAllowance{30};
 
 enum class Source { kSynthetic, kFiles, kCamera };
 enum class DisplayMode { kAuto, kWindow, kOffscreen, kNone };
@@ -70,9 +82,12 @@ enum class DisplayMode { kAuto, kWindow, kOffscreen, kNone };
 struct Options {
   Source source{Source::kSynthetic};
   std::filesystem::path images;
-  // Found by validate() for --source files.
+  // Found by validate() for --source files, with each file's header, read
+  // once.
   std::vector<std::filesystem::path> image_files;
+  std::vector<app::ImageFileInfo> image_infos;
   std::filesystem::path device{"/dev/video0"};
+  std::filesystem::path camera_info;
   bool loop{false};
   std::optional<std::uint32_t> count;
   std::uint32_t period_ms{33};
@@ -164,6 +179,8 @@ Options parse_args(int argc, char** argv) {
       opts.images = value;
     } else if (option == "--device") {
       opts.device = value;
+    } else if (option == "--camera-info") {
+      opts.camera_info = value;
     } else if (option == "--loop") {
       opts.loop = parse_bool(value, option);
     } else if (option == "--count") {
@@ -261,6 +278,9 @@ void usage(const char* argv0) {
          "  --metric-scale F --metric-shift F\n"
          "                             Metric depth from relative inverse depth d, as\n"
          "                             1 / z = scale * d + shift (default: none)\n"
+         "  --camera-info FILE         With metric depth: the camera's ROS camera_info file,\n"
+         "                             for image files and the camera (the synthetic scene's\n"
+         "                             is written for each run)\n"
          "  --color-min F --color-max F\n"
          "                             The inverse depths at the colormap's far and near ends\n"
          "                             (default: each frame's range)\n"
@@ -299,8 +319,11 @@ void usage(const char* argv0) {
          "  --timeout-seconds N        Fail when no result arrives for N seconds plus two\n"
          "                             source periods (default: 120)\n"
          "  --startup-timeout-seconds N\n"
-         "                             The same before the first result, which waits for the\n"
-         "                             engine build (default: 1800)\n";
+         "                             The same before the first result, while the estimator\n"
+         "                             loads its engine, which is built before the run starts\n"
+         "                             (default: 1800)\n"
+         "  --report-delay-ms N        Slow the reporter down by N ms per frame, 0..10000\n"
+         "                             (default: 0)\n";
 }
 
 bool is_stub(const Options& opts) { return opts.model == kStubModel; }
@@ -321,6 +344,7 @@ app::SyntheticImageSourceConfig synthetic_source_config(const Options& opts) {
 
 app::ImageFileSourceConfig file_source_config(const Options& opts) {
   return app::ImageFileSourceConfig{.files = opts.image_files,
+                                    .infos = opts.image_infos,
                                     .count = opts.count.value_or(0),
                                     .loop = opts.loop,
                                     .period = std::chrono::milliseconds(opts.period_ms),
@@ -360,8 +384,7 @@ md::MonoDepthConfig estimator_config(const Options& opts) {
   }
   // The output buffers fit the largest image the source gives.
   if (opts.source == Source::kFiles) {
-    for (const auto& file : opts.image_files) {
-      const app::ImageFileInfo info = app::read_image_info(file);
+    for (const app::ImageFileInfo& info : opts.image_infos) {
       config.max_width = std::max(config.max_width, info.width);
       config.max_height = std::max(config.max_height, info.height);
     }
@@ -396,6 +419,30 @@ void validate(Options& opts) {
         "--metric-scale converts a relative model's output; a metric "
         "model gives meters already");
   }
+  if (std::chrono::milliseconds(opts.report_delay_ms) > app::kMaxReportDelay) {
+    throw std::invalid_argument("--report-delay-ms must be 0..10000");
+  }
+  const bool metric = opts.metric_model || opts.metric_scale.has_value();
+  if (!opts.camera_info.empty()) {
+    if (!metric) {
+      throw std::invalid_argument(
+          "--camera-info goes with metric depth (--model-output metric or --metric-scale)");
+    }
+    if (opts.source == Source::kSynthetic) {
+      throw std::invalid_argument(
+          "--camera-info is for image files and the camera; the synthetic scene's is written "
+          "for each run");
+    }
+    // Read now, so that a file that cannot be used fails before the run.
+    try {
+      (void)hm::read_camera_info_yaml(opts.camera_info);
+    } catch (const std::exception& error) {
+      throw std::invalid_argument(std::string("--camera-info: ") + error.what());
+    }
+  } else if (metric && opts.source != Source::kSynthetic) {
+    throw std::invalid_argument(
+        "metric depth needs the camera: give its camera_info file with --camera-info");
+  }
   if (opts.color_min.has_value() != opts.color_max.has_value()) {
     throw std::invalid_argument("--color-min and --color-max go together");
   }
@@ -420,8 +467,10 @@ void validate(Options& opts) {
     }
     try {
       opts.image_files = app::list_image_files(opts.images);
+      // Each file's header, read here once: a file that cannot be used fails
+      // before the graph is built.
       for (const auto& file : opts.image_files) {
-        (void)app::read_image_info(file);
+        opts.image_infos.push_back(app::read_image_info(file));
       }
     } catch (const std::runtime_error& error) {
       throw std::invalid_argument(error.what());
@@ -518,14 +567,17 @@ std::size_t gpu_free_bytes() {
 }
 
 #if MONO_DEPTH_ENABLE_VISUALIZATION
-// The offscreen frame expected with the stub model and a still scene: the
-// image on the left, its colorized depth on the right, opaque.
-std::vector<std::uint8_t> expected_render(const Options& opts, const md::MonoDepthConfig& config) {
+// The offscreen frame expected for synthetic frame `frame_id` with the stub
+// model: the image on the left, its colorized depth on the right, opaque.
+std::vector<std::uint8_t> expected_render(const Options& opts, const md::MonoDepthConfig& config,
+                                          std::uint64_t frame_id) {
   const int width = frame_width(opts);
   const int height = frame_height(opts);
+  const auto scene_frame =
+      opts.still || frame_id == 0 ? 0U : static_cast<std::uint32_t>(frame_id - 1U);
   std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * height * 3U);
-  md::render_depth_scene(md::make_depth_scene(width, height, 0), md::PixelFormat::kRgb8, rgb.data(),
-                         static_cast<std::size_t>(width) * 3U);
+  md::render_depth_scene(md::make_depth_scene(width, height, scene_frame), md::PixelFormat::kRgb8,
+                         rgb.data(), static_cast<std::size_t>(width) * 3U);
   const md::ImageFit fit =
       md::make_fit(width, height, config.input_width, config.input_height, config.input_width,
                    config.input_height, config.resize_mode);
@@ -559,12 +611,90 @@ std::vector<std::uint8_t> expected_render(const Options& opts, const md::MonoDep
 
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
+// Where `--model stub` writes the stub model, whose engines are cached beside
+// it: $XDG_CACHE_HOME/holoscan-mono-depth, ~/.cache/holoscan-mono-depth, or
+// the temporary folder's. The model's file name carries a digest of its
+// contents, so a changed stub never meets an engine built from another.
+std::filesystem::path stub_directory() {
+  std::filesystem::path base;
+  if (env_set("XDG_CACHE_HOME")) {
+    base = std::getenv("XDG_CACHE_HOME");
+  } else if (env_set("HOME")) {
+    base = std::filesystem::path(std::getenv("HOME")) / ".cache";
+  } else {
+    base = std::filesystem::temp_directory_path();
+  }
+  const std::filesystem::path directory = base / "holoscan-mono-depth";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    throw std::runtime_error("cannot make " + directory.string() +
+                             " for the stub model: " + error.message());
+  }
+  return directory;
+}
+
+// The synthetic scene's camera, as CameraInfo: an undistorted pinhole. The
+// scene casts each pixel's ray through its center, at (u + 0.5, v + 0.5) from
+// the image's corner, and CameraInfo puts pixel centers at integer
+// coordinates.
+hm::CameraInfo synthetic_camera(int width, int height) {
+  const md::DepthScene scene = md::make_depth_scene(width, height, 0);
+  hm::CameraInfo info;
+  info.header.frame_id = "mono_depth_camera";
+  info.width = static_cast<std::uint32_t>(width);
+  info.height = static_cast<std::uint32_t>(height);
+  info.state = hm::CameraState::kUndistorted;
+  info.fx = scene.focal;
+  info.fy = scene.focal;
+  info.cx = static_cast<double>(scene.cx) - 0.5;
+  info.cy = static_cast<double>(scene.cy) - 0.5;
+  return info;
+}
+
+// The synthetic camera's camera_info file, written for CameraInfoSourceOp to
+// read, in a folder of its own that mkdtemp() names unpredictably, so that
+// nothing can be planted where the file goes. Removed with this object, on
+// every path out of the run.
+class SyntheticCameraInfoFile {
+ public:
+  explicit SyntheticCameraInfoFile(const hm::CameraInfo& camera) {
+    std::string folder =
+        (std::filesystem::temp_directory_path() / (std::string(kAppName) + "_XXXXXX")).string();
+    if (::mkdtemp(folder.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info file");
+    }
+    folder_ = folder;
+    path_ = folder_ / "camera_info.yaml";
+    try {
+      hm::write_camera_info_yaml(camera, path_);
+    } catch (...) {
+      remove();
+      throw;
+    }
+  }
+  ~SyntheticCameraInfoFile() { remove(); }
+  SyntheticCameraInfoFile(const SyntheticCameraInfoFile&) = delete;
+  SyntheticCameraInfoFile& operator=(const SyntheticCameraInfoFile&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+ private:
+  void remove() noexcept {
+    std::error_code ignored;
+    std::filesystem::remove_all(folder_, ignored);
+  }
+
+  std::filesystem::path folder_;
+  std::filesystem::path path_;
+};
+
 int execute(const Options& opts, SignalDomain& signals) {
   md::MonoDepthConfig estimator = estimator_config(opts);
   if (is_stub(opts)) {
-    // Written to the working directory, where its engine is cached beside it.
-    estimator.model =
-        md::write_stub_model(std::filesystem::current_path(), opts.input_width, opts.input_height);
+    // Written to the cache folder, where its engines are cached beside it.
+    estimator.model = md::write_stub_model(stub_directory(), opts.input_width, opts.input_height);
   }
 
   holoscan::Graph graph{std::string(kAppName)};
@@ -574,31 +704,58 @@ int execute(const Options& opts, SignalDomain& signals) {
   // The camera runs in real time, the other sources losslessly (edges.hpp),
   // unless asked otherwise.
   const bool realtime = opts.source == Source::kCamera || opts.realtime;
-  // Lossless, the synthetic and file sources send a frame only once the
-  // reporter is done with the one before: one frame in flight fits the depth
-  // of two that every input declares. The reporter's count of frames done is
-  // the signal, read by the source: the SDK refuses a graph with a cycle.
-  const std::shared_ptr<const std::atomic<std::uint32_t>> done =
-      realtime ? nullptr
-               : std::shared_ptr<const std::atomic<std::uint32_t>>(report, &report->frames);
+  const bool metric = md::gives_metric_depth(estimator);
+  // Lossless, every frame's operators run on one worker: the SDK 5.0 gives
+  // each automatic partition a worker of its own, and a source on its own
+  // worker would run ahead of the estimator and the reporter and meet full
+  // queues (see holoscan-messages' README). With a display, whose edges drop
+  // their oldest sample and never hold anything back, HoloViz and the render
+  // check run on a second worker: with HoloViz's offscreen output on the
+  // frames' worker, the SDK 5.0 often crashes as it tears the run down (a
+  // segmentation fault in its output pools, after a correct run). The SDK
+  // refuses that split for a graph with the camera info source (metric
+  // depth), which therefore runs on one worker, display included. In real time
+  // the automatic partitioning stays: its stages overlap, and its drop-oldest
+  // edges lose frames rather than wait.
+  std::optional<holoscan::PartitionHandle> frames_partition;
+  std::optional<holoscan::PartitionHandle> display_partition;
+  if (!realtime) {
+    if (shows(opts) && !metric) {
+      frames_partition.emplace(graph.partition(std::string(kAppName)));
+      display_partition.emplace(graph.partition("display"));
+    } else {
+      graph.partition(std::string(kAppName)).include_all();
+    }
+  }
   const holoscan::Output<holoscan::schema::ImageT>* image_out = nullptr;
   if (opts.source == Source::kSynthetic) {
-    auto config = synthetic_source_config(opts);
-    config.done = done;
-    image_out = &graph.op<app::SyntheticImageSourceOp>("source", std::move(config))->image;
+    auto source = graph.op<app::SyntheticImageSourceOp>("source", synthetic_source_config(opts));
+    image_out = &source->image;
+    if (frames_partition) frames_partition->add(source);
   } else if (opts.source == Source::kFiles) {
-    auto config = file_source_config(opts);
-    config.done = done;
-    image_out = &graph.op<app::ImageFileSourceOp>("source", std::move(config))->image;
+    auto source = graph.op<app::ImageFileSourceOp>("source", file_source_config(opts));
+    image_out = &source->image;
+    if (frames_partition) frames_partition->add(source);
   } else {
     image_out = &graph.op<app::CameraSourceOp>("source", camera_source_config(opts))->image;
   }
   auto estimator_op = graph.op<md::MonoDepthOp>("estimator", estimator);
+  if (frames_partition) frames_partition->add(estimator_op);
 
   const bool verify = opts.verify.value_or(false);
   app::Verify check = app::Verify::kNone;
   if (verify) {
     check = is_stub(opts) ? app::Verify::kReference : app::Verify::kOrdering;
+  }
+  // Metric depth needs the camera: the synthetic scene's, written for this
+  // run (CameraInfoSourceOp reads the file again when the run starts, so it
+  // stays until the run is over), or --camera-info.
+  std::optional<hm::CameraInfo> camera;
+  std::optional<SyntheticCameraInfoFile> synthetic_file;
+  std::filesystem::path camera_info_file = opts.camera_info;
+  if (metric && opts.source == Source::kSynthetic) {
+    camera = synthetic_camera(frame_width(opts), frame_height(opts));
+    camera_info_file = synthetic_file.emplace(*camera).path();
   }
   auto reporter = graph.op<app::DepthReportOp>(
       "report", app::DepthReportConfig{.report = report,
@@ -616,7 +773,10 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                     ? opts.image_files
                                                     : std::vector<std::filesystem::path>{},
                                        .print = opts.source == Source::kFiles,
-                                       .image_dir = opts.image_dir});
+                                       .image_dir = opts.image_dir,
+                                       .camera = camera,
+                                       .allowed_before_camera_info = metric ? 1U : 0U});
+  if (frames_partition) frames_partition->add(reporter);
 
   // Lossless, every frame's depth is estimated and reported, in order. In
   // real time, the estimator takes the newest frame and the reporter the
@@ -625,8 +785,14 @@ int execute(const Options& opts, SignalDomain& signals) {
   const holoscan::ConnectionOptions edge = realtime ? app::newest() : app::lossless();
   graph.add_flow(*image_out, estimator_op->image, edge);
   graph.add_flow(estimator_op->depth, reporter->depth, edge);
-  if (md::gives_metric_depth(estimator)) {
+  if (metric) {
+    auto camera_info = graph.op<hm::CameraInfoSourceOp>(
+        "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = camera_info_file});
+    if (frames_partition) frames_partition->add(camera_info);
+    graph.add_flow(camera_info->camera_info, estimator_op->camera_info,
+                   hm::latest_camera_info_connection());
     graph.add_flow(estimator_op->metric_depth, reporter->metric_depth, edge);
+    graph.add_flow(estimator_op->depth_camera_info, reporter->depth_camera_info, edge);
   }
   if (check == app::Verify::kReference) {
     graph.add_flow(*image_out, reporter->image, realtime ? app::recent_frames() : app::lossless());
@@ -665,24 +831,32 @@ int execute(const Options& opts, SignalDomain& signals) {
     auto visualizer =
         graph.op<viz::HolovizOp>("holoviz", std::move(layers), std::move(sink),
                                  viz::FrameTrigger{viz::LayerTrigger{1}}, max_input_age);
-    // Real time in either mode: the display keeps the newest sample and never
-    // holds back the estimator. HoloViz pairs the depth with the newest image
-    // no newer than it, which must still be queued, so that edge keeps a few.
+    if (display_partition) display_partition->add(visualizer);
+    // Drop-oldest in either mode: the display never holds back the estimator.
+    // HoloViz pairs the depth with the newest image no newer than it, which
+    // must still be queued when the depth arrives, an estimator's latency
+    // later: that edge keeps a few (edges.hpp).
     graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames());
     graph.add_flow(estimator_op->colorized, visualizer->image_layer_input(1), app::newest());
     if (opts.display == DisplayMode::kOffscreen) {
-      // Only a still synthetic scene through the stub has a known rendering.
-      std::vector<std::uint8_t> expected;
-      if (is_stub(opts) && opts.still && opts.source == Source::kSynthetic) {
-        expected = expected_render(opts, estimator);
+      // The synthetic scene through the stub has a known rendering, frame by
+      // frame. Lossless only: in real time HoloViz renders a few of many
+      // frames, too far apart to tell which.
+      std::function<std::vector<std::uint8_t>(std::uint64_t)> expected;
+      if (is_stub(opts) && opts.source == Source::kSynthetic && !realtime) {
+        expected = [opts, estimator](std::uint64_t frame_id) {
+          return expected_render(opts, estimator, frame_id);
+        };
       }
       auto checker = graph.op<app::RenderCheckOp>(
           "render_check", app::RenderCheckConfig{.check = render_check,
                                                  .width = 2 * frame_width(opts),
                                                  .height = frame_height(opts),
                                                  .expected = std::move(expected),
+                                                 .last_id = frames,
                                                  .write = opts.render_file});
       graph.add_flow(visualizer->output(), checker->frame, app::newest());
+      if (display_partition) display_partition->add(checker);
     }
   }
 #endif
@@ -700,7 +874,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (estimator.colorize) {
     on_gpu("estimator", "colorized");
   }
-  if (md::gives_metric_depth(estimator)) {
+  if (metric) {
     on_gpu("estimator", "metric_depth");
   }
   if (opts.source == Source::kFiles || (opts.source == Source::kSynthetic && !opts.host_input)) {
@@ -718,7 +892,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on, one per partition.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -767,6 +942,13 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cerr << kAppName << ": timed out: no result for " << *timed_out_after << " s\n";
     session.request_stop();
   }
+  if (!session.wait_for(kStopAllowance)) {
+    // A stage that never returns (a hung CUDA or TensorRT wait) would hold the
+    // session, and its destructor, forever: give the verdict and leave.
+    std::cerr << kAppName << ": the run did not stop within " << kStopAllowance.count() << " s\n";
+    std::cout << kAppName << ": verdict=FAIL" << std::endl;
+    std::_Exit(1);
+  }
   session.wait();
   const holoscan::RunTermination termination = session.termination();
   // The SDK logs a failed run's diagnostics itself, unless its report or its
@@ -790,8 +972,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   // normal end.
   const bool stopped = !timed_out_after && termination == holoscan::RunTermination::kStopped;
   // In real time, the frames that came while the estimator or the reporter
-  // was busy are skipped; the last one must arrive.
-  const bool all_frames = realtime ? report->last_frame_id == frames : report->frames == frames;
+  // was busy are skipped; the last one must arrive. Lossless, every frame
+  // must, but for the first with metric depth, should it come before the
+  // first camera info (CameraInfoSourceOp sends when the run starts, a source
+  // period before the first frame).
+  const bool all_frames = realtime ? report->last_frame_id >= frames
+                                   : report->frames + report->before_camera_info == frames &&
+                                         report->before_camera_info <= (metric ? 1U : 0U);
   // Offscreen, at least one frame was rendered, and every one checked matched.
   const bool rendered = opts.display != DisplayMode::kOffscreen ||
                         (render_check->frames > 0 && render_check->failed == 0 &&
@@ -821,7 +1008,7 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (report->frames != 0) {
     std::cout << " inverse_depth=" << report->min_depth << ".." << report->max_depth;
-    if (md::gives_metric_depth(estimator)) {
+    if (metric) {
       std::cout << " meters=" << report->min_meters << ".." << report->max_meters;
     }
   }
@@ -833,6 +1020,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (report->skipped != 0) {
     std::cout << " skipped=" << report->skipped;
+  }
+  if (metric) {
+    std::cout << " before_camera_info=" << report->before_camera_info
+              << " camera_info: checked=" << report->camera_info_checked
+              << " failed=" << report->camera_info_failed;
   }
   if (report->reference_checked != 0) {
     std::cout << " reference: checked=" << report->reference_checked
