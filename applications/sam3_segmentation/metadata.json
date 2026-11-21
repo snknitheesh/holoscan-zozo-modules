@@ -66,14 +66,14 @@
     "default_mode": "demo",
     "modes": {
       "demo": {
-        "description": "SAM 3 on 100 frames of the synthetic scene with the prompts circle, blue rectangle and triangle, each prompt's best instance checked against its true shape, with latency and GPU memory; shown in a HoloViz window when there is a display.",
+        "description": "SAM 3 on 100 frames of the synthetic scene with the prompts circle, blue rectangle and triangle, each prompt's best instance checked against its true shape, with latency and GPU memory.",
         "run": {
           "command": "\"<holohub_app_bin>/sam3_segmentation\" --model \"<holohub_data_dir>/sam3\" --count 100 --period-ms 10",
           "workdir": "holohub_app_bin"
         }
       },
       "files": {
-        "description": "SAM 3's instances in each JPEG and PPM image in the data directory's images folder, printed, and written over the images to the build directory.",
+        "description": "SAM 3's instances in each JPEG and PPM image in the data directory's sam3/images folder, which you fill with your own pictures first (see the README), printed, and written over the images to the build directory.",
         "run": {
           "command": "\"<holohub_app_bin>/sam3_segmentation\" --model \"<holohub_data_dir>/sam3\" --source files --images \"<holohub_data_dir>/sam3/images\" --prompts \"person,cup,bottle\" --image-dir .",
           "workdir": "holohub_app_bin"

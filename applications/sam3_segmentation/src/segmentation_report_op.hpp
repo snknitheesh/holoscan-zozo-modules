@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <cuda_runtime_api.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -42,9 +44,10 @@ struct SegmentationReport {
   // Frames whose id is not the one after the previous frame's; in real time,
   // only those whose id is not above it.
   std::uint32_t frame_gaps{};
-  // In real time: the frames passed over for newer ones, and the last id seen.
+  // In real time: the frames passed over for newer ones, and the last id seen,
+  // which a source reads (image_sources.hpp).
   std::uint64_t skipped{};
-  std::uint64_t last_frame_id{};
+  std::atomic<std::uint64_t> last_frame_id{};
   // Instances over the run.
   std::uint64_t instances{};
   // The stub's reference: frames checked, frames that differ from it, and the
@@ -109,15 +112,49 @@ struct SegmentationReportConfig {
   std::filesystem::path image_dir;
 };
 
+// Page-locked host memory, grown as needed, which the GPU copies into
+// without the CPU waiting for each copy.
+class PinnedBuffer {
+ public:
+  PinnedBuffer() = default;
+  PinnedBuffer(const PinnedBuffer&) = delete;
+  PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+  ~PinnedBuffer();
+
+  // At least `bytes`; the contents are kept only when it does not grow.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> reserve(std::size_t bytes);
+  template <typename T>
+  [[nodiscard]] T* as() const noexcept {
+    return static_cast<T*>(data_);
+  }
+
+ private:
+  void* data_{};
+  std::size_t bytes_{};
+};
+
+// Checks, times, prints and writes each image's instances. Per image it
+// copies to the host only what its settings read: the count always, the
+// scores, boxes and prompt ids when it verifies or prints, the masks when it
+// verifies, the label image and the image when it writes images, and the
+// image when it checks against the reference. The copies go to pinned memory
+// on the runtime's stream; it waits once for the instances, which marks the
+// latency, and once more for the masks, labels and image when it reads them.
 class SegmentationReportOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument if the report is missing or the settings
   // unusable.
   explicit SegmentationReportOp(SegmentationReportConfig config);
+  ~SegmentationReportOp() override;
+  SegmentationReportOp(const SegmentationReportOp&) = delete;
+  SegmentationReportOp& operator=(const SegmentationReportOp&) = delete;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  // Reads the prompt table for the reference check.
+  // @throws std::runtime_error if it cannot be read, or CUDA fails.
   void start() override;
+  void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
@@ -135,16 +172,21 @@ class SegmentationReportOp final : public holoscan::Operator<> {
   [[nodiscard]] bool needs_image() const noexcept;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> process(
       holoscan::ExecutionContext& context);
+  void release() noexcept;
 
   SegmentationReportConfig config_;
   std::uint64_t last_frame_id_{};
   std::uint32_t seen_{};
-  std::vector<std::uint8_t> masks_;
-  std::vector<std::uint16_t> labels_;
-  std::vector<float> scores_;
-  std::vector<float> boxes_;
-  std::vector<std::int32_t> prompt_ids_;
-  std::vector<std::uint8_t> pixels_;
+  // Read in start() for the reference check.
+  std::optional<holoscan::sam3::PromptTable> table_;
+  cudaEvent_t instances_copied_{};
+  PinnedBuffer count_;
+  PinnedBuffer masks_;
+  PinnedBuffer labels_;
+  PinnedBuffer scores_;
+  PinnedBuffer boxes_;
+  PinnedBuffer prompt_ids_;
+  PinnedBuffer pixels_;
 };
 
 // Connects every output of the segmenter to the reporter with `edge`.

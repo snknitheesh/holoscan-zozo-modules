@@ -11,6 +11,8 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -79,13 +81,16 @@ holoscan::schema::ImageEncoding encoding_of(PixelFormat format) {
   }
 }
 
-// What compute() returns after an emit: on success nothing more to do, the
-// frame is out; a consumer still busy with earlier frames makes the emit fail
-// with kBackpressured before anything is delivered, and the frame goes again
-// on the next tick; any other failure fails the run.
+// What compute() returns after an allocation or an emit: on success nothing
+// more to do, the frame is out. Consumers still busy with earlier frames make
+// an emit fail with kBackpressured before anything is delivered, or an
+// allocation with kResourceExhausted while every slot of the output's pool is
+// still held; the frame goes again on the next tick (the camera's is
+// dropped). Any other failure fails the run.
 Result settle(Result sent, bool& delivered) {
   delivered = static_cast<bool>(sent);
-  if (sent || sent.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (sent || sent.error().code == holoscan::ErrorCode::kBackpressured ||
+      sent.error().code == holoscan::ErrorCode::kResourceExhausted) {
     return {};
   }
   return sent;
@@ -138,13 +143,23 @@ holoscan::Contract SyntheticImageSourceOp::contract() const {
 
 void SyntheticImageSourceOp::start() {
   emitted_ = 0;
+  idle_ticks_ = 0;
   pending_capture_.reset();
 }
 
 holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
     holoscan::ExecutionContext& context) {
+  // Every frame out: done, idle until the run completes, unless the last
+  // must go again (see `reported`). The last frame's pixels are still drawn.
+  bool again = false;
   if (emitted_ >= config_.count) {
-    return {};  // Done: idle until the run completes.
+    const auto every = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(1, std::chrono::milliseconds(100) / config_.period));
+    if (!config_.reported || config_.reported->load() >= config_.count ||
+        ++idle_ticks_ % every != 0U) {
+      return {};
+    }
+    again = true;
   }
   if (!previous_done(config_.done, emitted_)) {
     return {};  // Try again on the next tick.
@@ -153,7 +168,7 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   const std::size_t pitch = static_cast<std::size_t>(config_.width) * static_cast<std::size_t>(n);
   // A still scene is drawn once. The frame is captured when it is drawn,
   // which takes a while on the CPU, and not before.
-  if (!config_.still || pixels_.empty()) {
+  if (!again && (!config_.still || pixels_.empty())) {
     pixels_.resize(pitch * static_cast<std::size_t>(config_.height));
     render_shape_scene(
         make_shape_scene(config_.width, config_.height, config_.still ? 0U : emitted_),
@@ -166,7 +181,8 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{config_.height, config_.width, n}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool unused = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), unused);
   }
   if (config_.device_output) {
     cudaStream_t stream = context.cuda_stream().get();
@@ -204,13 +220,15 @@ holoscan::expected<void, holoscan::Error> SyntheticImageSourceOp::compute(
   }
   bool delivered = false;
   const Result result = settle(
-      image.emit_tensor(
-          std::move(*loan), descriptor(config_.width, config_.height, config_.format),
-          holoscan::EmitOptions{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U}),
+      image.emit_tensor(std::move(*loan), descriptor(config_.width, config_.height, config_.format),
+                        holoscan::EmitOptions{.capture_time = *pending_capture_,
+                                              .frame_id = again ? emitted_ : emitted_ + 1U}),
       delivered);
   if (delivered) {
     pending_capture_.reset();
-    ++emitted_;
+    if (!again) {
+      ++emitted_;
+    }
   }
   return result;
 }
@@ -275,13 +293,11 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
   const std::filesystem::path& path = config_.files[index];
   const ImageFileInfo& info = infos_[index];
   const PixelFormat format = config_.bgr ? PixelFormat::kBgr8 : PixelFormat::kRgb8;
-  if (!pending_capture_) {
-    pending_capture_ = context.activation_time();
-  }
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{
       .shape = std::array<std::int64_t, 3>{info.height, info.width, 3}, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    bool unused = false;
+    return settle(holoscan::make_unexpected(std::move(loan).error()), unused);
   }
   auto writer = loan->write(stream);
   if (!writer) {
@@ -329,6 +345,12 @@ holoscan::expected<void, holoscan::Error> ImageFileSourceOp::compute(
   }
   if (auto committed = std::move(*writer).commit(); !committed) {
     return holoscan::make_unexpected(std::move(committed).error());
+  }
+  // The image is captured when it is decoded, and keeps that time when it
+  // goes again.
+  if (!pending_capture_) {
+    auto now = context.clock().now();
+    pending_capture_ = now ? *now : context.activation_time();
   }
   bool delivered = false;
   const Result result = settle(
@@ -462,6 +484,7 @@ void CameraSourceOp::start() {
   release();
   fd_ = open_camera(config_, pitch_);
   emitted_ = 0;
+  last_sequence_.reset();
   v4l2_requestbuffers request{};
   request.count = kCameraBuffers;
   request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -506,7 +529,8 @@ void CameraSourceOp::stop() {
 
 holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
     holoscan::ExecutionContext& context) {
-  if (config_.count != 0 && emitted_ >= config_.count) {
+  if (config_.count != 0 && emitted_ >= config_.count &&
+      (!config_.reported || config_.reported->load() >= config_.count)) {
     return {};
   }
   v4l2_buffer buffer{};
@@ -525,9 +549,19 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
           failure("VIDIOC_QBUF: " + std::string(std::strerror(errno))));
     }
   }
+  // Frames between the last one read and this one, by the driver's sequence
+  // numbers, were dropped by it or replaced above.
+  if (last_sequence_ && config_.dropped) {
+    const std::uint32_t gap = buffer.sequence - *last_sequence_;  // Wraps around.
+    if (gap > 1U) {
+      config_.dropped->fetch_add(gap - 1U, std::memory_order_relaxed);
+    }
+  }
+  last_sequence_ = buffer.sequence;
   // The frame's capture time on the graph's clock: now, less its age on the
   // monotonic clock V4L2 stamps it with.
-  holoscan::TimePoint captured = context.activation_time();
+  auto clock_now = context.clock().now();
+  holoscan::TimePoint captured = clock_now ? *clock_now : context.activation_time();
   if ((buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -566,6 +600,8 @@ holoscan::expected<void, holoscan::Error> CameraSourceOp::compute(
   const Result result = settle(emitted, delivered);
   if (delivered) {
     ++emitted_;
+  } else if (config_.dropped) {
+    config_.dropped->fetch_add(1U, std::memory_order_relaxed);
   }
   return result;
 }

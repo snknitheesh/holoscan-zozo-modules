@@ -50,6 +50,12 @@ struct SyntheticImageSourceConfig {
   // When set, the count of frames done downstream: a frame goes out only
   // once it has reached the number of frames out, so one at a time.
   std::shared_ptr<const std::atomic<std::uint32_t>> done;
+  // Real time: when set, the id of the last frame reported downstream. Once
+  // every frame is out, the last goes again, about every 100 ms, until it is
+  // reported: on drop-oldest edges, and in a segmenter that skips images
+  // while its outputs are all held, a frame may be lost on the way, and the
+  // run waits for the last.
+  std::shared_ptr<const std::atomic<std::uint64_t>> reported;
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -75,6 +81,8 @@ class SyntheticImageSourceOp final : public holoscan::Operator<> {
   std::vector<std::uint8_t> pixels_;
   std::uint32_t emitted_{};
   std::optional<holoscan::TimePoint> pending_capture_;
+  // Ticks since every frame went out, for sending the last again.
+  std::uint64_t idle_ticks_{};
 };
 
 struct ImageFileSourceConfig {
@@ -131,6 +139,13 @@ struct CameraSourceConfig {
   int height{480};
   // Frames to emit; 0 runs until the application is stopped.
   std::uint32_t count{0};
+  // Optional: counts the camera's frames that never went out: those the
+  // driver dropped (gaps in its sequence numbers), those replaced by a newer
+  // one before they were read, and those the graph had no room for.
+  std::shared_ptr<std::atomic<std::uint64_t>> dropped;
+  // With a count: when set, the id of the last frame reported downstream.
+  // Frames go on until it reaches the count, as one may be lost on the way.
+  std::shared_ptr<const std::atomic<std::uint64_t>> reported;
 };
 
 // Checks that `config.device` offers YUYV at the configured size.
@@ -174,6 +189,8 @@ class CameraSourceOp final : public holoscan::Operator<> {
   std::size_t pitch_{};
   std::vector<Mapping> buffers_;
   std::uint32_t emitted_{};
+  // The driver's sequence number of the last frame read, if any.
+  std::optional<std::uint32_t> last_sequence_;
 };
 
 }  // namespace sam3_app

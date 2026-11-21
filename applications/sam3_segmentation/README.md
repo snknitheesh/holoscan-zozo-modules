@@ -52,6 +52,10 @@ python3 modules/sam3/tools/prepare_model.py --output data/sam3 --accept-sam-lice
 and a few everyday ones (person, face, hand, cup, bottle, phone, keyboard, chair, car); add yours
 with `--prompts "apple,red mug" --prompts-only`.
 
+The `files` mode reads the JPEG and PPM images in `data/sam3/images`, which nothing creates: put
+your own pictures there first (`mkdir -p data/sam3/images`), or point `--images` at another file or
+folder.
+
 ## Build and run
 
 Build the module and install it, then the demo against it:
@@ -73,16 +77,22 @@ The modes in [`metadata.json`](metadata.json), run from the build folder:
 | `camera` | `./sam3_segmentation --model ../../data/sam3 --source camera --display window --prompts "person,cup" --interactive true` | A live webcam under its instances; type new prompts, comma-separated, and Enter |
 | `ci` | `./sam3_segmentation --model stub --count 30 --period-ms 5 --encoding bgr8 --box-on triangle` | The module's stub model through TensorRT, no download: two phrases and an exemplar box, every instance checked against the host reference |
 
-Each run ends with a line such as:
+Each run ends with a line such as this one, from the `demo` mode with `--count 200` on an RTX
+5090 shared with an inference server, SDK 5.0.0, FP16 engines, every frame counted, the first
+included:
 
 ```text
 sam3_segmentation: frames=200/200 prompts=3 instances=600 latency_ms: mean=29.514 p50=29.291 p99=33.784 max=38.657 gpu_memory_mib=1612 truth: checked=200 failed=0 iou_min=0.9874 iou_mean=0.9944
 sam3_segmentation: verdict=PASS
 ```
 
-and exits 0 only on `PASS`. The latency is from an image's capture to its instances on the host;
-the GPU memory is the drop in free memory during the run. A stop request (Ctrl+C, closing the
-window) ends a run with `verdict=STOPPED`, which for a camera without `--count` is its normal end.
+It exits 0 on `PASS`, and on `STOPPED` for a camera without `--count`, whose normal end is a stop
+request (Ctrl+C, closing the window); any other stop, and every failure, exits 1, and unusable
+options exit 2. The latency is from an image's capture to its instances on the host; the GPU memory
+is the drop in free memory during the run. In real time the line also counts `skipped` frames (passed
+over for newer ones), `dropped` images (skipped by the segmenter or the overlay while their outputs
+were all still held, as when the GPU falls behind) and `camera_dropped` frames (dropped by the
+driver, replaced by a newer one before they were read, or with no room in the graph).
 
 ### Prompts
 
@@ -105,10 +115,25 @@ window when there is a display, and other sources none.
 ### Lossless or real time
 
 Synthetic frames and files run losslessly: every frame is segmented and reported, in order, the
-source sending a frame only when the one before is done. The camera, and synthetic frames with
-`--realtime true`, run in real time: every edge keeps only the newest sample, so the segmenter
-takes the newest frame and never waits for a slower consumer, and frames that came while it was
-busy are skipped and counted.
+source sending a frame only when the one before is done, and the whole graph runs on one worker
+(`--compile-only true` prints the plan's worker count). The camera, and synthetic frames with
+`--realtime true`, run in real time on as many workers as the SDK's automatic partitioning gives:
+every edge keeps only the newest sample, so the segmenter takes the newest frame and never waits
+for a slower consumer, and frames that came while it was busy are skipped and counted. The edges
+that pair an image with its instances by capture time keep the frames of the last 600 ms (4 to 32
+of them), enough for SAM 3 on Jetson Orin, about 410 ms per image; instances that come later
+than that are not paired with their image. A source in real time sends its last frame again
+until it is reported, as a frame may be lost on the way.
+
+### CPU waits and copies per image
+
+| Operator | Waits | Copies |
+| --- | --- | --- |
+| `Sam3SegmentationOp` | None for GPU images; one `cudaStreamSynchronize` for pinned images whose memory cannot be held by the stream; a host image waits for its producer | Host images: one copy to the GPU (logged once); at the first image and at each prompt change, one wait and one upload of the prompts |
+| `Sam3OverlayOp` | One `cudaStreamSynchronize` | The count, scores, boxes and prompt ids to pinned host memory, about 25 bytes per instance slot |
+| Reporter | One for the instances, which marks the latency, and one more when it reads the masks, labels or image | Only what the mode reads: the count; the scores, boxes and prompt ids when it verifies or prints; the masks when it verifies; the labels and the image when it writes images; the image for the reference check |
+| Synthetic source | None | GPU frames: one copy from pageable memory, which the driver stages before the call returns |
+| File source | One `cudaStreamSynchronize` per JPEG (nvJPEG reads the file's bytes) | PPM: one copy from pageable memory |
 
 ### Options
 
@@ -129,10 +154,14 @@ encoder needs 4096). The prompts: `--prompts`, `--box`, `--box-on`, `--score-thr
 | `sam3_app_synthetic`, `_bgr8_fp32`, `_rgba8_host`, `_bgra8_tall`, `_small`, `_large` | Synthetic frames through the stub, every encoding, from GPU and host memory, FP16 and FP32, small to 1080p: every instance against the host reference |
 | `sam3_app_box_prompt`, `sam3_app_one_slot` | An exemplar box prompt; a single output slot for two prompts' instances |
 | `sam3_app_realtime_slow_consumer` | Real time with a reporter slower than the source: frames skipped, the last one reported |
+| `sam3_app_realtime_slow_gpu` | Real time with the GPU slowed by compute-sanitizer's memcheck: images the segmenter cannot hold are skipped, and the run passes. Skipped without compute-sanitizer |
+| `sam3_app_realtime_offscreen` | The camera's topology in real time, rendered offscreen and checked |
 | `sam3_app_files`, `_files_bgr8_loop`, `sam3_app_image_dir` | JPEG, progressive JPEG and PPM files, their instances printed and checked; images written with their instances |
 | `sam3_app_offscreen` | HoloViz renders offscreen; every frame matches the expected one |
-| `sam3_app_interactive` | Prompts typed while it runs: one taken, one not in the table refused |
+| `sam3_app_interactive` | Prompts typed while it runs: two taken, one not in the table refused; every image checked against the reference for the prompts it was segmented with |
 | `sam3_app_stopped`, `sam3_app_without_signal_domain` | A stop request's verdict; a run without managed signals |
-| `sam3_app_rejects_*`, `sam3_app_help`, `sam3_app_compile_only`, `sam3_app_window_plan` | Unusable options and files fail fast; the graph compiles with and without the window |
-| `sam3_real_synthetic`, `sam3_real_box`, `sam3_real_offscreen` | SAM 3 on the synthetic scene, by phrase and by box, and rendered: IoU at least 0.9. Skipped unless `SAM3_SEGMENTATION_DATA_DIR` (default `data/sam3`) holds the export |
+| `sam3_app_rejects_*`, `sam3_app_help` | Unusable options and files fail fast |
+| `sam3_app_compile_only`, `_unchecked_plan`, `_image_dir_plan`, `_files_plan`, `_window_plan`, `_offscreen_plan` | Every lossless graph compiles, with no warnings, onto one worker |
+| `sam3_app_realtime_window_plan` | The camera's real-time topology with a window compiles |
+| `sam3_real_synthetic`, `sam3_real_box`, `sam3_real_offscreen` | SAM 3 on the synthetic scene, by phrase and by box, and rendered: IoU at least 0.9. Skipped unless the export is in `SAM3_SEGMENTATION_DATA_DIR` (default `$HOLOSCAN_TEST_DATA/sam3` when that is set, else `data/sam3`). No CI lane has the model, so every lane skips them |
 | `sam3_segmentation_yuyv` | The webcam's YUYV to RGB conversion, without the SDK |

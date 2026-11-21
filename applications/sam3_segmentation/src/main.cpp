@@ -70,6 +70,8 @@ namespace s3 = holoscan::sam3;
 constexpr std::string_view kAppName = "sam3_segmentation";
 constexpr std::string_view kStubModel = "stub";
 constexpr std::uint8_t kFillAlpha = 110;
+// How long a run asked to stop after a timeout may take to end.
+constexpr std::chrono::seconds kStopGrace{30};
 
 enum class Source { kSynthetic, kFiles, kCamera };
 enum class DisplayMode { kAuto, kWindow, kOffscreen, kNone };
@@ -293,8 +295,8 @@ void usage(const char* argv0) {
          "  --model DIR|stub           A folder with tools/prepare_model.py's SAM 3 export\n"
          "                             (sam3_encoder.onnx, sam3_decoder.onnx, sam3_prompts.bin;\n"
          "                             the TensorRT engines are built once and cached beside\n"
-         "                             them); 'stub' writes and uses a stand-in model with a\n"
-         "                             known response, which needs no download\n"
+         "                             them); 'stub' writes a stand-in model with a known\n"
+         "                             response to ./sam3_stub and uses it; no download\n"
          "  --fp16 true|false          Build the engines with FP16 allowed (default: true)\n"
          "  --workspace-mib N          TensorRT's workspace while it builds an engine, in MiB\n"
          "                             (default: 1024; SAM 3's FP32 encoder needs 4096)\n"
@@ -329,6 +331,8 @@ void usage(const char* argv0) {
          "  --still true|false         Show the synthetic scene's first frame throughout\n"
          "  --realtime true|false      Connect synthetic frames as the camera, keeping only\n"
          "                             the newest sample on every edge (default: false)\n"
+         "  --report-delay-ms N        Make the reporter take N ms more per image, as a\n"
+         "                             slower consumer would (default: 0)\n"
          "Output:\n"
          "  --verify true|false        Check the instances: against the host reference with\n"
          "                             --model stub, against the scene's true shapes with SAM 3\n"
@@ -543,8 +547,12 @@ void validate(Options& opts) {
     }
     app::validate_config(synthetic_source_config(opts));
   }
-  if (opts.interactive && opts.verify.value_or(false)) {
-    throw std::invalid_argument("--interactive changes the prompts: use it with --verify false");
+  // The stub's reference follows the prompts each image was segmented with;
+  // the scene's true shapes are known only for the prompts given at the start.
+  if (opts.interactive && opts.verify.value_or(false) && !is_stub(opts)) {
+    throw std::invalid_argument(
+        "--interactive changes the prompts: check the instances only with --model stub, or use "
+        "--verify false");
   }
   if (!opts.image_dir.empty()) {
     std::error_code error;
@@ -667,8 +675,11 @@ int execute(const Options& opts, SignalDomain& signals) {
   s3::Sam3SegmentationConfig segmenter = segmenter_config(opts);
   const s3::StubShape stub_shape{};
   if (is_stub(opts)) {
-    // Written to the working directory, where its engines are cached beside it.
-    const s3::StubModel stub = s3::write_stub_model(std::filesystem::current_path(), stub_shape);
+    // Written to a folder of its own in the working directory, where its
+    // engines are cached beside it.
+    const std::filesystem::path stub_dir = std::filesystem::current_path() / "sam3_stub";
+    std::filesystem::create_directories(stub_dir);
+    const s3::StubModel stub = s3::write_stub_model(stub_dir, stub_shape);
     segmenter.encoder = stub.encoder;
     segmenter.decoder = stub.decoder;
     segmenter.prompt_table = stub.prompt_table;
@@ -689,10 +700,26 @@ int execute(const Options& opts, SignalDomain& signals) {
   // The camera runs in real time, the other sources losslessly (edges.hpp),
   // unless asked otherwise.
   const bool realtime = opts.source == Source::kCamera || opts.realtime;
-  // Lossless, the synthetic and file sources send a frame only once the
-  // reporter is done with the one before: one frame in flight fits the depth
-  // of two that every input declares. The reporter's count of frames done is
-  // the signal, read by the source: the SDK refuses a graph with a cycle.
+  // In real time: the images the segmenter and the overlay skipped while
+  // their outputs were all held, and the camera's frames that never went out.
+  const auto segmenter_dropped = std::make_shared<std::atomic<std::uint64_t>>(0U);
+  const auto overlay_dropped = std::make_shared<std::atomic<std::uint64_t>>(0U);
+  const auto camera_dropped = std::make_shared<std::atomic<std::uint64_t>>(0U);
+  // In real time, a source sends its last frame until it is reported.
+  const std::shared_ptr<const std::atomic<std::uint64_t>> reported =
+      realtime ? std::shared_ptr<const std::atomic<std::uint64_t>>(report, &report->last_frame_id)
+               : nullptr;
+  segmenter.drop_when_busy = realtime;
+  segmenter.dropped = segmenter_dropped;
+  // A camera's frames come at its own rate; pair as if at up to 60 a second.
+  const std::chrono::nanoseconds frame_period = opts.source == Source::kCamera
+                                                    ? std::chrono::nanoseconds{16'666'667}
+                                                    : std::chrono::milliseconds(opts.period_ms);
+  // Lossless, the whole graph runs on one worker (below), and the synthetic
+  // and file sources send a frame only once the reporter is done with the one
+  // before: one frame in flight fits the depth of two that every input
+  // declares. The reporter's count of frames done is the signal, read by the
+  // source: the SDK refuses a graph with a cycle.
   const std::shared_ptr<const std::atomic<std::uint32_t>> done =
       realtime ? nullptr
                : std::shared_ptr<const std::atomic<std::uint32_t>>(report, &report->frames);
@@ -700,13 +727,17 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (opts.source == Source::kSynthetic) {
     auto config = synthetic_source_config(opts);
     config.done = done;
+    config.reported = reported;
     image_out = &graph.op<app::SyntheticImageSourceOp>("source", std::move(config))->image;
   } else if (opts.source == Source::kFiles) {
     auto config = file_source_config(opts);
     config.done = done;
     image_out = &graph.op<app::ImageFileSourceOp>("source", std::move(config))->image;
   } else {
-    image_out = &graph.op<app::CameraSourceOp>("source", camera_source_config(opts))->image;
+    auto config = camera_source_config(opts);
+    config.dropped = camera_dropped;
+    config.reported = reported;
+    image_out = &graph.op<app::CameraSourceOp>("source", std::move(config))->image;
   }
   auto segmenter_op = graph.op<s3::Sam3SegmentationOp>("segmenter", segmenter);
 
@@ -746,7 +777,8 @@ int execute(const Options& opts, SignalDomain& signals) {
   graph.add_flow(*image_out, segmenter_op->image, edge);
   app::connect_instances(graph, segmenter_op, reporter, edge);
   if (check == app::Verify::kReference || !opts.image_dir.empty()) {
-    graph.add_flow(*image_out, reporter->image, realtime ? app::recent_frames() : app::lossless());
+    graph.add_flow(*image_out, reporter->image,
+                   realtime ? app::recent_frames(frame_period) : app::lossless());
   }
 
   auto render_check = std::make_shared<app::RenderCheck>();
@@ -770,8 +802,9 @@ int execute(const Options& opts, SignalDomain& signals) {
         viz::TextLayerDesc{.max_glyphs = 2U * static_cast<std::uint32_t>(opts.max_instances) *
                                          s3::kOverlayLabelBytes,
                            .normalized_coordinates = true});
-    const auto max_input_age =
-        std::max(4 * std::chrono::milliseconds(opts.period_ms), std::chrono::milliseconds{250});
+    // The image layer may be as old as the instances' latency allows.
+    const auto max_input_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::max<std::chrono::nanoseconds>(4 * frame_period, app::kMaxPairingLatency));
     viz::SinkDesc sink =
         viz::WindowSinkDesc{.title = "SAM 3 Segmentation", .width = width, .height = height};
     if (opts.display == DisplayMode::kOffscreen) {
@@ -788,12 +821,15 @@ int execute(const Options& opts, SignalDomain& signals) {
                                          .max_instances = opts.max_instances,
                                          .prompt_names = prompt_names,
                                          .prompt_control = segmenter.prompt_control,
-                                         .fill_alpha = kFillAlpha});
+                                         .fill_alpha = kFillAlpha,
+                                         .drop_when_busy = true,
+                                         .dropped = overlay_dropped});
     // Real time in either mode: the display keeps the newest sample and never
-    // holds back the segmenter. HoloViz pairs the instances with the newest
-    // image no newer than them, which must still be queued, so that edge
-    // keeps a few.
-    graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames());
+    // holds back the segmenter, and the overlay skips an image rather than
+    // fail when its outputs are all held. HoloViz pairs the instances with the
+    // newest image no newer than them, which must still be queued, so that
+    // edge keeps a few.
+    graph.add_flow(*image_out, visualizer->image_layer_input(0), app::recent_frames(frame_period));
     graph.add_flow(segmenter_op->labels, overlay->labels, app::newest());
     graph.add_flow(segmenter_op->scores, overlay->scores, app::newest());
     graph.add_flow(segmenter_op->boxes, overlay->boxes, app::newest());
@@ -840,6 +876,15 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (opts.display == DisplayMode::kOffscreen) {
     on_gpu("holoviz", "output");
   }
+  // A lossless graph runs on one worker, one operator at a time: across
+  // workers, a producer runs while its consumer's blocking queue is full, and
+  // what it sends is refused, which an operator in the middle of the chain
+  // cannot send again (see holoscan-messages' README). The real-time graph,
+  // whose drop-oldest edges lose frames rather than wait, is left to the
+  // automatic partitioning, so that its stages overlap.
+  if (!realtime) {
+    graph.partition(std::string(kAppName)).include_all();
+  }
   const auto plan = holoscan::compile(graph, std::move(compile_options));
   // Warnings on an accepted plan, as well as the reasons for a rejected one.
   if (!plan.diagnostics().empty()) {
@@ -849,7 +894,7 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -902,6 +947,15 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (timed_out_after) {
     std::cerr << kAppName << ": timed out: no result for " << *timed_out_after << " s\n";
     session.request_stop();
+    // Stopping is cooperative; an operator or a kernel that never returns
+    // would hang here.
+    if (!session.wait_for(kStopGrace)) {
+      std::cerr << kAppName << ": the run did not stop within "
+                << std::chrono::duration_cast<std::chrono::seconds>(kStopGrace).count() << " s\n"
+                << kAppName << ": verdict=FAIL\n"
+                << std::flush;
+      std::_Exit(1);
+    }
   }
   session.wait();
   const holoscan::RunTermination termination = session.termination();
@@ -927,7 +981,8 @@ int execute(const Options& opts, SignalDomain& signals) {
   const bool stopped = !timed_out_after && termination == holoscan::RunTermination::kStopped;
   // In real time, the frames that came while the segmenter or the reporter
   // was busy are skipped; the last one must arrive.
-  const bool all_frames = realtime ? report->last_frame_id == frames : report->frames == frames;
+  const bool all_frames =
+      realtime ? report->last_frame_id.load() >= frames : report->frames == frames;
   // Offscreen, at least one frame was rendered, and every one checked matched.
   const bool rendered = opts.display != DisplayMode::kOffscreen ||
                         (render_check->frames > 0 && render_check->failed == 0 &&
@@ -961,6 +1016,13 @@ int execute(const Options& opts, SignalDomain& signals) {
   }
   if (report->frame_gaps != 0) {
     std::cout << " frame_gaps=" << report->frame_gaps;
+  }
+  if (const std::uint64_t dropped = segmenter_dropped->load() + overlay_dropped->load();
+      dropped != 0) {
+    std::cout << " dropped=" << dropped;
+  }
+  if (camera_dropped->load() != 0) {
+    std::cout << " camera_dropped=" << camera_dropped->load();
   }
   if (report->skipped != 0) {
     std::cout << " skipped=" << report->skipped;

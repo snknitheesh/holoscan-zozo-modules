@@ -28,7 +28,9 @@ RenderCheckOp::RenderCheckOp(RenderCheckConfig config) : config_(std::move(confi
 }
 
 void RenderCheckOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(frame, "frame").queue_depth(2U);
+  // The newest rendered frame: the edge from HoloViz sets the depth (one,
+  // drop-oldest; edges.hpp).
+  spec.input(frame, "frame");
 }
 
 holoscan::Contract RenderCheckOp::contract() const {

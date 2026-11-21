@@ -50,24 +50,38 @@ std::optional<PixelFormat> pixel_format(holoscan::schema::ImageEncoding encoding
   }
 }
 
-// Copies a packed tensor of element type T to `out`; returns its shape.
+holoscan::Error cuda_failure(const char* what, cudaError_t status) {
+  return holoscan::Error{
+      holoscan::ErrorCode::kFailure,
+      std::string("SegmentationReportOp: ") + what + ": " + cudaGetErrorString(status)};
+}
+
+// The number of elements of a packed tensor of element type T, or an error.
 template <typename T>
-holoscan::expected<std::vector<std::int64_t>, holoscan::Error> fetch(const holoscan::Tensor& tensor,
-                                                                     ::cuda::stream_ref stream,
-                                                                     std::vector<T>& out) {
+holoscan::expected<std::size_t, holoscan::Error> packed_elements(const holoscan::Tensor& tensor) {
   if (!tensor.is_contiguous() || tensor.dtype().bits != sizeof(T) * 8U) {
     return holoscan::make_unexpected(invalid("a tensor is not packed as expected"));
   }
-  const std::span<const std::int64_t> shape = tensor.shape_span();
   std::size_t elements = 1;
-  for (const std::int64_t extent : shape) {
+  for (const std::int64_t extent : tensor.shape_span()) {
     elements *= static_cast<std::size_t>(extent);
   }
-  out.resize(elements);
-  if (auto copied = tensor.copy_to_host(out.data(), out.size() * sizeof(T), stream); !copied) {
-    return holoscan::make_unexpected(std::move(copied).error());
+  return elements;
+}
+
+// Queues a copy of a packed tensor of element type T to `out` on `stream`,
+// after its producer's work, growing `out` to fit.
+template <typename T>
+holoscan::expected<void, holoscan::Error> fetch_async(const holoscan::Tensor& tensor,
+                                                      cudaStream_t stream, PinnedBuffer& out) {
+  auto elements = packed_elements<T>(tensor);
+  if (!elements) {
+    return holoscan::make_unexpected(std::move(elements).error());
   }
-  return std::vector<std::int64_t>(shape.begin(), shape.end());
+  if (auto reserved = out.reserve(*elements * sizeof(T)); !reserved) {
+    return reserved;
+  }
+  return tensor.copy_to_host_async(out.as<void>(), *elements * sizeof(T), stream);
 }
 
 std::string numbered(std::uint64_t frame_id) {
@@ -76,18 +90,42 @@ std::string numbered(std::uint64_t frame_id) {
   return number;
 }
 
-// The prompts in effect: the control's, once set, or the configured ones.
-std::vector<s3::Sam3Prompt> prompts_of(const s3::Sam3SegmentationConfig& config) {
+// The prompts the image captured at `capture_ns` was segmented with: those
+// the segmenter recorded with its control, or the configured ones.
+std::vector<s3::Sam3Prompt> prompts_of(const s3::Sam3SegmentationConfig& config,
+                                       std::int64_t capture_ns) {
   if (config.prompt_control) {
-    auto [generation, prompts] = config.prompt_control->latest();
-    if (generation != 0) {
-      return prompts;
+    if (auto prompts = config.prompt_control->prompts_at(capture_ns)) {
+      return *std::move(prompts);
     }
   }
   return config.prompts;
 }
 
 }  // namespace
+
+PinnedBuffer::~PinnedBuffer() {
+  if (data_ != nullptr) {
+    cudaFreeHost(data_);
+  }
+}
+
+holoscan::expected<void, holoscan::Error> PinnedBuffer::reserve(std::size_t bytes) {
+  if (bytes <= bytes_) {
+    return {};
+  }
+  if (data_ != nullptr) {
+    cudaFreeHost(data_);
+    data_ = nullptr;
+    bytes_ = 0;
+  }
+  if (const cudaError_t status = cudaMallocHost(&data_, bytes); status != cudaSuccess) {
+    data_ = nullptr;
+    return holoscan::make_unexpected(cuda_failure("cudaMallocHost", status));
+  }
+  bytes_ = bytes;
+  return {};
+}
 
 SegmentationReportOp::SegmentationReportOp(SegmentationReportConfig config)
     : config_(std::move(config)) {
@@ -143,11 +181,33 @@ holoscan::Contract SegmentationReportOp::contract() const {
   return result;
 }
 
+SegmentationReportOp::~SegmentationReportOp() { release(); }
+
+void SegmentationReportOp::release() noexcept {
+  if (instances_copied_ != nullptr) {
+    cudaEventDestroy(instances_copied_);
+    instances_copied_ = nullptr;
+  }
+}
+
 // Each run counts its own frames from the start.
 void SegmentationReportOp::start() {
+  release();
   seen_ = 0;
   last_frame_id_ = 0;
+  if (config_.verify == Verify::kReference) {
+    table_ = s3::read_prompt_table(config_.segmenter.prompt_table);
+  }
+  if (const cudaError_t status =
+          cudaEventCreateWithFlags(&instances_copied_, cudaEventDisableTiming);
+      status != cudaSuccess) {
+    instances_copied_ = nullptr;
+    throw std::runtime_error(std::string("SegmentationReportOp: cudaEventCreateWithFlags: ") +
+                             cudaGetErrorString(status));
+  }
 }
+
+void SegmentationReportOp::stop() { release(); }
 
 holoscan::expected<void, holoscan::Error> SegmentationReportOp::compute(
     holoscan::ExecutionContext& context) {
@@ -174,52 +234,73 @@ holoscan::expected<void, holoscan::Error> SegmentationReportOp::process(
   if (!scores_sample) return holoscan::make_unexpected(std::move(scores_sample).error());
   if (!boxes_sample) return holoscan::make_unexpected(std::move(boxes_sample).error());
   if (!prompt_ids_sample) return holoscan::make_unexpected(std::move(prompt_ids_sample).error());
-  const ::cuda::stream_ref stream = context.cuda_stream();
-  std::vector<std::int32_t> counted;
-  auto label_shape = fetch(labels_sample->data, stream, labels_);
-  auto mask_shape = fetch(masks_sample->data, stream, masks_);
-  for (auto fetched : {fetch(count_sample->data, stream, counted).has_value(),
-                       fetch(scores_sample->data, stream, scores_).has_value(),
-                       fetch(boxes_sample->data, stream, boxes_).has_value(),
-                       fetch(prompt_ids_sample->data, stream, prompt_ids_).has_value()}) {
-    if (!fetched) {
-      return holoscan::make_unexpected(invalid("cannot read the instances"));
+  // In real time a source sends its last frame again until it is reported
+  // (image_sources.hpp): a frame already reported is passed over.
+  if (config_.realtime && seen_ != 0 && count_sample->metadata.frame_id <= last_frame_id_) {
+    if (needs_image()) {
+      if (auto frame = image.receive(); !frame) {
+        return holoscan::make_unexpected(std::move(frame).error());
+      }
     }
+    return {};
   }
-  if (!label_shape || !mask_shape || label_shape->size() != 2 || mask_shape->size() != 3 ||
-      counted.size() != 1) {
+  if (instances_copied_ == nullptr) {
+    return holoscan::make_unexpected(invalid("not started"));
+  }
+  // The runtime's stream, which outlives the run's output pools: they wait on
+  // it before they reuse what was copied. Without one, every copy completes
+  // before it returns.
+  cudaStream_t stream = context.cuda_stream().get();
+  const holoscan::Tensor& label_image = labels_sample->data;
+  const holoscan::Tensor& mask_planes = masks_sample->data;
+  const std::span<const std::int64_t> label_shape = label_image.shape_span();
+  const std::span<const std::int64_t> mask_shape = mask_planes.shape_span();
+  const std::span<const std::int64_t> count_shape = count_sample->data.shape_span();
+  if (label_shape.size() != 2 || mask_shape.size() != 3 || count_shape.size() != 1 ||
+      count_shape[0] != 1) {
     return holoscan::make_unexpected(invalid("unexpected instance tensors"));
   }
-  const int height = static_cast<int>((*label_shape)[0]);
-  const int width = static_cast<int>((*label_shape)[1]);
-  const int capacity = static_cast<int>((*mask_shape)[0]);
-  const int n = counted[0];
-  if (n < 0 || n > capacity) {
-    return holoscan::make_unexpected(invalid("instance count out of range"));
-  }
+  const int height = static_cast<int>(label_shape[0]);
+  const int width = static_cast<int>(label_shape[1]);
+  const int capacity = static_cast<int>(mask_shape[0]);
   const std::size_t plane = static_cast<std::size_t>(width) * height;
+  const bool verifies = config_.verify != Verify::kNone;
+  const bool reads_instances = verifies || config_.print;
+  const bool writes_images = !config_.image_dir.empty();
 
-  SegmentationReport& report = *config_.report;
-  const holoscan::SampleMetadata& metadata = count_sample->metadata;
-  // The instances are on the host now: the time since capture is the latency
-  // a host consumer sees.
-  if (auto now = context.clock().now();
-      now && metadata.source_clock_id.valid() && now->clock_id == metadata.source_clock_id) {
-    report.latencies_ms.push_back(
-        static_cast<double>(now->timestamp_ns - metadata.capture_timestamp_ns) * 1e-6);
+  // The instances, then the masks, labels and image the settings read, to
+  // pinned memory on the stream.
+  if (auto copied = fetch_async<std::int32_t>(count_sample->data, stream, count_); !copied) {
+    return copied;
   }
-  // Sources number their frames from 1; the instances keep their image's.
-  const std::uint64_t frame_id = metadata.frame_id;
-  if (config_.realtime && frame_id > last_frame_id_) {
-    report.skipped += frame_id - last_frame_id_ - 1U;
-  } else if (frame_id != last_frame_id_ + 1U) {
-    ++report.frame_gaps;
+  if (reads_instances) {
+    for (auto copied : {fetch_async<float>(scores_sample->data, stream, scores_),
+                        fetch_async<float>(boxes_sample->data, stream, boxes_),
+                        fetch_async<std::int32_t>(prompt_ids_sample->data, stream, prompt_ids_)}) {
+      if (!copied) {
+        return copied;
+      }
+    }
   }
-  last_frame_id_ = frame_id;
-  report.last_frame_id = frame_id;
-  report.instances += static_cast<std::uint64_t>(n);
-  const std::vector<s3::Sam3Prompt> prompts = prompts_of(config_.segmenter);
-
+  if (stream != nullptr) {
+    if (const cudaError_t status = cudaEventRecord(instances_copied_, stream);
+        status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaEventRecord", status));
+    }
+  }
+  bool more = false;
+  if (verifies) {
+    if (auto copied = fetch_async<std::uint8_t>(mask_planes, stream, masks_); !copied) {
+      return copied;
+    }
+    more = true;
+  }
+  if (writes_images) {
+    if (auto copied = fetch_async<std::uint16_t>(label_image, stream, labels_); !copied) {
+      return copied;
+    }
+    more = true;
+  }
   std::optional<PixelFormat> format;
   if (needs_image()) {
     auto frame = image.receive();
@@ -231,39 +312,85 @@ holoscan::expected<void, holoscan::Error> SegmentationReportOp::process(
       return holoscan::make_unexpected(
           invalid("can check only RGB8, BGR8, RGBA8 and BGRA8 images"));
     }
-    auto image_shape = fetch(*frame->data.data, stream, pixels_);
-    if (!image_shape) {
-      return holoscan::make_unexpected(std::move(image_shape).error());
-    }
-    if (image_shape->size() != 3 || (*image_shape)[0] != height || (*image_shape)[1] != width) {
+    const std::span<const std::int64_t> image_shape = frame->data.data->shape_span();
+    if (image_shape.size() != 3 || image_shape[0] != height || image_shape[1] != width) {
       return holoscan::make_unexpected(invalid("the instances and their image differ in size"));
     }
+    if (auto copied = fetch_async<std::uint8_t>(*frame->data.data, stream, pixels_); !copied) {
+      return copied;
+    }
+    more = true;
   }
+
+  // The instances are on the host now: the time since capture is the latency
+  // a host consumer sees.
+  if (stream != nullptr) {
+    if (const cudaError_t status = cudaEventSynchronize(instances_copied_); status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaEventSynchronize", status));
+    }
+  }
+  SegmentationReport& report = *config_.report;
+  const holoscan::SampleMetadata& metadata = count_sample->metadata;
+  if (auto now = context.clock().now();
+      now && metadata.source_clock_id.valid() && now->clock_id == metadata.source_clock_id) {
+    report.latencies_ms.push_back(
+        static_cast<double>(now->timestamp_ns - metadata.capture_timestamp_ns) * 1e-6);
+  }
+  if (more && stream != nullptr) {
+    if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+    }
+  }
+  const int n = *count_.as<std::int32_t>();
+  if (n < 0 || n > capacity) {
+    return holoscan::make_unexpected(invalid("instance count out of range"));
+  }
+  const auto slots = static_cast<std::size_t>(capacity);
+  const std::span<const float> scores_host(scores_.as<float>(), reads_instances ? slots : 0U);
+  const std::span<const float> boxes_host(boxes_.as<float>(), reads_instances ? 4U * slots : 0U);
+  const std::span<const std::int32_t> ids(prompt_ids_.as<std::int32_t>(),
+                                          reads_instances ? slots : 0U);
+  const std::uint8_t* masks_host = masks_.as<std::uint8_t>();
+  const std::uint8_t* pixels = pixels_.as<std::uint8_t>();
+
+  // Sources number their frames from 1; the instances keep their image's.
+  const std::uint64_t frame_id = metadata.frame_id;
+  if (config_.realtime && frame_id > last_frame_id_) {
+    report.skipped += frame_id - last_frame_id_ - 1U;
+  } else if (frame_id != last_frame_id_ + 1U) {
+    ++report.frame_gaps;
+  }
+  last_frame_id_ = frame_id;
+  report.last_frame_id.store(frame_id, std::memory_order_release);
+  report.instances += static_cast<std::uint64_t>(n);
+  const std::vector<s3::Sam3Prompt> prompts =
+      prompts_of(config_.segmenter, metadata.capture_timestamp_ns);
 
   if (config_.verify == Verify::kReference) {
     // The stub's outputs, from the image, through the references.
     const s3::Sam3SegmentationConfig& seg = config_.segmenter;
     const std::vector<float> input = s3::reference_preprocess(
-        pixels_.data(), static_cast<std::size_t>(width) * channels(*format), *format, width, height,
+        pixels, static_cast<std::size_t>(width) * channels(*format), *format, width, height,
         config_.stub.input_size, config_.stub.input_size, s3::Normalization{});
     const std::vector<float> fpn0 = s3::reference_stub_encoder(input, config_.stub);
-    const s3::PromptTable table = s3::read_prompt_table(seg.prompt_table);
     std::vector<s3::DecoderOutput> outputs;
     for (const s3::Sam3Prompt& prompt : prompts) {
       outputs.push_back(s3::reference_stub_decoder(
-          fpn0, s3::make_decoder_prompt(prompt, table, config_.stub.boxes), config_.stub));
+          fpn0, s3::make_decoder_prompt(prompt, *table_, config_.stub.boxes), config_.stub));
     }
     const float threshold = s3::logit_of(seg.mask_threshold);
     const s3::ReferenceInstances expected = s3::reference_instances(
         outputs, seg.max_instances, seg.score_threshold, threshold, width, height);
-    bool same = expected.count == n && expected.prompt_ids == prompt_ids_;
-    for (std::size_t k = 0; same && k < scores_.size(); ++k) {
-      same = std::fabs(scores_[k] - expected.scores[k]) <= 1e-3F;
+    bool same =
+        expected.count == n &&
+        std::equal(expected.prompt_ids.begin(), expected.prompt_ids.end(), ids.begin(), ids.end());
+    for (std::size_t k = 0; same && k < scores_host.size(); ++k) {
+      same = std::fabs(scores_host[k] - expected.scores[k]) <= 1e-3F;
     }
     std::uint64_t differing = 0;
     for (std::size_t k = 0; same && k < static_cast<std::size_t>(n); ++k) {
       for (std::size_t i = 0; i < plane; ++i) {
-        if (masks_[k * plane + i] != expected.masks[k * plane + i] &&
+        if (masks_host[k * plane + i] != expected.masks[k * plane + i] &&
             std::fabs(expected.logits[k * plane + i] - threshold) > config_.logit_slack) {
           ++differing;
         }
@@ -293,12 +420,12 @@ holoscan::expected<void, holoscan::Error> SegmentationReportOp::process(
         continue;
       }
       // Instances are best first: the prompt's first is its best.
-      const auto end = prompt_ids_.begin() + n;
-      const auto first = std::find(prompt_ids_.begin(), end, static_cast<std::int32_t>(p));
+      const auto end = ids.begin() + n;
+      const auto first = std::find(ids.begin(), end, static_cast<std::int32_t>(p));
       double iou = 0.0;
       if (first != end) {
-        const auto k = static_cast<std::size_t>(first - prompt_ids_.begin());
-        iou = s3::mask_iou(std::span(masks_.data() + k * plane, plane), shapes,
+        const auto k = static_cast<std::size_t>(first - ids.begin());
+        iou = s3::mask_iou(std::span(masks_host + k * plane, plane), shapes,
                            *config_.expected_shapes[p]);
       }
       report.min_iou = std::min(report.min_iou, iou);
@@ -322,13 +449,13 @@ holoscan::expected<void, holoscan::Error> SegmentationReportOp::process(
     }
     out << width << "x" << height << ", " << n << " instances";
     for (std::size_t k = 0; k < static_cast<std::size_t>(n); ++k) {
-      const std::int32_t id = prompt_ids_[k];
+      const std::int32_t id = ids[k];
       const std::string name = id >= 0 && static_cast<std::size_t>(id) < prompts.size()
                                    ? s3::display_name(prompts[static_cast<std::size_t>(id)])
                                    : "prompt " + std::to_string(id);
-      out << (k == 0 ? ": " : ", ") << name << ' ' << scores_[k] << " [" << std::setprecision(0)
-          << boxes_[4 * k] << ' ' << boxes_[4 * k + 1] << ' ' << boxes_[4 * k + 2] << ' '
-          << boxes_[4 * k + 3] << ']' << std::setprecision(2);
+      out << (k == 0 ? ": " : ", ") << name << ' ' << scores_host[k] << " [" << std::setprecision(0)
+          << boxes_host[4 * k] << ' ' << boxes_host[4 * k + 1] << ' ' << boxes_host[4 * k + 2]
+          << ' ' << boxes_host[4 * k + 3] << ']' << std::setprecision(2);
     }
     std::cout << out.str() << '\n' << std::flush;
   }
@@ -336,9 +463,9 @@ holoscan::expected<void, holoscan::Error> SegmentationReportOp::process(
   if (!config_.image_dir.empty()) {
     // The image under its instances' overlay, blended as HoloViz blends it.
     const std::vector<std::uint8_t> rgb =
-        to_rgb(pixels_.data(), static_cast<std::size_t>(width) * channels(*format), width, height,
-               *format);
-    const std::vector<std::uint8_t> overlay = s3::reference_overlay(labels_, width, height, 110);
+        to_rgb(pixels, static_cast<std::size_t>(width) * channels(*format), width, height, *format);
+    const std::vector<std::uint8_t> overlay = s3::reference_overlay(
+        std::span<const std::uint16_t>(labels_.as<std::uint16_t>(), plane), width, height, 110);
     std::vector<std::uint8_t> blended(rgb.size());
     for (std::size_t i = 0; i < plane; ++i) {
       const float alpha = static_cast<float>(overlay[4 * i + 3]) / 255.0F;

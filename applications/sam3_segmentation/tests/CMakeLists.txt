@@ -5,10 +5,17 @@
 # download: the module's stub model stands in for SAM 3, and the reporter checks every
 # instance against the host reference of the whole pipeline. The tests of the real model
 # are skipped (exit 77) unless it has been exported to SAM3_SEGMENTATION_DATA_DIR (see the
-# README). The module's own suite covers the kernels and the operators.
+# README): the sam3 folder of the test data ($HOLOSCAN_TEST_DATA) when that is set, and
+# data/sam3 otherwise. No CI lane has the model. The module's own suite covers the kernels
+# and the operators.
+if(NOT "$ENV{HOLOSCAN_TEST_DATA}" STREQUAL "")
+  set(_sam3_data_dir "$ENV{HOLOSCAN_TEST_DATA}/sam3")
+else()
+  set(_sam3_data_dir "${PROJECT_SOURCE_DIR}/../../data/sam3")
+endif()
 set(
   SAM3_SEGMENTATION_DATA_DIR
-  "${PROJECT_SOURCE_DIR}/../../data/sam3"
+  "${_sam3_data_dir}"
   CACHE PATH
   "Where prepare_model.py wrote the SAM 3 export, for the real-model tests"
 )
@@ -19,7 +26,8 @@ add_library(sam3_segmentation_spawn_thread_preload SHARED spawn_thread_preload.c
 
 # Runs the demo through run_and_match.cmake, which checks its exit status as well as its
 # output: sam3_app_test(<name> <exit status> <output regex> <arguments>...). It runs in
-# this directory, where `--model stub` writes the stub model and its engines are cached.
+# this directory, where `--model stub` writes the stub model to sam3_stub/ and its engines
+# are cached.
 set(_run_and_match "${CMAKE_CURRENT_SOURCE_DIR}/run_and_match.cmake")
 function(sam3_app_test name status output)
   add_test(
@@ -91,6 +99,24 @@ sam3_app_test(sam3_app_realtime_slow_consumer 0
 )
 set_tests_properties(sam3_app_realtime_slow_consumer PROPERTIES FIXTURES_REQUIRED sam3_stub)
 
+# The real-time path with the GPU far behind the source, slowed by compute-sanitizer's
+# memcheck: the outputs of samples the edges dropped stay held until the GPU is done with
+# them, so the segmenter skips the images it has no output slot for, and the run passes,
+# with the last frame. Skipped (exit 77) without compute-sanitizer.
+find_program(SAM3_SEGMENTATION_COMPUTE_SANITIZER compute-sanitizer HINTS "${CUDAToolkit_BIN_DIR}")
+add_test(
+  NAME sam3_app_realtime_slow_gpu
+  COMMAND
+    ${CMAKE_COMMAND} -DEXPECT_EXIT=0 "-DEXPECT_OUTPUT=frames=[0-9]+/100 .*verdict=PASS"
+    "-DSKIP_UNLESS_EXISTS=${SAM3_SEGMENTATION_COMPUTE_SANITIZER}" -P "${_run_and_match}" --
+    "${SAM3_SEGMENTATION_COMPUTE_SANITIZER}" --tool memcheck $<TARGET_FILE:sam3_segmentation>
+    ${_stub} --count 100 --period-ms 2 --realtime true
+)
+set_tests_properties(
+  sam3_app_realtime_slow_gpu
+  PROPERTIES FIXTURES_REQUIRED sam3_stub SKIP_RETURN_CODE 77 TIMEOUT 1200 RUN_SERIAL TRUE
+)
+
 # Images with their instances written as files.
 set(_images "${CMAKE_CURRENT_BINARY_DIR}/images")
 add_test(
@@ -139,16 +165,29 @@ sam3_app_test(sam3_app_offscreen 0
   "rendered=[1-9][0-9]* render: checked=[1-9][0-9]* failed=0 .*verdict=PASS"
   ${_stub} --count 20 --period-ms 20 --box-on triangle --display offscreen --render-file "${_render}"
 )
-set_tests_properties(sam3_app_offscreen PROPERTIES FIXTURES_REQUIRED sam3_stub)
+# The same in real time, as the camera runs: the segmenter takes the newest frame and the
+# display the newest instances, and the last frame arrives.
+sam3_app_test(sam3_app_realtime_offscreen 0
+  "frames=[0-9]+/40 .*rendered=[1-9][0-9]* render: checked=[1-9][0-9]* failed=0 .*verdict=PASS"
+  ${_stub} --count 40 --period-ms 10 --box-on triangle --realtime true --display offscreen
+)
+set_tests_properties(
+  sam3_app_offscreen
+  sam3_app_realtime_offscreen
+  PROPERTIES FIXTURES_REQUIRED sam3_stub
+)
 
-# Prompts typed while it runs: a line it can use, and one it cannot.
+# Prompts typed while it runs: a line it can use, one it cannot, and another it can. Every
+# image's instances are checked against the reference for the prompts it was segmented
+# with, so an image decoded with prompts half uploaded, or checked or named with the wrong
+# ones, fails.
 add_test(
   NAME sam3_app_interactive
   COMMAND
     ${CMAKE_COMMAND} -DEXPECT_EXIT=0
-    "-DEXPECT_OUTPUT=prompts now: blue.*not in the prompt table.*frames=200/200 .*verdict=PASS" -P
-    "${_run_and_match}" -- sh -c
-    "(echo blue && sleep 0.3 && echo green) | \"$1\" --model stub --count 200 --period-ms 5 --verify false --interactive true"
+    "-DEXPECT_OUTPUT=prompts now: blue.*not in the prompt table.*prompts now: red, blue.*frames=200/200 .*reference: checked=200 failed=0 worst_pixels=0.*verdict=PASS"
+    -P "${_run_and_match}" -- sh -c
+    "(echo blue && sleep 0.3 && echo green && sleep 0.3 && echo red, blue) | \"$1\" --model stub --count 200 --period-ms 5 --interactive true"
     sh $<TARGET_FILE:sam3_segmentation>
 )
 set_tests_properties(sam3_app_interactive PROPERTIES FIXTURES_REQUIRED sam3_stub)
@@ -183,8 +222,8 @@ sam3_app_test(sam3_app_rejects_render_file 2 "^error: --render-file needs --disp
 sam3_app_test(sam3_app_rejects_small_frames 2 "^error: synthetic images are" ${_stub} --width 16)
 sam3_app_test(sam3_app_rejects_zero_period 2 "^error: --period-ms" ${_stub} --period-ms 0)
 sam3_app_test(sam3_app_rejects_encoding 2 "^error: --encoding" ${_stub} --encoding mono8)
-sam3_app_test(sam3_app_rejects_interactive_verify 2 "^error: --interactive changes" ${_stub}
-  --interactive true
+sam3_app_test(sam3_app_rejects_interactive_verify 2 "^error: --interactive changes"
+  --model "${_junk}" --interactive true
 )
 sam3_app_test(sam3_app_rejects_still_with_files 2 "^error: --still, --realtime"
   ${_stub} --source files --images "${CMAKE_CURRENT_SOURCE_DIR}" --still true
@@ -196,10 +235,32 @@ sam3_app_test(sam3_app_rejects_missing_camera 2 "^error: cannot open camera /dev
   ${_stub} --source camera --device /dev/video99
 )
 sam3_app_test(sam3_app_help 0 "^Usage: .*--model DIR\\|stub" --help)
-# Only the plan's verdict: an accepted plan has no warnings.
-sam3_app_test(sam3_app_compile_only 0 "^sam3_segmentation: plan=OK\n*$" ${_stub} --compile-only true)
-sam3_app_test(sam3_app_window_plan 0 "^sam3_segmentation: plan=OK\n*$"
+# Only the plan's verdict: an accepted plan has no warnings, and every lossless graph, the
+# ci and demo modes', with files, its images written or a display, runs on one worker.
+set(_one_worker "^sam3_segmentation: plan=OK workers=1\n*$")
+sam3_app_test(sam3_app_compile_only 0 "${_one_worker}" ${_stub} --compile-only true)
+sam3_app_test(sam3_app_unchecked_plan 0 "${_one_worker}"
+  ${_stub} --verify false --compile-only true
+)
+sam3_app_test(sam3_app_image_dir_plan 0 "${_one_worker}"
+  ${_stub} --image-dir "${CMAKE_CURRENT_BINARY_DIR}" --compile-only true
+)
+sam3_app_test(sam3_app_files_plan 0 "${_one_worker}"
+  ${_stub} --source files --images "${_files}" --image-dir "${CMAKE_CURRENT_BINARY_DIR}"
+  --compile-only true
+)
+set_tests_properties(sam3_app_files_plan PROPERTIES FIXTURES_REQUIRED sam3_images)
+sam3_app_test(sam3_app_window_plan 0 "${_one_worker}"
   ${_stub} --display window --compile-only true
+)
+sam3_app_test(sam3_app_offscreen_plan 0 "${_one_worker}"
+  ${_stub} --display offscreen --compile-only true
+)
+# The camera's topology, real time with a window, which is left to the automatic
+# partitioning; the camera itself needs a device, so synthetic frames stand in for it.
+sam3_app_test(sam3_app_realtime_window_plan 0 "^sam3_segmentation: plan=OK workers=[1-9][0-9]*\n*$"
+  ${_stub} --realtime true --display window --image-dir "${CMAKE_CURRENT_BINARY_DIR}"
+  --compile-only true
 )
 
 # A stop request ends the run early with its own verdict, and the warning it leaves is
