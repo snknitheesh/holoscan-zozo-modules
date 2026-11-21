@@ -479,6 +479,29 @@ void cameras_that_see_the_same() {
   VERIFY(std::abs(gains[1] * 0.5 / gains[0] - 1.0) < 0.03);
 }
 
+void tiny_output() {
+  // Outputs 1 and 2 pixels across have no exposure sample pixel: the gains
+  // stay 1 and the blend is the reference's.
+  const CameraRig rig = surround_rig(320, 180);
+  const auto frame = render_frame(kWorld, rig, RigPose{}, PixelFormat::kRgb8,
+                                  std::vector<float>{1.0F, 0.7F, 1.2F, 0.9F});
+  BlendSettings settings;
+  settings.exposure_compensation = true;
+  for (const int side : {1, 2}) {
+    for (const auto& [width, height] : {std::pair{side, 64}, std::pair{64, side}}) {
+      const OutputGeometry g = ground_view(width, height, 5.0);
+      Stitcher stitcher(rig, g, settings);
+      const auto got = stitch_frame(stitcher, frame);
+      const std::vector<float> gains = stitcher.gains(nullptr);
+      for (const float gain : gains) VERIFY_MSG(gain == 1.0F, std::to_string(gain));
+      std::vector<std::uint8_t> want(static_cast<std::size_t>(width) * height * 4U);
+      reference_stitch(stitcher.download_tables(), frame.host_images, settings, gains, want.data(),
+                       static_cast<std::size_t>(width) * 4U);
+      VERIFY_MSG(got == want, std::to_string(width) + "x" + std::to_string(height));
+    }
+  }
+}
+
 void invalid_input() {
   const CameraRig rig = surround_rig(320, 180);
   Stitcher stitcher(rig, ground_view(64, 64, 5.0), BlendSettings{});
@@ -525,6 +548,7 @@ int main() {
       {"input_formats", st::input_formats},
       {"camera_that_sees_nothing", st::camera_that_sees_nothing},
       {"cameras_that_see_the_same", st::cameras_that_see_the_same},
+      {"tiny_output", st::tiny_output},
       {"invalid_input", st::invalid_input},
   });
 }

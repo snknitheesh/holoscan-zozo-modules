@@ -316,9 +316,13 @@ cudaError_t Stitcher::stitch(std::span<const DeviceImage> images, void* output,
     const int half = kExposureStride / 2;
     const int samples_x = (s.geometry.width - half + kExposureStride - 1) / kExposureStride;
     const int samples_y = (s.geometry.height - half + kExposureStride - 1) / kExposureStride;
-    stats_kernel<<<grid_for(samples_x, samples_y), kBlock, 0, stream>>>(params, s.sum, s.count);
-    if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
-      return status;
+    // An output of 1 or 2 pixels across has no sample pixel: no statistics,
+    // and the gains solve to 1, as in the CPU reference.
+    if (samples_x > 0 && samples_y > 0) {
+      stats_kernel<<<grid_for(samples_x, samples_y), kBlock, 0, stream>>>(params, s.sum, s.count);
+      if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return status;
+      }
     }
     gains_kernel<<<1, 1, 0, stream>>>(static_cast<int>(n), s.sum, s.count,
                                       detail::gain_alpha(s.settings), detail::gain_beta(s.settings),
