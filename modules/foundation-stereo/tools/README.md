@@ -57,8 +57,8 @@ pixels of search. It writes `c_fast_foundationstereo_<H>x<W>_it<N>.onnx`, or
 
 The C-Fast-FoundationStereo checkpoint predates the `normalize` setting the pinned upstream code
 reads; the script adds it with the value upstream assumes when it is missing (`True`), on a copy.
-Exporting it at 480x736 gives the same results as the fetched ONNX file on the recorded RealSense
-clip.
+Exporting it at 480x736 gives the same results as the fetched ONNX file on the 720p stereo camera
+recording.
 
 **Research checkpoints** (`23-36-37`, `20-26-39`, `20-30-48`) are linked from the upstream README,
 on Google Drive, which offers no stable download URL; download one yourself and pass its
@@ -74,8 +74,9 @@ code: use checkpoints from sources you trust, in an environment of their own.
 `FoundationStereoOp` (and `prepare_engine()`) builds the TensorRT engine of an `.onnx` model
 beside it on first use, named after the model, the GPU, the TensorRT version and the precision,
 and loads it from there afterwards. Building the 480x736 model takes about 2 minutes on an
-RTX 5090 and about 46 minutes on a Jetson AGX Orin. Preparing a model again under the same name deletes the engines
-cached for the old one.
+RTX 5090 and about 46 minutes on a Jetson Orin. Preparing a model again under the same name deletes
+the engines cached for the old one, and so does the operator when it finds a model's content
+changed (it keeps the content's digest in `<model>.digest`).
 
 ## Options
 

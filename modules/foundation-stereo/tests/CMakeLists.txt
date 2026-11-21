@@ -3,13 +3,13 @@
 
 # The module's full suite. The kernel and operator tests need the SDK, CUDA and a GPU;
 # none needs a download: the stub model stands in for Fast-FoundationStereo. The test of
-# the real model is skipped (exit 77) unless tools/prepare_model.py has written it to
-# HOLOSCAN_FOUNDATION_STEREO_MODEL.
+# the real model is skipped (exit 77) unless HOLOSCAN_FOUNDATION_STEREO_MODEL names the
+# model tools/prepare_model.py wrote.
 set(
   HOLOSCAN_FOUNDATION_STEREO_MODEL
-  "${PROJECT_SOURCE_DIR}/../../data/foundation_stereo/c_fast_foundationstereo_480x736.onnx"
+  ""
   CACHE FILEPATH
-  "A Fast-FoundationStereo ONNX model for the real-model test"
+  "A Fast-FoundationStereo ONNX model for the real-model test; empty skips it"
 )
 
 add_executable(foundation_stereo_kernels_test kernels_test.cu)

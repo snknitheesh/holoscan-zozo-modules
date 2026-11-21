@@ -63,8 +63,8 @@ void check_scene(holoscan::schema::ImageEncoding encoding, int width, int height
   constexpr std::uint32_t kFrames = 3;
   for (std::uint32_t frame = 0; frame < kFrames; ++frame) {
     auto pair = scene_pair(make_scene(frame * 9U, width, height), encoding, Memory::kDevice);
-    h.push_frame(ht::frame_at(capture_time(frame), ht::input("left", std::move(pair[0].image)),
-                              ht::input("right", std::move(pair[1].image))));
+    h.push_frame(test::stereo_frame(capture_time(frame), std::move(pair),
+                                    test::scene_info(make_scene(0, width, height))));
   }
   h.input_source_device("left", holoscan::DeviceId{0});
   h.input_source_device("right", holoscan::DeviceId{0});
@@ -113,7 +113,8 @@ void check_scene(holoscan::schema::ImageEncoding encoding, int width, int height
   std::cout << "  " << what << ": model " << config.stats->model_width << "x"
             << config.stats->model_height << ", gpu_ms(mean/max)="
             << (timed == 0 ? 0.0 : static_cast<double>(config.stats->gpu_ns_total) / 1e6 / timed)
-            << '/' << static_cast<double>(config.stats->gpu_ns_max) / 1e6 << ", model_memory_mib="
+            << '/' << static_cast<double>(config.stats->gpu_ns_max) / 1e6
+            << ", free_memory_drop_mib="
             << static_cast<double>(config.stats->model_bytes) / (1024.0 * 1024.0) << '\n';
 }
 
@@ -122,11 +123,11 @@ void check_scene(holoscan::schema::ImageEncoding encoding, int width, int height
 
 int main(int argc, char** argv) {
   namespace fs = holoscan::foundation_stereo;
-  if (argc != 2) {
-    std::cerr << "usage: " << argv[0] << " MODEL\n";
+  if (argc > 2) {
+    std::cerr << "usage: " << argv[0] << " [MODEL]\n";
     return 2;
   }
-  fs::g_model = argv[1];
+  if (argc == 2) fs::g_model = argv[1];
   if (!std::filesystem::is_regular_file(fs::g_model)) {
     std::cout << "SKIPPED: no model at " << fs::g_model.string()
               << "; tools/prepare_model.py writes it\n";

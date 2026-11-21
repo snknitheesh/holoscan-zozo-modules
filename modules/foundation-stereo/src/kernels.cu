@@ -3,8 +3,8 @@
 
 #include <cstdint>
 
+#include <holoscan/foundation_stereo/depth.hpp>
 #include <holoscan/foundation_stereo/kernels.hpp>
-#include <holoscan/foundation_stereo/stereo_geometry.hpp>
 
 namespace holoscan::foundation_stereo {
 namespace {

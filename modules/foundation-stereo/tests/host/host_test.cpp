@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The module's host-only pieces, without the SDK, CUDA or a GPU: the stub
-// model file and its formula; the stereo geometry's checks and depth formula;
+// model file and its formula, and the engines of a replaced one; the camera
+// info rules, the depth's camera and the depth formula;
 // and the CPU references that the GPU tests compare against, on cases worked
 // out by hand.
 //
@@ -13,14 +14,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <holoscan/foundation_stereo/camera_info.hpp>
+#include <holoscan/foundation_stereo/depth.hpp>
 #include <holoscan/foundation_stereo/reference.hpp>
-#include <holoscan/foundation_stereo/stereo_geometry.hpp>
 #include <holoscan/foundation_stereo/stub_model.hpp>
+#include <holoscan/messages/camera_info.hpp>
+#include <holoscan/messages/synthetic_calibration.hpp>
 
 #include "test_support.hpp"
 
@@ -54,8 +57,15 @@ void check_stub_model_file() {
   const auto written = std::filesystem::last_write_time(path);
   VERIFY(write_stub_model(folder, 160, 96) == path &&
          std::filesystem::last_write_time(path) == written);
+  // A changed file is replaced, and the engines cached for it go with it;
+  // another model's are kept.
   std::ofstream(path, std::ios::binary) << "corrupt";
+  const auto stale = folder / "foundation_stereo_stub_160x96.GPU.trt.10.cfg0.engine.fp16";
+  const auto other = folder / "foundation_stereo_stub_96x160.GPU.trt.10.cfg0.engine.fp16";
+  std::ofstream(stale) << "engine";
+  std::ofstream(other) << "engine";
   VERIFY(write_stub_model(folder, 160, 96) == path && read_file(path) == model);
+  VERIFY(!std::filesystem::exists(stale) && std::filesystem::exists(other));
   VERIFY(test::throws<std::runtime_error>(
       [] { (void)write_stub_model(g_directory / "no" / "such" / "folder", 160, 96); }));
 }
@@ -70,21 +80,55 @@ void check_stub_formula() {
   VERIFY(stub_disparity(black, 64.0F) < 0.0F);
 }
 
-void check_geometry() {
-  const StereoGeometry good{.fx = 337.0, .baseline = 0.095, .width = 1280, .height = 720};
-  VERIFY(!test::throws<std::invalid_argument>([&] { validate_geometry(good); }));
-  const auto rejects = [&](auto edit) {
-    StereoGeometry g = good;
-    edit(g);
-    return test::throws<std::invalid_argument>([&] { validate_geometry(g); });
-  };
-  VERIFY(rejects([](StereoGeometry& g) { g.fx = 0; }));
-  VERIFY(rejects([](StereoGeometry& g) { g.baseline = -0.1; }));
-  VERIFY(rejects([](StereoGeometry& g) { g.baseline = std::numeric_limits<double>::infinity(); }));
-  VERIFY(rejects([](StereoGeometry& g) { g.width = 0; }));
-  VERIFY(rejects([](StereoGeometry& g) { g.height = 16385; }));
-  VERIFY(rejects([](StereoGeometry& g) { g.cx = std::nan(""); }));
-  VERIFY(rejects([](StereoGeometry& g) { g.doffs = std::numeric_limits<double>::infinity(); }));
+// A rectified 1280x720 pair with a 95 mm baseline and 2.5 px of doffs.
+messages::StereoCameraInfo rectified_pair() {
+  messages::CameraInfo left;
+  left.header.frame_id = "left";
+  left.width = 1280;
+  left.height = 720;
+  left.state = messages::CameraState::kRectified;
+  left.fx = 337.0;
+  left.fy = 337.0;
+  left.cx = 640.5;
+  left.cy = 360.5;
+  messages::CameraInfo right = left;
+  right.header.frame_id = "right";
+  right.cx = 643.0;
+  messages::StereoCameraInfo pair;
+  pair.header.frame_id = "left";
+  pair.left = left;
+  pair.right = right;
+  pair.right_from_left.translation = {-0.095, 0.0, 0.0};
+  pair.baseline = 0.095;
+  pair.doffs = 2.5;
+  messages::validate(pair);
+  return pair;
+}
+
+void check_camera_info() {
+  const messages::StereoCameraInfo pair = rectified_pair();
+  VERIFY(!camera_info_problem(pair, 1280, 720));
+  const auto size = camera_info_problem(pair, 640, 480);
+  VERIFY(size && size->find("is for 1280x720 (left)") != std::string::npos);
+  const auto raw = camera_info_problem(
+      messages::synthetic_stereo_camera_info(messages::DistortionModel::kPlumbBob, 1280, 720), 1280,
+      720);
+  VERIFY(raw && raw->find("must be a rectified pair") != std::string::npos);
+  // The depth's camera: the left camera, with the pair's frame id when it has
+  // none, and no capture time.
+  messages::StereoCameraInfo stamped = pair;
+  stamped.left.header.frame_id.clear();
+  stamped.left.header.capture_timestamp_ns = 42;
+  const messages::CameraInfo depth = depth_camera_info(stamped);
+  VERIFY(depth.width == 1280 && depth.height == 720 && depth.fx == 337.0 && depth.cx == 640.5);
+  VERIFY(depth.state == messages::CameraState::kRectified);
+  VERIFY(depth.header.frame_id == "left" && depth.header.capture_timestamp_ns == 0);
+  VERIFY(test::throws<std::invalid_argument>([] {
+    (void)depth_camera_info(
+        messages::synthetic_stereo_camera_info(messages::DistortionModel::kPlumbBob, 640, 480));
+  }));
+  // The pair's depth formula, as the kernels use it.
+  VERIFY(messages::fx_baseline(pair) == 337.0 * 0.095);
   // z = fx * B / (d + doffs); 0 for a disparity of 0 or less.
   VERIFY(depth_from_disparity(32.0F, 32.0F, 0.0F) == 1.0F);
   VERIFY(depth_from_disparity(30.0F, 32.0F, 2.0F) == 1.0F);
@@ -127,7 +171,7 @@ int main(int argc, char** argv) {
   return fs::test::run({
       {"stub model file", fs::check_stub_model_file},
       {"stub formula", fs::check_stub_formula},
-      {"stereo geometry and depth", fs::check_geometry},
+      {"camera info and depth", fs::check_camera_info},
       {"CPU references", fs::check_references},
   });
 }

@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Stereo pairs of the synthetic scene as image messages, in device, host or
-// pinned host memory, for the operator tests.
+// Stereo pairs of the synthetic scene as image messages, in device memory,
+// the runtime's pinned or pageable host memory, or imported pinned memory,
+// and frames of them with their camera info, for the operator tests.
 
 #pragma once
 
@@ -15,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,8 @@
 #include <holoscan/foundation_stereo/synthetic_scene.hpp>
 #include <holoscan/memory/tensor_storage.hpp>
 #include <holoscan/memory/unbounded_allocator.hpp>
+#include <holoscan/messages/conversion.hpp>
+#include <holoscan/messages/stereo_camera_info_schema_traits.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 
@@ -34,7 +38,10 @@ inline std::chrono::nanoseconds capture_time(std::uint32_t frame) {
   return std::chrono::milliseconds(100 * (frame + 1));
 }
 
-enum class Memory { kDevice, kHost, kPinned };
+// kHost: the runtime's pinned host memory (MemoryStorageType::kHost); kPageable:
+// plain system memory (kSystem); kPinned: pinned memory imported through
+// DLPack, which the runtime cannot hold for the GPU.
+enum class Memory { kDevice, kHost, kPageable, kPinned };
 
 inline PixelFormat format_of(ImageEncoding encoding) {
   switch (encoding) {
@@ -51,16 +58,17 @@ inline PixelFormat format_of(ImageEncoding encoding) {
   }
 }
 
-// A tensor of `shape` holding `bytes`, in device, host or pinned host memory.
+// A tensor of `shape` holding `bytes`, in `memory`.
 inline std::shared_ptr<holoscan::Tensor> make_tensor(std::vector<std::uint8_t> bytes,
                                                      std::vector<std::int64_t> shape,
                                                      Memory memory) {
-  if (memory == Memory::kDevice || memory == Memory::kHost) {
-    auto tensor =
-        holoscan::make_tensor(shape, DLDataType{kDLUInt, 8, 1}, std::nullopt,
-                              memory == Memory::kDevice ? holoscan::MemoryStorageType::kDevice
-                                                        : holoscan::MemoryStorageType::kHost,
-                              std::make_shared<holoscan::UnboundedAllocator>());
+  if (memory != Memory::kPinned) {
+    const holoscan::MemoryStorageType storage =
+        memory == Memory::kDevice ? holoscan::MemoryStorageType::kDevice
+        : memory == Memory::kHost ? holoscan::MemoryStorageType::kHost
+                                  : holoscan::MemoryStorageType::kSystem;
+    auto tensor = holoscan::make_tensor(shape, DLDataType{kDLUInt, 8, 1}, std::nullopt, storage,
+                                        std::make_shared<holoscan::UnboundedAllocator>());
     if (!tensor) throw std::runtime_error(tensor.error().message);
     auto destination = tensor->mutable_data();
     if (!destination ||
@@ -139,6 +147,35 @@ inline std::array<Eye, 2> scene_pair(const SyntheticScene& scene, ImageEncoding 
     pair[side].image.data = make_tensor(std::move(bytes), std::move(shape), memory);
   }
   return pair;
+}
+
+// The scene's camera info as the operator's input takes it.
+inline holoscan::messages::schema::StereoCameraInfoT scene_info(const SyntheticScene& scene) {
+  return holoscan::messages::to_message(scene_camera_info(scene));
+}
+
+template <typename T>
+void add_field(holoscan::testing::TestFrame& frame, std::string name, T value,
+               std::chrono::nanoseconds time, std::uint64_t frame_id) {
+  auto sample = holoscan::testing::sample_at(std::move(value), time);
+  if (frame_id != 0) sample.metadata.frame_id = frame_id;
+  std::vector<holoscan::testing::TestSample<T>> samples;
+  samples.push_back(std::move(sample));
+  frame.fields.push_back(
+      {std::move(name), holoscan::testing::staged_samples<T>(std::move(samples))});
+}
+
+// One stereo frame at `time`: its camera info first, when given, as a
+// producer sending it with every pair does, then the left and right images;
+// all with frame id `frame_id` when it is not 0.
+inline holoscan::testing::TestFrame stereo_frame(
+    std::chrono::nanoseconds time, std::array<Eye, 2> pair,
+    std::optional<holoscan::messages::schema::StereoCameraInfoT> info, std::uint64_t frame_id = 0) {
+  holoscan::testing::TestFrame frame;
+  if (info) add_field(frame, "camera_info", std::move(*info), time, frame_id);
+  add_field(frame, "left", std::move(pair[0].image), time, frame_id);
+  add_field(frame, "right", std::move(pair[1].image), time, frame_id);
+  return frame;
 }
 
 template <typename T>

@@ -206,6 +206,7 @@ std::filesystem::path write_stub_model(const std::filesystem::path& directory, i
   const std::filesystem::path path =
       directory /
       ("foundation_stereo_stub_" + std::to_string(width) + "x" + std::to_string(height) + ".onnx");
+  bool replacing = false;
   {
     std::ifstream existing(path, std::ios::binary);
     if (existing) {
@@ -213,6 +214,18 @@ std::filesystem::path write_stub_model(const std::filesystem::path& directory, i
                                 std::istreambuf_iterator<char>()};
       if (current == bytes) {
         return path;
+      }
+      replacing = true;
+    }
+  }
+  if (replacing) {
+    // The engines cached for the stub this file held: <stem>.*engine*.
+    const std::string prefix = path.stem().string() + ".";
+    std::error_code ignored;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, ignored)) {
+      const std::string name = entry.path().filename().string();
+      if (name.starts_with(prefix) && name.find(".engine", prefix.size()) != std::string::npos) {
+        std::filesystem::remove(entry.path(), ignored);
       }
     }
   }

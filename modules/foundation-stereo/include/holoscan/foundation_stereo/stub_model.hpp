@@ -39,9 +39,10 @@ inline constexpr int kMaxStubSide = 4096;
 
 // Writes the model to `directory`/foundation_stereo_stub_<width>x<height>.onnx
 // unless that file already holds it, and returns its path. The file is
-// replaced atomically, so concurrent runs can share the directory, and a
-// TensorRT engine cached beside it stays valid as long as the file does not
-// change.
+// replaced atomically, so concurrent runs can share the directory. HoloInfer
+// names the TensorRT engine it caches beside the file after the file's name,
+// not its content, so replacing a file that held another stub (an older
+// build's) also deletes the engines cached for it.
 // @throws std::runtime_error if the file cannot be written.
 std::filesystem::path write_stub_model(const std::filesystem::path& directory, int width,
                                        int height);

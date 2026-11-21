@@ -43,7 +43,7 @@ struct PostprocessParams {
   int width{};  // The image's size, which the outputs have.
   int height{};
   // For `depth`: focal length in pixels times baseline in meters, and doffs
-  // (see stereo_geometry.hpp).
+  // (see depth.hpp).
   float fx_baseline{};
   float doffs{};
   // Also invalidate pixels whose match would lie left of the right image

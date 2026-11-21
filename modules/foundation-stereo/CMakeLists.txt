@@ -51,29 +51,19 @@ if(HOLOSCAN_FOUNDATION_STEREO_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info messages: the target of this build when the repository root added
+# holoscan-messages first, else its installed package.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
-# The geometry message, generated from its FlatBuffers schema into the public include tree.
-set(_generated_include_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
-holoscan_add_flatbuffer_schema(
-  TARGET holoscan_foundation_stereo_schema
-  SCHEMA schemas/stereo_geometry.fbs
-  OUTPUT_DIR "${_generated_include_dir}/holoscan/foundation_stereo"
-  MAX_SERIALIZED_SIZE 256
-)
-get_target_property(
-  _generated_headers
-  holoscan_foundation_stereo_schema
-  HOLOSCAN_FLATBUFFER_GENERATED_HEADERS
-)
-
-# holoscan::foundation_stereo: FoundationStereoOp, its kernels, the geometry message, and the
+# holoscan::foundation_stereo: FoundationStereoOp, its kernels and camera info rules, and the
 # stub model and synthetic scene for tests.
 add_library(
   holoscan_foundation_stereo
+  src/camera_info.cpp
   src/foundation_stereo_op.cpp
-  src/geometry_message.cpp
   src/kernels.cu
-  src/stereo_geometry.cpp
   src/stub_model.cpp
   src/synthetic_scene.cu
 )
@@ -91,16 +81,11 @@ target_include_directories(
   holoscan_foundation_stereo
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<BUILD_INTERFACE:${_generated_include_dir}>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
 )
 target_link_libraries(
   holoscan_foundation_stereo
-  PUBLIC
-    holoscan::core
-    holoscan::sensor_io
-    CUDA::cudart
-    "$<BUILD_INTERFACE:holoscan_foundation_stereo_schema>"
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
   PRIVATE holoscan::infer
 )
 set_target_properties(
@@ -113,8 +98,7 @@ set_target_properties(
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Installation: the library, public and generated headers, the schema, the model tool, and
-# the package.
+# Installation: the library, its headers, the model tool, and the package.
 set(_cmake_dir "${CMAKE_INSTALL_LIBDIR}/cmake/holoscan-foundation-stereo")
 set(_share_dir "${CMAKE_INSTALL_DATAROOTDIR}/holoscan-foundation-stereo")
 install(
@@ -128,11 +112,6 @@ install(
   DIRECTORY include/holoscan/foundation_stereo
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/holoscan"
 )
-install(
-  FILES ${_generated_headers}
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/holoscan/foundation_stereo"
-)
-install(FILES schemas/stereo_geometry.fbs DESTINATION "${_share_dir}/schemas")
 install(PROGRAMS tools/prepare_model.py DESTINATION "${_share_dir}")
 set(_doc_dir "${CMAKE_INSTALL_DATAROOTDIR}/doc/holoscan-foundation-stereo")
 install(FILES ../../LICENSE NOTICE README.md DESTINATION "${_doc_dir}")
@@ -144,6 +123,12 @@ install(
   DESTINATION "${_cmake_dir}"
 )
 set(HOLOSCAN_FOUNDATION_STEREO_PREPARE_MODEL "${_share_dir}/prepare_model.py")
+# HoloInfer is linked privately: only a static library passes it on to its consumers.
+if(BUILD_SHARED_LIBS)
+  set(HOLOSCAN_FOUNDATION_STEREO_SDK_COMPONENTS "core sensor_io")
+else()
+  set(HOLOSCAN_FOUNDATION_STEREO_SDK_COMPONENTS "core sensor_io inference")
+endif()
 configure_package_config_file(
   cmake/holoscan-foundation-stereo-config.cmake.in
   "${CMAKE_CURRENT_BINARY_DIR}/holoscan-foundation-stereo-config.cmake"

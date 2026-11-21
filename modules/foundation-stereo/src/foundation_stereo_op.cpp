@@ -11,12 +11,16 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -25,14 +29,15 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/foundation_stereo/camera_info.hpp>
 #include <holoscan/foundation_stereo/kernels.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
 
 namespace holoscan::foundation_stereo {
 namespace {
 
-using std::chrono_literals::operator""ns;
 namespace infer = holoscan::inference;
 
 constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
@@ -48,6 +53,12 @@ constexpr const char* kOutputName = "disparity";
 
 // Frames whose GPU time may be pending at once; see State::timing.
 constexpr std::size_t kTimingSlots = 4;
+// Frames on the GPU at once: compute() waits for the frame before last before
+// it queues another. This is the operator's only GPU throttle: without it, a
+// live source on drop-oldest edges would queue frames faster than the model
+// runs them, and each disparity would come out later than the one before.
+constexpr std::size_t kMaxFramesInFlight = 2;
+static_assert(kMaxFramesInFlight < kTimingSlots);
 
 holoscan::Error invalid(const std::string& message) {
   return holoscan::Error{holoscan::ErrorCode::kInvalidArgument, "FoundationStereoOp: " + message};
@@ -61,11 +72,95 @@ holoscan::Error cuda_failure(const char* what, cudaError_t status) {
   return failure(std::string(what) + ": " + cudaGetErrorString(status));
 }
 
+// The device's free and total memory, for an error about loading a model.
+std::string memory_text() {
+  std::size_t free = 0;
+  std::size_t total = 0;
+  if (cudaMemGetInfo(&free, &total) != cudaSuccess) {
+    cudaGetLastError();
+    return {};
+  }
+  return "; the GPU has " + std::to_string(free >> 20U) + " of " + std::to_string(total >> 20U) +
+         " MiB free";
+}
+
 bool is_onnx(const std::filesystem::path& path) {
   std::string extension = path.extension().string();
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return extension == ".onnx";
+}
+
+// A 64-bit FNV-1a digest of a file's bytes, in hex, or nullopt if it cannot be
+// read.
+std::optional<std::string> file_digest(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return std::nullopt;
+  std::uint64_t hash = 0xcbf29ce484222325ULL;
+  std::vector<char> chunk(std::size_t{1} << 20U);
+  while (in) {
+    in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    for (std::streamsize i = 0; i < in.gcount(); ++i) {
+      hash = (hash ^ static_cast<unsigned char>(chunk[static_cast<std::size_t>(i)])) *
+             0x100000001b3ULL;
+    }
+  }
+  if (in.bad()) return std::nullopt;
+  std::ostringstream text;
+  text << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return text.str();
+}
+
+// HoloInfer names the engine it caches for an .onnx model after the model's
+// name, the GPU, the TensorRT version and the build options, not after the
+// model's content: an engine built for a model that has since been replaced
+// under the same name would be loaded as it is. So the content's digest is
+// kept beside the model, and when it no longer matches, the cached engines
+// (<stem>.*engine*) are deleted, to be built again.
+void drop_stale_engines(const std::filesystem::path& model) {
+  if (!is_onnx(model)) return;
+  const auto digest = file_digest(model);
+  if (!digest) return;  // HoloInfer reports a model it cannot read.
+  std::filesystem::path record = model;
+  record += ".digest";
+  {
+    std::ifstream in(record);
+    std::string recorded;
+    if (in && std::getline(in, recorded) && recorded == *digest) return;
+  }
+  const std::filesystem::path folder = model.has_parent_path() ? model.parent_path() : ".";
+  const std::string prefix = model.stem().string() + ".";
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with(prefix) && name.find(".engine", prefix.size()) != std::string::npos) {
+      std::error_code removed;
+      if (std::filesystem::remove(entry.path(), removed)) {
+        HOLOSCAN_LOG_INFO(
+            "FoundationStereoOp: deleted {}, cached for another content of {}; it is built again",
+            entry.path().string(), model.string());
+      }
+    }
+  }
+  // Written whole, then renamed, so that a concurrent reader sees the old or
+  // the new digest.
+  std::filesystem::path temporary = record;
+  temporary += ".tmp";
+  {
+    std::ofstream out(temporary, std::ios::trunc);
+    out << *digest << '\n';
+    if (!out.flush()) {
+      HOLOSCAN_LOG_WARN("FoundationStereoOp: cannot write {}; a changed {} is not detected",
+                        record.string(), model.string());
+      return;
+    }
+  }
+  std::filesystem::rename(temporary, record, error);
+  if (error) {
+    std::filesystem::remove(temporary, error);
+    HOLOSCAN_LOG_WARN("FoundationStereoOp: cannot write {}; a changed {} is not detected",
+                      record.string(), model.string());
+  }
 }
 
 std::optional<PixelFormat> pixel_format(holoscan::schema::ImageEncoding encoding) {
@@ -148,7 +243,8 @@ holoscan::expected<EyeView, holoscan::Error> view_eye(const holoscan::schema::Im
   if (!on_device && device.device_type != kDLCPU && device.device_type != kDLCUDAHost) {
     return holoscan::make_unexpected(invalid(side + " image must be in host or CUDA memory"));
   }
-  if (device.device_type == kDLCUDA && device.device_id != 0) {
+  if ((device.device_type == kDLCUDA || device.device_type == kDLCUDAManaged) &&
+      device.device_id != 0) {
     return holoscan::make_unexpected(
         invalid(side + " image is on GPU " + std::to_string(device.device_id) +
                 "; the operator runs on GPU 0, where HoloInfer loads the model"));
@@ -198,18 +294,13 @@ std::shared_ptr<infer::InferenceSpecs> make_specs(const FoundationStereoConfig& 
 }
 
 // Keeps a pinned host tensor's memory from reuse until the work queued on
-// `stream` so far is done: its allocator waits for the stream if it can,
-// otherwise this waits.
-holoscan::expected<void, holoscan::Error> hold_until_done(const holoscan::Tensor& tensor,
-                                                          cudaStream_t stream) {
+// `stream` so far is done, by having its allocator wait for the stream;
+// false when its memory cannot (an imported tensor), which the caller must
+// then hold until its copy is done. It cannot be held past compute(): the
+// runtime waits for a frame's inputs to be released before it stops.
+bool release_after(const holoscan::Tensor& tensor, cudaStream_t stream) {
   holoscan::Tensor handle = tensor;
-  if (handle.set_deallocation_stream(stream)) {
-    return {};
-  }
-  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
-  }
-  return {};
+  return handle.set_deallocation_stream(stream);
 }
 
 }  // namespace
@@ -229,7 +320,8 @@ struct FoundationStereoOp::State {
   int model_width{};
   int model_height{};
 
-  // Device copies of host images, both eyes, grown as needed.
+  // Device copies of host images, both eyes, made at the largest size on the
+  // first host image.
   std::unique_ptr<void, DeviceFree> staging;
   std::size_t staging_bytes{};
   // A start and an end event per frame, in a ring. The model's buffers and
@@ -240,14 +332,27 @@ struct FoundationStereoOp::State {
   struct Timing {
     cudaEvent_t start{};
     cudaEvent_t end{};
-    bool pending{};
+    bool pending{};  // `end` is recorded and not yet seen complete.
+    bool timed{};    // The frame ran to the end: its time counts.
+    bool first{};    // The run's first frame, which also captures the CUDA graph.
   };
   std::array<Timing, kTimingSlots> timing{};
   std::size_t next_slot{};
+  std::uint64_t queued{};  // Frames queued in this run.
   cudaEvent_t last_end{};
+  // Recorded after the copies of host images whose memory the runtime cannot
+  // hold for the GPU, which compute() then waits for before it returns.
+  cudaEvent_t copied{};
   bool copy_logged{};
+  // The newest valid stereo camera info, and the depth's camera made from it,
+  // with the frame ids it was made from: a camera info whose calibration is
+  // the same may still name another frame.
+  messages::LatestCameraInfo<messages::schema::StereoCameraInfoT> camera_info;
+  messages::schema::CameraInfoT depth_camera_info;
+  std::optional<std::pair<std::string, std::string>> depth_frame_ids;
 
-  // Adds a completed frame's GPU time to the stats; with `wait`, waits for it.
+  // Once the frame in `slot` is done (with `wait`, after waiting for it), adds
+  // its GPU time to the stats.
   void harvest(Timing& slot, FoundationStereoStats* stats, bool wait) noexcept {
     if (!slot.pending) return;
     const cudaError_t done = wait ? cudaEventSynchronize(slot.end) : cudaEventQuery(slot.end);
@@ -257,12 +362,17 @@ struct FoundationStereoOp::State {
     }
     slot.pending = false;
     float ms = 0.0F;
-    if (done != cudaSuccess || cudaEventElapsedTime(&ms, slot.start, slot.end) != cudaSuccess) {
+    if (!slot.timed || done != cudaSuccess ||
+        cudaEventElapsedTime(&ms, slot.start, slot.end) != cudaSuccess) {
       cudaGetLastError();
       return;
     }
     if (stats == nullptr) return;
     const auto ns = static_cast<std::uint64_t>(static_cast<double>(ms) * 1e6);
+    if (slot.first) {
+      stats->gpu_ns_first = ns;
+      return;
+    }
     stats->timed_frames.fetch_add(1);
     stats->gpu_ns_total.fetch_add(ns);
     std::uint64_t previous = stats->gpu_ns_max.load();
@@ -286,7 +396,10 @@ struct FoundationStereoOp::State {
       slot = Timing{};
     }
     next_slot = 0;
+    queued = 0;
     last_end = nullptr;
+    if (copied != nullptr) cudaEventDestroy(copied);
+    copied = nullptr;
   }
 
   ~State() { release(); }
@@ -296,16 +409,11 @@ void validate_config(const FoundationStereoConfig& config) {
   if (config.model.empty()) {
     throw std::invalid_argument("a model path is required");
   }
-  if (config.geometry && config.geometry_input) {
-    // The input's geometry would always win; refuse a setting that would be ignored.
-    throw std::invalid_argument("give the geometry or enable the geometry input, not both");
+  if (config.depth_camera_info && !config.depth) {
+    throw std::invalid_argument("the depth_camera_info output goes with the depth output");
   }
-  if (config.geometry) {
-    validate_geometry(*config.geometry);
-  }
-  if (config.depth && !config.geometry && !config.geometry_input) {
-    throw std::invalid_argument(
-        "the depth output needs the geometry: give it, or enable the geometry input");
+  if (config.camera_info_input.max_age <= std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("camera_info_input.max_age must be > 0");
   }
   if (config.max_width < 1 || config.max_height < 1 || config.max_width > kMaxSide ||
       config.max_height > kMaxSide) {
@@ -322,14 +430,15 @@ void prepare_engine(const FoundationStereoConfig& config) {
   }
   HOLOSCAN_LOG_INFO(
       "FoundationStereoOp: preparing {}; building its TensorRT engine takes minutes when none "
-      "is cached",
+      "is cached; an interrupt (Ctrl-C) takes effect only once that is done",
       config.model.string());
+  drop_stale_engines(config.model);
   auto specs = make_specs(config);
   infer::InferContext context;
   const infer::InferStatus status = context.set_inference_params(specs);
   if (status.get_code() != infer::holoinfer_code::H_SUCCESS) {
     throw std::runtime_error("FoundationStereoOp: cannot load " + config.model.string() + ": " +
-                             status.get_message());
+                             status.get_message() + memory_text());
   }
 }
 
@@ -346,11 +455,9 @@ void FoundationStereoOp::setup(holoscan::OperatorSpec& spec) {
   // Two slots per input: one frame in compute() while the next one arrives.
   spec.input(left, "left").queue_depth(2U);
   spec.input(right, "right").queue_depth(2U);
-  // Optional ports exist only when configured: an unconnected input would
-  // never be satisfied, and an emit into an unconnected output fails.
-  if (config_.geometry_input) {
-    spec.input(geometry, "geometry").queue_depth(2U);
-  }
+  spec.input(camera_info, "camera_info").queue_depth(2U);
+  // Optional outputs exist only when configured: an emit into an unconnected
+  // output fails.
   spec.output(disparity, "disparity")
       .produces_tensor(device_image(bytes))
       .payload_options(image_payload());
@@ -359,24 +466,22 @@ void FoundationStereoOp::setup(holoscan::OperatorSpec& spec) {
         .produces_tensor(device_image(bytes))
         .payload_options(image_payload());
   }
+  if (config_.depth_camera_info) {
+    spec.output(depth_camera_info, "depth_camera_info");
+  }
 }
 
 holoscan::Contract FoundationStereoOp::contract() const {
-  // Every part of a stereo frame carries the same capture time.
-  std::vector<holoscan::PortRef> ports{left, right};
-  if (config_.geometry_input) ports.emplace_back(geometry);
-  holoscan::Contract result;
-  result.trigger(holoscan::OnAligned{.ports = holoscan::PortList{ports}, .window = 0ns});
-  result.input(left, holoscan::Exact{});
-  result.input(right, holoscan::Exact{});
-  if (config_.geometry_input) result.input(geometry, holoscan::Exact{});
-  return result;
+  // The left and right images of a pair carry the same capture time.
+  return messages::camera_info_contract(config_.camera_info_input, camera_info, left, right);
 }
 
 void FoundationStereoOp::start() {
   State& state = *state_;
   state.release();
   state.copy_logged = false;
+  state.camera_info.reset();
+  state.depth_frame_ids.reset();
   const bool onnx = is_onnx(config_.model);
   HOLOSCAN_LOG_INFO("FoundationStereoOp: loading {}{}", config_.model.string(),
                     onnx ? "; building its TensorRT engine takes minutes when none is cached" : "");
@@ -384,6 +489,7 @@ void FoundationStereoOp::start() {
   std::size_t total = 0;
   const bool measured = cudaMemGetInfo(&free_before, &total) == cudaSuccess;
 
+  drop_stale_engines(config_.model);
   state.specs = make_specs(config_);
   state.context = std::make_unique<infer::InferContext>();
   infer::InferStatus status = state.context->set_inference_params(state.specs);
@@ -391,7 +497,7 @@ void FoundationStereoOp::start() {
     const std::string message = status.get_message();
     state.release();
     throw std::runtime_error("FoundationStereoOp: cannot load " + config_.model.string() + ": " +
-                             message);
+                             message + memory_text());
   }
 
   // The model must take two equal [1, 3, H, W] inputs and give [1, 1, H, W].
@@ -455,6 +561,12 @@ void FoundationStereoOp::start() {
     state.release();
     throw std::runtime_error("FoundationStereoOp: the model output is not allocated");
   }
+  if (cudaEventCreateWithFlags(&state.copied, cudaEventDisableTiming) != cudaSuccess) {
+    const cudaError_t error = cudaGetLastError();
+    state.release();
+    throw std::runtime_error(std::string("FoundationStereoOp: cudaEventCreate: ") +
+                             cudaGetErrorString(error));
+  }
   for (State::Timing& slot : state.timing) {
     if (cudaEventCreate(&slot.start) != cudaSuccess || cudaEventCreate(&slot.end) != cudaSuccess) {
       const cudaError_t error = cudaGetLastError();
@@ -477,7 +589,8 @@ void FoundationStereoOp::start() {
     config_.stats->model_bytes = used;
   }
   HOLOSCAN_LOG_INFO(
-      "FoundationStereoOp: {} ready, input [1, 3, {}, {}]{}, about {:.0f} MiB of GPU memory",
+      "FoundationStereoOp: {} ready, input [1, 3, {}, {}]{}; the GPU's free memory fell by {:.0f} "
+      "MiB while loading it",
       model_name, height, width, config_.fp16 && onnx ? " (FP16 allowed)" : "",
       static_cast<double>(used) / (1024.0 * 1024.0));
 }
@@ -492,6 +605,15 @@ void FoundationStereoOp::stop() {
 
 holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
     holoscan::ExecutionContext& context) {
+  State& state = *state_;
+  auto info = state.camera_info.update(camera_info);
+  if (!info) {
+    return holoscan::make_unexpected(std::move(info).error());
+  }
+  if (*info == nullptr) {
+    return {};  // No camera info yet: the frame is skipped.
+  }
+  const messages::StereoCameraInfo& pair_info = **info;
   auto left_sample = left.receive();
   if (!left_sample) {
     return holoscan::make_unexpected(std::move(left_sample).error());
@@ -500,7 +622,6 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
   if (!right_sample) {
     return holoscan::make_unexpected(std::move(right_sample).error());
   }
-  State& state = *state_;
   if (!state.context) {
     return holoscan::make_unexpected(failure("the model is not loaded"));
   }
@@ -516,35 +637,31 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
   }
   const int width = eyes[0].width;
   const int height = eyes[0].height;
-  const std::string size = std::to_string(width) + "x" + std::to_string(height);
+  const auto size = [](int w, int h) { return std::to_string(w) + "x" + std::to_string(h); };
   if (eyes[1].width != width || eyes[1].height != height) {
-    return holoscan::make_unexpected(invalid("the left image is " + size + " and the right " +
-                                             std::to_string(eyes[1].width) + "x" +
-                                             std::to_string(eyes[1].height)));
+    return holoscan::make_unexpected(invalid("the left image is " + size(width, height) +
+                                             " and the right " +
+                                             size(eyes[1].width, eyes[1].height)));
   }
   if (width > config_.max_width || height > config_.max_height) {
-    return holoscan::make_unexpected(invalid("image " + size + " exceeds the configured " +
-                                             std::to_string(config_.max_width) + "x" +
-                                             std::to_string(config_.max_height)));
+    return holoscan::make_unexpected(invalid("image " + size(width, height) +
+                                             " exceeds the configured " +
+                                             size(config_.max_width, config_.max_height)));
   }
-
-  // The frame's geometry, or the configured one.
-  std::optional<StereoGeometry> frame_geometry = config_.geometry;
-  if (config_.geometry_input) {
-    auto sample = geometry.receive();
-    if (!sample) {
-      return holoscan::make_unexpected(std::move(sample).error());
-    }
-    try {
-      frame_geometry = from_message(sample->data);
-    } catch (const std::invalid_argument& error) {
-      return holoscan::make_unexpected(invalid(error.what()));
-    }
+  if (auto problem = camera_info_problem(pair_info, width, height)) {
+    return holoscan::make_unexpected(invalid(*problem));
   }
-  if (frame_geometry && (frame_geometry->width != width || frame_geometry->height != height)) {
-    return holoscan::make_unexpected(
-        invalid("the geometry is for " + std::to_string(frame_geometry->width) + "x" +
-                std::to_string(frame_geometry->height) + " images, and the images are " + size));
+  if (config_.depth_camera_info) {
+    auto frame_ids = std::make_pair(pair_info.header.frame_id, pair_info.left.header.frame_id);
+    if (state.camera_info.changed() || state.depth_frame_ids != frame_ids) {
+      try {
+        state.depth_camera_info =
+            messages::to_message(foundation_stereo::depth_camera_info(pair_info));
+      } catch (const std::invalid_argument& error) {
+        return holoscan::make_unexpected(invalid(error.what()));
+      }
+      state.depth_frame_ids = std::move(frame_ids);
+    }
   }
 
   // The runtime gives an operator with device outputs a stream, and writes
@@ -561,17 +678,23 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
     return holoscan::make_unexpected(invalid("runs on GPU 0, where HoloInfer loads the model"));
   }
 
-  // Earlier frames' GPU time, if done; the slot this frame takes must be.
+  // At most kMaxFramesInFlight frames on the GPU: wait for the frame before
+  // last. Earlier frames' GPU time is taken when done; the slot this frame
+  // takes, older still, is done too.
   for (State::Timing& slot : state.timing) {
     state.harvest(slot, config_.stats.get(), /*wait=*/false);
   }
+  state.harvest(state.timing[(state.next_slot + kTimingSlots - kMaxFramesInFlight) % kTimingSlots],
+                config_.stats.get(), /*wait=*/true);
   State::Timing& slot = state.timing[state.next_slot];
   state.harvest(slot, config_.stats.get(), /*wait=*/true);
   state.next_slot = (state.next_slot + 1) % kTimingSlots;
+  slot.timed = false;
+  slot.first = state.queued++ == 0;
 
   // The previous frame may have run on another stream: wait for its work on
   // the buffers this one reuses, and mark this one's when it has been queued,
-  // on every way out.
+  // on every way out (without timing a frame that did not run to the end).
   if (state.last_end != nullptr) {
     if (const cudaError_t status = cudaStreamWaitEvent(stream, state.last_end, 0);
         status != cudaSuccess) {
@@ -582,33 +705,48 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
     State& state;
     State::Timing& slot;
     cudaStream_t stream;
-    bool armed{true};
     ~MarkDone() {
-      if (armed && cudaEventRecord(slot.end, stream) == cudaSuccess) {
+      if (cudaEventRecord(slot.end, stream) == cudaSuccess) {
         state.last_end = slot.end;
+        slot.pending = true;
+      } else {
+        cudaGetLastError();
       }
     }
   } mark_done{state, slot, stream};
+  // Imported pinned inputs, which the runtime cannot hold for the GPU: kept
+  // until their copies are done, which is waited for on every way out, once
+  // the frame's other GPU work is queued.
+  struct HeldInputs {
+    cudaEvent_t copied;
+    cudaStream_t stream;
+    std::vector<holoscan::Tensor> tensors;
+    bool recorded{};
+    ~HeldInputs() {
+      if (tensors.empty()) return;
+      if (!recorded || cudaEventSynchronize(copied) != cudaSuccess) {
+        cudaGetLastError();
+        cudaStreamSynchronize(stream);
+      }
+    }
+  } held{state.copied, stream, {}};
 
-  // Host images go to the GPU first, through the staging buffer: plain host
+  // Host images go to the GPU first, through the staging buffer: pageable
   // memory once its producer is done with it, pinned memory held until the
   // asynchronous copy has read it.
   const bool any_host = !eyes[0].on_device || !eyes[1].on_device;
   if (any_host) {
     const std::size_t half = static_cast<std::size_t>(width) * height * 4U;
-    if (state.staging_bytes < 2 * half) {
-      // Grows a few times at most; earlier frames are done with it first.
-      if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-        return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
-      }
-      state.staging.reset();
-      state.staging_bytes = 0;
+    if (!state.staging) {
+      // Once, at the largest size, so no frame ever waits to grow it.
+      const std::size_t bytes = static_cast<std::size_t>(config_.max_width) *
+                                static_cast<std::size_t>(config_.max_height) * 4U * 2U;
       void* memory = nullptr;
-      if (const cudaError_t status = cudaMalloc(&memory, 2 * half); status != cudaSuccess) {
+      if (const cudaError_t status = cudaMalloc(&memory, bytes); status != cudaSuccess) {
         return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
       }
       state.staging.reset(memory);
-      state.staging_bytes = 2 * half;
+      state.staging_bytes = bytes;
     }
     if (!state.copy_logged) {
       state.copy_logged = true;
@@ -640,13 +778,14 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
           status != cudaSuccess) {
         return holoscan::make_unexpected(cuda_failure("cudaMemcpy2DAsync", status));
       }
-      if (eye.pinned) {
-        if (auto held = hold_until_done(*eye.tensor, stream); !held) {
-          return holoscan::make_unexpected(std::move(held).error());
-        }
+      if (eye.pinned && !release_after(*eye.tensor, stream)) {
+        held.tensors.push_back(*eye.tensor);
       }
       eye.data = target;
       eye.pitch = row;
+    }
+    if (!held.tensors.empty()) {
+      held.recorded = cudaEventRecord(held.copied, stream) == cudaSuccess;
     }
   }
 
@@ -696,6 +835,9 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
       return holoscan::make_unexpected(std::move(opened).error());
     }
     writer.emplace(std::move(*opened));
+    if (writer->data_as<float>() == nullptr) {
+      return holoscan::make_unexpected(failure("the runtime gave an output without memory"));
+    }
     return {};
   };
   if (auto taken = take(disparity, disparity_loan, disparity_writer); !taken) {
@@ -706,27 +848,21 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
       return taken;
     }
   }
-  PostprocessParams params{.model_width = state.model_width,
-                           .model_height = state.model_height,
-                           .width = width,
-                           .height = height,
-                           .invalidate_out_of_view = config_.invalidate_out_of_view};
-  if (frame_geometry) {
-    params.fx_baseline = static_cast<float>(frame_geometry->fx * frame_geometry->baseline);
-    params.doffs = static_cast<float>(frame_geometry->doffs);
-  }
+  const PostprocessParams params{
+      .model_width = state.model_width,
+      .model_height = state.model_height,
+      .width = width,
+      .height = height,
+      .fx_baseline = static_cast<float>(messages::fx_baseline(pair_info)),
+      .doffs = static_cast<float>(pair_info.doffs),
+      .invalidate_out_of_view = config_.invalidate_out_of_view};
   if (const cudaError_t status =
           launch_postprocess(state.output, params, disparity_writer->data_as<float>(),
                              depth_writer ? depth_writer->data_as<float>() : nullptr, stream);
       status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("postprocess kernel", status));
   }
-  mark_done.armed = false;
-  if (const cudaError_t status = cudaEventRecord(slot.end, stream); status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("cudaEventRecord", status));
-  }
-  state.last_end = slot.end;
-  slot.pending = true;
+  slot.timed = true;
   if (config_.stats) {
     config_.stats->frames.fetch_add(1);
   }
@@ -748,6 +884,14 @@ holoscan::expected<void, holoscan::Error> FoundationStereoOp::compute(
   };
   if (auto sent = send(disparity, *disparity_loan, *disparity_writer); !sent) {
     return sent;
+  }
+  if (config_.depth_camera_info) {
+    // Before the depth: a consumer taking the newest camera info gets this one.
+    state.depth_camera_info.header->capture_timestamp_ns =
+        emit.capture_time ? emit.capture_time->timestamp_ns : 0;
+    if (auto sent = depth_camera_info.emit_ref(state.depth_camera_info, emit); !sent) {
+      return sent;
+    }
   }
   if (depth_loan) {
     return send(depth, *depth_loan, *depth_writer);

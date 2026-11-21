@@ -7,12 +7,13 @@
 # the module installs. It contains no model.
 include("${PROJECT_SOURCE_DIR}/cmake/holohub_configure_deb.cmake")
 
-# "holoscan" is the Debian package of the SDK 5.0 on its platforms; it carries HoloInfer.
+# "holoscan" is the Debian package of the SDK 5.0 on its platforms, which carries HoloInfer;
+# holoscan-messages this collection's camera info messages.
 holohub_configure_deb(
   NAME "holoscan-foundation-stereo"
   DESCRIPTION "${PROJECT_DESCRIPTION}"
   VERSION "${PROJECT_VERSION}"
   VENDOR "zozo"
   CONTACT "zozo <snknitheesh@gmail.com>"
-  DEPENDS "holoscan (>= 5.0.0)"
+  DEPENDS "holoscan (>= 5.0.0), holoscan-messages (>= 1.0.0)"
 )

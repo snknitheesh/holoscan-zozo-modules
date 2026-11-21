@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "holoscan/foundation_stereo/synthetic_scene.hpp"
 
@@ -79,13 +80,26 @@ float max_scene_disparity(int width) {
   return kFocalPerWidth * static_cast<float>(width) * kBaseline / kNearest;
 }
 
-StereoGeometry scene_geometry(const SyntheticScene& scene) {
-  return StereoGeometry{.fx = scene.focal,
-                        .baseline = scene.baseline,
-                        .width = scene.width,
-                        .height = scene.height,
-                        .cx = scene.cx,
-                        .cy = scene.cy};
+messages::StereoCameraInfo scene_camera_info(const SyntheticScene& scene) {
+  messages::CameraInfo left;
+  left.header.frame_id = "left";
+  left.width = static_cast<std::uint32_t>(scene.width);
+  left.height = static_cast<std::uint32_t>(scene.height);
+  left.state = messages::CameraState::kRectified;
+  left.fx = scene.focal;
+  left.fy = scene.focal;
+  left.cx = scene.cx;
+  left.cy = scene.cy;
+  messages::CameraInfo right = left;
+  right.header.frame_id = "right";
+  messages::StereoCameraInfo info;
+  info.header.frame_id = "left";
+  info.left = std::move(left);
+  info.right = std::move(right);
+  info.right_from_left.translation = {-static_cast<double>(scene.baseline), 0.0, 0.0};
+  info.baseline = scene.baseline;
+  messages::validate(info, "synthetic scene camera_info");
+  return info;
 }
 
 cudaError_t render_scene(const SyntheticScene& scene, int channels, std::uint8_t* left,

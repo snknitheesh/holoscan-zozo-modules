@@ -14,7 +14,8 @@
 
 #include <cstdint>
 
-#include <holoscan/foundation_stereo/stereo_geometry.hpp>
+#include <holoscan/foundation_stereo/depth.hpp>
+#include <holoscan/messages/camera_info.hpp>
 
 namespace holoscan::foundation_stereo {
 
@@ -57,8 +58,10 @@ inline constexpr int kMaxSceneSide = 4096;
 // The largest disparity of any frame of a scene `width` pixels wide.
 [[nodiscard]] float max_scene_disparity(int width);
 
-// The scene's camera pair.
-[[nodiscard]] StereoGeometry scene_geometry(const SyntheticScene& scene);
+// The scene's camera pair, rectified: one focal length, both principal points
+// at the image center, the right camera `baseline` meters to the left one's
+// right, frame ids "left" and "right".
+[[nodiscard]] messages::StereoCameraInfo scene_camera_info(const SyntheticScene& scene);
 
 namespace detail {
 

@@ -4,7 +4,7 @@
     "name": "holoscan-foundation-stereo",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Learned stereo disparity and depth on the GPU with NVIDIA's Fast-FoundationStereo through TensorRT (HoloInfer): a rectified left and right image in, CUDA resize and normalization, the model, and the disparity resized and rescaled back to the image, with optional depth in meters. Its ports match the classic stereo matcher's, so either can replace the other. The model is not included: a tool fetches or exports it, under NVIDIA's licenses.",
+    "description": "Learned stereo disparity and depth on the GPU with NVIDIA's Fast-FoundationStereo through TensorRT (HoloInfer): a rectified left and right image and the pair's StereoCameraInfo in, CUDA resize and normalization, the model, and the disparity resized and rescaled back to the image, with optional depth in meters and the depth's CameraInfo, which holoscan-point-cloud takes directly. It has the left, right, camera_info, disparity, depth and depth_camera_info ports of holoscan-stereo-disparity's StereoDisparityOp, with no confidence output and no downscale. The model is not included: a tool fetches or exports it, under NVIDIA's licenses.",
     "authors": [
       {
         "name": "zozo",
@@ -45,7 +45,7 @@
       "hardware": [
         {
           "name": "NVIDIA GPU",
-          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10. The 480x736 model takes about 0.8 GB of GPU memory."
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK, with TensorRT 10. The 480x736 model takes about 0.8 GB of GPU memory on an RTX 5090 and about 1.9 GB on a Jetson Orin; it has not been run on a Jetson Thor, where the tests use the stub model."
         }
       ],
       "data": [
@@ -57,7 +57,11 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-foundation-stereo",
       "install_commands": [

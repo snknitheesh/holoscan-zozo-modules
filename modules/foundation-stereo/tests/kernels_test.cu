@@ -18,9 +18,9 @@
 #include <string>
 #include <vector>
 
+#include <holoscan/foundation_stereo/depth.hpp>
 #include <holoscan/foundation_stereo/kernels.hpp>
 #include <holoscan/foundation_stereo/reference.hpp>
-#include <holoscan/foundation_stereo/stereo_geometry.hpp>
 
 #include "test_support.hpp"
 
