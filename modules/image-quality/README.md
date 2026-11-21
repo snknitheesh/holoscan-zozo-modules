@@ -14,7 +14,7 @@ HoloViz overlay that show where in the image the problem is. The
 | Headers | `<holoscan/image_quality/...>` |
 | C++ namespace | `holoscan::image_quality` |
 | Debian package | `holoscan-image-quality` |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## `ImageQualityOp`
 
@@ -26,14 +26,19 @@ HoloViz overlay that show where in the image the problem is. The
 | `tiles` (output, with `tiles_output`) | `holoscan::Tensor` | float32 `[tiles_y, tiles_x, 7]`, in `TileChannel` order, in host memory |
 | `overlay` (output, with `overlay_output`) | `holoscan::schema::ImageT` | `RGBA8` `[tiles_y * cell, tiles_x * cell, 4]` in host memory: obstructed tiles magenta, blurred tiles red, low-texture tiles faint yellow, the rest clear; HoloViz stretches it over the image |
 
-Every output carries the image's capture time and frame id (an unstamped image's outputs are stamped
-with the activation time), so `OnAligned` pairs them downstream. The optional ports exist only when
+Every output carries the image's capture time and frame id, so `OnAligned` pairs them downstream. An
+image without a capture time gives outputs stamped with the activation time instead, which is not a
+capture time: they are flagged `SampleFlags::kDegraded`. The optional ports exist only when
 configured. Images in host memory are copied to the GPU, which the operator logs once. Failed frames
 are logged as warnings, at most once per `log_interval` (5 s; zero turns it off), with the flags they
 had.
 
-Each frame takes four kernel launches and one copy back of about 30 kB, and the operator waits for
-them, so its outputs are on the host when `compute()` returns. All sums are integer and the
+Each frame takes four kernel launches and one copy back, of 25.6 kB of histograms and 88 bytes per
+block of tile sums (38 kB on Jetson Orin and 89 kB on the RTX 5090, with the default grid), and the
+operator waits for them once, so its outputs are on the host when `compute()` returns. The GPU
+buffers are allocated in `start()` for images up to `reserve_width` x `reserve_height` (1920x1080); a
+larger image grows them in `compute()` on its first frame, which waits for the device and is logged
+once. All sums are integer and the
 histograms integer atomics, so the results do not depend on the GPU or the run: they are the same
 bit for bit as the CPU reference's (`<holoscan/image_quality/reference.hpp>`), which the tests check.
 VPI has a Laplacian and histograms, but each would be a separate pass over the image; the fused
@@ -82,14 +87,35 @@ Tenengrad, and:
 | `kOverexposed` | 3 | `mean_luma > max_mean_luma` (205) or `overexposed_fraction > max_overexposed_fraction` (0.25) |
 | `kNoisy` | 4 | `noise_sigma > max_noise_sigma` (5 luma levels) |
 | `kFrozen` | 5 | The frame's bytes hash to the previous frame's (a sum of a 64-bit mix of each pixel's position and bytes), or `frame_difference <= frozen_difference` (0.05), for `frozen_frames` (1) frames in a row |
-| `kObstructed` | 6 | A tile was not textured in at least `obstruction_fraction` (all) of the last `obstruction_frames` (30) frames, counted once that many frames have been seen: a smudge or a blocked lens shows after 30 frames, not before |
+| `kObstructed` | 6 | More than `max_obstructed_tile_fraction` (0: any) of the tiles are obstructed. A tile is obstructed when it was not textured in at least `obstruction_fraction` (all) of the last `obstruction_frames` (30) frames, counted once that many frames have been seen: a smudge or a blocked lens shows after 30 frames, not before |
 | `kColorCast` | 7 | `color_cast > max_color_cast` (0.15), color images only |
 
 Every threshold is a field of `QualityThresholds`; the defaults are in parentheses.
 
+### Configuration
+
+`ImageQualityConfig` is the operator's only configuration. It is a constructor argument, checked
+there (`std::invalid_argument` names the first unusable field), and fixed for the run: the operator
+declares no Holoscan parameters.
+
+| Field | Default | |
+| --- | --- | --- |
+| `stats.tiles_x`, `stats.tiles_y` | 16, 9 | The tile grid, 1..256 each; an image smaller than it gets one tile per pixel on that axis |
+| `stats.flat_fraction` | 0.5 | Fraction of the interior pixels, those with the smallest Sobel gradient, the noise estimate reads |
+| `thresholds` | | `QualityThresholds`: every threshold in the flag table above |
+| `tiles_output` | `false` | Declare the `tiles` output |
+| `overlay_output` | `false` | Declare the `overlay` output |
+| `overlay_cell` | 16 | Overlay pixels per tile side, 1..64 |
+| `log_interval` | 5 s | Least time between two warnings about failed frames; zero turns them off |
+| `reserve_width`, `reserve_height` | 1920, 1080 | The largest image whose GPU buffers `start()` allocates; both 0 to allocate on the first frame |
+
 Limits worth knowing: a scene that is genuinely flat in places (sky, a blank wall) makes those tiles
-low-texture, so a static camera on it flags `kObstructed` after `obstruction_frames`; a static
-noiseless scene looks frozen; a scene dominated by one color looks cast; strong noise hides blur in
+low-texture, so a static camera on it flags `kObstructed` after `obstruction_frames`. With the
+default `max_obstructed_tile_fraction` of 0, `kObstructed` is per-tile evidence: on the local
+recordings (a fixed camera on a ceiling, see `image_quality_real_data`) 8 to 13 % of the tiles are
+flat and static, and every color frame from the 31st on is flagged. A fixed camera can raise
+`max_obstructed_tile_fraction` above its view's flat share, at the cost of missing a smaller smudge,
+or read the `tiles` output. A static noiseless scene, or a nearly black one, looks frozen; a scene dominated by one color looks cast; strong noise hides blur in
 a tile (hence the standard error) and the noise estimate also counts fine texture that survives the
 flat-pixel selection. Noise is estimated on luma: independent noise of `s` on each of R, G and B is
 `0.668 s` on luma.
@@ -143,25 +169,45 @@ From the tests, on the synthetic scene (cells of 12 pixels, values 40..215), 192
 | Red x1.3, blue x0.75 | `kColorCast` only (0.27; clean scenes stay under 0.03) |
 | Clean moving scenes, every format, 333x211 to 1280x720, 35 frames | No flag |
 
+That no flag fires on clean frames rests on these synthetic scenes. On real pixels,
+`image_quality_real_data` runs the local recordings: four clips of 60 frames from a fixed camera
+looking at an office ceiling, the color stream at 848x480 and 1280x720 and the left infrared eye.
+The GPU gives the CPU reference's statistics bit for bit on all 480 frames. With the default
+thresholds:
+
+| Stream | Flags |
+| --- | --- |
+| Color, 848x480 | `obstructed` from frame 31 on (up to 12 to 13 % of the tiles, flat and static); `overexposed` on 45 and 49 of 60 (up to 28 % of the pixels at luma 239 or more: the ceiling lights); color cast up to 0.033 |
+| Color, 1280x720 | `obstructed` from frame 31 on (up to 8 to 12 % of the tiles); color cast up to 0.024 |
+| Infrared, projector on | `underexposed` on every frame, `obstructed` from frame 31 on; at 1280x720 also `local_blur` on every frame |
+| Infrared, projector off | Nearly black: `underexposed` on every frame, `frozen` on every frame but the first (frames differ by less than `frozen_difference`), `obstructed` from frame 31 on (97 % of the tiles); at 1280x720 also `blurred` on 33 and `local_blur` on 27 |
+
 ## Performance
 
-Per frame, as `ImageQualityOp` spends it (the kernels, the copy back, the wait and the evaluation),
-RGB8, from the `image_quality_benchmark` test, median of 100 frames:
+Per frame, `ImageQualityAnalyzer::analyze()` from the `image_quality_benchmark` test: the copy to the
+GPU (host input), the kernels, the copy back, the wait and the evaluation, RGB8, median of 100
+frames. `ImageQualityOp` adds its input checks and its outputs' allocations and copies, which this
+does not time.
 
 | | 1920x1080, device input | 1920x1080, host input | 3840x2160, device input | 3840x2160, host input |
 | --- | --- | --- | --- | --- |
-| RTX 5090 (x86_64) | 0.055 ms | 0.32 ms | 0.105 ms | 1.1 ms |
-| Jetson AGX Orin (JetPack 7.2) | 0.48 ms | 1.2 ms | 1.9 ms | 6.0 ms |
+| RTX 5090 | 0.055 ms | 0.32 ms | 0.105 ms | 1.1 ms |
+| Jetson Orin | 0.68 ms | 1.4 ms | 1.7 ms | 5.6 ms |
 
-Under 2 % of a 30 fps frame at 1080p on the Orin, 6 % at 4K. Host input adds the copy to the GPU;
-send device images where the camera can.
+Both in the repository's CI image (Holoscan SDK 5.0.0, CUDA 13.2): the RTX 5090 with driver
+595.91.07; the Jetson Orin with JetPack 7.2 in the MAXN power mode, the middle of three runs while
+other work shared the board (load average about 4). A GPU busy with other work is far slower: on
+an RTX 5090 at full use by other processes, the 1080p device-input frame took 2.5 ms. Host input
+adds the copy to the GPU; send device images where the camera can.
 
 ## Requirements
 
-- Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), CUDA 13 (with its CUB), CMake 4.0
-  or later and a C++20 compiler.
+- Holoscan SDK 5.0 (Core and Sensor I/O; Testing for the tests), the CUDA runtime, CMake 4.0 or
+  later and a C++20 compiler. CUB, header-only, comes from the CCCL found first on the include path:
+  the SDK's (CCCL 3.3.3 in SDK 5.0.0), then the CUDA Toolkit's.
 
-The module downloads nothing and needs no models or data.
+The module downloads nothing and needs no models or data; one test reads the local recordings when
+`$HOLOSCAN_TEST_DATA` names them.
 
 ## Build, test and install
 
@@ -180,19 +226,20 @@ cmake --install build/image-quality --prefix "$PWD/install"
 | `HOLOSCAN_IMAGE_QUALITY_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
-The tests, all on synthetic images made at test time:
+The tests, on synthetic images made at test time but for `image_quality_real_data`:
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `image_quality_host` | Nothing | The CPU reference and the evaluator: the metrics against a direct floating-point computation on small images, and every accuracy case above, with clean scenes, tiny (1x1 to 17x1) and constant images, and determinism; threshold validation, row pitch, and the obstruction window with a fraction below one |
 | `image_quality_analyzer` | GPU | Every accuracy case on the GPU, from host and from device memory; the statistics bit for bit equal to the CPU reference's for every format, sizes from 1x1 to 1921x1081, pitched rows and other tile grids; the same for any split of tiles into blocks |
-| `image_quality_operator` | GPU | `ImageQualityOp` through the SDK's operator test harness: host and device images in three formats, metrics, flags, tiles and overlay equal to the reference's, provenance on every output, and the rejection of unusable encodings and settings |
-| `image_quality_benchmark` | GPU | The timings above; fails only if a 1080p frame from device memory takes longer than 33 ms |
+| `image_quality_operator` | GPU | `ImageQualityOp` through the SDK's operator test harness: host and device images in three formats, metrics, flags, tiles and overlay equal to the reference's, provenance on every output, an unstamped image's outputs flagged degraded, and the rejection of unusable encodings, images whose tensor disagrees with them, and settings |
+| `image_quality_real_data` | GPU, `$HOLOSCAN_TEST_DATA` | Every frame of the local recordings' color stream and left infrared eye, from host and device memory: the GPU's statistics, metrics and flags bit for bit the CPU reference's; prints each flag's rate with the default thresholds, and fails if a color frame is flagged frozen. Skipped when `$HOLOSCAN_TEST_DATA` is unset; fails when it names no recording with an `index.csv` |
+| `image_quality_benchmark` | GPU | The timings above; label `benchmark`. Fails only if a 1080p frame from device memory takes longer than 33 ms |
 
 `image_quality_host` is also a standalone project, [`tests/host/`](tests/host/), which the hosted CI
 job runs without the SDK or a GPU. [`tests/installed_consumer/`](tests/installed_consumer/) is a
-separate project that uses the installed package: a small graph sends five frames, the last two
-repeats, and checks that exactly those are frozen. Build it with the install prefix on
+separate project that uses the installed package: a small graph, on one worker, sends five frames,
+the last two repeats, and checks that exactly those are frozen. Build it with the install prefix on
 `CMAKE_PREFIX_PATH` and run `ctest` there.
 
 ## Debian package
@@ -211,4 +258,5 @@ current directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, s
 
 ## Licenses
 
-Apache-2.0. See [NOTICE](NOTICE).
+Apache-2.0. CUB, compiled into the library from the SDK's or the CUDA Toolkit's CCCL, is
+BSD-3-Clause; its notice is in [NOTICE](NOTICE), which the package installs.

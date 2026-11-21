@@ -12,7 +12,7 @@ image-quality/
 ├── pkg/holoscan-image-quality/      Debian packaging, entered when PKG_holoscan_image_quality is ON
 └── tests/
     ├── host/                        SDK-free tests of the CPU reference and the evaluator
-    └── installed_consumer/          Uses the installed package
+    └── installed_consumer/          Uses the installed package, on one worker
 ```
 
 The folder is `image-quality`, as the package is `holoscan-image-quality`; C++ names cannot hold a
@@ -38,7 +38,11 @@ image ──> ReferenceStats (CPU) ───┘     integer sums,     metrics, f
 - `QualityEvaluator` is the only place metrics, thresholds and the temporal state (previous hash,
   frozen run, each tile's low-texture window) live. It is plain C++, so the host test covers it.
 - `ImageQualityOp` checks the image, runs `ImageQualityAnalyzer` (both of the above) on the
-  runtime's CUDA stream, or its own when there is none, and emits.
+  runtime's CUDA stream, or its own when there is none, and emits. The analyzer allocates its GPU
+  buffers in `start()` for `reserve_width` x `reserve_height`; `compute()` allocates on the GPU only
+  for a larger image, once per larger size, and logs it once.
+- Per frame, `ImageQualityOp` makes one CPU wait (the stream synchronization before the read-back
+  its host outputs need), one copy back, and, for host input, one copy to the GPU (logged once).
 
 ## Build and package boundary
 
@@ -51,8 +55,8 @@ image ──> ReferenceStats (CPU) ───┘     integer sums,     metrics, f
 | Package | `<prefix>/lib/cmake/holoscan-image-quality/holoscan-image-quality-config.cmake`, `SameMajorVersion` |
 | Consumer form | `find_package(holoscan-image-quality)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Debian package | `holoscan-image-quality`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB from the CUDA Toolkit |
-| Platforms | x86_64; aarch64 (Jetson Thor with JetPack 7, Jetson Orin with JetPack 7.2) |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`; `testing` for the tests), the CUDA runtime, CUB (header-only, BSD-3-Clause) from the CCCL found first on the include path: the SDK's, then the CUDA Toolkit's |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 | Test labels | `image_quality`, and `gpu` or `host` |
 
 ## Conventions
@@ -62,8 +66,9 @@ image ──> ReferenceStats (CPU) ───┘     integer sums,     metrics, f
 - The kernels call the host's `constexpr` helpers (`luma()`, `tile_begin()`, `pixel_hash()`), with
   `--expt-relaxed-constexpr`, so both sides compute them from the same code. Keep every statistic an
   integer: a floating-point sum on the GPU would break the equality with the reference.
-- Device code needs nothing newer than CUDA 13.0 (CUB from its own CCCL), so the module also builds
-  with JetPack 7's toolkit.
+- CUB comes from the CCCL found first on the include path, the SDK's (CCCL 3.3.3 in SDK 5.0.0), then
+  the CUDA Toolkit's; it is compiled into the library, so NOTICE carries its BSD-3-Clause licence.
+  Keep CUB in `src/`: public headers name no CUB type.
 - An operator has an optional port only when configured: an emit into an unconnected output fails.
 - A new metric or flag needs a case in `tests/accuracy_cases.hpp`, which runs on the CPU reference
   (host test) and on the GPU from host and device memory; a new statistic, a case in
