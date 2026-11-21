@@ -3,7 +3,6 @@
 
 #include "point_cloud_sources.hpp"
 
-#include <array>
 #include <cstring>
 #include <exception>
 #include <optional>
@@ -11,8 +10,8 @@
 #include <string>
 #include <utility>
 
-#include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/point_cloud/synthetic_scene.hpp>
 
 #include "cloud_io.hpp"
@@ -20,34 +19,12 @@
 namespace point_cloud_to_depth_app {
 namespace {
 
-using holoscan::point_cloud::CameraIntrinsics;
+namespace hm = holoscan::messages;
 using holoscan::point_cloud::generate_synthetic_cloud;
+using holoscan::point_cloud::synthetic_camera_info;
 using holoscan::point_cloud::synthetic_cloud_layout;
 using holoscan::point_cloud::synthetic_frame;
 using holoscan::point_cloud::SyntheticFrame;
-
-constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
-constexpr DLDataType kFloat32{kDLFloat, 32U, 1U};
-
-// Which outputs of the frame being sent are out.
-constexpr std::uint32_t kSentIntrinsics = 1U;
-constexpr std::uint32_t kSentColors = 2U;
-constexpr std::uint32_t kSentPoints = 4U;
-
-holoscan::TensorOutputSpec tensor_spec(holoscan::MemoryKind memory, DLDataType dtype,
-                                       std::uint32_t rank, std::uint64_t bytes) {
-  return holoscan::TensorOutputSpec{
-      .representation =
-          holoscan::TensorRepresentation{
-              .memory_kind = memory,
-              .dtype = dtype,
-              .rank = rank,
-              .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-          },
-      .bounds = holoscan::tensor_bounds(bytes),
-      .storage = holoscan::TensorOutputStorage::kRuntimePool,
-  };
-}
 
 holoscan::Error failure(std::string message) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, std::move(message)};
@@ -59,40 +36,53 @@ holoscan::Error cuda_failure(const char* what, cudaError_t status) {
 
 using Result = holoscan::expected<void, holoscan::Error>;
 
-// Records the outcome of sending one output of a frame. A consumer still busy
-// with earlier frames makes an emit fail with kBackpressured before anything
-// is delivered; the source then sends that output again on its next tick,
-// with the frame's capture time, rather than failing the run or skipping the
-// frame. Returns nothing to go on with the frame's other outputs, or what
-// compute() returns now: success when the consumer is busy, else the error.
-std::optional<Result> settle(Result sent, std::uint32_t output, std::uint32_t& sent_outputs) {
+// Settles the outcome of sending one output of a frame. Consumers still busy
+// with earlier frames make an emit fail with kBackpressured before anything
+// is delivered, or an allocation with kResourceExhausted while every slot of
+// the output's pool is still held, by frames they have not finished with or
+// by a frame they refused (the SDK takes back a refused loan only once this
+// source's GPU work on it is done); the source then sends that output again
+// on its next tick, with the frame's capture time, rather than failing the
+// run or skipping the frame. Returns nothing to go on with the frame's other
+// outputs, or what compute() returns now: success when the consumers are
+// busy, else the error.
+std::optional<Result> settle(Result sent) {
   if (sent) {
-    sent_outputs |= output;
     return std::nullopt;
   }
-  if (sent.error().code == holoscan::ErrorCode::kBackpressured) {
+  if (sent.error().code == holoscan::ErrorCode::kBackpressured ||
+      sent.error().code == holoscan::ErrorCode::kResourceExhausted) {
     return Result{};
   }
   return Result{holoscan::make_unexpected(std::move(sent).error())};
 }
 
-// Fills a host loan with `size` bytes from `bytes` and commits it.
-holoscan::expected<void, holoscan::Error> fill_host(holoscan::TensorOutputLoan& loan,
-                                                    const void* bytes, std::size_t size) {
-  return loan.write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                        -> holoscan::expected<void, holoscan::Error> {
-    if (writer.byte_size() != size) {
-      return holoscan::make_unexpected(failure("tensor loan has an unexpected size"));
-    }
-    if (size != 0U) {
-      std::memcpy(writer.data_as<std::uint8_t>(), bytes, size);
-    }
-    return {};
-  });
+// Fills a host field of `cloud` with `size` bytes from `bytes` and commits it.
+Result fill_host(hm::PointCloudLoan& cloud,
+                 holoscan::TensorFieldSelector<hm::schema::PointCloudT> field, const void* bytes,
+                 std::size_t size) {
+  return cloud.write_host_and_commit(
+      field, [&](const holoscan::TensorOutputWriteGuard& writer) -> Result {
+        if (writer.byte_size() != size) {
+          return holoscan::make_unexpected(failure("cloud loan has an unexpected size"));
+        }
+        if (size != 0U) {
+          std::memcpy(writer.data_as<std::uint8_t>(), bytes, size);
+        }
+        return {};
+      });
 }
 
-std::array<std::int64_t, 2> cloud_shape(std::size_t points) {
-  return {static_cast<std::int64_t>(points), 3};
+// Sends `cloud`, unorganized, in `frame_id` with the capture time of `emit`.
+Result send_cloud(holoscan::Output<hm::schema::PointCloudT>& port, hm::PointCloudLoan cloud,
+                  std::size_t points, const std::string& frame_id,
+                  const holoscan::EmitOptions& emit) {
+  hm::Header header{.frame_id = frame_id};
+  if (emit.capture_time) {
+    header.capture_timestamp_ns = emit.capture_time->timestamp_ns;
+  }
+  return hm::emit_point_cloud(port, std::move(cloud), header,
+                              hm::unorganized_cloud(static_cast<std::int64_t>(points)), -1, emit);
 }
 
 }  // namespace
@@ -115,18 +105,14 @@ SyntheticCloudSourceOp::SyntheticCloudSourceOp(SyntheticCloudSourceConfig config
 SyntheticCloudSourceOp::~SyntheticCloudSourceOp() { release(); }
 
 void SyntheticCloudSourceOp::setup(holoscan::OperatorSpec& spec) {
-  const holoscan::MemoryKind memory =
-      config_.device_output ? holoscan::MemoryKind::kCudaDevice : holoscan::MemoryKind::kHost;
-  spec.output(points, "points")
-      .produces_tensor(tensor_spec(memory, kFloat32, 2U, point_count_ * 3ULL * sizeof(float)));
-  if (config_.color) {
-    spec.output(colors, "colors")
-        .produces_tensor(tensor_spec(memory, kUInt8, 2U, point_count_ * 3ULL));
-  }
-  if (config_.intrinsics) {
-    spec.output(intrinsics, "intrinsics")
-        .produces_tensor(
-            tensor_spec(holoscan::MemoryKind::kHost, kFloat32, 1U, 4U * sizeof(float)));
+  hm::declare_point_cloud_output(
+      spec, point_cloud, "point_cloud",
+      {.max_points = point_count_,
+       .colors = config_.color,
+       .memory_kind = config_.device_output ? holoscan::MemoryKind::kCudaDevice
+                                            : holoscan::MemoryKind::kHost});
+  if (config_.camera_info) {
+    spec.output(camera_info, "camera_info");
   }
 }
 
@@ -138,8 +124,9 @@ holoscan::Contract SyntheticCloudSourceOp::contract() const {
 
 void SyntheticCloudSourceOp::start() {
   emitted_ = 0;
+  delayed_ = false;
   pending_capture_.reset();
-  sent_ = 0U;
+  camera_info_sent_ = false;
 }
 
 void SyntheticCloudSourceOp::stop() { release(); }
@@ -168,10 +155,79 @@ holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::ensure_scratch
   return {};
 }
 
+holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::fill(hm::PointCloudLoan& cloud,
+                                                                       const SyntheticFrame& frame,
+                                                                       cudaStream_t stream) {
+  const std::size_t point_bytes = point_count_ * 3U * sizeof(float);
+  const std::size_t color_bytes = point_count_ * 3U;
+  if (config_.device_output) {
+    // One kernel makes the points and the colors, so the colors' write runs
+    // inside the points'.
+    const auto generate = [&](float* points, std::uint8_t* colors) -> Result {
+      if (const cudaError_t status =
+              generate_synthetic_cloud(frame, config_.millimeter_depth, points, colors, stream);
+          status != cudaSuccess) {
+        return holoscan::make_unexpected(cuda_failure("generate_synthetic_cloud", status));
+      }
+      return {};
+    };
+    return cloud.write_and_commit(hm::PointCloudFields::points, stream,
+                                  [&](const holoscan::TensorOutputWriteGuard& points) -> Result {
+                                    if (!config_.color) {
+                                      return generate(points.data_as<float>(), nullptr);
+                                    }
+                                    return cloud.write_and_commit(
+                                        hm::PointCloudFields::colors, stream,
+                                        [&](const holoscan::TensorOutputWriteGuard& colors) {
+                                          return generate(points.data_as<float>(),
+                                                          colors.data_as<std::uint8_t>());
+                                        });
+                                  });
+  }
+  // Make the cloud on the GPU, then fill the host loans from it.
+  if (auto scratch = ensure_scratch(); !scratch) {
+    return scratch;
+  }
+  auto* bytes = static_cast<std::uint8_t*>(scratch_);
+  if (const cudaError_t status =
+          generate_synthetic_cloud(frame, config_.millimeter_depth, reinterpret_cast<float*>(bytes),
+                                   bytes + point_bytes, stream);
+      status != cudaSuccess) {
+    return holoscan::make_unexpected(cuda_failure("generate_synthetic_cloud", status));
+  }
+  const auto copy_out = [&](holoscan::TensorFieldSelector<hm::schema::PointCloudT> field,
+                            std::size_t offset, std::size_t size) {
+    return cloud.write_host_and_commit(
+        field, [&](const holoscan::TensorOutputWriteGuard& writer) -> Result {
+          if (writer.byte_size() != size) {
+            return holoscan::make_unexpected(failure("cloud loan has an unexpected size"));
+          }
+          const cudaError_t status = cudaMemcpyAsync(writer.data_as<std::uint8_t>(), bytes + offset,
+                                                     size, cudaMemcpyDeviceToHost, stream);
+          const cudaError_t synced = status == cudaSuccess ? cudaStreamSynchronize(stream) : status;
+          if (synced != cudaSuccess) {
+            return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", synced));
+          }
+          return {};
+        });
+  };
+  if (auto copied = copy_out(hm::PointCloudFields::points, 0, point_bytes); !copied) {
+    return copied;
+  }
+  if (config_.color) {
+    return copy_out(hm::PointCloudFields::colors, point_bytes, color_bytes);
+  }
+  return {};
+}
+
 holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::compute(
     holoscan::ExecutionContext& context) {
   if (emitted_ >= config_.count) {
     return {};  // Done: idle until the consumers request completion.
+  }
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
   }
   cudaStream_t stream = context.cuda_stream().get();
   if (stream == nullptr) {
@@ -195,133 +251,31 @@ holoscan::expected<void, holoscan::Error> SyntheticCloudSourceOp::compute(
   // sent on a retry still pair with those sent before it.
   if (!pending_capture_) {
     pending_capture_ = context.activation_time();
-    sent_ = 0U;
+    camera_info_sent_ = false;
   }
   // Frame ids count from 1; 0 means none.
   const holoscan::EmitOptions emit{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U};
   const SyntheticFrame frame =
-      synthetic_frame(config_.width, config_.height, emitted_, config_.intrinsics);
-  const std::size_t point_bytes = point_count_ * 3U * sizeof(float);
-  const std::size_t color_bytes = point_count_ * 3U;
+      synthetic_frame(config_.width, config_.height, emitted_, config_.camera_info);
 
-  if (config_.intrinsics && (sent_ & kSentIntrinsics) == 0U) {
-    auto loan = intrinsics.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = std::array<std::int64_t, 1>{4}, .dtype = kFloat32});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    const CameraIntrinsics& k = frame.intrinsics;
-    const std::array<float, 4> values{k.fx, k.fy, k.cx, k.cy};
-    if (auto written = fill_host(*loan, values.data(), sizeof(values)); !written) {
-      return written;
-    }
-    if (auto stop = settle(intrinsics.emit(std::move(*loan), emit), kSentIntrinsics, sent_)) {
+  if (config_.camera_info && !camera_info_sent_) {
+    hm::CameraInfo info = synthetic_camera_info(frame);
+    info.header.capture_timestamp_ns = pending_capture_->timestamp_ns;
+    if (auto stop = settle(camera_info.emit(hm::to_message(info), emit))) {
       return *stop;
     }
+    camera_info_sent_ = true;
   }
-
-  const bool need_colors = config_.color && (sent_ & kSentColors) == 0U;
-  const bool need_points = (sent_ & kSentPoints) == 0U;
-  std::optional<holoscan::TensorOutputLoan> points_loan;
-  std::optional<holoscan::TensorOutputLoan> colors_loan;
-  if (need_points) {
-    auto loan = points.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = cloud_shape(point_count_), .dtype = kFloat32});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    points_loan.emplace(std::move(*loan));
+  auto cloud = hm::allocate_point_cloud(point_cloud, hm::unorganized_cloud(point_count_),
+                                        {.colors = config_.color}, ::cuda::stream_ref(stream));
+  if (!cloud) {
+    return settle(holoscan::make_unexpected(std::move(cloud).error())).value_or(Result{});
   }
-  if (need_colors) {
-    auto loan = colors.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = cloud_shape(point_count_), .dtype = kUInt8});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    colors_loan.emplace(std::move(*loan));
+  if (auto filled = fill(*cloud, frame, stream); !filled) {
+    return filled;
   }
-
-  if (config_.device_output) {
-    std::optional<holoscan::TensorOutputWriteGuard> points_writer;
-    std::optional<holoscan::TensorOutputWriteGuard> colors_writer;
-    if (points_loan) {
-      auto writer = points_loan->write(stream);
-      if (!writer) {
-        return holoscan::make_unexpected(std::move(writer).error());
-      }
-      points_writer.emplace(std::move(*writer));
-    }
-    if (colors_loan) {
-      auto writer = colors_loan->write(stream);
-      if (!writer) {
-        return holoscan::make_unexpected(std::move(writer).error());
-      }
-      colors_writer.emplace(std::move(*writer));
-    }
-    // Only the outputs still owed are made.
-    if (const cudaError_t status = generate_synthetic_cloud(
-            frame, config_.millimeter_depth,
-            points_writer ? points_writer->data_as<float>() : nullptr,
-            colors_writer ? colors_writer->data_as<std::uint8_t>() : nullptr, stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("generate_synthetic_cloud", status));
-    }
-    for (auto* writer : {&points_writer, &colors_writer}) {
-      if (*writer) {
-        if (auto committed = std::move(**writer).commit(); !committed) {
-          return holoscan::make_unexpected(std::move(committed).error());
-        }
-      }
-    }
-  } else {
-    // Make the cloud on the GPU, then fill the host loans from it.
-    if (auto scratch = ensure_scratch(); !scratch) {
-      return scratch;
-    }
-    auto* bytes = static_cast<std::uint8_t*>(scratch_);
-    if (const cudaError_t status =
-            generate_synthetic_cloud(frame, config_.millimeter_depth,
-                                     reinterpret_cast<float*>(bytes), bytes + point_bytes, stream);
-        status != cudaSuccess) {
-      return holoscan::make_unexpected(cuda_failure("generate_synthetic_cloud", status));
-    }
-    const auto copy_out = [&](holoscan::TensorOutputLoan& loan, std::size_t offset,
-                              std::size_t size) {
-      return loan.write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
-                                            -> holoscan::expected<void, holoscan::Error> {
-        if (writer.byte_size() != size) {
-          return holoscan::make_unexpected(failure("tensor loan has an unexpected size"));
-        }
-        const cudaError_t status = cudaMemcpyAsync(writer.data_as<std::uint8_t>(), bytes + offset,
-                                                   size, cudaMemcpyDeviceToHost, stream);
-        const cudaError_t synced = status == cudaSuccess ? cudaStreamSynchronize(stream) : status;
-        if (synced != cudaSuccess) {
-          return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", synced));
-        }
-        return {};
-      });
-    };
-    if (points_loan) {
-      if (auto copied = copy_out(*points_loan, 0, point_bytes); !copied) {
-        return copied;
-      }
-    }
-    if (colors_loan) {
-      if (auto copied = copy_out(*colors_loan, point_bytes, color_bytes); !copied) {
-        return copied;
-      }
-    }
-  }
-
-  if (colors_loan) {
-    if (auto stop = settle(colors.emit(std::move(*colors_loan), emit), kSentColors, sent_)) {
-      return *stop;
-    }
-  }
-  if (points_loan) {
-    if (auto stop = settle(points.emit(std::move(*points_loan), emit), kSentPoints, sent_)) {
-      return *stop;
-    }
+  if (auto stop = settle(send_cloud(point_cloud, std::move(*cloud), point_count_, "body", emit))) {
+    return *stop;
   }
   // Every output of this frame is out.
   pending_capture_.reset();
@@ -351,14 +305,10 @@ CloudFileSourceOp::CloudFileSourceOp(CloudFileSourceConfig config) : config_(std
 }
 
 void CloudFileSourceOp::setup(holoscan::OperatorSpec& spec) {
-  spec.output(points, "points")
-      .produces_tensor(tensor_spec(holoscan::MemoryKind::kHost, kFloat32, 2U,
-                                   config_.max_points * 3U * sizeof(float)));
-  if (config_.color) {
-    spec.output(colors, "colors")
-        .produces_tensor(
-            tensor_spec(holoscan::MemoryKind::kHost, kUInt8, 2U, config_.max_points * 3U));
-  }
+  hm::declare_point_cloud_output(spec, point_cloud, "point_cloud",
+                                 {.max_points = config_.max_points,
+                                  .colors = config_.color,
+                                  .memory_kind = holoscan::MemoryKind::kHost});
 }
 
 holoscan::Contract CloudFileSourceOp::contract() const {
@@ -369,8 +319,8 @@ holoscan::Contract CloudFileSourceOp::contract() const {
 
 void CloudFileSourceOp::start() {
   emitted_ = 0;
-  pending_capture_.reset();
-  sent_ = 0U;
+  delayed_ = false;
+  pending_.reset();
 }
 
 holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
@@ -378,13 +328,19 @@ holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
   if (emitted_ >= total_) {
     return {};
   }
-  const auto& path = config_.files[emitted_ % config_.files.size()];
-  PointCloud cloud;
-  try {
-    cloud = read_ply(path);
-  } catch (const std::exception& error) {
-    return holoscan::make_unexpected(failure(error.what()));
+  if (config_.delay_first_frame && !delayed_) {
+    delayed_ = true;
+    return {};
   }
+  const auto& path = config_.files[emitted_ % config_.files.size()];
+  if (!pending_) {
+    try {
+      pending_ = read_ply(path);
+    } catch (const std::exception& error) {
+      return holoscan::make_unexpected(failure(error.what()));
+    }
+  }
+  const PointCloud& cloud = *pending_;
   if (cloud.size() > config_.max_points) {
     return holoscan::make_unexpected(
         holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
@@ -395,37 +351,30 @@ holoscan::expected<void, holoscan::Error> CloudFileSourceOp::compute(
     return holoscan::make_unexpected(
         holoscan::Error{holoscan::ErrorCode::kInvalidArgument, path.string() + ": has no colors"});
   }
-  if (!pending_capture_) {
-    pending_capture_ = context.activation_time();
-    sent_ = 0U;
-  }
-  const holoscan::EmitOptions emit{.capture_time = *pending_capture_, .frame_id = emitted_ + 1U};
-  if (config_.color && (sent_ & kSentColors) == 0U) {
-    auto loan = colors.allocate_tensor(
-        holoscan::TensorLoanRequest{.shape = cloud_shape(cloud.size()), .dtype = kUInt8});
-    if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
-    }
-    if (auto written = fill_host(*loan, cloud.rgb.data(), cloud.rgb.size()); !written) {
-      return written;
-    }
-    if (auto stop = settle(colors.emit(std::move(*loan), emit), kSentColors, sent_)) {
-      return *stop;
-    }
-  }
-  auto loan = points.allocate_tensor(
-      holoscan::TensorLoanRequest{.shape = cloud_shape(cloud.size()), .dtype = kFloat32});
+  const holoscan::EmitOptions emit{.capture_time = context.activation_time(),
+                                   .frame_id = emitted_ + 1U};
+  auto loan = hm::allocate_point_cloud(
+      point_cloud, hm::unorganized_cloud(static_cast<std::int64_t>(cloud.size())),
+      {.colors = config_.color}, context.cuda_stream());
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    return settle(holoscan::make_unexpected(std::move(loan).error())).value_or(Result{});
   }
-  if (auto written = fill_host(*loan, cloud.xyz.data(), cloud.xyz.size() * sizeof(float));
+  if (auto written = fill_host(*loan, hm::PointCloudFields::points, cloud.xyz.data(),
+                               cloud.xyz.size() * sizeof(float));
       !written) {
     return written;
   }
-  if (auto stop = settle(points.emit(std::move(*loan), emit), kSentPoints, sent_)) {
+  if (config_.color) {
+    if (auto written =
+            fill_host(*loan, hm::PointCloudFields::colors, cloud.rgb.data(), cloud.rgb.size());
+        !written) {
+      return written;
+    }
+  }
+  if (auto stop = settle(send_cloud(point_cloud, std::move(*loan), cloud.size(), "points", emit))) {
     return *stop;
   }
-  pending_capture_.reset();
+  pending_.reset();
   ++emitted_;
   return {};
 }
