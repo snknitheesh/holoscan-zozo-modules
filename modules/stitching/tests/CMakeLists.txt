@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The module's full suite. Everything but the host tests needs the SDK, CUDA and a GPU,
-# and makes its own data: a synthetic world rendered by virtual cameras.
+# and makes its own data: a synthetic world rendered by virtual cameras; the real-data
+# test reads the local recordings from $HOLOSCAN_TEST_DATA and is skipped without it.
 
 # The tests compare against the CPU reference, so they must not contract either.
 add_library(stitching_test_flags INTERFACE)
@@ -21,11 +22,17 @@ target_link_libraries(
 add_executable(stitching_benchmark benchmark.cpp)
 target_link_libraries(stitching_benchmark PRIVATE holoscan::stitching)
 
+# The local recordings, from $HOLOSCAN_TEST_DATA; skipped when it is unset (CI).
+add_executable(stitching_real_data_test real_data_test.cpp)
+target_link_libraries(stitching_real_data_test PRIVATE holoscan::stitching stitching_test_flags)
+
 add_test(NAME stitching_stitcher COMMAND stitching_stitcher_test)
 add_test(NAME stitching_operator COMMAND stitching_operator_test)
+add_test(NAME stitching_real_data COMMAND stitching_real_data_test)
 set_tests_properties(
   stitching_stitcher
   stitching_operator
+  stitching_real_data
   PROPERTIES LABELS "stitching;gpu" TIMEOUT 900 SKIP_RETURN_CODE 77
 )
 

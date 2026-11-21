@@ -3,9 +3,11 @@
 //
 // Times the Stitcher at the demo's sizes: four 1280x720 fisheye cameras into a
 // 1024x1024 bird's-eye view and a 4096x1024 panorama. The tables' build on the
-// host clock (once per calibration); each frame with CUDA events over 200
-// stitches queued back to back, the best of three rounds. Prints a Markdown
-// table. Not a test: run it by hand (see DEVELOPER.md).
+// host clock (once per calibration); a frame's GPU time with CUDA events, as
+// the mean of 200 stitches queued back to back (the best of three rounds: the
+// throughput), and as the median of 50 stitches each waited for before the
+// next (a lone frame, launches included). Prints a Markdown table. Not a test:
+// run it by hand (see DEVELOPER.md).
 
 #include <cuda_runtime_api.h>
 
@@ -26,6 +28,7 @@ namespace {
 
 constexpr int kStitches = 200;
 constexpr int kRounds = 3;
+constexpr int kLoneStitches = 50;
 
 double time_stitches(st::Stitcher& stitcher, const st::test::RigFrame& frame, void* output,
                      std::size_t pitch, cudaStream_t stream) {
@@ -48,6 +51,30 @@ double time_stitches(st::Stitcher& stitcher, const st::test::RigFrame& frame, vo
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
   return best;
+}
+
+// The median time of one stitch, from its submission until it is done, each
+// waited for before the next.
+double time_lone_stitch(st::Stitcher& stitcher, const st::test::RigFrame& frame, void* output,
+                        std::size_t pitch, cudaStream_t stream) {
+  cudaEvent_t start;
+  cudaEvent_t stop;
+  st::test::cuda_check(cudaEventCreate(&start), "cudaEventCreate");
+  st::test::cuda_check(cudaEventCreate(&stop), "cudaEventCreate");
+  std::vector<double> times;
+  for (int i = 0; i < kLoneStitches; ++i) {
+    st::test::cuda_check(cudaEventRecord(start, stream), "cudaEventRecord");
+    st::test::cuda_check(stitcher.stitch(frame.images, output, pitch, stream), "stitch");
+    st::test::cuda_check(cudaEventRecord(stop, stream), "cudaEventRecord");
+    st::test::cuda_check(cudaEventSynchronize(stop), "cudaEventSynchronize");
+    float ms = 0.0F;
+    st::test::cuda_check(cudaEventElapsedTime(&ms, start, stop), "cudaEventElapsedTime");
+    times.push_back(ms);
+  }
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  std::nth_element(times.begin(), times.begin() + kLoneStitches / 2, times.end());
+  return times[kLoneStitches / 2];
 }
 
 }  // namespace
@@ -90,8 +117,10 @@ int main() {
                                 {"feather, RGB8 out", rgb}};
 
   std::printf("GPU: %s\n\n", properties.name);
-  std::printf("| Output | Input | Blend | Tables (ms, once) | Table memory (MB) | Frame (ms) |\n");
-  std::printf("| --- | --- | --- | ---: | ---: | ---: |\n");
+  std::printf(
+      "| Output | Input | Blend | Tables (ms, once) | Table memory (MB) | Frame, back to back "
+      "(ms) | Frame, alone (ms) |\n");
+  std::printf("| --- | --- | --- | ---: | ---: | ---: | ---: |\n");
   for (const Output& out : outputs) {
     for (const st::PixelFormat input : {st::PixelFormat::kRgba8, st::PixelFormat::kRgb8}) {
       const auto frame = st::test::render_frame(world, rig, st::RigPose{}, input, {}, 1);
@@ -109,9 +138,10 @@ int main() {
         st::test::cuda_check(stitcher.stitch(frame.images, output.data(), pitch, stream), "stitch");
         st::test::cuda_check(cudaStreamSynchronize(stream), "stitch");
         const double frame_ms = time_stitches(stitcher, frame, output.data(), pitch, stream);
-        std::printf("| %s | 4 x %s 1280x720 | %s | %.1f | %.1f | %.3f |\n", out.name.c_str(),
+        const double lone_ms = time_lone_stitch(stitcher, frame, output.data(), pitch, stream);
+        std::printf("| %s | 4 x %s 1280x720 | %s | %.1f | %.1f | %.3f | %.3f |\n", out.name.c_str(),
                     std::string(st::format_name(input)).c_str(), mode.name.c_str(), build_ms,
-                    static_cast<double>(stitcher.table_bytes()) / 1e6, frame_ms);
+                    static_cast<double>(stitcher.table_bytes()) / 1e6, frame_ms, lone_ms);
       }
     }
   }
