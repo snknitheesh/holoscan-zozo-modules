@@ -28,7 +28,7 @@ The [YOLO26 Detection demo](../../applications/yolo26_detection/) runs them end 
 | C++ namespace | `holoscan::yolo26` |
 | Debian package | `holoscan-yolo26` |
 | Model tool | `tools/prepare_model.py`, installed as `share/holoscan-yolo26/prepare_model.py` |
-| Platforms | x86_64; aarch64 (Jetson Thor, JetPack 7; Jetson AGX Orin, JetPack 7.2) |
+| Platforms | x86_64; aarch64 (Jetson Thor and Jetson Orin, JetPack 7.2) |
 
 ## Operators
 
@@ -374,7 +374,7 @@ directory. It installs to `/usr` and depends on `holoscan (>= 5.0.0)`, so
 
 ## Performance
 
-On an RTX 5090 (driver 595.91.07, shared with another process) with SDK 5.0.0, CUDA 13.2 and
+On an RTX 5090 (shared with another process) with SDK 5.0.0, CUDA 13.2 and
 TensorRT 10.16, for YOLO26n at 640 on the 640x480 COCO image, the GPU work per frame is a median
 of:
 
@@ -402,9 +402,8 @@ against YOLO26n-seg at 640 on the same image (five instances found), median of 2
 The mask kernels' time grows with the image's pixels times the detections, and the masks
 output's size with `max_detections`.
 
-The operator's code was validated, before it became this module, with SDK 5.0.0 on x86_64 (RTX
-5090, CUDA 13.2, TensorRT 10.16; RTX 5080 Laptop GPU, CUDA 13.0, TensorRT 10.13) and on Jetson AGX
-Thor (JetPack 7, CUDA 13.0, TensorRT 10.15), where the real model's FP32 and FP16 engines give the
+The operator's code was validated, before it became this module, with SDK 5.0.0 on an RTX 5090
+(CUDA 13.2, TensorRT 10.16) and on Jetson Thor (JetPack 7, CUDA 13.0, TensorRT 10.15), where the real model's FP32 and FP16 engines give the
 same detections as on x86_64.
 
 ## Licenses

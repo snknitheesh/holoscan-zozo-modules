@@ -1,0 +1,70 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 zozo
+// SPDX-License-Identifier: Apache-2.0
+
+#include "render_check_op.hpp"
+
+#include <cstddef>
+#include <cstdlib>
+#include <span>
+#include <stdexcept>
+#include <utility>
+
+namespace isp_demo {
+
+RenderCheckOp::RenderCheckOp(std::shared_ptr<RenderTally> tally) : tally_(std::move(tally)) {
+  if (!tally_) {
+    throw std::invalid_argument("RenderCheckOp needs a tally");
+  }
+}
+
+void RenderCheckOp::setup(holoscan::OperatorSpec& spec) { spec.input(frame, "frame"); }
+
+holoscan::Contract RenderCheckOp::contract() const {
+  holoscan::Contract result;
+  result.trigger(holoscan::OnEach{frame});
+  return result;
+}
+
+holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
+    holoscan::ExecutionContext& context) {
+  auto sample = frame.receive();
+  if (!sample) {
+    return holoscan::make_unexpected(std::move(sample).error());
+  }
+  if (!sample->data.data) {
+    return holoscan::make_unexpected(holoscan::Error{holoscan::ErrorCode::kInvalidArgument,
+                                                     "RenderCheckOp: a frame without pixels"});
+  }
+  const holoscan::Tensor& tensor = *sample->data.data;
+  const std::span<const std::int64_t> shape = tensor.shape_span();
+  if (shape.size() != 3 || shape[2] != 4) {
+    return holoscan::make_unexpected(holoscan::Error{
+        holoscan::ErrorCode::kInvalidArgument, "RenderCheckOp: expected an RGBA8 [H, W, 4] frame"});
+  }
+  const auto height = static_cast<std::size_t>(shape[0]);
+  const auto width = static_cast<std::size_t>(shape[1]);
+  pixels_.resize(height * width * 4U);
+  if (auto copied = tensor.copy_to_host(pixels_.data(), pixels_.size(), context.cuda_stream());
+      !copied) {
+    return copied;
+  }
+  std::size_t gray = 0;     // Left: gray and lit.
+  std::size_t colored = 0;  // Right: channels apart.
+  for (std::size_t v = 0; v < height; ++v) {
+    for (std::size_t u = 0; u < width; ++u) {
+      const std::uint8_t* p = pixels_.data() + 4U * (v * width + u);
+      if (u < width / 2) {
+        gray += p[0] == p[1] && p[1] == p[2] && p[0] != 0U ? 1U : 0U;
+      } else {
+        colored += std::abs(p[0] - p[1]) + std::abs(p[1] - p[2]) > 30 ? 1U : 0U;
+      }
+    }
+  }
+  const std::size_t half = height * (width / 2);
+  ++tally_->frames;
+  // Most of the mosaic is lit; the chart's patches and ramps make a good share colourful.
+  tally_->showing += 10U * gray > 9U * half && 10U * colored > half ? 1U : 0U;
+  return {};
+}
+
+}  // namespace isp_demo
