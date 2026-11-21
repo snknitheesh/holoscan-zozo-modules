@@ -39,6 +39,12 @@ files, or in a module it uses, or one those depend on. CI then builds and instal
 uses first, and runs their tests only if the pull request selected them too. See
 [What a run tests](../.github/RUNNERS.md#what-a-run-tests), which also says how to run every test.
 
+A demo whose graph is lossless, with `QueuePolicy::kBlocking` edges that must deliver every frame,
+runs it on one worker (`graph.partition("<demo>").include_all()`) and has a test that checks
+`plan.scheduler_plan().worker_count` is 1, usually through a `--compile-only` run that prints it.
+Live edges that only need the newest frame, such as a display's, use `QueuePolicy::kDropOldest` with
+depth 1. See [Run a graph on one worker](../modules/messages/README.md#run-a-graph-on-one-worker).
+
 Optionally, `tests/host/` is a standalone CMake project for tests that need no Holoscan SDK, CUDA
 or GPU; the hosted `Lint` job runs it.
 
