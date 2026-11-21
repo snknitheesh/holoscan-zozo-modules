@@ -4,6 +4,7 @@
 // A project built against the installed holoscan-image-quality package: a source
 // sends synthetic frames, the last two repeats of the one before, through
 // ImageQualityOp, and a sink checks that exactly the repeats are flagged frozen.
+// Every frame must arrive, so the graph runs on one worker.
 
 #include <array>
 #include <chrono>
@@ -16,7 +17,9 @@
 
 #include <holoscan/core/compile.hpp>
 #include <holoscan/core/connection_options.hpp>
+#include <holoscan/core/diagnostic.hpp>
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/core/errors.hpp>
 #include <holoscan/core/graph.hpp>
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/run.hpp>
@@ -72,7 +75,8 @@ class SceneSourceOp final : public holoscan::Operator<> {
     const std::array<std::int64_t, 3> shape{kHeight, kWidth, 3};
     auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
     if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
+      return busy(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                : holoscan::make_unexpected(std::move(loan).error());
     }
     auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
                                                    -> holoscan::expected<void, holoscan::Error> {
@@ -93,15 +97,20 @@ class SceneSourceOp final : public holoscan::Operator<> {
       ++sent_;
       return {};
     }
-    // A busy consumer refuses the frame; send it again on the next tick.
-    return emitted.error().code == holoscan::ErrorCode::kBackpressured
-               ? holoscan::expected<void, holoscan::Error>{}
-               : emitted;
+    return busy(emitted.error()) ? holoscan::expected<void, holoscan::Error>{} : emitted;
   }
 
   holoscan::Output<holoscan::schema::ImageT> image;
 
  private:
+  // A busy consumer refuses the frame: the emit with kBackpressured, or the
+  // allocation with kResourceExhausted while every slot of the pool is still
+  // held. Either way, send the same frame again on the next tick.
+  static bool busy(const holoscan::Error& error) {
+    return error.code == holoscan::ErrorCode::kBackpressured ||
+           error.code == holoscan::ErrorCode::kResourceExhausted;
+  }
+
   std::size_t sent_{};
 };
 
@@ -167,11 +176,23 @@ int main() {
   graph.add_flow(source->image, quality->image, lossless);
   graph.add_flow(quality->metrics, sink->metrics, lossless);
   graph.add_flow(quality->flags, sink->flags, lossless);
+  // Every frame must arrive: one worker, so that no stage is refused for running
+  // ahead of the next (see holoscan-messages' README).
+  graph.partition("image_quality_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   const holoscan::ExecutionPlan plan = holoscan::compile(graph);
+  // Warnings on an accepted plan as well as the reasons for a rejected one.
+  if (!plan.diagnostics().empty()) {
+    std::cerr << holoscan::format_diagnostics(plan.diagnostics(), plan.graph()) << '\n';
+  }
   if (!plan.ok()) {
-    std::cerr << plan.json() << '\n';
+    return 1;
+  }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "image_quality_consumer: workers=" << workers << '\n';
+  if (workers != 1U) {
+    std::cerr << "image_quality_consumer: the graph must run on one worker\n";
     return 1;
   }
   if (const int status = holoscan::run(plan); status != 0) {

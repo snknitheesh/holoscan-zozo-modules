@@ -3,8 +3,6 @@
 
 #include "render_check_op.hpp"
 
-#include <cuda_runtime_api.h>
-
 #include <cstdio>
 #include <memory>
 #include <span>
@@ -14,6 +12,7 @@
 #include <vector>
 
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/logger/logger.hpp>
 
 namespace image_quality_app {
 namespace {
@@ -35,7 +34,7 @@ RenderCheckOp::RenderCheckOp(RenderCheckConfig config) : config_(std::move(confi
 }
 
 void RenderCheckOp::setup(holoscan::OperatorSpec& spec) {
-  spec.input(frame, "frame").queue_depth(2U);
+  spec.input(frame, "frame").queue_depth(1U);
 }
 
 holoscan::Contract RenderCheckOp::contract() const {
@@ -44,7 +43,8 @@ holoscan::Contract RenderCheckOp::contract() const {
   return result;
 }
 
-holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(holoscan::ExecutionContext&) {
+holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
+    holoscan::ExecutionContext& context) {
   auto sample = frame.receive();
   if (!sample) {
     return holoscan::make_unexpected(std::move(sample).error());
@@ -60,13 +60,17 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(holoscan::Execu
   const int height = static_cast<int>(shape[0]);
   const int width = static_cast<int>(shape[1]);
   pixels_.resize(static_cast<std::size_t>(width) * height * 4U);
-  if (auto ready = tensor.synchronize_for_host(); !ready) {
-    return holoscan::make_unexpected(std::move(ready).error());
+  if (!copy_logged_) {
+    copy_logged_ = true;
+    HOLOSCAN_LOG_INFO(
+        "RenderCheckOp: each rendered frame is copied from the GPU to the host to be checked, "
+        "{} bytes per frame",
+        pixels_.size());
   }
-  if (const cudaError_t status =
-          cudaMemcpy(pixels_.data(), tensor.data(), pixels_.size(), cudaMemcpyDefault);
-      status != cudaSuccess) {
-    return holoscan::make_unexpected(failure(cudaGetErrorString(status)));
+  // One copy on this operator's stream, after HoloViz's writes, and one wait for it.
+  if (auto copied = tensor.copy_to_host(pixels_.data(), pixels_.size(), context.cuda_stream());
+      !copied) {
+    return copied;
   }
 
   RenderReport& report = *config_.report;

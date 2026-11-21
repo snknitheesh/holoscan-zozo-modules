@@ -25,7 +25,8 @@ struct CameraConfig {
   // Frames to send; each is sent with frame id = its index.
   std::uint64_t count{630};
   std::chrono::nanoseconds period{std::chrono::milliseconds{33}};
-  // Send the frames in CUDA device memory instead of host memory.
+  // Send the frames in CUDA device memory instead of host memory. The camera
+  // renders on the CPU, so each frame is then copied to the GPU (logged once).
   bool device_output{false};
 };
 
@@ -46,6 +47,7 @@ class SyntheticCameraOp final : public holoscan::Operator<> {
  private:
   CameraConfig config_;
   std::uint64_t sent_{};
+  bool upload_logged_{};
 };
 
 }  // namespace image_quality_app

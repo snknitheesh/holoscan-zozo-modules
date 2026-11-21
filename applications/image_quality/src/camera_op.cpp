@@ -15,6 +15,7 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
 
 namespace image_quality_app {
 namespace {
@@ -23,6 +24,16 @@ constexpr DLDataType kUInt8{kDLUInt, 8U, 1U};
 
 holoscan::Error failure(std::string message) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, "SyntheticCameraOp: " + std::move(message)};
+}
+
+// Whether `error` says the consumers are still busy with earlier frames: an emit
+// fails with kBackpressured before anything is delivered, and an allocation with
+// kResourceExhausted while every slot of the output's pool is still held, by
+// frames the consumers have not finished with or by a refused one. The camera
+// then sends the same frame on its next tick instead of failing the run.
+bool consumers_busy(const holoscan::Error& error) {
+  return error.code == holoscan::ErrorCode::kBackpressured ||
+         error.code == holoscan::ErrorCode::kResourceExhausted;
 }
 
 }  // namespace
@@ -78,9 +89,17 @@ holoscan::expected<void, holoscan::Error> SyntheticCameraOp::compute(
   const std::array<std::int64_t, 3> shape{frame.height, frame.width, 3};
   auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
   if (!loan) {
-    return holoscan::make_unexpected(std::move(loan).error());
+    return consumers_busy(loan.error()) ? holoscan::expected<void, holoscan::Error>{}
+                                        : holoscan::make_unexpected(std::move(loan).error());
   }
   if (config_.device_output) {
+    if (!upload_logged_) {
+      upload_logged_ = true;
+      HOLOSCAN_LOG_INFO(
+          "SyntheticCameraOp: frames are rendered on the CPU and copied to the GPU from pageable "
+          "memory, {} bytes per frame",
+          frame.pixels.size());
+    }
     auto writer = loan->write(context.cuda_stream());
     if (!writer) {
       return holoscan::make_unexpected(std::move(writer).error());
@@ -122,11 +141,7 @@ holoscan::expected<void, holoscan::Error> SyntheticCameraOp::compute(
     ++sent_;
     return {};
   }
-  // A busy consumer fails the emit with kBackpressured before anything is
-  // delivered: send the same frame again on the next tick.
-  return emitted.error().code == holoscan::ErrorCode::kBackpressured
-             ? holoscan::expected<void, holoscan::Error>{}
-             : emitted;
+  return consumers_busy(emitted.error()) ? holoscan::expected<void, holoscan::Error>{} : emitted;
 }
 
 }  // namespace image_quality_app

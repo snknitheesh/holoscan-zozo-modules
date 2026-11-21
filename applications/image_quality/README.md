@@ -32,20 +32,29 @@ cmake -S applications/image_quality -B build/image_quality -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
 cmake --build build/image_quality
 build/image_quality/image_quality --count 630                                             # display mode
-build/image_quality/image_quality --count 315 --period-ms 10 --display offscreen --snapshot image_quality.ppm  # offscreen mode
+build/image_quality/image_quality --count 315 --period-ms 10 --display offscreen               # offscreen mode
 build/image_quality/image_quality --count 560 --segment-frames 40 --period-ms 5 --display false  # ci mode
 ```
 
 `--help` lists the options: the frame count, period and size, frames per segment, the obstruction
 window (`--obstruction-frames`, 30, which must be shorter than a segment, 45), and
-`--device-input true` for frames in GPU memory. With host frames the operator logs once that it
-copies each frame to the GPU.
+`--device-input true` for frames in GPU memory. The camera renders on the CPU: with host frames the
+operator logs once that it copies each frame to the GPU, and with `--device-input true` the camera
+logs once that it does. In the offscreen mode, `--snapshot PATH` saves the rendered frame with the
+most overlay as a PPM file at `PATH` (the picture above is one); without it nothing is written.
+`--compile-only true` builds the graph and prints `plan=OK workers=1` without running it.
 
 The modes in [metadata.json](metadata.json) are the three commands above: `display`, in a window
 when there is a display; `offscreen`, where HoloViz renders into GPU memory and a checker requires
 every rendered frame to show the scene, some to show the text and some to show the overlay's
-magenta over the smudge and nowhere else, then saves the frame with the most of it; and `ci`, the
-finite headless check CI runs.
+magenta over the smudge and nowhere else; and `ci`, the finite headless check CI runs.
+
+Every mode runs the whole graph on one worker, as
+[holoscan-messages](../../modules/messages/README.md#run-a-graph-on-one-worker) advises for a
+lossless chain: the camera, `ImageQualityOp` and the reporter are joined by blocking edges, and every
+frame must reach the reporter. HoloViz and the text take the newest sample (drop-oldest, depth 1),
+but for two edges: the camera's image reaches HoloViz at depth 4, so that the frame's image is still
+queued when its overlay arrives, and HoloViz's rendered frames reach the offscreen checker at depth 1.
 
 ## Output
 
@@ -72,7 +81,10 @@ segment's first 29 frames have none, as they must. Up to ten wrong frames are li
 
 With `-DBUILD_TESTING=ON`, `ctest` runs the demo: two cycles of short segments from host memory,
 one from GPU memory, one at 1280x720, every frame's flags checked; the offscreen render check with
-a snapshot; that the window graph compiles; and the exit status of invalid options.
+a snapshot; that the window, offscreen and headless graphs each compile onto one worker; and the
+exit status of invalid options. [`tests/host/`](tests/host/), which needs no SDK or GPU and which
+the hosted CI job also builds on its own, checks the camera's schedule and, for two whole cycles,
+that the module's CPU reference gives every frame exactly the flags its segment requires.
 
 ## Licenses
 

@@ -21,7 +21,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include <holoscan/core/compile.hpp>
@@ -44,7 +43,6 @@
 
 namespace {
 
-using std::chrono_literals::operator""ms;
 namespace iq = holoscan::image_quality;
 namespace app = image_quality_app;
 namespace viz = holoscan::visualization;
@@ -202,6 +200,21 @@ void print_segments(const app::RunReport& report) {
   }
 }
 
+// How long a finite run may take: two periods per frame, plus the camera's CPU
+// time to render and degrade each frame (about 100 ns per pixel), which can
+// exceed its period on large images, plus kTimeoutAllowance. Computed in
+// seconds, as a double, and capped, so that no --count overflows it.
+std::chrono::nanoseconds run_allowance(const Options& opts) {
+  const double pixels = static_cast<double>(opts.schedule.width) * opts.schedule.height;
+  const double per_frame = 2e-3 * opts.period_ms + 100e-9 * pixels;
+  const double seconds = std::chrono::duration<double>(kTimeoutAllowance).count() +
+                         static_cast<double>(opts.count) * per_frame;
+  // About 31 years: beyond any run, and far inside what nanoseconds hold.
+  constexpr double kMaxSeconds = 1e9;
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(std::min(seconds, kMaxSeconds)));
+}
+
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
 
 int execute(const Options& opts, SignalDomain& signals) {
@@ -289,12 +302,17 @@ int execute(const Options& opts, SignalDomain& signals) {
       auto checker = graph.op<app::RenderCheckOp>(
           "render_check",
           app::RenderCheckConfig{.report = render_report, .smudge = schedule.smudge()});
-      const holoscan::ConnectionOptions frames{.queue_policy = holoscan::QueuePolicy::kDropOldest,
-                                               .queue_depth = 2U};
-      graph.add_flow(visualizer->output(), checker->frame, frames);
+      // Best effort too: the checker needs some rendered frames, not all of them.
+      graph.add_flow(visualizer->output(), checker->frame, latest);
     }
   }
 
+  // One worker for the whole graph, in every mode, as holoscan-messages' README
+  // advises for a lossless chain: the display's fork and join would otherwise
+  // split it onto several workers, where a stage runs while its consumer's queue
+  // is full, and ImageQualityOp, in the middle of the chain, cannot send a
+  // refused output again: the run would fail.
+  graph.partition(std::string(kAppName)).include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
   holoscan::CompileOptions compile_options;
   if (opts.device_input) {
@@ -313,7 +331,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on: one per partition that runs operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -323,16 +342,7 @@ int execute(const Options& opts, SignalDomain& signals) {
               << "; an interrupt ends the process without a report\n";
   }
   auto session = signals ? holoscan::run_async(plan, *signals) : holoscan::run_async(plan);
-  // The camera renders and degrades each frame on the CPU, which can take longer than
-  // its period on large images.
-  const auto pixels = static_cast<std::int64_t>(schedule.width) * schedule.height;
-  const auto deadline =
-      std::chrono::steady_clock::now() + kTimeoutAllowance +
-      static_cast<std::int64_t>(opts.count) * (2 * period + std::chrono::nanoseconds(100 * pixels));
-  while (session.is_running() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const bool timed_out = session.is_running();
+  const bool timed_out = !session.wait_for(run_allowance(opts));
   if (timed_out) {
     std::cerr << kAppName << ": timed out\n";
     session.request_stop();
@@ -399,5 +409,8 @@ int main(int argc, char** argv) try {
   return 2;
 } catch (const std::exception& error) {
   std::cerr << "error: " << error.what() << '\n';
+  return 1;
+} catch (...) {
+  std::cerr << "error: an unknown exception\n";
   return 1;
 }

@@ -41,9 +41,17 @@ image_quality_app_test(image_quality_app_offscreen 0
   --count 140 --segment-frames 20 --obstruction-frames 10 --period-ms 10 --display offscreen
   --snapshot "${CMAKE_CURRENT_BINARY_DIR}/image_quality_offscreen.ppm"
 )
-# The window graph compiles, with or without a display to run it.
-image_quality_app_test(image_quality_app_window_plan 0 "plan=OK"
+# Every mode's graph compiles onto one worker: the window's (with or without a display to
+# run it), the offscreen one and the headless one. The automatic partitioning would split
+# the display's fork and join across workers.
+image_quality_app_test(image_quality_app_window_plan 0 "plan=OK workers=1\n"
   --display true --compile-only true
+)
+image_quality_app_test(image_quality_app_offscreen_plan 0 "plan=OK workers=1\n"
+  --display offscreen --compile-only true
+)
+image_quality_app_test(image_quality_app_headless_plan 0 "plan=OK workers=1\n"
+  --display false --compile-only true
 )
 
 # Invalid input fails fast with a usage error (exit status 2) instead of starting a run.
@@ -60,3 +68,6 @@ image_quality_app_test(image_quality_app_rejects_snapshot 2 "^error: --snapshot"
 
 get_property(_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_tests} PROPERTIES LABELS "image_quality;gpu" TIMEOUT 600)
+
+# The SDK-free tests, which the hosted CI job also builds on their own.
+add_subdirectory(host)

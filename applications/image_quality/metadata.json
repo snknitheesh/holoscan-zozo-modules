@@ -39,6 +39,11 @@
         {
           "name": "NVIDIA GPU",
           "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "Display",
+          "description": "A display server (X11, or Wayland), for the HoloViz window of the display mode only; without one, the display mode runs headless, and the offscreen and ci modes never need one.",
+          "required": false
         }
       ]
     },
@@ -52,21 +57,21 @@
     "default_mode": "display",
     "modes": {
       "display": {
-        "description": "Two cycles of the degrading camera on a HoloViz display (when there is one): the image, a tile overlay (red blurred, magenta obstructed, yellow low-texture tiles) and the metrics, every frame's flags checked.",
+        "description": "Two cycles of the degrading camera on a HoloViz display (when there is one), on one worker: the image, a tile overlay (red blurred, magenta obstructed, yellow low-texture tiles) and the metrics, every frame's flags checked.",
         "run": {
           "command": "\"<holohub_app_bin>/image_quality\" --count 630",
           "workdir": "holohub_app_bin"
         }
       },
       "offscreen": {
-        "description": "One cycle rendered offscreen by HoloViz into GPU memory, each rendered frame checked for the scene, the text and the overlay over the smudge, and the frame with the most overlay saved as image_quality.ppm.",
+        "description": "One cycle rendered offscreen by HoloViz into GPU memory, on one worker, each rendered frame checked for the scene, the text and the overlay over the smudge; add --snapshot PATH to save the frame with the most overlay.",
         "run": {
-          "command": "\"<holohub_app_bin>/image_quality\" --count 315 --period-ms 10 --display offscreen --snapshot image_quality.ppm",
+          "command": "\"<holohub_app_bin>/image_quality\" --count 315 --period-ms 10 --display offscreen",
           "workdir": "holohub_app_bin"
         }
       },
       "ci": {
-        "description": "Finite headless check: two cycles of 40-frame segments (560 frames), each frame's flags checked against its segment: blurred only in the blurred segment, underexposed in the dark one, noisy in the noisy one, frozen on the repeats, obstructed once the smudge has lasted 30 frames, color cast in the tinted one, and nothing in the sharp segment or anywhere else.",
+        "description": "Finite headless check on one worker: two cycles of 40-frame segments (560 frames), each frame's flags checked against its segment: blurred only in the blurred segment, underexposed in the dark one, noisy in the noisy one, frozen on the repeats, obstructed once the smudge has lasted 30 frames, color cast in the tinted one, and nothing in the sharp segment or anywhere else.",
         "run": {
           "command": "\"<holohub_app_bin>/image_quality\" --count 560 --segment-frames 40 --period-ms 5 --display false",
           "workdir": "holohub_app_bin",

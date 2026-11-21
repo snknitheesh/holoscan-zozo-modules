@@ -58,6 +58,7 @@ class RenderCheckOp final : public holoscan::Operator<> {
  private:
   RenderCheckConfig config_;
   std::vector<std::uint8_t> pixels_;
+  bool copy_logged_{};
 };
 
 // Writes RGBA8 `pixels` as a binary PPM (RGB).
