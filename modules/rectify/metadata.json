@@ -1,0 +1,77 @@
+{
+  "$schema": "urn:holoscan:module:v2",
+  "module": {
+    "name": "holoscan-rectify",
+    "version": "1.0.0",
+    "support_level": "community",
+    "description": "Undistortion and stereo rectification for any camera calibrated in ROS camera_info files: plumb_bob, rational_polynomial and equidistant fisheye lenses, Bouguet rectification computed once on the CPU, and the remap of every frame on the GPU (CUDA) or on the VIC or the PVA (VPI 4), with the rectified pair's StereoCameraInfo for a disparity operator.",
+    "authors": [
+      {
+        "name": "zozo",
+        "affiliation": "Independent"
+      }
+    ],
+    "license": "Apache-2.0",
+    "language": [
+      "C++"
+    ],
+    "namespace": {
+      "cpp": "holoscan::rectify"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "5.0.0",
+      "tested_versions": [
+        "5.0.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Robotics",
+      "Computer Vision and Perception",
+      "Camera",
+      "Stereo",
+      "Calibration",
+      "CUDA",
+      "VPI"
+    ],
+    "homepage": "https://github.com/snknitheesh/holoscan-zozo-modules/tree/main/modules/rectify",
+    "source_repository": "https://github.com/snknitheesh/holoscan-zozo-modules",
+    "operator_names": [
+      "UndistortOp",
+      "StereoRectifyOp"
+    ],
+    "requirements": {
+      "hardware": [
+        {
+          "name": "NVIDIA GPU",
+          "description": "A CUDA-capable GPU supported by the Holoscan SDK."
+        },
+        {
+          "name": "VIC and PVA",
+          "description": "The Video Image Compositor and Programmable Vision Accelerator of Jetson Orin or Thor, used by the vpi-vic and vpi-pva backends when present.",
+          "required": false
+        }
+      ]
+    },
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
+    "binary_packages": {
+      "debian": "holoscan-rectify",
+      "install_commands": [
+        "sudo apt install ./holoscan-rectify_1.0.0_$(dpkg --print-architecture).deb"
+      ]
+    },
+    "testing": {
+      "cpp": "ctest"
+    },
+    "documentation": {
+      "readme": "README.md"
+    }
+  }
+}
