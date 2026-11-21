@@ -4,7 +4,7 @@
     "name": "holoscan-mono-depth",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Monocular depth estimation on the GPU: a CUDA resize and normalization into the model's input, TensorRT through the SDK's HoloInfer, and a CUDA resample of the output back onto the image, as relative inverse depth, optional metric depth and an optional colorized image for HoloViz. Made for Depth Anything V2 Small (Apache-2.0), which is not included: a tool exports it to ONNX.",
+    "description": "Monocular depth estimation on the GPU: a CUDA resize and normalization into the model's input, TensorRT through the SDK's HoloInfer, and a CUDA resample of the output back onto the image, as relative inverse depth, optional metric depth with its CameraInfo (holoscan-messages) for holoscan-point-cloud, and an optional colorized image for HoloViz. Made for Depth Anything V2 Small (Apache-2.0), which is not included: a tool exports it to ONNX.",
     "authors": [
       {
         "name": "zozo",
@@ -57,11 +57,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-mono-depth",
       "install_commands": [
-        "sudo apt install ./holoscan-mono-depth_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-mono-depth_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

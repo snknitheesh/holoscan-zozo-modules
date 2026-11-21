@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/conversion.hpp>
 #include <holoscan/mono_depth/kernels.hpp>
 #include <holoscan/mono_depth/mono_depth_op.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
@@ -71,9 +73,12 @@ holoscan::PayloadOptions image_payload() {
   };
 }
 
-holoscan::schema::ImageT descriptor(int width, int height,
-                                    holoscan::schema::ImageEncoding encoding) {
+// An output image of the input's size, with the input's header (its frame
+// id and stamps), which every output keeps.
+holoscan::schema::ImageT descriptor(int width, int height, holoscan::schema::ImageEncoding encoding,
+                                    const std::shared_ptr<holoscan::schema::HeaderT>& header) {
   holoscan::schema::ImageT image;
+  image.header = header;
   image.width = width;
   image.height = height;
   image.encoding = encoding;
@@ -112,17 +117,17 @@ std::string dims_text(const std::vector<std::int64_t>& dims) {
 
 // Keeps a pinned host tensor's memory from reuse until the work queued on
 // `stream` so far is done: its allocator waits for the stream if it can,
-// otherwise this waits.
-holoscan::expected<void, holoscan::Error> hold_until_done(const holoscan::Tensor& tensor,
+// otherwise this waits. Returns whether it waited.
+holoscan::expected<bool, holoscan::Error> hold_until_done(const holoscan::Tensor& tensor,
                                                           cudaStream_t stream) {
   holoscan::Tensor handle = tensor;
   if (handle.set_deallocation_stream(stream)) {
-    return {};
+    return false;
   }
   if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
     return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
   }
-  return {};
+  return true;
 }
 
 // HoloInfer's settings for `config`'s model, the same for prepare_engine() and
@@ -203,6 +208,13 @@ void validate_config(const MonoDepthConfig& config) {
         (*config.color_range)[0] < (*config.color_range)[1])) {
     throw std::invalid_argument("color_range must be finite, its first value below its second");
   }
+  if (config.color_range && !config.colorize) {
+    throw std::invalid_argument("color_range applies to the colorized output: set colorize");
+  }
+  if (gives_metric_depth(config) &&
+      config.camera_info_input.max_age <= std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("camera_info_input.max_age must be > 0");
+  }
   if (config.max_width < 1 || config.max_height < 1 || config.max_width > kMaxImageSide ||
       config.max_height > kMaxImageSide) {
     throw std::invalid_argument("max_width and max_height must be 1.." +
@@ -244,6 +256,9 @@ void MonoDepthOp::setup(holoscan::OperatorSpec& spec) {
       .produces_tensor(device_image(kFloat32, 2U, pixels * 4U))
       .payload_options(image_payload());
   if (gives_metric_depth(config_)) {
+    // Mandatory: an unwired camera_info fails compile().
+    spec.input(camera_info, "camera_info").queue_depth(2U);
+    spec.output(depth_camera_info, "depth_camera_info");
     spec.output(metric_depth, "metric_depth")
         .produces_tensor(device_image(kFloat32, 2U, pixels * 4U))
         .payload_options(image_payload());
@@ -256,6 +271,9 @@ void MonoDepthOp::setup(holoscan::OperatorSpec& spec) {
 }
 
 holoscan::Contract MonoDepthOp::contract() const {
+  if (gives_metric_depth(config_)) {
+    return messages::camera_info_contract(config_.camera_info_input, camera_info, image);
+  }
   holoscan::Contract result;
   result.trigger(holoscan::OnEach{image});
   return result;
@@ -263,6 +281,9 @@ holoscan::Contract MonoDepthOp::contract() const {
 
 void MonoDepthOp::start() {
   release();
+  camera_.reset();
+  copy_logged_ = false;
+  wait_logged_ = false;
   const bool onnx = is_onnx(config_.model);
   HOLOSCAN_LOG_INFO("MonoDepthOp: loading {}{}", config_.model.string(),
                     onnx ? "; building its TensorRT engine takes a while when none is cached" : "");
@@ -351,7 +372,11 @@ void MonoDepthOp::start() {
 void MonoDepthOp::stop() { release(); }
 
 void MonoDepthOp::release() noexcept {
-  // Freeing waits for the GPU work that may still use the buffers.
+  // The last frame's work may still use the model's buffers, the staging
+  // buffer and the range: wait for it before any of them goes.
+  if (frame_done_ != nullptr) {
+    cudaEventSynchronize(frame_done_);
+  }
   engine_.reset();
   if (frame_done_ != nullptr) {
     cudaEventDestroy(frame_done_);
@@ -388,14 +413,19 @@ holoscan::expected<const std::uint8_t*, holoscan::Error> MonoDepthOp::stage(
       return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
     }
     staging_bytes_ = grown;
-    HOLOSCAN_LOG_INFO(
-        "MonoDepthOp: host images are copied to the GPU first; give it GPU images to save the "
-        "copy");
   }
   // Plain host memory: the runtime does not order its producer, so wait for
   // it; the copy then stages it before returning. Pinned memory: hold it
   // until the asynchronous copy has read it.
   const bool pinned = tensor.device().device_type == kDLCUDAHost;
+  if (!copy_logged_) {
+    copy_logged_ = true;
+    HOLOSCAN_LOG_INFO(
+        "MonoDepthOp: the images are in {} host memory and are copied to the GPU, {}; give it "
+        "GPU images to save the copy",
+        pinned ? "pinned" : "pageable",
+        pinned ? "asynchronously" : "after a wait for their producer, before the copy returns");
+  }
   if (!pinned) {
     if (auto ready = tensor.synchronize_for_host(); !ready) {
       return holoscan::make_unexpected(std::move(ready).error());
@@ -408,8 +438,15 @@ holoscan::expected<const std::uint8_t*, holoscan::Error> MonoDepthOp::stage(
     return holoscan::make_unexpected(cuda_failure("cudaMemcpy2DAsync", status));
   }
   if (pinned) {
-    if (auto held = hold_until_done(tensor, stream); !held) {
+    auto held = hold_until_done(tensor, stream);
+    if (!held) {
       return holoscan::make_unexpected(std::move(held).error());
+    }
+    if (*held && !wait_logged_) {
+      wait_logged_ = true;
+      HOLOSCAN_LOG_INFO(
+          "MonoDepthOp: the pinned images' allocator cannot wait for the copy's stream, so each "
+          "frame waits for its copy on the CPU");
     }
   }
   return static_cast<const std::uint8_t*>(staging_);
@@ -417,6 +454,21 @@ holoscan::expected<const std::uint8_t*, holoscan::Error> MonoDepthOp::stage(
 
 holoscan::expected<void, holoscan::Error> MonoDepthOp::compute(
     holoscan::ExecutionContext& context) {
+  // A metric configuration's camera: frames before the first are skipped.
+  const messages::CameraInfo* camera = nullptr;
+  if (gives_metric_depth(config_)) {
+    auto info = camera_.update(camera_info);
+    if (!info) {
+      return holoscan::make_unexpected(std::move(info).error());
+    }
+    if (*info == nullptr) {
+      return {};
+    }
+    camera = *info;
+    if (camera_.changed()) {
+      depth_camera_ = messages::to_message(*camera);
+    }
+  }
   auto sample = image.receive();
   if (!sample) {
     return holoscan::make_unexpected(std::move(sample).error());
@@ -492,6 +544,13 @@ holoscan::expected<void, holoscan::Error> MonoDepthOp::compute(
       (descriptor_in.height != 0 && descriptor_in.height != height)) {
     return holoscan::make_unexpected(
         invalid("the image's width and height disagree with its tensor"));
+  }
+  if (camera != nullptr && (static_cast<std::int64_t>(camera->width) != width ||
+                            static_cast<std::int64_t>(camera->height) != height)) {
+    return holoscan::make_unexpected(
+        invalid("the camera info is for " + std::to_string(camera->width) + "x" +
+                std::to_string(camera->height) + " images, and the image is " +
+                std::to_string(width) + "x" + std::to_string(height)));
   }
   const DLDevice where = tensor.device();
   const bool on_gpu = where.device_type == kDLCUDA || where.device_type == kDLCUDAManaged;
@@ -630,26 +689,36 @@ holoscan::expected<void, holoscan::Error> MonoDepthOp::compute(
   }
 
   // One set of options, so every output carries the image's capture time and
-  // frame id.
+  // frame id, and every image output its header.
   const auto w = static_cast<int>(width);
   const auto h = static_cast<int>(height);
+  const auto& header = descriptor_in.header;
   const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*sample);
   if (auto sent = depth.emit_tensor(
-          std::move(*depth_loan), descriptor(w, h, holoscan::schema::ImageEncoding_MONO32F), emit);
+          std::move(*depth_loan), descriptor(w, h, holoscan::schema::ImageEncoding_MONO32F, header),
+          emit);
       !sent) {
     return sent;
   }
   if (metric_loan) {
+    // The camera before the metric depth: a consumer taking the newest camera
+    // info gets this one.
+    depth_camera_.header->capture_timestamp_ns =
+        emit.capture_time ? emit.capture_time->timestamp_ns : 0;
+    if (auto sent = depth_camera_info.emit_ref(depth_camera_, emit); !sent) {
+      return sent;
+    }
     if (auto sent = metric_depth.emit_tensor(
-            std::move(*metric_loan), descriptor(w, h, holoscan::schema::ImageEncoding_MONO32F),
-            emit);
+            std::move(*metric_loan),
+            descriptor(w, h, holoscan::schema::ImageEncoding_MONO32F, header), emit);
         !sent) {
       return sent;
     }
   }
   if (color_loan) {
     return colorized.emit_tensor(std::move(*color_loan),
-                                 descriptor(w, h, holoscan::schema::ImageEncoding_RGBA8), emit);
+                                 descriptor(w, h, holoscan::schema::ImageEncoding_RGBA8, header),
+                                 emit);
   }
   return {};
 }

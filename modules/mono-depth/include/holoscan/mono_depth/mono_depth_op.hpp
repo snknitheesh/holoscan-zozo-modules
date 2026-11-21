@@ -23,17 +23,43 @@
 // and TensorRT version and caches it beside the file, so later runs start in
 // seconds; any other file is taken as such an engine.
 //
-// Each image's outputs carry its capture time and frame id. They go out one
-// after another: should one fail to go out, those before it have been
+// Each image's outputs carry its capture time, frame id and header. They go
+// out one after another: should one fail to go out, those before it have been
 // delivered alone and compute() returns the error. Pair them by capture time.
 //
+// Metric depth needs the camera: when the configuration gives metric depth
+// (gives_metric_depth()), the operator takes holoscan-messages' CameraInfo on
+// a mandatory `camera_info` input, with messages::camera_info_contract() (by
+// default the newest one received; frames before the first are skipped), and
+// sends the depth's own camera on `depth_camera_info` with every frame, for
+// holoscan-point-cloud's DepthToPointCloudOp. The depth is at the image's own
+// size, so its camera is the image's: the camera info must be for images of
+// that size, and only its capture time changes.
+//
 // On a blocking edge, an output a busy consumer has no room for is such a
-// failure (kBackpressured): a lossless graph paces its source to what its
-// consumers keep up with. For a live source, connect the input and every
-// output with holoscan::ConnectionOptions{.queue_policy =
+// failure (kBackpressured). Keep a lossless graph on one worker
+// (graph.partition("name").include_all(), see holoscan-messages' README): the
+// SDK 5.0 runs each automatic partition on a worker of its own, and a source
+// on another worker than this operator can fill its queue while it is still
+// busy. A source then treats kBackpressured and kResourceExhausted as
+// backpressure and sends the same frame again on its next tick. For a live
+// source, connect the input and every output with
+// holoscan::ConnectionOptions{.queue_policy =
 // holoscan::QueuePolicy::kDropOldest, .queue_depth = 1}: a full queue then
 // drops its oldest sample, so the operator never waits for a slower consumer
 // and takes the newest image.
+//
+// CPU waits and copies: none per frame for an image in GPU memory. An image
+// in host memory is copied to the GPU, and the operator logs that once: plain
+// (pageable) memory costs a wait for the image's producer and a copy that the
+// driver stages before it returns; pinned memory an asynchronous copy, and a
+// wait for it only when the image's allocator cannot wait for the stream
+// itself (logged once). HoloInfer runs TensorRT on a CUDA stream of its own,
+// joined to the operator's with events: a Green Context on the operator's
+// partition does not hold the inference.
+//
+// The configuration is fixed when the operator is constructed; it has no
+// parameters to set later, and no Python bindings.
 
 #pragma once
 
@@ -52,6 +78,8 @@
 #include <holoscan/core/operator_spec.hpp>
 #include <holoscan/core/port.hpp>
 #include <holoscan/core/temporal_contract.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_schema_traits.hpp>
 #include <holoscan/mono_depth/image_fit.hpp>
 #include <holoscan/mono_depth/pixel_math.hpp>
 #include <holoscan/sensor_io/sensor_schema_package.hpp>
@@ -75,17 +103,23 @@ struct MonoDepthConfig {
   // For a relative model, a scale and shift that turn its inverse depth into
   // meters, enabling the metric_depth output.
   std::optional<InverseDepthAffine> metric_from_relative;
+  // How the `camera_info` input of a metric configuration is taken: kLatest
+  // (the default) for camera info at any rate, as CameraInfoSourceOp sends
+  // it, or kEveryFrame for a producer that sends one with every image (see
+  // holoscan-messages' camera_info_input.hpp).
+  messages::CameraInfoInputOptions camera_info_input{};
   // Enables the colorized output.
   bool colorize{false};
-  // The inverse depths at the colormap's far and near ends; per frame, the
-  // image's smallest and largest, when unset.
+  // With `colorize` only: the inverse depths at the colormap's far and near
+  // ends; per frame, the image's smallest and largest, when unset.
   std::optional<std::array<float, 2>> color_range;
   // The largest image, which sizes the output buffers.
   int max_width{1920};
   int max_height{1080};
   // Build the engine with FP16 kernels allowed (ignored for an engine file).
   bool fp16{true};
-  // Let HoloInfer replay the inference as a CUDA graph.
+  // Let HoloInfer capture the inference once and replay it as a CUDA graph,
+  // which saves TensorRT's per-launch CPU work; false launches it each frame.
   bool cuda_graphs{true};
   // TensorRT's workspace limit while it builds the engine.
   std::size_t build_workspace_bytes{std::size_t{1} << 30U};
@@ -136,9 +170,18 @@ class MonoDepthOp final : public holoscan::Operator<> {
   // relative for a relative model, 1 / meters for a metric one; 0 where the
   // model gave no valid depth.
   holoscan::Output<holoscan::schema::ImageT> depth;
+  // With gives_metric_depth() only: the camera of the images, at their size
+  // (holoscan-messages' CameraInfo). Mandatory: an unwired one fails
+  // compile(). Connect it with messages::latest_camera_info_connection().
+  holoscan::Input<messages::schema::CameraInfoT> camera_info;
+  // With gives_metric_depth() only: the camera of `depth` and `metric_depth`,
+  // which is the image's camera info with the image's capture time. Sent with
+  // every frame, before `metric_depth`.
+  holoscan::Output<messages::schema::CameraInfoT> depth_camera_info;
   // MONO32F, float32 [height, width]: depth in meters, 0 where none is valid.
-  // Declared only when gives_metric_depth(); it feeds holoscan-point-cloud's
-  // DepthToPointCloudOp as it is.
+  // Declared only when gives_metric_depth(). With `depth_camera_info` it feeds
+  // holoscan-point-cloud's DepthToPointCloudOp, configured with a depth_scale
+  // of 1 (meters per unit).
   holoscan::Output<holoscan::schema::ImageT> metric_depth;
   // RGBA8 [height, width, 4]: the inverse depth in the Turbo colormap, far
   // blue to near red, opaque. Declared only with `colorize`.
@@ -154,6 +197,13 @@ class MonoDepthOp final : public holoscan::Operator<> {
 
   MonoDepthConfig config_;
   std::unique_ptr<Engine> engine_;
+  // The newest camera info of a metric configuration, and the message sent
+  // on `depth_camera_info`.
+  messages::LatestCameraInfo<messages::schema::CameraInfoT> camera_;
+  messages::schema::CameraInfoT depth_camera_;
+  // One-time notes: host images are copied; a pinned image is waited for.
+  bool copy_logged_{};
+  bool wait_logged_{};
   // A GPU copy of host images, grown as needed.
   void* staging_{};
   std::size_t staging_bytes_{};

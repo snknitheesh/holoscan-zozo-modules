@@ -15,13 +15,47 @@ Copyright (c) NVIDIA CORPORATION & AFFILIATES.
 Under NVIDIA's licenses, installed with them. Used through the installed SDK and CUDA;
 not redistributed.
 
+holoscan-messages (../messages), this collection's camera info messages
+Copyright (c) 2026 zozo
+Licensed under Apache-2.0. Linked from its installed package; not redistributed.
+
+CUB, part of NVIDIA CCCL (https://github.com/NVIDIA/cccl)
+Header-only, from the CUDA Toolkit; its block reduction (cub::BlockReduce, the colorization's
+per-frame range) is compiled into the library.
+Licensed under the BSD 3-Clause License:
+
+Copyright (c) 2011, Duane Merrill. All rights reserved.
+Copyright (c) 2011-2025, NVIDIA CORPORATION. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+   *  Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+   *  Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+   *  Neither the name of the NVIDIA CORPORATION nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 It includes the following third-party data:
 
 Turbo colormap (include/holoscan/mono_depth/colormap.hpp)
-Copyright 2019 Google LLC. Designed by Anton Mikhailov.
+Copyright 2019 Google LLC.
 Licensed under Apache-2.0
-(https://gist.github.com/mikhailov-work/ee72ba4191942acecc03fe6da94fc73f). Its
-published 256-entry table, rounded to 8 bits per channel.
+(https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization/).
+Its published 256-entry table, rounded to 8 bits per channel.
 
 The models are NOT part of holoscan-mono-depth. tools/prepare_model.py (installed as
 share/holoscan-mono-depth/prepare_model.py) downloads a pinned checkpoint from Hugging
@@ -46,8 +80,7 @@ and Hugging Face Transformers. The checkpoints and their licenses:
   publish the original checkpoints (Depth-Anything-V2-Metric-Hypersim-Small and
   Depth-Anything-V2-Metric-VKITTI-Small) under Apache-2.0.
 
-Depth Anything V2: Lihe Yang, Bingyi Kang, Zilong Huang, Zhen Zhao, Xiaogang Xu,
-Jiashi Feng, Hengshuang Zhao. "Depth Anything V2", arXiv:2406.09414, 2024.
+Depth Anything V2: "Depth Anything V2", arXiv:2406.09414, 2024.
 https://github.com/DepthAnything/Depth-Anything-V2
 
 The terms that apply to a model you export, and to anything you build or distribute

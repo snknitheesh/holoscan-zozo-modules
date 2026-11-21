@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace holoscan::mono_depth {
 
@@ -33,11 +34,17 @@ inline constexpr float kStubBias = 2.5F;
 // @throws std::invalid_argument for a side outside 1..kMaxModelSide.
 [[nodiscard]] std::string stub_model_onnx(int width, int height);
 
+// A digest of a model's bytes, 16 hexadecimal digits (64-bit FNV-1a): it
+// names the contents, it does not guard against tampering.
+[[nodiscard]] std::string stub_model_digest(std::string_view bytes);
+
 // Writes the model for width x height to
-// `directory`/mono_depth_stub_<width>x<height>.onnx unless that file already
-// holds it, and returns its path. The file is replaced atomically, so
-// concurrent runs can share the directory, and a TensorRT engine cached beside
-// it stays valid as long as the file does not change.
+// `directory`/mono_depth_stub_<width>x<height>_<digest>.onnx, the digest
+// stub_model_digest() of its bytes, unless that file already holds it, and
+// returns its path. The file is replaced atomically, so concurrent runs can
+// share the directory. HoloInfer names a cached TensorRT engine after the
+// model's file, so a stub whose contents change gets a new name and a new
+// engine, never one built from other bytes.
 // @throws std::runtime_error if the file cannot be written.
 std::filesystem::path write_stub_model(const std::filesystem::path& directory, int width,
                                        int height);

@@ -2,7 +2,8 @@
 
 A Holoscan SDK 5 Module for monocular depth estimation on the GPU. `MonoDepthOp` takes an image
 and emits its depth at the image's own size, as a GPU image: relative inverse depth always, metric
-depth when it can, and a colorized depth for HoloViz on request. Inside, a CUDA kernel resizes the
+depth when it can, with the depth's camera as a holoscan-messages `CameraInfo` for
+holoscan-point-cloud, and a colorized depth for HoloViz on request. Inside, a CUDA kernel resizes the
 image into the model's fixed input and normalizes it, the SDK's TensorRT inference library
 (HoloInfer) runs the model, and a second kernel resamples the model's output back onto the image.
 It is made for [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) Small. The
@@ -30,6 +31,7 @@ It is made for [Depth Anything V2](https://github.com/DepthAnything/Depth-Anythi
 | C++ namespace | `holoscan::mono_depth` |
 | Debian package | `holoscan-mono-depth` |
 | Model tool | `tools/prepare_model.py`, installed as `share/holoscan-mono-depth/prepare_model.py` |
+| Depends on | [holoscan-messages](../messages/) 1.x (`CameraInfo`) |
 | Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7.2) |
 
 ## Operator
@@ -39,18 +41,44 @@ It is made for [Depth Anything V2](https://github.com/DepthAnything/Depth-Anythi
 | Port | Direction | Type |
 | --- | --- | --- |
 | `image` | in | `holoscan::schema::ImageT`: RGB8, BGR8, RGBA8 or BGRA8, uint8 `[H, W, C]`, pixels packed within each row; GPU memory on device 0, or host or pinned memory |
+| `camera_info` | in | `holoscan::messages::schema::CameraInfoT`: the camera of the images, for images of their size. Declared, and mandatory, only with metric depth (a metric model or `metric_from_relative`) |
 | `depth` | out | `holoscan::schema::ImageT`: MONO32F, float32 `[H, W]`, inverse depth: relative for a relative model, `1 / meters` for a metric one, 0 where there is no valid depth; GPU memory |
-| `metric_depth` | out | MONO32F, float32 `[H, W]`, meters, 0 where there is no valid depth; GPU memory. Declared only for a metric model or with `metric_from_relative` |
+| `depth_camera_info` | out | `CameraInfoT`: the camera of `depth` and `metric_depth`, which is the image's, with the image's capture time. Declared only with metric depth |
+| `metric_depth` | out | MONO32F, float32 `[H, W]`, meters, 0 where there is no valid depth; GPU memory. Declared only with metric depth |
 | `colorized` | out | RGBA8 `[H, W, 4]`: the inverse depth in the Turbo colormap, far dark blue to near dark red, opaque; GPU memory. Declared only with `colorize` |
 
-Connect every output the configuration declares. The outputs carry the image's capture time and
-frame id, and go out in the order of the table: should one fail to go out, those before it have
-been delivered alone and the frame fails. Pair them by capture time, with an `OnAligned`
-contract. `metric_depth` feeds holoscan-point-cloud's `DepthToPointCloudOp` as it is. Images may
-change size from frame to frame, up to `max_width` x `max_height`; images in host memory are copied
-to the GPU through a staging buffer, which the operator says once. The frames share the model's
-buffers, and the runtime may give each one another CUDA stream, so each frame's stream waits on a
-CUDA event that the previous frame recorded.
+Connect every input and output the configuration declares. The outputs carry the image's capture
+time and frame id, the image outputs its header, and they go out in the order of the table: should
+one fail to go out, those before it have been delivered alone and the frame fails. Pair them by
+capture time, with an `OnAligned` contract. Images may change size from frame to frame, up to
+`max_width` x `max_height` (with metric depth, the camera info must change with them). The frames
+share the model's buffers, and the runtime may give each one another CUDA stream, so each frame's
+stream waits on a CUDA event that the previous frame recorded.
+
+With metric depth the operator takes the camera info with holoscan-messages'
+`camera_info_contract()` and `LatestCameraInfo`: by default each image uses the newest camera info
+received before it, which `CameraInfoSourceOp` sends from a ROS `camera_info` file at its own rate;
+images before the first camera info are skipped, and nothing waits for camera info.
+`camera_info_input = {.timing = CameraInfoTiming::kEveryFrame}` is for a producer that sends one
+with every image (see [holoscan-messages](../messages/README.md#take-camera-info-in-an-operator)). A
+camera info for images of another size fails the frame.
+
+### CPU waits and copies per frame
+
+| Input | CPU waits | Copies |
+| --- | --- | --- |
+| GPU image | none | none |
+| Pinned host image | none, if its allocator can wait for the copy's stream; else one `cudaStreamSynchronize` (logged once) | one asynchronous host-to-device copy |
+| Pageable host image | one wait for the image's producer (`synchronize_for_host()`), and the copy, which the driver stages before it returns | one host-to-device copy |
+
+The first host image is logged once, saying which. A larger host image than any before grows the
+staging buffer: one `cudaStreamSynchronize`, a free and an allocation, a few times at most. The
+preprocessing, the inference, the resampling and the colorization (its per-frame range included)
+all stay on the GPU; nothing is copied back. HoloInfer runs TensorRT on a CUDA stream of its own,
+which it joins to the operator's stream with events, so the operator does not wait for the
+inference either. That stream is HoloInfer's, not the partition's: a Green Context on the
+operator's partition does not hold the inference, so size a Green Context slice for the
+preprocessing and resampling only, or leave the operator outside one.
 
 | `MonoDepthConfig` | Default | Meaning |
 | --- | --- | --- |
@@ -60,12 +88,19 @@ CUDA event that the previous frame recorded.
 | `normalization` | ImageNet's | Per RGB channel, `(value / 255 - mean) / std` |
 | `model_output` | `kRelativeInverseDepth` | Or `kMetricDepth`, for a model that gives meters |
 | `metric_from_relative` | none | `{scale, shift}`: meters from a relative model as `1 / z = scale * d + shift` |
+| `camera_info_input` | `kLatest`, 10 s | With metric depth: how the camera info is taken (`timing`, `max_age`) |
 | `colorize` | `false` | Declare the `colorized` output |
-| `color_range` | none | `{low, high}`: the inverse depths at the colormap's ends; each frame's smallest and largest when unset |
+| `color_range` | none | With `colorize` only: `{low, high}`, the inverse depths at the colormap's ends; each frame's smallest and largest when unset |
 | `max_width`, `max_height` | `1920`, `1080` | The largest image, which sizes the output buffers |
 | `fp16` | `true` | Build the engine with FP16 kernels allowed |
-| `cuda_graphs` | `true` | Let HoloInfer replay the inference as a CUDA graph |
+| `cuda_graphs` | `true` | Let HoloInfer capture the inference once and replay it as a CUDA graph, which saves TensorRT's per-launch CPU work; `false` launches it each frame (tested both ways) |
 | `build_workspace_bytes` | 1 GiB | TensorRT's workspace limit while it builds the engine |
+
+The configuration is fixed when the operator is constructed: it has no parameters to set later,
+and the constructor refuses an unusable one (`std::invalid_argument`, naming the field). The module
+has C++ only, no Python bindings. Its version follows semantic versioning for the source API, and
+the library's soname is its major version; build against the minor version you run with, as the
+configuration structs may gain fields.
 
 Given an ONNX file, HoloInfer builds a TensorRT engine and caches it beside the file, named after
 the GPU, the TensorRT version and the settings (FP16 or FP32 among them), so later runs load it in
@@ -124,15 +159,15 @@ There are two ways to get meters, both of which enable the `metric_depth` output
   up to 80 m). They give meters directly, as well as their training scenes resemble yours.
 - **A scale and shift for a relative model**, `metric_from_relative = {scale, shift}`, with
   `1 / z = scale * d + shift`. Fit them by least squares between `d` and `1 / z` at pixels of known
-  depth `z`; the module's real-model test does exactly that against a RealSense's depth and prints
-  the fit. They hold only for scenes like those they were fitted on: a relative model's scale and
+  depth `z`; the module's real-data test does exactly that against a depth camera's recorded depth
+  and prints the fit. They hold only for scenes like those they were fitted on: a relative model's scale and
   shift drift from image to image.
 
 ## Use it in your graph
 
 ```cmake
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS core sensor_io)
-find_package(holoscan-mono-depth 1.0 REQUIRED CONFIG)
+find_package(holoscan-mono-depth 1.0 REQUIRED CONFIG)  # Finds holoscan-messages too.
 target_link_libraries(my_app PRIVATE holoscan::mono_depth)
 ```
 
@@ -163,14 +198,51 @@ md::prepare_engine(config);   // Before the run: see above.
 const int status = holoscan::run(plan);   // Adopts `signals`.
 ```
 
+### Metric depth into a point cloud
+
+With metric depth, the camera comes from a ROS `camera_info` file through holoscan-messages'
+`CameraInfoSourceOp`, and `depth_camera_info` and `metric_depth` go to holoscan-point-cloud's
+`DepthToPointCloudOp`, whose `depth_scale` must then be 1 (meters per unit; its default, 0.001, is
+for millimeter depth):
+
+```cpp
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/point_cloud/depth_to_point_cloud_op.hpp>
+
+namespace hm = holoscan::messages;
+namespace pc = holoscan::point_cloud;
+
+md::MonoDepthConfig config{.model = "/data/depth_anything_v2_metric-indoor-small_518x518.onnx",
+                           .model_output = md::ModelOutput::kMetricDepth};
+auto depth = graph.op<md::MonoDepthOp>("depth", config);
+auto camera = graph.op<hm::CameraInfoSourceOp>(
+    "camera_info", hm::CameraInfoSourceConfig{.camera_info_path = "camera.yaml"});
+auto cloud = graph.op<pc::DepthToPointCloudOp>("cloud", pc::DepthToPointCloudConfig{.depth_scale = 1.0F});
+graph.add_flow(camera->camera_info, depth->camera_info, hm::latest_camera_info_connection());
+graph.add_flow(depth->metric_depth, cloud->depth);
+graph.add_flow(depth->depth_camera_info, cloud->camera_info, hm::latest_camera_info_connection());
+```
+
 ### Lossless or real time
 
 `add_flow()` without options gives a blocking edge: every image's depth is estimated and
 delivered, in order, at the queue depth the input declares (two). A blocking edge waits only
 briefly for room, though. When a consumer is still busy with earlier frames, `emit()` returns
 `kBackpressured` with nothing delivered, and the operator cannot send that frame's outputs again,
-so the run fails. A lossless graph therefore paces its source to what its consumers keep up with,
-as the demo's test modes do with one frame in flight.
+so the run fails. Keep a lossless graph on one worker:
+
+```cpp
+graph.partition("my_app").include_all();  // Every operator of the graph, on one worker.
+```
+
+The SDK 5.0 runs each automatic partition on a worker of its own, and splits a graph wherever it
+has another source (a `CameraInfoSourceOp` is one), forks or joins; a source on its own worker
+then runs while the operator's queue is full. On one worker the operators run one at a time, and a
+source that treats `kBackpressured` and `kResourceExhausted` as backpressure, sending the same frame
+again on its next tick, never fails the run. See holoscan-messages'
+[one-worker section](../messages/README.md#run-a-graph-on-one-worker). The demo's lossless modes
+and the installed consumer test do this, and check that their plan has one worker
+(`plan.scheduler_plan().worker_count`).
 
 For a live source, such as a camera, connect the operator's input and every output as a depth-1
 drop-oldest edge instead. A full queue then drops its oldest sample rather than refusing the new
@@ -185,9 +257,9 @@ graph.add_flow(camera->image, depth->image, newest);
 graph.add_flow(depth->depth, consumer->depth, newest);
 ```
 
-A consumer that pairs the depth with its image by capture time takes the image over a deeper
-drop-oldest edge, so that the image is still queued when its depth arrives; the demo keeps four
-frames, and shows the HoloViz wiring.
+A consumer that pairs the depth with its image by capture time, on another worker, takes the image
+over a deeper drop-oldest edge, so that the image is still queued when its depth arrives, an
+estimator's latency later; the demo keeps four frames, and shows the HoloViz wiring.
 
 The kernels need no Holoscan graph: `<holoscan/mono_depth/kernels.hpp>` has `launch_preprocess()`,
 `launch_postprocess()`, `launch_depth_range()` and `launch_colorize()`, and
@@ -260,22 +332,26 @@ cmake --install build/mono-depth --prefix "$PWD/install"
 | --- | --- | --- |
 | `BUILD_TESTING` | `OFF` | Build the tests, when the module is the top-level project |
 | `HOLOSCAN_MONO_DEPTH_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module (`add_subdirectory()`, `FetchContent`); its `BUILD_TESTING` and `include(CTest)` do not |
-| `HOLOSCAN_MONO_DEPTH_MODEL` | `data/mono_depth/depth_anything_v2_small_518x518.onnx` | The exported model the real-model test uses |
+| `HOLOSCAN_MONO_DEPTH_MODEL` | empty | The exported model the real-model and real-data tests use; they are skipped without one |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `mono_depth_kernels` | GPU | The kernels against the host references, bit for bit: the preprocessing of random images in every encoding, letterboxed and stretched, wide and tall, with padded rows, down- and upscaled; the postprocessing of outputs at, below and above the input's size into inverse and metric depth; the range with non-finite values; the colorization; and what the values mean: the normalization, the padding, the channel order, the reciprocals and the colormap's ends |
-| `mono_depth_operators` | GPU | `MonoDepthOp` through the SDK's operator test harness, with the stub model and TensorRT, every output value against the host reference of the whole pipeline: every encoding, from GPU, host and pinned memory, wide, tall and small images, letterboxed and stretched into a wide input, changing image sizes, the colorized output with a per-frame and a fixed range, metric depth from an affine and from a metric model, an FP16 engine, provenance on every output, unusable images, settings and models |
-| `mono_depth_real_model` | GPU, the exported model; skipped without it | Depth Anything V2 Small on the synthetic scene, FP16 and FP32, letterboxed and stretched: Spearman's rank correlation with the true depth at least 0.85, and the near panel, the sphere and the far wall in that order. With `HOLOSCAN_TEST_DATA`, also real RealSense D585 frames against the camera's depth (see [Accuracy](#accuracy)) |
+| `mono_depth_operators` | GPU | `MonoDepthOp` through the SDK's operator test harness, with the stub model and TensorRT, every output value against the host reference of the whole pipeline: every encoding, from GPU, host and pinned memory, wide, tall and small images, letterboxed and stretched into a wide input, changing image sizes, the colorized output with a per-frame and a fixed range, metric depth from an affine and from a metric model with the camera info they take and the depth camera info they send, frames before the first camera info skipped, a camera info of another size refused, an FP16 engine, inference without a CUDA graph, provenance and the header on every output, unusable images (those the SDK refuses before the operator too), settings and models |
+| `mono_depth_real_model` | GPU, the exported model; skipped without it | Depth Anything V2 Small on the synthetic scene, FP16 and FP32, letterboxed and stretched: Spearman's rank correlation with the true depth at least 0.85, and the near panel, the sphere and the far wall in that order |
+| `mono_depth_real_data` | GPU, the exported model and `HOLOSCAN_TEST_DATA`; skipped without either | The model on the local recordings' RGB frames against their depth camera's depth, both cameras from the clips' ROS `camera_info` files (see [Accuracy](#accuracy)) |
 | `mono_depth_host` | Nothing | The image fit for wide, tall, thin and stretched images and outputs of other sizes; the references against direct evaluations; the stub model file; the synthetic scene's geometry and truth; Spearman's correlation with ties; the ordering check; the colormap |
 | `mono_depth_prepare_model` | Python | `prepare_model.py` without PyTorch or the network: pinned revisions and digests, a wrong digest, the cache, the non-commercial licenses, a failed or missing exporter, an export of another size, and reuse of prepared files |
 
 `mono_depth_host` and `mono_depth_prepare_model` are also a project of their own in
 [`tests/host/`](tests/host/), which the hosted CI job builds and runs.
 [`tests/installed_consumer/`](tests/installed_consumer/) is a separate project that uses the
-installed package: a small graph that runs `MonoDepthOp` with the stub model on synthetic frames and
-checks every frame's depth against the reference, and a run of the installed `prepare_model.py`.
+installed package: a graph on one worker (it checks the plan's worker count) that runs `MonoDepthOp`
+with the stub model and metric depth on synthetic frames, with the camera from a `camera_info` file
+through `CameraInfoSourceOp`, and checks every frame's inverse and metric depth against the
+reference and its depth camera info against the camera; and a run of the installed
+`prepare_model.py`.
 
 ## Debian package
 
@@ -287,7 +363,8 @@ holoscan --project-root modules/mono-depth package holoscan-mono-depth --languag
 ```
 
 This builds for every major GPU architecture and writes `holoscan-mono-depth_1.0.0_<arch>.deb`. It
-installs to `/usr` and depends on `holoscan (>= 5.0.0)`. It holds no model.
+installs to `/usr` and depends on `holoscan (>= 5.0.0)` and `holoscan-messages` 1.x. It holds no
+model.
 
 ## Accuracy
 
@@ -298,9 +375,9 @@ Depth Anything V2 Small at 518x518, letterboxed, through `MonoDepthOp`:
 | The synthetic scene, 1280x720, 300 frames | FP16 | 0.9185 to 0.9200, regions always in order |
 | The same | FP32 | 0.9185 to 0.9200 |
 | The same, stretched | FP16 | 0.916 to 0.919 |
-| RealSense D585 RGB, 1280x720, office ceiling, 4 frames | FP16 | 0.924 to 0.935 |
+| A depth camera's recorded RGB frames, 1280x720, an office ceiling, 4 frames | FP16 | 0.924 to 0.935 |
 
-On the RealSense frames, the camera's depth is reprojected into the RGB camera, and one scale and
+On the recorded frames, the camera's depth is reprojected into the RGB camera, and one scale and
 shift per frame (least squares in inverse depth) maps the prediction onto it. What remains is an
 absolute relative error of 0.24 to 0.30 and 40 to 60 % of pixels within 25 % of the camera's depth:
 the ordering is right, but a relative model's depth is not a measurement, and this camera's very
@@ -310,9 +387,13 @@ FP32 engines give the same correlations to four places, so FP16 is the default.
 ## Performance
 
 Depth Anything V2 Small, 518x518 input, measured with SDK 5.0.0, CUDA 13.2 and TensorRT 10.16 in
-the repository's CI image:
+the repository's CI image; the RTX 5090 with driver 595.99.02, the Jetson Orin on JetPack 7.2 in a
+power mode that was not recorded. The inference rows are `trtexec --loadEngine=<engine>
+--useCudaGraph` with its default run; the capture-to-depth rows are the demo's `demo` mode, 300
+frames (`mono_depth --model <model> --count 300 --period-ms 10`, `--width 640 --height 480` for the
+smaller frames, `--fp16 false` for FP32):
 
-| | RTX 5090 (x86_64) | Jetson AGX Orin (JetPack 7.2) |
+| | RTX 5090 (x86_64) | Jetson Orin (JetPack 7.2) |
 | --- | --- | --- |
 | TensorRT inference alone, FP16 (`trtexec`, CUDA graph, median) | 0.87 ms | 8.9 ms |
 | The same, FP32 | 2.75 ms | 40.4 ms |
@@ -323,10 +404,10 @@ the repository's CI image:
 | The demo's whole process on the GPU (`nvidia-smi`), FP16, 1280x720 | 772 MiB | not measured |
 
 Both GPUs were shared with other work while measured: an inference server on the RTX 5090, and
-another container's GPU tests on the Orin, which the Orin's tail latencies show. The process memory
+another container's GPU tests on the Jetson Orin, which its tail latencies show. The process memory
 includes the CUDA context and the TensorRT libraries; the engine's weights are about 50 MiB in FP16.
 On Jetson Thor, CI runs the stub model only, as no model is downloaded there; the real model's
-latency on Thor is not measured. For 16:9 frames, a 518x294 export keeps the same correlation on the
+latency on Jetson Thor is not measured. For 16:9 frames, a 518x294 export keeps the same correlation on the
 synthetic scene (0.920) and takes 1.1 ms instead of 1.4 ms on the RTX 5090.
 
 ## Licenses

@@ -7,11 +7,14 @@
 include("${PROJECT_SOURCE_DIR}/cmake/holohub_configure_deb.cmake")
 
 # "holoscan" is the Debian package of the SDK 5.0 on its platforms; it carries HoloInfer.
+# "holoscan-messages" the messages module's, whose camera info the metric outputs carry: 1.x
+# only, as the CMake package finds it (SameMajorVersion) and the library links its major
+# version's soname.
 holohub_configure_deb(
   NAME "holoscan-mono-depth"
   DESCRIPTION "${PROJECT_DESCRIPTION}"
   VERSION "${PROJECT_VERSION}"
   VENDOR "zozo"
   CONTACT "zozo <snknitheesh@gmail.com>"
-  DEPENDS "holoscan (>= 5.0.0)"
+  DEPENDS "holoscan (>= 5.0.0), holoscan-messages (>= 1.0.0), holoscan-messages (<< 2)"
 )

@@ -3,9 +3,8 @@
 //
 // The colormap of the operator's colorized depth: Turbo, as 256 8-bit RGB
 // entries, from far (dark blue) through green and yellow to near (dark red).
-// Turbo was designed by Anton Mikhailov at Google (Copyright 2019 Google LLC,
-// Apache-2.0); these entries are its published table, rounded to 8 bits. Host
-// and device code; no SDK.
+// Turbo is Google's (Copyright 2019 Google LLC, Apache-2.0); these entries
+// are its published table, rounded to 8 bits. Host and device code; no SDK.
 
 #pragma once
 

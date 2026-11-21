@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The module's full suite. The kernel and operator tests need the SDK, CUDA and a GPU;
-# none needs a download: the stub model stands in for Depth Anything. The real-model test
-# runs when HOLOSCAN_MONO_DEPTH_MODEL names an exported model, and is skipped otherwise.
+# none needs a download: the stub model stands in for Depth Anything. The real-model tests
+# run when HOLOSCAN_MONO_DEPTH_MODEL names an exported model, and are skipped otherwise.
 set(
   HOLOSCAN_MONO_DEPTH_MODEL
-  "${PROJECT_SOURCE_DIR}/../../data/mono_depth/depth_anything_v2_small_518x518.onnx"
+  ""
   CACHE FILEPATH
-  "A Depth Anything V2 model from tools/prepare_model.py, for the real-model test"
+  "A Depth Anything V2 model from tools/prepare_model.py, for the real-model tests"
 )
 
 add_executable(mono_depth_kernels_test kernels_test.cu)
@@ -36,13 +36,21 @@ set_tests_properties(
   PROPERTIES LABELS "mono_depth;gpu" TIMEOUT 900
 )
 # The engine is built beside the model, once per GPU and TensorRT version, which takes
-# minutes on a Jetson.
+# minutes on Jetson Thor and Orin.
 add_test(
   NAME mono_depth_real_model
   COMMAND mono_depth_real_model_test "${HOLOSCAN_MONO_DEPTH_MODEL}"
 )
+# The same model on the local recordings, when HOLOSCAN_TEST_DATA names them; skipped
+# otherwise, as in CI. Their depth is in units of 0.000452 m.
+add_test(
+  NAME mono_depth_real_data
+  COMMAND
+    mono_depth_real_model_test "${HOLOSCAN_MONO_DEPTH_MODEL}" --recorded --depth-scale 0.000452
+)
 set_tests_properties(
   mono_depth_real_model
+  mono_depth_real_data
   PROPERTIES LABELS "mono_depth;gpu;real_model" TIMEOUT 3600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
 )
 

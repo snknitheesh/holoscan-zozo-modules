@@ -46,6 +46,11 @@ if(HOLOSCAN_MONO_DEPTH_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info messages of the metric outputs: in this build when the repository root
+# added holoscan-messages before this module, else installed.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
 # holoscan::mono_depth: MonoDepthOp, its kernels, and the stub model, synthetic scene and
 # host references for tests.
@@ -77,14 +82,18 @@ target_include_directories(
 )
 target_link_libraries(
   holoscan_mono_depth
-  PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
   PRIVATE holoscan::infer
 )
+# Installed, the library finds holoscan-messages' beside it, in the same prefix, also for
+# a program that does not use holoscan-messages itself (a program's run path does not
+# reach its libraries' own dependencies).
 set_target_properties(
   holoscan_mono_depth
   PROPERTIES
     EXPORT_NAME mono_depth
     OUTPUT_NAME holoscan_mono_depth
+    INSTALL_RPATH "$ORIGIN"
     POSITION_INDEPENDENT_CODE ON
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}

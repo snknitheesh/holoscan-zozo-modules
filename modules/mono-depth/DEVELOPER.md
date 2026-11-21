@@ -34,17 +34,18 @@ unchanged.
 | Package | `<prefix>/lib/cmake/holoscan-mono-depth/holoscan-mono-depth-config.cmake`, `SameMajorVersion`; sets `holoscan-mono-depth_PREPARE_MODEL` |
 | Consumer form | `find_package(holoscan-mono-depth)`; the install prefix on `CMAKE_PREFIX_PATH`, or `/usr` from the Debian package |
 | Installed tool | `<prefix>/share/holoscan-mono-depth/prepare_model.py` |
-| Debian package | `holoscan-mono-depth`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` |
-| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`, `inference`; `testing` for the tests), the CUDA runtime, TensorRT 10 through HoloInfer |
+| Debian package | `holoscan-mono-depth`, all install rules, prefix `/usr`; depends on `holoscan (>= 5.0.0)` and `holoscan-messages` 1.x |
+| External dependencies | Holoscan SDK 5.0 (`core`, `sensor_io`, `inference`; `testing` for the tests), the CUDA runtime, TensorRT 10 through HoloInfer, holoscan-messages 1.x (in this build when the repository root added it first, else installed; `find_dependency()` in the package config) |
+| Run path | The installed library's is `$ORIGIN`, so that it finds holoscan-messages' library beside it in a prefix other than `/usr`, also for a program that does not use holoscan-messages itself |
 | Platforms | x86_64; aarch64 (Jetson Thor and Orin, JetPack 7.2) |
-| Test labels | `mono_depth` on all; `gpu` for the GPU tests; `host` for the SDK-free tests; `real_model` for the test that needs the exported model |
+| Test labels | `mono_depth` on all; `gpu` for the GPU tests; `host` for the SDK-free tests; `real_model` for the tests that need the exported model |
 
 ## Conventions
 
 - Code lives in `holoscan::mono_depth`. Inside it, write the SDK's test harness as
   `holoscan::testing::...`; the tests' own helpers are `holoscan::mono_depth::test`.
-- Public headers carry only SDK, CUDA runtime and standard types; HoloInfer stays private to
-  `src/mono_depth_op.cpp`. `image_fit.hpp`, `pixel_math.hpp`, `colormap.hpp`, `reference.hpp`,
+- Public headers carry only SDK, holoscan-messages, CUDA runtime and standard types; HoloInfer
+  stays private to `src/mono_depth_op.cpp`. `image_fit.hpp`, `pixel_math.hpp`, `colormap.hpp`, `reference.hpp`,
   `stub_model.hpp` and `synthetic_scene.hpp` need no CUDA, so `tests/host/` builds their sources
   without it.
 - Every per-pixel expression of a kernel lives in `pixel_math.hpp`, as a `__host__ __device__`
@@ -59,3 +60,23 @@ unchanged.
   default of 1024 records sizes the output's GPU pool to 1024 images.
 - A new setting or behavior of the operator needs a case in `mono_depth_operators`; a change to a
   kernel, a case in `mono_depth_kernels`.
+- A lossless graph in a test, the demo or the installed consumer runs on one worker
+  (`include_all()`), and a test checks the plan's worker count.
+
+## Sanitizers
+
+`compute-sanitizer` 2026.1.1 (CUDA 13.2, the CI image) on an RTX 5090, 2026-11-21:
+
+| Test | Tools | Result |
+| --- | --- | --- |
+| `mono_depth_kernels_test` | memcheck with `--leak-check full`, initcheck, racecheck, synccheck | 0 errors, 0 bytes leaked, 0 hazards |
+| `mono_depth_operator_test` | memcheck | 0 errors |
+
+```bash
+compute-sanitizer --tool initcheck --error-exitcode 9 build/mono-depth/tests/mono_depth_kernels_test
+compute-sanitizer --tool memcheck --error-exitcode 9 \
+  build/mono-depth/tests/mono_depth_operator_test build/mono-depth/tests/operator_models
+```
+
+The kernels test downloads only the buffers the kernels write: an output buffer read back without
+being written fails initcheck, and the test is clean under all four tools.

@@ -170,7 +170,11 @@ void check_colormap() {
 // tensors MonoDepthOp expects.
 void check_stub_model() {
   const auto path = write_stub_model(g_directory, 518, 294);
-  VERIFY(path.filename() == "mono_depth_stub_518x294.onnx");
+  VERIFY(path.filename() ==
+         "mono_depth_stub_518x294_" + stub_model_digest(stub_model_onnx(518, 294)) + ".onnx");
+  VERIFY(stub_model_digest("") == "cbf29ce484222325");
+  VERIFY(stub_model_digest(stub_model_onnx(518, 294)) !=
+         stub_model_digest(stub_model_onnx(518, 518)));
   std::ifstream in(path, std::ios::binary);
   const std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
   VERIFY(bytes == stub_model_onnx(518, 294));

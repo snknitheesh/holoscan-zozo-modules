@@ -206,11 +206,15 @@ void check_postprocess_meaning() {
   device_output.upload(output);
   DeviceBuffer<float> inverse(width * height);
   DeviceBuffer<float> metric(width * height);
+  // The metric buffer only when the kernel writes it: never read memory that
+  // nothing wrote (compute-sanitizer's initcheck).
   const auto run = [&](ModelOutput kind, const InverseDepthAffine* affine) {
-    check_cuda(launch_postprocess(device_output.get(), fit, kind, affine,
-                                  DepthOutputs{inverse.get(), metric.get()}, nullptr),
+    const bool gives_metric = kind == ModelOutput::kMetricDepth || affine != nullptr;
+    check_cuda(launch_postprocess(
+                   device_output.get(), fit, kind, affine,
+                   DepthOutputs{inverse.get(), gives_metric ? metric.get() : nullptr}, nullptr),
                "launch_postprocess");
-    return std::pair{inverse.download(), metric.download()};
+    return std::pair{inverse.download(), gives_metric ? metric.download() : std::vector<float>{}};
   };
   const auto [relative, unused] = run(ModelOutput::kRelativeInverseDepth, nullptr);
   VERIFY(all_near(relative, 2.0F));

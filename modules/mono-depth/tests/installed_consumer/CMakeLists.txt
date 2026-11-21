@@ -26,7 +26,9 @@ add_test(
 )
 set_tests_properties(
   mono_depth_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "mono_depth_consumer: PASS" TIMEOUT 600
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION "mono_depth_consumer: workers=1 .*mono_depth_consumer: PASS"
+    TIMEOUT 600
 )
 
 # The model preparation tool is installed and runs.

@@ -182,11 +182,28 @@ std::string stub_model_onnx(int width, int height) {
   return model.str();
 }
 
+std::string stub_model_digest(std::string_view bytes) {
+  // 64-bit FNV-1a: a name for the contents, not a check against tampering.
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (const char c : bytes) {
+    hash ^= static_cast<unsigned char>(c);
+    hash *= 1099511628211ULL;
+  }
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string digest(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    digest[static_cast<std::size_t>(i)] = kHex[hash & 0xFU];
+    hash >>= 4U;
+  }
+  return digest;
+}
+
 std::filesystem::path write_stub_model(const std::filesystem::path& directory, int width,
                                        int height) {
   const std::string bytes = stub_model_onnx(width, height);
-  const std::filesystem::path path = directory / ("mono_depth_stub_" + std::to_string(width) + "x" +
-                                                  std::to_string(height) + ".onnx");
+  const std::filesystem::path path =
+      directory / ("mono_depth_stub_" + std::to_string(width) + "x" + std::to_string(height) + "_" +
+                   stub_model_digest(bytes) + ".onnx");
   {
     std::ifstream existing(path, std::ios::binary);
     if (existing) {
