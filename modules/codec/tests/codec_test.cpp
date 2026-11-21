@@ -4,8 +4,10 @@
 // VideoEncoder and VideoDecoder on every backend this machine has, for H.264 and H.265, with the
 // synthetic test video: quality (PSNR) per rate-control setting, the bitstream's parameter sets
 // and keyframes at the GOP, frame count, order and timestamps through a round trip, odd sizes, a
-// change of size, empty and undecodable access units, and rejected settings and images. Exits 77
-// (skipped) when no backend can both encode and decode here, saying why.
+// change of size, empty and undecodable access units, streams with B-frames from another encoder,
+// frames handed to a sink without copies, and rejected settings and images. Exits 77 (skipped)
+// when no backend can both encode and decode here, saying why, except in CI, where the lane's
+// backend must work (ci_backend.hpp).
 
 #include <cuda_runtime_api.h>
 
@@ -15,6 +17,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +26,8 @@
 #include <holoscan/codec/test_video.hpp>
 #include <holoscan/codec/video_codec.hpp>
 
+#include "ci_backend.hpp"
+#include "reordered_stream.hpp"
 #include "test_support.hpp"
 
 namespace holoscan::codec {
@@ -345,6 +350,85 @@ void check_stream_edges(Codec codec, Backend backend) {
   for (std::size_t i = 0; i < pts.size(); ++i) VERIFY(pts[i] == static_cast<std::int64_t>(i + 5));
 }
 
+// A stream with B-frames from another encoder, its access units in decode order: every frame
+// comes back once, in display order, with the pts of its own access unit, and looks most like its
+// own source frame.
+void check_reordered(Codec codec, Backend backend) {
+  const auto units = test::load_reordered_stream(codec);
+  Stream stream;
+  VideoDecoder decoder(codec, backend, false);
+  std::vector<HostFrame> frames;
+  for (const test::ReorderedUnit& unit : units) {
+    auto decoded = to_host(decoder.decode(unit.data, unit.display_index, stream.stream),
+                           test::kReorderedWidth, test::kReorderedHeight, stream.stream);
+    for (auto& frame : decoded) frames.push_back(std::move(frame));
+  }
+  for (auto& frame : to_host(decoder.flush(stream.stream), test::kReorderedWidth,
+                             test::kReorderedHeight, stream.stream)) {
+    frames.push_back(std::move(frame));
+  }
+  VERIFY_MSG(frames.size() == test::kReorderedFrames,
+             std::to_string(frames.size()) + " frames decoded");
+  for (std::size_t i = 0; i < frames.size(); ++i) {
+    VERIFY_MSG(
+        frames[i].pts == static_cast<std::int64_t>(i),
+        "frame " + std::to_string(i) + " has the pts of frame " + std::to_string(frames[i].pts));
+    const auto index = static_cast<std::uint32_t>(i);
+    const double own = frame_psnr(frames[i], index);
+    VERIFY_MSG(own > 34.0, "frame " + std::to_string(i) + ": PSNR " + std::to_string(own));
+    if (i > 0) VERIFY(own > frame_psnr(frames[i], index - 1) + 3.0);
+    if (i + 1 < frames.size()) VERIFY(own > frame_psnr(frames[i], index + 1) + 3.0);
+  }
+}
+
+// Frames handed to a sink, in the decoder's own memory, are the frames the copies are; an
+// exception from the sink comes out of decode() unchanged. end_stream() starts a new stream.
+void check_sink_and_end_stream(Codec codec, Backend backend) {
+  EncoderSettings settings = settings_for(codec, backend);
+  settings.rate_control = RateControl::kConstQp;
+  settings.qp = 22;
+  settings.gop = 100;
+  VideoEncoder encoder(settings);
+  auto units = encode_video(encoder, 640, 480, 4);
+  encoder.end_stream();
+  const auto next = encode_video(encoder, 640, 480, 4, 4, 4);
+  VERIFY(next.front().keyframe && next.front().index == 0 && !next.back().keyframe);
+  units.insert(units.end(), next.begin(), next.end());
+
+  Stream stream;
+  VideoDecoder decoder(codec, backend);
+  DeviceBuffer rgb(std::size_t{640} * 480 * 3);
+  std::vector<std::int64_t> pts;
+  double worst = 1e9;
+  for (const EncodedFrame& unit : units) {
+    decoder.decode(unit.data, unit.pts, stream.stream, [&](const DecodedFrame& frame) {
+      VERIFY(frame.image.width == 640 && frame.image.height == 480);
+      convert_from_nv12(frame.image, PixelFormat::kRgb8, rgb.get(), 640 * 3, 640, 480,
+                        stream.stream);
+      std::vector<std::uint8_t> host(std::size_t{640} * 480 * 3);
+      VERIFY(cudaMemcpyAsync(host.data(), rgb.get(), host.size(), cudaMemcpyDeviceToHost,
+                             stream.stream) == cudaSuccess);
+      VERIFY(cudaStreamSynchronize(stream.stream) == cudaSuccess);
+      worst =
+          std::min(worst, psnr(render_test_frame(640, 480, static_cast<std::uint32_t>(frame.pts)),
+                               host, 640, 480, 3));
+      pts.push_back(frame.pts);
+    });
+  }
+  decoder.flush(stream.stream, [&](const DecodedFrame& frame) { pts.push_back(frame.pts); });
+  VERIFY_MSG(pts.size() == 8, std::to_string(pts.size()) + " frames through the sink");
+  for (std::size_t i = 0; i < pts.size(); ++i) VERIFY(pts[i] == static_cast<std::int64_t>(i));
+  VERIFY_MSG(worst > 35.0, "worst PSNR " + std::to_string(worst));
+
+  VideoDecoder failing(codec, backend);
+  VERIFY(test::throws<std::logic_error>([&] {
+    for (const EncodedFrame& unit : units) {
+      failing.decode(unit.data, unit.pts, stream.stream,
+                     [](const DecodedFrame&) { throw std::logic_error("from the sink"); });
+    }
+  }));
+}
+
 void check_rejections() {
   EncoderSettings bad;
   bad.qp = 52;
@@ -399,7 +483,19 @@ int main() {
           {name + ": odd sizes and a size change", [=] { check_sizes(codec, backend); }});
       cases.push_back({name + ": empty and undecodable access units",
                        [=] { check_stream_edges(codec, backend); }});
+      cases.push_back({name + ": B-frames from another encoder, reordering decoder",
+                       [=] { check_reordered(codec, backend); }});
+      cases.push_back({name + ": frames to a sink, end of stream",
+                       [=] { check_sink_and_end_stream(codec, backend); }});
     }
+  }
+  if (const auto required = test::ci_backend()) {
+    // In CI the lane's backend must work: a runner without it fails rather than skips.
+    if (const std::string problem = test::backend_problem(*required); !problem.empty()) {
+      std::cout << "FAIL: HOLOSCAN_CI_PLATFORM is set, but " << problem << '\n';
+      return 1;
+    }
+    std::cout << "CI: " << backend_name(*required) << " encodes and decodes both codecs here\n";
   }
   if (pairs == 0) {
     std::cout << "SKIPPED: no backend can encode and decode here (see above)\n";

@@ -18,8 +18,6 @@ add_executable(codec_consumer main.cpp)
 target_compile_features(codec_consumer PRIVATE cxx_std_20)
 target_link_libraries(codec_consumer PRIVATE holoscan::codec)
 
+# Passes on exit status 0, which the consumer returns only when it prints PASS; 77 is a skip.
 add_test(NAME codec_installed_consumer COMMAND codec_consumer)
-set_tests_properties(
-  codec_installed_consumer
-  PROPERTIES PASS_REGULAR_EXPRESSION "codec_consumer: .*: PASS" SKIP_RETURN_CODE 77 TIMEOUT 300
-)
+set_tests_properties(codec_installed_consumer PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)

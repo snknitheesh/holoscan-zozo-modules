@@ -6,8 +6,10 @@
 // timestamps carried, keyframes at the GOP, and the raw stream written to a file; access units
 // decoded back to RGB and NV12 images of the right size, in order and close to their sources; a
 // change of size started as a new stream, or refused; empty and undecodable access units giving
-// nothing; and unusable settings refused. Exits 77 (skipped) when no backend can encode and
-// decode here.
+// nothing; a stream with B-frames decoded in display order under each frame's own header; a
+// stream's end handing out every frame the decoder holds; a capture time never made up; a backend
+// that cannot run failing at startup; and unusable settings refused. Exits 77 (skipped) when no
+// backend can encode and decode here, except in CI (ci_backend.hpp).
 
 #include <cuda_runtime_api.h>
 
@@ -20,6 +22,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +35,8 @@
 #include <holoscan/core/domain/tensor.hpp>
 #include <holoscan/testing/operator_test_harness.hpp>
 
+#include "ci_backend.hpp"
+#include "reordered_stream.hpp"
 #include "test_support.hpp"
 
 namespace holoscan::codec {
@@ -228,14 +233,17 @@ constexpr int kMaxWidth = 800;
 constexpr int kMaxHeight = 600;
 
 VideoDecoderConfig decoder_config(PixelFormat format = PixelFormat::kRgb8) {
-  return VideoDecoderConfig{
-      .output_format = format, .max_width = kMaxWidth, .max_height = kMaxHeight};
+  return VideoDecoderConfig{.backend = Backend::kAuto,
+                            .output_format = format,
+                            .max_width = kMaxWidth,
+                            .max_height = kMaxHeight};
 }
 
 VideoEncoderConfig encoder_config(Codec codec, std::uint32_t gop = 30) {
   VideoEncoderConfig config;
   config.max_width = kMaxWidth;
   config.max_height = kMaxHeight;
+  config.settings.backend = Backend::kAuto;
   config.settings.codec = codec;
   config.settings.rate_control = RateControl::kConstQp;
   config.settings.qp = 22;
@@ -398,6 +406,153 @@ void check_stream_edges(Codec codec) {
   }
 }
 
+// A stream with B-frames from another encoder, in decode order: with low latency off, every
+// image comes out in display order with its own access unit's header, the last ones on the
+// access unit that ends the stream.
+std::vector<schema::EncodedVideoFrameT> reordered_inputs(Codec codec) {
+  const auto units = test::load_reordered_stream(codec);
+  std::vector<schema::EncodedVideoFrameT> inputs;
+  for (std::size_t i = 0; i < units.size(); ++i) {
+    const std::uint32_t index = units[i].display_index;
+    schema::EncodedVideoFrameT input;
+    input.header = std::make_shared<holoscan::schema::HeaderT>();
+    input.header->capture_timestamp_ns = kFirstCapture + kFramePeriod * index;
+    input.header->device_sequence = index + 1U;
+    input.codec = codec == Codec::kH264 ? schema::VideoCodec_H264 : schema::VideoCodec_H265;
+    input.width = test::kReorderedWidth;
+    input.height = test::kReorderedHeight;
+    input.pts = input.header->capture_timestamp_ns;
+    input.keyframe = is_keyframe(codec, units[i].data);
+    input.frame_index = i;
+    input.end_of_stream = i + 1 == units.size();
+    const auto size = static_cast<std::int64_t>(units[i].data.size());
+    input.data = host_tensor(units[i].data, {size});
+    inputs.push_back(std::move(input));
+  }
+  return inputs;
+}
+
+// Every image of the reordered stream came out once, in display order, with its own header.
+void check_reordered_images(const std::vector<ImageSnapshot>& decoded) {
+  VERIFY_MSG(decoded.size() == test::kReorderedFrames, std::to_string(decoded.size()) + " images");
+  for (std::uint32_t i = 0; i < decoded.size(); ++i) {
+    const holoscan::schema::ImageT meta = decoded[i].metadata();
+    VERIFY_MSG(meta.header && meta.header->device_sequence == i + 1U,
+               "image " + std::to_string(i) + " carries the header of frame " +
+                   std::to_string(meta.header ? meta.header->device_sequence - 1U : 0U));
+    VERIFY(meta.header && meta.header->capture_timestamp_ns == kFirstCapture + kFramePeriod * i);
+    const double quality =
+        psnr(render_test_frame(test::kReorderedWidth, test::kReorderedHeight, i),
+             bytes_of(decoded[i].tensor(holoscan::schema::ImageTensorFields::data)),
+             test::kReorderedWidth, test::kReorderedHeight, 3);
+    VERIFY_MSG(quality > 34.0, "image " + std::to_string(i) + ": PSNR " + std::to_string(quality));
+  }
+}
+
+void check_reordered(Codec codec) {
+  VideoDecoderConfig config = decoder_config();
+  config.low_latency = false;
+  check_reordered_images(run_decoder(config, reordered_inputs(codec)));
+}
+
+// With room for 1 image per compute(), the frames the stream's end hands out are copied, held,
+// and emitted first by the next computes (here, empty end-of-stream markers): none is lost and
+// the order and headers hold.
+void check_held_images(Codec codec) {
+  auto inputs = reordered_inputs(codec);
+  schema::EncodedVideoFrameT marker = inputs.back();
+  marker.data = host_tensor({}, {0});
+  marker.end_of_stream = true;
+  for (int i = 0; i < 20; ++i) inputs.push_back(marker);
+  VideoDecoderConfig config = decoder_config();
+  config.low_latency = false;
+  config.max_images_per_compute = 1;
+  check_reordered_images(run_decoder(config, inputs));
+}
+
+// With frames_per_stream, the encoder marks each stream's last access unit end_of_stream and
+// starts the next with a keyframe; a decoder without low latency hands out every frame it holds
+// there. An empty access unit marked end_of_stream ends a stream too.
+void check_end_of_stream(Codec codec) {
+  std::vector<holoscan::schema::ImageT> images;
+  for (std::uint32_t i = 0; i < 10; ++i) images.push_back(test_image(640, 480, i));
+  VideoEncoderConfig config = encoder_config(codec, 100);
+  config.settings.low_latency = false;
+  config.frames_per_stream = 6;
+  const auto frames = run_encoder(config, images);
+  VERIFY(frames.size() == 10);
+  for (std::uint32_t i = 0; i < frames.size(); ++i) {
+    const auto meta = frames[i].metadata();
+    VERIFY_MSG(meta.end_of_stream == (i == 5), "frame " + std::to_string(i) + " end_of_stream");
+    VERIFY(meta.keyframe == (i == 0 || i == 6));
+    VERIFY(meta.frame_index == (i < 6 ? i : i - 6));
+  }
+  auto inputs = as_input(frames);
+  // The second stream ends with an empty access unit.
+  schema::EncodedVideoFrameT end = inputs.back();
+  end.data = host_tensor({}, {0});
+  end.end_of_stream = true;
+  inputs.push_back(end);
+  VideoDecoderConfig decoder = decoder_config();
+  decoder.low_latency = false;
+  const auto decoded = run_decoder(decoder, inputs);
+  VERIFY_MSG(decoded.size() == 10, std::to_string(decoded.size()) + " images");
+  for (std::uint32_t i = 0; i < decoded.size(); ++i) {
+    VERIFY(decoded[i].metadata().header->capture_timestamp_ns == kFirstCapture + kFramePeriod * i);
+  }
+}
+
+// An image without a capture time keeps none through the codec: the decoded header is the
+// encoded image's, not the pts the encoder made up from the frame's index.
+void check_capture_time_kept(Codec codec) {
+  std::vector<holoscan::schema::ImageT> images;
+  for (std::uint32_t i = 0; i < 3; ++i) {
+    images.push_back(test_image(640, 480, i));
+    images.back().header->capture_timestamp_ns = 0;
+  }
+  const auto frames = run_encoder(encoder_config(codec), images);
+  VERIFY(frames.size() == 3);
+  const auto decoded = run_decoder(decoder_config(), as_input(frames));
+  VERIFY(decoded.size() == 3);
+  for (std::uint32_t i = 0; i < decoded.size(); ++i) {
+    const auto meta = decoded[i].metadata();
+    VERIFY(meta.header && meta.header->capture_timestamp_ns == 0);
+    VERIFY(meta.header && meta.header->device_sequence == i + 1U);
+  }
+}
+
+// A backend that cannot run here fails the run at startup, even when no frame ever comes.
+void check_startup_failure() {
+  std::optional<Backend> missing;
+  for (const BackendStatus& status : probe_encoder_backends(Codec::kH264)) {
+    if (!status.available) missing = status.backend;
+  }
+  if (!missing) return;  // Every backend works here.
+  // Fails in start(), before the frame is computed.
+  const auto fails_at_start = [](const auto& result) {
+    const std::string failure = result.ok() ? "" : result.describe_failure();
+    VERIFY_MSG(failure.find("stage=kStart") != std::string::npos,
+               "expected a failure at startup, got: " + failure);
+  };
+  VideoEncoderConfig encoder = encoder_config(Codec::kH264);
+  encoder.settings.backend = *missing;
+  auto encoding = holoscan::testing::create_operator_test<VideoEncoderOp>(encoder);
+  encoding.push("image", test_image(640, 480, 0));
+  encoding.capture_snapshot<schema::EncodedVideoFrameT>("bitstream");
+  fails_at_start(encoding.run());
+  VideoDecoderConfig decoder = decoder_config();
+  decoder.backend = *missing;
+  std::vector<holoscan::schema::ImageT> images{test_image(640, 480, 0)};
+  const auto inputs = as_input(run_encoder(encoder_config(Codec::kH264), images));
+  VERIFY(inputs.size() == 1);
+  if (inputs.empty()) return;
+  auto decoding = holoscan::testing::create_operator_test<VideoDecoderOp>(decoder);
+  decoding.push("bitstream", inputs.front());
+  decoding.output_device("image", holoscan::DeviceId{0});
+  decoding.capture_snapshot<holoscan::schema::ImageT>("image");
+  fails_at_start(decoding.run());
+}
+
 void check_configs() {
   const auto encoder_rejects = [](VideoEncoderConfig config) {
     return test::throws<std::invalid_argument>([&] { VideoEncoderOp op(config); });
@@ -437,10 +592,32 @@ int main() {
     cases.push_back({name + ": input encodings and memory", [=] { check_inputs(codec); }});
     cases.push_back({name + ": size change", [=] { check_size_change(codec); }});
     cases.push_back({name + ": empty and undecodable", [=] { check_stream_edges(codec); }});
+    cases.push_back(
+        {name + ": B-frames, display order, own headers", [=] { check_reordered(codec); }});
+    cases.push_back({name + ": end of stream", [=] { check_end_of_stream(codec); }});
+    cases.push_back(
+        {name + ": images beyond one compute's room held", [=] { check_held_images(codec); }});
+    cases.push_back({name + ": no capture time made up", [=] { check_capture_time_kept(codec); }});
+  }
+  if (const auto required = test::ci_backend()) {
+    // In CI the lane's backend must work, and be what auto picks.
+    if (const std::string problem = test::backend_problem(*required); !problem.empty()) {
+      std::cout << "FAIL: HOLOSCAN_CI_PLATFORM is set, but " << problem << '\n';
+      return 1;
+    }
+    EncoderSettings automatic;
+    automatic.backend = Backend::kAuto;
+    const Backend picked = VideoEncoder(automatic).backend();
+    if (picked != *required) {
+      std::cout << "FAIL: auto picks " << backend_name(picked) << ", not "
+                << backend_name(*required) << '\n';
+      return 1;
+    }
   }
   if (cases.size() == 1) {
     std::cout << "SKIPPED: no backend encodes and decodes here\n";
     return test::kSkipped;
   }
+  cases.push_back({"a backend that cannot run fails at startup", check_startup_failure});
   return test::run(cases);
 }

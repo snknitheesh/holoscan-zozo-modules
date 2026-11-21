@@ -6,8 +6,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <holoscan/codec/bitstream.hpp>
@@ -64,6 +66,60 @@ void check_h264() {
   VERIFY(!is_keyframe(Codec::kH264, bare_idr));
 }
 
+// An SEI NAL unit (H.264 type 6) holding `messages`, each {payloadType, payloadSize}, the payload
+// bytes zero, then the rbsp trailing bits.
+Bytes sei(std::initializer_list<std::pair<int, int>> messages) {
+  Bytes nal = {0, 0, 0, 1, 0x06};
+  for (const auto& [type, size] : messages) {
+    for (int left = type; left >= 0xFF; left -= 0xFF) nal.push_back(0xFF);
+    nal.push_back(static_cast<std::uint8_t>(type % 0xFF));
+    nal.push_back(static_cast<std::uint8_t>(size));
+    // Zero payload bytes, with emulation prevention after every second zero.
+    int zeros = 0;
+    for (int i = 0; i < size; ++i) {
+      if (zeros == 2) {
+        nal.push_back(3);
+        zeros = 0;
+      }
+      nal.push_back(0);
+      ++zeros;
+    }
+  }
+  nal.push_back(0x80);
+  return nal;
+}
+
+// A stream without IDRs (intra refresh, an open GOP) can start at a picture with a recovery point
+// SEI message and its parameter sets.
+void check_h264_recovery_point() {
+  const auto access_unit = [](const Bytes& message, bool with_sets) {
+    Bytes au;
+    if (with_sets) {
+      append_nal(au, Codec::kH264, 7);
+      append_nal(au, Codec::kH264, 8);
+    }
+    au.insert(au.end(), message.begin(), message.end());
+    append_nal(au, Codec::kH264, 1);  // A non-IDR slice.
+    return au;
+  };
+  // A user-data message (type 5, 20 bytes with emulation prevention), then the recovery point.
+  const Bytes refresh = access_unit(sei({{5, 20}, {6, 2}}), true);
+  const AccessUnitInfo info = analyze_access_unit(Codec::kH264, refresh);
+  VERIFY(info.recovery_point && info.random_access && !info.idr && info.slices == 1);
+  VERIFY(is_keyframe(Codec::kH264, refresh));
+  // Without its parameter sets it cannot start decoding.
+  VERIFY(!is_keyframe(Codec::kH264, access_unit(sei({{6, 2}}), false)));
+  // Other messages are no recovery point, nor is a type whose 0xFF prefix sums past 6.
+  const Bytes other = access_unit(sei({{5, 20}, {4, 3}}), true);
+  VERIFY(!analyze_access_unit(Codec::kH264, other).recovery_point);
+  VERIFY(!is_keyframe(Codec::kH264, other));
+  VERIFY(
+      !analyze_access_unit(Codec::kH264, access_unit(sei({{0xFF + 6, 1}}), true)).recovery_point);
+  // A truncated message is not read past its end.
+  Bytes truncated = {0, 0, 0, 1, 0x06, 0xFF, 0xFF};
+  VERIFY(!analyze_access_unit(Codec::kH264, truncated).recovery_point);
+}
+
 void check_h265() {
   Bytes idr;
   append_nal(idr, Codec::kH265, 32);  // VPS
@@ -117,6 +173,8 @@ void check_settings() {
   for (const Backend backend : {Backend::kNvcodec, Backend::kV4l2, Backend::kAuto}) {
     VERIFY(parse_backend(backend_name(backend)) == backend);
   }
+  // An explicit backend by default; auto is opt-in.
+  VERIFY(EncoderSettings{}.backend == Backend::kNvcodec);
   for (const RateControl rc : {RateControl::kCbr, RateControl::kVbr, RateControl::kConstQp}) {
     VERIFY(parse_rate_control(rate_control_name(rc)) == rc);
   }
@@ -186,6 +244,7 @@ int main() {
   using namespace holoscan::codec;  // NOLINT(build/namespaces)
   return test::run({
       {"H.264 access units", check_h264},
+      {"H.264 recovery points", check_h264_recovery_point},
       {"H.265 access units", check_h265},
       {"degenerate streams", check_degenerate_streams},
       {"settings", check_settings},
