@@ -34,11 +34,11 @@ codec_app_test(codec_app_reordering_decoder 0 "frames=40/40 .*verdict=PASS"
 )
 # Rendered offscreen by HoloViz: the original and the decoded frame side by side, both checked;
 # also with a source faster than the chain.
-codec_app_test(codec_app_offscreen 0 "workers=1 frames=30/30 .*rendered=[1-9].*verdict=PASS"
+codec_app_test(codec_app_offscreen 0 "workers=2 frames=30/30 .*rendered=[1-9].*verdict=PASS"
   --display offscreen --count 30 --period-ms 20 --rate-control cqp --qp 25 --min-psnr 34
   --render-file "${CMAKE_CURRENT_BINARY_DIR}/codec_render.ppm"
 )
-codec_app_test(codec_app_offscreen_fast 0 "workers=1 frames=120/120 .*verdict=PASS"
+codec_app_test(codec_app_offscreen_fast 0 "workers=2 frames=120/120 .*verdict=PASS"
   --display offscreen --count 120 --period-ms 5
 )
 # The live graph's edges and automatic partitioning, headless: the source's pacing keeps every
@@ -46,12 +46,12 @@ codec_app_test(codec_app_offscreen_fast 0 "workers=1 frames=120/120 .*verdict=PA
 codec_app_test(codec_app_live_edges 0 "frames=120/120 .*verdict=PASS"
   --display none --workers auto --count 120 --period-ms 5
 )
-# The lossless graphs run on one worker; the live window graph compiles with the automatic
-# partitioning, with or without a display to run it.
+# The lossless graphs run their frames on one worker, and HoloViz with its check on a second; the
+# live window graph compiles with the automatic partitioning, with or without a display to run it.
 codec_app_test(codec_app_one_worker 0 "^codec_demo: plan=OK workers=1\n*$"
   --display none --compile-only true
 )
-codec_app_test(codec_app_offscreen_one_worker 0 "^codec_demo: plan=OK workers=1\n*$"
+codec_app_test(codec_app_offscreen_frames_one_worker 0 "^codec_demo: plan=OK workers=2\n*$"
   --display offscreen --compile-only true
 )
 codec_app_test(codec_app_window_plan 0 "^codec_demo: plan=OK workers=[1-9][0-9]*\n*$"

@@ -222,8 +222,9 @@ void usage(const char* argv0) {
          "  --min-psnr DB              Fail on a decoded frame below this PSNR (default: 0, off)\n"
          "  --timeout-seconds N        Fail when no frame comes for N seconds (default: 60)\n"
          "Graph:\n"
-         "  --workers one|auto         One worker for the whole graph, or the automatic\n"
-         "                             partitioning (default: one with --count, auto without)\n"
+         "  --workers one|auto         One worker for the frames (and one for HoloViz), or the\n"
+         "                             automatic partitioning (default: one with --count, auto\n"
+         "                             without)\n"
          "  --compile-only true|false  Build and check the graph, print its workers, and exit\n"
          "Benchmark:\n"
          "  --benchmark N              Instead of the graph, time N frames of encoding and\n"
@@ -347,6 +348,15 @@ int execute(const Options& opts, SignalDomain& signals) {
   const std::uint32_t in_flight = opts.settings.low_latency ? kInFlight : kInFlightReordering;
   auto report = std::make_shared<app::CodecReport>();
   const bool render = opts.display != Display::kNone;
+  // A finite run's frames on one worker: with a worker per operator, a producer can run while its
+  // consumer's lossless queue is full, and fail on the refused emit. HoloViz and the render check
+  // then run on a second worker: their edges drop their oldest sample and hold nothing back, and
+  // with HoloViz's offscreen output on the frames' worker, the SDK 5.0 sometimes crashes as it
+  // tears a correct run down (a segmentation fault recording a CUDA event on that worker). An
+  // endless run, which mostly shows a window, keeps the automatic partitioning; the source's
+  // pacing keeps it lossless.
+  const bool one_worker =
+      opts.workers == Workers::kOne || (opts.workers == Workers::kDefault && finite);
 
   holoscan::Graph graph{std::string(kAppName)};
   auto source = graph.op<app::TestSourceOp>(
@@ -383,6 +393,9 @@ int execute(const Options& opts, SignalDomain& signals) {
   // decode the next, and a frame the report never sees would hold the source back for good. In
   // real time the source skips a tick instead while the chain is behind (on a slow decoder, for
   // example), so no queue fills and no emit is refused.
+  if (one_worker) {
+    graph.partition(std::string(kAppName)).add(source, encoder, decoder, reporter);
+  }
   graph.add_flow(source->image, encoder->image, lossless(in_flight));
   graph.add_flow(encoder->bitstream, decoder->bitstream, lossless(in_flight));
   graph.add_flow(encoder->bitstream, reporter->bitstream, lossless(in_flight));
@@ -416,6 +429,11 @@ int execute(const Options& opts, SignalDomain& signals) {
     auto visualizer =
         graph.op<viz::HolovizOp>("holoviz", std::move(layers), std::move(sink),
                                  viz::FrameTrigger{viz::LayerTrigger{0}}, max_input_age);
+    std::optional<holoscan::PartitionHandle> display;
+    if (one_worker) {
+      display.emplace(graph.partition("display"));
+      display->add(visualizer);
+    }
     graph.add_flow(decoder->image, visualizer->image_layer_input(0), newest());
     // HoloViz shows the newest original no newer than the decoded frame: keep a few, so that the
     // decoded frame's own original is still there when it arrives.
@@ -428,16 +446,9 @@ int execute(const Options& opts, SignalDomain& signals) {
                                                  .height = opts.height,
                                                  .min_psnr = std::max(opts.min_psnr - 3.0, 20.0),
                                                  .image_file = opts.render_file});
+      if (display) display->add(checker);
       graph.add_flow(visualizer->output(), checker->rendered, newest());
     }
-  }
-  // A finite run on one worker: with a worker per operator, a producer can run while its
-  // consumer's lossless queue is full, and fail on the refused emit. An endless run, which mostly
-  // shows a window, keeps the automatic partitioning; the source's pacing keeps it lossless.
-  const bool one_worker =
-      opts.workers == Workers::kOne || (opts.workers == Workers::kDefault && finite);
-  if (one_worker) {
-    graph.partition(std::string(kAppName)).include_all();
   }
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
