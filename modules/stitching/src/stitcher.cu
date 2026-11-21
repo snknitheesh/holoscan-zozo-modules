@@ -291,11 +291,13 @@ cudaError_t Stitcher::stitch(std::span<const DeviceImage> images, void* output,
   for (std::size_t c = 0; c < n; ++c) {
     const DeviceImage& image = images[c];
     const Camera& camera = s.rig.cameras[c];
-    if (image.data == nullptr || image.width != camera.width || image.height != camera.height ||
+    const auto width = static_cast<int>(camera.info.width);
+    const auto height = static_cast<int>(camera.info.height);
+    if (image.data == nullptr || image.width != width || image.height != height ||
         image.pitch < static_cast<std::size_t>(image.width) * channels(image.format)) {
-      throw std::invalid_argument(
-          "Stitcher: image " + std::to_string(c) + " is not a " + std::to_string(camera.width) +
-          "x" + std::to_string(camera.height) + " image of camera " + camera.name);
+      throw std::invalid_argument("Stitcher: image " + std::to_string(c) + " is not a " +
+                                  std::to_string(width) + "x" + std::to_string(height) +
+                                  " image of " + camera_label(camera, c));
     }
     detail::set_camera(params, static_cast<int>(c), static_cast<const std::uint8_t*>(image.data),
                        image.pitch, image.width, image.height, image.format, s.rois[c], s.uv[c],
@@ -357,8 +359,8 @@ RemapTables Stitcher::download_tables() const {
   for (std::size_t c = 0; c < s.rois.size(); ++c) {
     const detail::Roi& roi = s.rois[c];
     CameraTable table;
-    table.image_width = s.rig.cameras[c].width;
-    table.image_height = s.rig.cameras[c].height;
+    table.image_width = static_cast<int>(s.rig.cameras[c].info.width);
+    table.image_height = static_cast<int>(s.rig.cameras[c].info.height);
     table.x0 = roi.x0;
     table.y0 = roi.y0;
     table.width = roi.width;

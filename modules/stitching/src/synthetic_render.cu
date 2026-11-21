@@ -257,8 +257,10 @@ int format_code(PixelFormat format) {
 cudaError_t render_camera(const SyntheticWorld& world, const Camera& camera, const RigPose& pose,
                           float gain, PixelFormat format, void* image, std::size_t pitch,
                           int samples, cudaStream_t stream) {
+  const auto width = static_cast<int>(camera.info.width);
+  const auto height = static_cast<int>(camera.info.height);
   if (image == nullptr || samples < 1 || samples > 8 ||
-      pitch < static_cast<std::size_t>(camera.width) * channels(format)) {
+      pitch < static_cast<std::size_t>(width) * channels(format)) {
     return cudaErrorInvalidValue;
   }
   const CameraParams c = detail::camera_params(camera);
@@ -267,7 +269,7 @@ cudaError_t render_camera(const SyntheticWorld& world, const Camera& camera, con
   const float3 origin = make_float3(static_cast<float>(rig_from_camera.translation[0]),
                                     static_cast<float>(rig_from_camera.translation[1]),
                                     static_cast<float>(rig_from_camera.translation[2]));
-  camera_kernel<<<grid_for(camera.width, camera.height), kBlock, 0, stream>>>(
+  camera_kernel<<<grid_for(width, height), kBlock, 0, stream>>>(
       world_params(world, pose), c, origin, gain, format_code(format), channels(format),
       static_cast<std::uint8_t*>(image), pitch, samples);
   return cudaGetLastError();

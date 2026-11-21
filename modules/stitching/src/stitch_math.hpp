@@ -23,6 +23,11 @@
 #define STITCH_UNROLL
 #endif
 
+namespace holoscan::messages {
+struct CameraInfo;
+struct RigidTransform;
+}  // namespace holoscan::messages
+
 namespace holoscan::stitching {
 struct Camera;
 struct OutputGeometry;
@@ -31,6 +36,7 @@ struct BlendSettings;
 
 namespace holoscan::stitching::detail {
 
+// The public kMaxCameras (camera_rig.hpp), which camera_rig.cpp checks.
 inline constexpr int kMaxCameras = 8;
 // Overlaps with fewer samples than this are left out of the gain solve.
 inline constexpr std::uint32_t kMinOverlapSamples = 16U;
@@ -57,7 +63,9 @@ STITCH_HD T m_max(T a, T b) {
 
 // --- Cameras ---------------------------------------------------------------
 
-enum : int { kModelNone = 0, kModelBrownConrady = 1, kModelRational = 2, kModelKannalaBrandt4 = 3 };
+// The lens models of holoscan-messages' CameraInfo: none, plumb_bob,
+// rational_polynomial and equidistant.
+enum : int { kModelNone = 0, kModelPlumbBob = 1, kModelRational = 2, kModelEquidistant = 3 };
 
 // A camera as the kernels read it. k holds k1, k2, p1, p2, k3, k4, k5, k6 for
 // the pinhole models (zero where a model has none), k1..k4 for the fisheye.
@@ -75,7 +83,9 @@ struct CameraParams {
   double max_angle;  // Radians from the optical axis; see max_valid_angle().
 };
 
-// Host only: the parameters of a validated camera.
+// Host only: the parameters of a validated camera, at `camera_from_rig`.
+[[nodiscard]] CameraParams camera_params(const messages::CameraInfo& camera,
+                                         const messages::RigidTransform& camera_from_rig);
 [[nodiscard]] CameraParams camera_params(const Camera& camera);
 
 // The lens' distortion of a ray at angle `theta` from the axis whose
@@ -87,7 +97,7 @@ STITCH_HD void distort_ray(const CameraParams& c, T theta, T dx, T dy, T x, T y,
   const T k1 = static_cast<T>(c.k[1]);
   const T k2 = static_cast<T>(c.k[2]);
   const T k3 = static_cast<T>(c.k[3]);
-  if (c.model == kModelKannalaBrandt4) {
+  if (c.model == kModelEquidistant) {
     const T t2 = theta * theta;
     const T theta_d = theta * (T(1) + t2 * (k0 + t2 * (k1 + t2 * (k2 + t2 * k3))));
     xd = theta_d * dx;
@@ -130,7 +140,7 @@ STITCH_HD bool project(const CameraParams& c, const T p[3], bool at_infinity, T&
   }
   T xd;
   T yd;
-  if (c.model == kModelKannalaBrandt4) {
+  if (c.model == kModelEquidistant) {
     const T dx = r > T(0) ? X[0] / r : T(0);
     const T dy = r > T(0) ? X[1] / r : T(0);
     distort_ray(c, theta, dx, dy, T(0), T(0), xd, yd);
@@ -157,7 +167,7 @@ STITCH_HD bool pixel_ray(const CameraParams& c, T u, T v, T ray[3]) {
   const T yd = (v - static_cast<T>(c.cy)) / static_cast<T>(c.fy);
   const T max_angle = static_cast<T>(c.max_angle);
   const T tolerance = sizeof(T) == sizeof(double) ? T(1e-12) : T(1e-5);
-  if (c.model == kModelKannalaBrandt4) {
+  if (c.model == kModelEquidistant) {
     const T theta_d = m_sqrt(xd * xd + yd * yd);
     if (theta_d == T(0)) {
       ray[0] = T(0);
@@ -497,9 +507,10 @@ STITCH_HD void sample_luminance(const BlendParams& p, int x, int y, int luminanc
   }
 }
 
-// The gains from the overlap statistics (see reference_overlap_stats()), by
-// solving the normal equations of Brown and Lowe's gain error with Gaussian
-// elimination, then blending with `previous`. `alpha` = 1 / sigma_N^2,
+// The gains from the overlap statistics (see reference_overlap_stats()): the
+// least-squares gains that make each overlap's mean luminance the same in both
+// cameras, with a prior that holds each gain near 1, by solving the normal
+// equations with Gaussian elimination, then blending with `previous`. `alpha` = 1 / sigma_N^2,
 // `beta` = 1 / sigma_g^2. A camera without overlaps keeps gain 1.
 STITCH_HD void solve_gains(int n, const unsigned long long* sum,  // NOLINT(runtime/int)
                            const std::uint32_t* count, double alpha, double beta, double smoothing,

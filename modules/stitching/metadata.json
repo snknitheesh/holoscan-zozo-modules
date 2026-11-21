@@ -4,7 +4,7 @@
     "name": "holoscan-stitching",
     "version": "1.0.0",
     "support_level": "community",
-    "description": "Multi-camera stitching on the GPU: one image from each camera of a calibrated rig (pinhole Brown-Conrady, rational or Kannala-Brandt fisheye) into a cylindrical or spherical panorama or a bird's-eye surround view of the ground, from remap tables built once per calibration, with bilinear sampling, distance-weighted feathering or hard seams, and optional per-camera exposure compensation.",
+    "description": "Multi-camera stitching on the GPU: one image from each camera of a rig, calibrated in ROS camera_info files (plumb_bob, rational_polynomial or equidistant fisheye) and taken as CameraInfo messages, into a cylindrical or spherical panorama or a bird's-eye surround view of the ground, from remap tables built once per calibration, with bilinear sampling, distance-weighted feathering or hard seams, and optional per-camera exposure compensation.",
     "authors": [
       {
         "name": "zozo",
@@ -50,11 +50,15 @@
         }
       ]
     },
-    "dependencies": [],
+    "dependencies": [
+      {
+        "name": "messages"
+      }
+    ],
     "binary_packages": {
       "debian": "holoscan-stitching",
       "install_commands": [
-        "sudo apt install ./holoscan-stitching_1.0.0_$(dpkg --print-architecture).deb"
+        "sudo apt install ./holoscan-messages_1.0.0_$(dpkg --print-architecture).deb ./holoscan-stitching_1.0.0_$(dpkg --print-architecture).deb"
       ]
     },
     "testing": {

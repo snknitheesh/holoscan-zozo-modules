@@ -45,13 +45,17 @@ if(HOLOSCAN_STITCHING_BUILD_TESTING)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
 find_package(CUDAToolkit REQUIRED)
+# The camera info message and its consumer contract: the target of this build when the
+# repository root added holoscan-messages first, else its installed package.
+if(NOT TARGET holoscan::messages)
+  find_package(holoscan-messages 1.0 REQUIRED CONFIG)
+endif()
 
-# holoscan::stitching: the calibration and geometry, the CPU reference, the GPU Stitcher,
+# holoscan::stitching: the rig's cameras and geometry, the CPU reference, the GPU Stitcher,
 # StitchOp, and the synthetic world.
 add_library(
   holoscan_stitching
   src/camera_rig.cpp
-  src/json.cpp
   src/projection.cpp
   src/remap.cpp
   src/stitch_op.cpp
@@ -81,7 +85,10 @@ target_include_directories(
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(holoscan_stitching PUBLIC holoscan::core holoscan::sensor_io CUDA::cudart)
+target_link_libraries(
+  holoscan_stitching
+  PUBLIC holoscan::core holoscan::sensor_io holoscan::messages CUDA::cudart
+)
 set_target_properties(
   holoscan_stitching
   PROPERTIES

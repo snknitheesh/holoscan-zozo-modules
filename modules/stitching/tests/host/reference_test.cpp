@@ -27,13 +27,14 @@ namespace {
 
 Camera pinhole(const std::string& name, double yaw, double pitch, std::array<double, 3> position) {
   Camera c;
-  c.name = name;
-  c.width = 160;
-  c.height = 120;
-  c.fx = 80.0;
-  c.fy = 80.0;
-  c.cx = 79.5;
-  c.cy = 59.5;
+  c.info.header.frame_id = name;
+  c.info.state = messages::CameraState::kUndistorted;
+  c.info.width = 160;
+  c.info.height = 120;
+  c.info.fx = 80.0;
+  c.info.fy = 80.0;
+  c.info.cx = 79.5;
+  c.info.cy = 59.5;
   c.camera_from_rig = mount(position, yaw, pitch);
   return c;
 }
@@ -172,14 +173,15 @@ struct SolidImages {
 SolidImages solid(const CameraRig& rig, const std::vector<std::array<std::uint8_t, 3>>& colours) {
   SolidImages s;
   for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
-    const Camera& cam = rig.cameras[c];
+    const messages::CameraInfo& cam = rig.cameras[c].info;
     std::vector<std::uint8_t> p(static_cast<std::size_t>(cam.width) * cam.height * 3U);
     for (std::size_t i = 0; i < p.size(); ++i) p[i] = colours[c][i % 3];
     s.pixels.push_back(std::move(p));
   }
   for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
-    const Camera& cam = rig.cameras[c];
-    s.images.push_back(HostImage{s.pixels[c].data(), cam.width, cam.height,
+    const messages::CameraInfo& cam = rig.cameras[c].info;
+    s.images.push_back(HostImage{s.pixels[c].data(), static_cast<int>(cam.width),
+                                 static_cast<int>(cam.height),
                                  static_cast<std::size_t>(cam.width) * 3U, PixelFormat::kRgb8});
   }
   return s;
@@ -266,7 +268,7 @@ void gains() {
     hi = std::max(hi, g[i] * exposure[i]);
   }
   VERIFY_MSG((hi - lo) / lo < 0.01, "spread " + std::to_string((hi - lo) / lo));
-  // Brown and Lowe's sigma_g = 0.1 holds the gains nearer to 1.
+  // A smaller sigma_g (0.1) holds the gains nearer to 1.
   BlendSettings strict;
   strict.exposure_sigma_gain = 0.1F;
   const std::vector<float> held = reference_gains(stats, strict, {});

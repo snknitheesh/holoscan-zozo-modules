@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numbers>
 #include <stdexcept>
 #include <string>
@@ -48,23 +49,40 @@ RigPose moving_pose(std::uint32_t frame, std::uint32_t frames_per_lap) {
   return RigPose{kRadius * std::sin(t), kRadius * (1.0 - std::cos(t)), t / kDegree};
 }
 
+namespace {
+
+// A camera's calibration with known values, as its camera_info file says.
+messages::CameraInfo synthetic_info(std::string frame_id, int width, int height, double f,
+                                    messages::DistortionModel model,
+                                    std::vector<double> coefficients) {
+  messages::CameraInfo info;
+  info.header.frame_id = std::move(frame_id);
+  info.width = static_cast<std::uint32_t>(width);
+  info.height = static_cast<std::uint32_t>(height);
+  info.fx = f;
+  info.fy = f;
+  info.cx = (width - 1) / 2.0;
+  info.cy = (height - 1) / 2.0;
+  info.distortion_model = model;
+  info.coefficients = std::move(coefficients);
+  info.state = std::any_of(info.coefficients.begin(), info.coefficients.end(),
+                           [](double k) { return k != 0.0; })
+                   ? messages::CameraState::kRaw
+                   : messages::CameraState::kUndistorted;
+  return info;
+}
+
+}  // namespace
+
 CameraRig surround_rig(int width, int height) {
   CameraRig rig;
   const double f = 330.0 * width / 1280.0;
   const auto fisheye = [&](const char* name, std::array<double, 3> position, double yaw,
                            double pitch) {
-    Camera c;
-    c.name = name;
-    c.width = width;
-    c.height = height;
-    c.fx = f;
-    c.fy = f;
-    c.cx = (width - 1) / 2.0;
-    c.cy = (height - 1) / 2.0;
-    c.distortion_model = DistortionModel::kKannalaBrandt4;
-    c.distortion = {0.02, -0.005, 0.001, -0.0001};
-    c.camera_from_rig = mount(position, yaw, pitch);
-    return c;
+    return Camera{
+        .info = synthetic_info(name, width, height, f, messages::DistortionModel::kEquidistant,
+                               {0.02, -0.005, 0.001, -0.0001}),
+        .camera_from_rig = mount(position, yaw, pitch)};
   };
   rig.cameras.push_back(fisheye("front", {2.0, 0.0, 0.8}, 0.0, -30.0));
   rig.cameras.push_back(fisheye("left", {0.0, 1.0, 1.0}, 90.0, -40.0));
@@ -84,19 +102,12 @@ CameraRig ring_rig(int count, int width, int height, double horizontal_fov_deg, 
   const double f = 0.5 * width / std::tan(0.5 * horizontal_fov_deg * kDegree);
   for (int i = 0; i < count; ++i) {
     const double yaw = 360.0 * i / count;
-    Camera c;
-    c.name = "camera_" + std::to_string(i);
-    c.width = width;
-    c.height = height;
-    c.fx = f;
-    c.fy = f;
-    c.cx = (width - 1) / 2.0;
-    c.cy = (height - 1) / 2.0;
-    c.distortion_model = DistortionModel::kBrownConrady;
-    c.distortion = {-0.08, 0.02, 0.0005, -0.0003, 0.0};
-    c.camera_from_rig =
-        mount({radius * std::cos(yaw * kDegree), radius * std::sin(yaw * kDegree), 1.0}, yaw, 0.0);
-    rig.cameras.push_back(std::move(c));
+    rig.cameras.push_back(Camera{
+        .info = synthetic_info("camera_" + std::to_string(i), width, height, f,
+                               messages::DistortionModel::kPlumbBob,
+                               {-0.08, 0.02, 0.0005, -0.0003, 0.0}),
+        .camera_from_rig = mount(
+            {radius * std::cos(yaw * kDegree), radius * std::sin(yaw * kDegree), 1.0}, yaw, 0.0)});
   }
   return rig;
 }

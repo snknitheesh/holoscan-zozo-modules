@@ -122,8 +122,8 @@ RemapTables build_remap_tables(const CameraRig& rig, const OutputGeometry& geome
     }
     const detail::Roi roi = detail::region_of_interest(columns, y_first, y_last, tables.wraps);
     CameraTable table;
-    table.image_width = camera.width;
-    table.image_height = camera.height;
+    table.image_width = static_cast<int>(camera.info.width);
+    table.image_height = static_cast<int>(camera.info.height);
     table.x0 = roi.x0;
     table.y0 = roi.y0;
     table.width = roi.width;

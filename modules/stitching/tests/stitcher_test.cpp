@@ -417,7 +417,7 @@ void camera_that_sees_nothing() {
   const CameraRig rig = surround_rig(320, 180);
   CameraRig with_sky = rig;
   Camera up = ring_rig(1, 320, 180, 60.0, 0.0).cameras[0];
-  up.name = "sky";
+  up.info.header.frame_id = "sky";
   up.camera_from_rig = mount({0.0, 0.0, 1.5}, 0.0, 90.0);
   with_sky.cameras.push_back(up);
   const OutputGeometry g = ground_view(256, 256, 5.5);
@@ -457,7 +457,7 @@ void cameras_that_see_the_same() {
   const CameraRig ring = ring_rig(1, 640, 360, 90.0, 0.0);
   CameraRig twins = ring;
   twins.cameras.push_back(ring.cameras[0]);
-  twins.cameras[1].name = "twin";
+  twins.cameras[1].info.header.frame_id = "twin";
   OutputGeometry g = wall_panorama(kWorld, Projection::kCylindrical, 1024, 256);
   g.panorama.horizontal_fov_deg = 120.0;
   Stitcher single(ring, g, BlendSettings{});
@@ -495,7 +495,6 @@ void invalid_input() {
   CameraRig nine;
   for (int i = 0; i < 9; ++i) {
     nine.cameras.push_back(ring_rig(1, 32, 32, 60.0, 0.0).cameras[0]);
-    nine.cameras.back().name = std::to_string(i);
   }
   VERIFY(test::throws<std::invalid_argument>(
       [&] { Stitcher s(nine, ground_view(64, 64, 5.0), BlendSettings{}); }));

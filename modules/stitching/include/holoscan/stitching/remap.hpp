@@ -83,20 +83,21 @@ enum class BlendMode : std::uint8_t {
 
 struct BlendSettings {
   BlendMode mode{BlendMode::kFeather};
-  // With kFeather, caps the weight at this margin in camera pixels, as
-  // OpenCV's FeatherBlender's sharpness does: a camera reaches full weight
-  // this far from its edge, so the ramps at the overlap's ends are this wide
+  // With kFeather, caps the weight at this margin in camera pixels: a camera
+  // reaches full weight this far from its edge, so the ramps at the overlap's ends are this wide
   // and between them the cameras count equally. 0 lets the weight grow over
   // the whole overlap, so the transition spans all of it.
   float feather_width{0.0F};
   // Scale each camera by a gain that matches the overlaps' mean brightness
-  // (gain compensation after Brown and Lowe, 2007), computed every frame.
+  // (gain compensation over the overlap means: the least-squares gains that
+  // make each overlap equally bright in both cameras, held near 1 by a
+  // prior), computed every frame.
   bool exposure_compensation{false};
   // The noise of the overlap means (sigma_N, in 8-bit levels) and how far the
   // gains may stray from 1 (sigma_g): a smaller sigma_g holds them nearer to 1
-  // and leaves more of a difference uncorrected. Brown and Lowe use 10 and
-  // 0.1, which on overlaps of mean brightness near 100 leaves about a third of
-  // a camera's exposure difference; 0.5 leaves about 2%.
+  // and leaves more of a difference uncorrected. With sigma_g = 0.1, overlaps
+  // of mean brightness near 100 keep about a third of a camera's exposure
+  // difference; 0.5 leaves about 2%.
   float exposure_sigma_noise{10.0F};
   float exposure_sigma_gain{0.5F};
   // Each frame's gains are blended with the previous frame's:

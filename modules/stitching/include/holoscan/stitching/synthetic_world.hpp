@@ -48,13 +48,13 @@ struct RigPose {
 // every `frames_per_lap` frames, facing along its path.
 [[nodiscard]] RigPose moving_pose(std::uint32_t frame, std::uint32_t frames_per_lap = 600);
 
-// Four fisheye cameras (kKannalaBrandt4, about 215 degrees across, 120
+// Four fisheye cameras (equidistant, about 215 degrees across, 120
 // degrees high) on a 4 m x 2 m vehicle, as surround-view systems mount them:
 // "front" and "rear" 0.8 m up at the bumpers, tilted down 30 degrees, "left"
 // and "right" 1 m up on the sides, tilted down 40 degrees.
 [[nodiscard]] CameraRig surround_rig(int width = 1280, int height = 720);
 
-// `count` pinhole cameras (kBrownConrady, mild barrel distortion) of
+// `count` pinhole cameras (plumb_bob, mild barrel distortion) of
 // `horizontal_fov_deg` across, looking outwards from a ring of `radius` metres
 // at 1 m height, evenly around, level; camera 0 looks along +x.
 [[nodiscard]] CameraRig ring_rig(int count, int width, int height, double horizontal_fov_deg,
@@ -73,7 +73,7 @@ struct RigPose {
 [[nodiscard]] OutputGeometry ground_view(int width, int height, double half_extent);
 
 // Renders what `camera` of a rig at `pose` sees, scaled by `gain` (an
-// exposure), into `image`: `camera.width` x `camera.height` in `format`,
+// exposure), into `image`: `camera.info.width` x `camera.info.height` in `format`,
 // `pitch` bytes per row, in CUDA device memory. Each pixel averages
 // `samples` x `samples` rays (1..8); pixels with no valid ray are black.
 [[nodiscard]] cudaError_t render_camera(const SyntheticWorld& world, const Camera& camera,
@@ -98,10 +98,10 @@ struct RigPose {
                                                   const OutputGeometry& geometry,
                                                   const RigPose& pose, double margin = 8.0);
 
-// Refines a checkerboard corner of a gray image near `guess`, as OpenCV's
-// cornerSubPix does: the point that every gradient within `radius` pixels is
-// orthogonal to. nullopt when the window holds too little gradient, leaves
-// the image, or the corner moves further than `radius` / 2.
+// Refines a checkerboard corner of a gray image near `guess` to sub-pixel
+// precision: the point that every gradient within `radius` pixels is
+// orthogonal to (least squares over the window). nullopt when the window holds too little gradient,
+// leaves the image, or the corner moves further than `radius` / 2.
 [[nodiscard]] std::optional<Point2> refine_corner(std::span<const float> gray, int width,
                                                   int height, Point2 guess, int radius = 5);
 

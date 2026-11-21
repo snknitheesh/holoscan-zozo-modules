@@ -66,14 +66,15 @@ inline RigFrame render_frame(const SyntheticWorld& world, const CameraRig& rig, 
   RigFrame frame;
   for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
     const Camera& camera = rig.cameras[c];
-    const std::size_t pitch = static_cast<std::size_t>(camera.width) * channels(format) + pad;
-    frame.buffers.emplace_back(pitch * camera.height);
+    const auto width = static_cast<int>(camera.info.width);
+    const auto height = static_cast<int>(camera.info.height);
+    const std::size_t pitch = static_cast<std::size_t>(width) * channels(format) + pad;
+    frame.buffers.emplace_back(pitch * height);
     const float gain = gains.empty() ? 1.0F : gains[c];
     cuda_check(render_camera(world, camera, pose, gain, format, frame.buffers.back().data(), pitch,
                              samples, nullptr),
                "render_camera");
-    frame.images.push_back(
-        DeviceImage{frame.buffers.back().data(), camera.width, camera.height, pitch, format});
+    frame.images.push_back(DeviceImage{frame.buffers.back().data(), width, height, pitch, format});
   }
   cuda_check(cudaDeviceSynchronize(), "render");
   for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
