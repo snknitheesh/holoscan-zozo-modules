@@ -93,7 +93,7 @@ enum Flag : std::uint32_t {
   kOverexposed = 1U << 3U,   // Too bright: mean luma or the bright fraction.
   kNoisy = 1U << 4U,         // Noise above max_noise_sigma.
   kFrozen = 1U << 5U,        // Identical or near identical to the previous frame.
-  kObstructed = 1U << 6U,    // A tile has stayed low-texture over obstruction_frames frames.
+  kObstructed = 1U << 6U,    // More than max_obstructed_tile_fraction of the tiles obstructed.
   kColorCast = 1U << 7U,     // Gray-world deviation above max_color_cast (color input only).
 };
 inline constexpr std::uint32_t kAllFlags = (1U << 8U) - 1U;
@@ -155,6 +155,11 @@ struct QualityThresholds {
   // have been seen.
   int obstruction_frames{30};
   double obstruction_fraction{1.0};
+  // Fraction of the tiles that may be obstructed without flagging the frame
+  // kObstructed. The default, 0, flags a frame for any obstructed tile, which is
+  // per-tile evidence: a static view of a genuinely flat area (sky, a blank wall)
+  // flags it too. A fixed camera can raise it above its view's flat share.
+  double max_obstructed_tile_fraction{0.0};
   // Gray-world deviation above which a color frame has a color cast.
   double max_color_cast{0.15};
 };

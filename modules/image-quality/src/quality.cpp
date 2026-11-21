@@ -171,6 +171,9 @@ void validate_thresholds(const QualityThresholds& t) {
   if (!(t.obstruction_fraction > 0 && t.obstruction_fraction <= 1)) {
     throw std::invalid_argument("obstruction_fraction must be in (0, 1]");
   }
+  if (!(t.max_obstructed_tile_fraction >= 0 && t.max_obstructed_tile_fraction < 1)) {
+    throw std::invalid_argument("max_obstructed_tile_fraction must be in [0, 1)");
+  }
   if (!finite_nonnegative(t.max_color_cast)) {
     throw std::invalid_argument("max_color_cast must be finite and non-negative");
   }
@@ -426,7 +429,8 @@ QualityReport QualityEvaluator::evaluate(const FrameStats& stats) {
   if (frozen_run_ >= static_cast<std::uint32_t>(t.frozen_frames)) {
     flags |= kFrozen;
   }
-  if (obstructed != 0) {
+  if (obstructed != 0 && static_cast<double>(obstructed) >
+                             t.max_obstructed_tile_fraction * static_cast<double>(tile_count)) {
     flags |= kObstructed;
   }
   report.flags = flags;

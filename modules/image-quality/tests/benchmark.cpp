@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 // SPDX-License-Identifier: Apache-2.0
 //
-// Time per frame of the GPU analyzer at 1920x1080 and 3840x2160 RGB8, from
-// device and from host memory: the kernels, the copy back, the stream wait and
-// the evaluation, as ImageQualityOp spends it. Fails only if a 1080p frame from
-// device memory takes longer than a 30 fps frame period on average.
+// Time per frame of ImageQualityAnalyzer::analyze() at 1920x1080 and 3840x2160
+// RGB8, from device and from host memory: the copy to the GPU (host input), the
+// kernels, the copy back, the stream wait and the evaluation. ImageQualityOp
+// adds its input checks and its outputs' allocations and copies, which this does
+// not time. Fails only if a 1080p frame from device memory takes longer than a
+// 30 fps frame period on average.
 
 #include <cuda_runtime_api.h>
 
@@ -36,7 +38,7 @@ Timing time_frames(iq::ImageQualityAnalyzer& analyzer, const iq::ImageView& imag
     const double elapsed =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     if (report.tiles.empty()) throw std::runtime_error("no report");
-    if (i >= 10) ms.push_back(elapsed);  // The first frames allocate.
+    if (i >= 10) ms.push_back(elapsed);  // The first frames warm up the GPU.
   }
   std::sort(ms.begin(), ms.end());
   Timing t;
@@ -66,15 +68,18 @@ int main() try {
   for (const auto& size : sizes) {
     const iq::HostImage image = iq::render_scene(size[0], size[1], 0);
     void* device_pixels = nullptr;
+    // On the legacy stream, which the non-blocking `stream` does not wait for:
+    // done before the timing starts.
     if (cudaMalloc(&device_pixels, image.pixels.size()) != cudaSuccess ||
         cudaMemcpy(device_pixels, image.pixels.data(), image.pixels.size(),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
       throw std::runtime_error("device copy failed");
     }
     iq::ImageView on_device = image.view();
     on_device.data = static_cast<const std::uint8_t*>(device_pixels);
     for (const bool from_device : {true, false}) {
-      iq::ImageQualityAnalyzer analyzer({}, {});
+      iq::ImageQualityAnalyzer analyzer({.reserve_width = size[0], .reserve_height = size[1]}, {});
       const Timing t =
           time_frames(analyzer, from_device ? on_device : image.view(), from_device, stream, 100);
       std::printf(

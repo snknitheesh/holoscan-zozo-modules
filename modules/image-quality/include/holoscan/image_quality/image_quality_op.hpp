@@ -34,6 +34,11 @@ struct ImageQualityConfig {
   int overlay_cell{16};
   // Least time between two warnings about failed frames; zero turns them off.
   std::chrono::milliseconds log_interval{5000};
+  // The largest image, in pixels, whose GPU buffers start() allocates, so that
+  // compute() allocates nothing for it; a larger image grows them on its first
+  // frame (logged once), which waits for the device. 0 x 0 allocates on the first frame.
+  int reserve_width{1920};
+  int reserve_height{1080};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -67,7 +72,9 @@ class ImageQualityOp final : public holoscan::Operator<> {
 
   // MONO8, RGB8, BGR8, RGBA8 or BGRA8, [H, W] or [H, W, channels], pixels packed
   // within each row, in host or CUDA device memory. Host images are copied to the
-  // GPU, which is logged once.
+  // GPU, which is logged once. Every output carries the image's capture time and
+  // frame id; an image without a capture time gives outputs stamped with the
+  // activation time and flagged SampleFlags::kDegraded.
   holoscan::Input<holoscan::schema::ImageT> image;
   // float32 [kMetricCount] in host memory, in Metric order.
   holoscan::Output<holoscan::Tensor> metrics;

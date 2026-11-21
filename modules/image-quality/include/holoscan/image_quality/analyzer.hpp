@@ -10,6 +10,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <memory>
 
 #include <holoscan/image_quality/quality.hpp>
@@ -21,11 +22,17 @@ struct AnalyzerOptions {
   // Blocks each tile is split into, along its rows; 0 picks enough to fill the
   // GPU. Any value gives the same statistics.
   int parts_per_tile{0};
+  // The image size, in pixels, whose buffers the constructor allocates, so that
+  // gather() allocates nothing for images up to it (from host memory too); 0 x 0
+  // allocates on the first frame. A larger image grows the buffers on the frame
+  // it arrives with: a cudaFree and a cudaMalloc, which wait for the device.
+  int reserve_width{0};
+  int reserve_height{0};
 };
 
 class GpuStats {
  public:
-  // Uses the current CUDA device.
+  // Uses the current CUDA device, and allocates the buffers for the reserved size.
   // @throws std::invalid_argument if `options` is not valid.
   // @throws std::runtime_error if CUDA fails.
   explicit GpuStats(AnalyzerOptions options);
@@ -45,9 +52,17 @@ class GpuStats {
   void reset() noexcept;
   // The blocks each tile is split into for an image of this size.
   [[nodiscard]] int parts_per_tile(int width, int height) const noexcept;
+  // Whether gather() allocates nothing for `image`.
+  [[nodiscard]] bool fits(const ImageView& image, bool on_device) const noexcept;
 
  private:
   struct Buffers;
+  // The bytes of the statistics copied back for a width x height image.
+  [[nodiscard]] std::size_t results_bytes(int width, int height) const noexcept;
+  // Grows the buffers to a width x height image, with a staging copy of `ch`
+  // channels per pixel (0 for none).
+  void reserve(int width, int height, int ch);
+
   AnalyzerOptions options_;
   int multiprocessors_{};
   std::unique_ptr<Buffers> buffers_;
@@ -63,6 +78,8 @@ class ImageQualityAnalyzer {
   // See GpuStats::gather.
   [[nodiscard]] QualityReport analyze(const ImageView& image, bool on_device, cudaStream_t stream);
   void reset() noexcept;
+  // See GpuStats::fits.
+  [[nodiscard]] bool fits(const ImageView& image, bool on_device) const noexcept;
 
  private:
   GpuStats stats_;

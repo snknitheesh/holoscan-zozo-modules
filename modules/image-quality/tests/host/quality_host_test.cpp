@@ -4,7 +4,9 @@
 // The CPU reference and the evaluator, without the SDK, CUDA or a GPU: every
 // accuracy case, and the evaluator's own rules.
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -47,6 +49,8 @@ void check_validation() {
   VERIFY(rejects([](QualityThresholds& t) { t.frozen_frames = 0; }));
   VERIFY(rejects([](QualityThresholds& t) { t.obstruction_frames = 0; }));
   VERIFY(rejects([](QualityThresholds& t) { t.obstruction_fraction = 0; }));
+  VERIFY(rejects([](QualityThresholds& t) { t.max_obstructed_tile_fraction = -0.1; }));
+  VERIFY(rejects([](QualityThresholds& t) { t.max_obstructed_tile_fraction = 1; }));
   VERIFY(!rejects([](QualityThresholds&) {}));
   VERIFY(throws<std::invalid_argument>([] { validate_stats_options({.tiles_x = 0}); }));
   VERIFY(throws<std::invalid_argument>([] { validate_stats_options({.flat_fraction = 0}); }));
@@ -100,6 +104,38 @@ void check_obstruction_fraction() {
   }
 }
 
+// The frame flag needs more than max_obstructed_tile_fraction of the tiles
+// obstructed; the tiles are flagged whatever it is.
+void check_max_obstructed_tile_fraction() {
+  // A moving scene on the right, a flat area over the left tiles and a little
+  // beyond, so that their stencils see no edge: 2 of 4 tiles low-texture.
+  const auto half_flat = [](std::uint32_t frame) {
+    HostImage image = render_scene(96, 96, frame, PixelFormat::kMono8);
+    for (int y = 0; y < 96; ++y) std::fill_n(image.pixels.data() + y * 96, 52, std::uint8_t{90});
+    return image;
+  };
+  for (const double limit : {0.0, 0.25, 0.5}) {
+    QualityThresholds t;
+    t.obstruction_frames = 3;
+    t.max_obstructed_tile_fraction = limit;
+    QualityEvaluator evaluator(t);
+    ReferenceStats stats({.tiles_x = 2, .tiles_y = 2});
+    QualityReport r;
+    for (std::uint32_t frame = 0; frame < 3; ++frame) {
+      r = evaluator.evaluate(stats.gather(half_flat(frame).view()));
+    }
+    const std::string what = "limit " + std::to_string(limit) + ": ";
+    VERIFY_MSG(r.metric(Metric::kObstructedTileFraction) == 0.5F,
+               what + "half the tiles, not " +
+                   std::to_string(r.metric(Metric::kObstructedTileFraction)) + " (" +
+                   flag_names(r.flags) + ")");
+    VERIFY_MSG((r.tile_flags(0, 0) & kTileObstructed) != 0U &&
+                   (r.tile_flags(1, 0) & kTileObstructed) == 0U,
+               what + "the flat tiles, and only those, obstructed");
+    VERIFY_MSG(((r.flags & kObstructed) != 0U) == (limit < 0.5), what + "the frame flag");
+  }
+}
+
 }  // namespace
 }  // namespace holoscan::image_quality::test
 
@@ -110,5 +146,6 @@ int main() {
   cases.push_back({"names", check_names});
   cases.push_back({"pitch", check_pitch});
   cases.push_back({"obstruction_fraction", check_obstruction_fraction});
+  cases.push_back({"max_obstructed_tile_fraction", check_max_obstructed_tile_fraction});
   return run(cases);
 }

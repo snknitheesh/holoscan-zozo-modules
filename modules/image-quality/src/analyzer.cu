@@ -47,6 +47,9 @@ static_assert(kHeaderBytes % alignof(TileStats) == 0);
 static_assert(std::is_trivially_copyable_v<TileStats>);
 // Most blocks a tile is split into.
 constexpr int kMaxParts = 64;
+// The largest reserved image side, and the most channels a host image has.
+constexpr int kMaxReserve = 16384;
+constexpr int kMaxChannels = 4;
 
 struct Geometry {
   int width;
@@ -352,6 +355,41 @@ GpuStats::GpuStats(AnalyzerOptions options)
   check(cudaGetDevice(&device), "cudaGetDevice");
   check(cudaDeviceGetAttribute(&multiprocessors_, cudaDevAttrMultiProcessorCount, device),
         "cudaDeviceGetAttribute");
+  if (options_.reserve_width < 0 || options_.reserve_height < 0 ||
+      options_.reserve_width > kMaxReserve || options_.reserve_height > kMaxReserve ||
+      (options_.reserve_width == 0) != (options_.reserve_height == 0)) {
+    throw std::invalid_argument("reserve_width and reserve_height must both be 0, or 1..16384");
+  }
+  if (options_.reserve_width > 0) {
+    reserve(options_.reserve_width, options_.reserve_height, kMaxChannels);
+  }
+}
+
+std::size_t GpuStats::results_bytes(int width, int height) const noexcept {
+  const TileGrid grid = tile_grid(width, height, options_.stats.tiles_x, options_.stats.tiles_y);
+  const auto parts = static_cast<std::size_t>(grid.tiles_x) * grid.tiles_y *
+                     static_cast<std::size_t>(parts_per_tile(width, height));
+  return kHeaderBytes + parts * sizeof(TileStats);
+}
+
+void GpuStats::reserve(int width, int height, int ch) {
+  Buffers& buf = *buffers_;
+  const auto pixels = static_cast<std::size_t>(width) * height;
+  buf.luma[0].reserve(pixels);
+  buf.luma[1].reserve(pixels);
+  buf.results.reserve(results_bytes(width, height));
+  buf.host.reserve(results_bytes(width, height));
+  buf.staging.reserve(pixels * static_cast<std::size_t>(ch));
+}
+
+bool GpuStats::fits(const ImageView& image, bool on_device) const noexcept {
+  const Buffers& buf = *buffers_;
+  const auto pixels = static_cast<std::size_t>(image.width) * image.height;
+  const std::size_t results = results_bytes(image.width, image.height);
+  const std::size_t staging =
+      on_device ? 0U : pixels * static_cast<std::size_t>(channels(image.format));
+  return buf.luma[0].bytes >= pixels && buf.luma[1].bytes >= pixels &&
+         buf.results.bytes >= results && buf.host.bytes >= results && buf.staging.bytes >= staging;
 }
 
 GpuStats::~GpuStats() = default;
@@ -379,21 +417,16 @@ FrameStats GpuStats::gather(const ImageView& image, bool on_device, cudaStream_t
   const TileGrid grid = tile_grid(width, height, options_.stats.tiles_x, options_.stats.tiles_y);
   const int parts = parts_per_tile(width, height);
   const int tiles = grid.tiles_x * grid.tiles_y;
-  const auto pixels = static_cast<std::size_t>(width) * height;
-  const std::size_t part_count = static_cast<std::size_t>(tiles) * parts;
-  const std::size_t results_bytes = kHeaderBytes + part_count * sizeof(TileStats);
+  const std::size_t results_bytes = this->results_bytes(width, height);
 
   const bool has_previous = buf.previous_width == width && buf.previous_height == height;
-  buf.luma[0].reserve(pixels);
-  buf.luma[1].reserve(pixels);
-  buf.results.reserve(results_bytes);
-  buf.host.reserve(results_bytes);
+  // Allocates only for an image larger than any before and than the reserved size.
+  reserve(width, height, on_device ? 0 : ch);
 
   const std::uint8_t* source = image.data;
   std::size_t pitch = image.pitch;
   if (!on_device) {
     const std::size_t row = static_cast<std::size_t>(width) * ch;
-    buf.staging.reserve(row * height);
     check(cudaMemcpy2DAsync(buf.staging.data, row, image.data, image.pitch, row, height,
                             cudaMemcpyHostToDevice, stream),
           "cudaMemcpy2DAsync");
@@ -463,6 +496,10 @@ ImageQualityAnalyzer::ImageQualityAnalyzer(AnalyzerOptions options, QualityThres
 QualityReport ImageQualityAnalyzer::analyze(const ImageView& image, bool on_device,
                                             cudaStream_t stream) {
   return evaluator_.evaluate(stats_.gather(image, on_device, stream));
+}
+
+bool ImageQualityAnalyzer::fits(const ImageView& image, bool on_device) const noexcept {
+  return stats_.fits(image, on_device);
 }
 
 void ImageQualityAnalyzer::reset() noexcept {

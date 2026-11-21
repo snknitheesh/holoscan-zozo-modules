@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <holoscan/core/payload_options.hpp>
+#include <holoscan/core/sample.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
 #include <holoscan/image_quality/analyzer.hpp>
@@ -125,6 +126,11 @@ void validate_config(const ImageQualityConfig& config) {
   if (config.log_interval.count() < 0) {
     throw std::invalid_argument("log_interval must not be negative");
   }
+  if (config.reserve_width < 0 || config.reserve_height < 0 || config.reserve_width > 16384 ||
+      config.reserve_height > 16384 ||
+      (config.reserve_width == 0) != (config.reserve_height == 0)) {
+    throw std::invalid_argument("reserve_width and reserve_height must both be 0, or 1..16384");
+  }
 }
 
 void draw_overlay(const QualityReport& report, int cell, std::uint8_t* rgba) {
@@ -167,6 +173,9 @@ struct ImageQualityOp::State {
   // For activations without a runtime CUDA stream; made on first use.
   std::unique_ptr<CUstream_st, StreamDestroy> own_stream;
   bool copy_logged{};
+  bool growth_logged{};
+  // The overlay's pixels, kept from frame to frame.
+  std::vector<std::uint8_t> overlay;
   // Failed frames, and the union of their flags, since the last warning.
   std::uint64_t frames{};
   std::uint64_t failed{};
@@ -211,10 +220,19 @@ holoscan::Contract ImageQualityOp::contract() const {
 
 void ImageQualityOp::start() {
   State& state = *state_;
-  // The analyzer allocates on the device this thread uses, so it is made here,
-  // not in the constructor.
-  state.analyzer = std::make_unique<ImageQualityAnalyzer>(AnalyzerOptions{.stats = config_.stats},
-                                                          config_.thresholds);
+  // The analyzer allocates its GPU buffers for reserve_width x reserve_height
+  // when it is made, on the device this thread uses: so here, not in the
+  // constructor, and not in compute() for images up to that size.
+  state.analyzer = std::make_unique<ImageQualityAnalyzer>(
+      AnalyzerOptions{.stats = config_.stats,
+                      .reserve_width = config_.reserve_width,
+                      .reserve_height = config_.reserve_height},
+      config_.thresholds);
+  if (config_.overlay_output) {
+    const auto cell = static_cast<std::size_t>(config_.overlay_cell);
+    state.overlay.reserve(static_cast<std::size_t>(config_.stats.tiles_x) * config_.stats.tiles_y *
+                          cell * cell * 4U);
+  }
   state.frames = state.failed = 0;
   state.failed_flags = 0;
   state.last_warning.reset();
@@ -277,6 +295,14 @@ holoscan::expected<void, holoscan::Error> ImageQualityOp::compute(
         "images to avoid the copy",
         bytes, static_cast<double>(bytes) / 1e6);
   }
+  if (!state.growth_logged && !state.analyzer->fits(input->view, input->on_device)) {
+    state.growth_logged = true;
+    HOLOSCAN_LOG_INFO(
+        "ImageQualityOp: a {}x{} image is larger than the reserved {}x{}, so its GPU buffers "
+        "are allocated now, which waits for the device; set reserve_width and reserve_height "
+        "to the largest image",
+        input->view.width, input->view.height, config_.reserve_width, config_.reserve_height);
+  }
 
   // The analyzer returns once the GPU is done, so nothing reads the image afterwards.
   QualityReport report;
@@ -290,11 +316,13 @@ holoscan::expected<void, holoscan::Error> ImageQualityOp::compute(
         std::string("ImageQualityOp: ") + error.what()});
   }
 
-  // The frame's capture time, so its outputs align with the image downstream;
-  // an unstamped image's outputs are stamped now.
+  // The frame's capture time, so its outputs align with the image downstream.
+  // An unstamped image's outputs are stamped now, which is not a capture time,
+  // so they are flagged degraded for a consumer to tell.
   holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*sample);
   if (!sample->metadata.source_clock_id.valid()) {
     emit.capture_time = context.activation_time();
+    emit.flags |= holoscan::SampleFlags::kDegraded;
   }
 
   // Allocates a host tensor on `output` and copies `bytes` into it.
@@ -347,7 +375,8 @@ holoscan::expected<void, holoscan::Error> ImageQualityOp::compute(
     const int cell = config_.overlay_cell;
     const int width = report.tiles_x * cell;
     const int height = report.tiles_y * cell;
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 4U);
+    std::vector<std::uint8_t>& pixels = state.overlay;
+    pixels.resize(static_cast<std::size_t>(width) * height * 4U);
     draw_overlay(report, cell, pixels.data());
     const std::array<std::int64_t, 3> overlay_shape{height, width, 4};
     auto overlay_loan = host_loan(overlay, overlay_shape, kUInt8, pixels.data());

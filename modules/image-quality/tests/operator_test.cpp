@@ -3,8 +3,9 @@
 //
 // ImageQualityOp on its own, through the SDK's operator test harness: the
 // metrics and flags of host and device images match the CPU reference's, the
-// optional tile and overlay outputs, provenance carried to every output, and
-// unusable inputs and configurations rejected.
+// optional tile and overlay outputs, provenance carried to every output (and an
+// unstamped image's outputs flagged degraded), and unusable inputs and
+// configurations rejected.
 
 #include <cuda_runtime_api.h>
 
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include <holoscan/core/domain/tensor.hpp>
+#include <holoscan/core/sample.hpp>
 #include <holoscan/image_quality/image_quality_op.hpp>
 #include <holoscan/image_quality/quality.hpp>
 #include <holoscan/image_quality/reference.hpp>
@@ -66,8 +68,11 @@ holoscan::schema::ImageT image_message(const HostImage& image, bool device) {
   if (!tensor) throw std::runtime_error(tensor.error().message);
   auto destination = tensor->mutable_data();
   if (!destination) throw std::runtime_error(destination.error().message);
+  // On the legacy stream, which the operator's non-blocking stream does not wait
+  // for: done before the tensor is handed over.
   if (cudaMemcpy(*destination, image.pixels.data(), image.pixels.size(), cudaMemcpyDefault) !=
-      cudaSuccess) {
+          cudaSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess) {
     throw std::runtime_error("cudaMemcpy failed");
   }
   holoscan::schema::ImageT message;
@@ -160,6 +165,7 @@ void check_frames(PixelFormat format, bool device, bool extra_outputs) {
       VERIFY_MSG(metadata->capture_timestamp_ns == capture_time(i).count() &&
                      metadata->frame_id == 70U + i,
                  what + ": provenance not carried");
+      VERIFY_MSG(metadata->flags == holoscan::SampleFlags::kNone, what + ": flagged degraded");
     }
   }
   if (!extra_outputs) return;
@@ -204,6 +210,93 @@ void check_overlay_colors() {
   VERIFY(second[3] == 0);
 }
 
+// An image without a capture time: its outputs are stamped with the activation
+// time and flagged degraded, and its metrics are still the reference's.
+void check_unstamped_image() {
+  const HostImage frame = render_scene(kWidth, kHeight, 0);
+  const std::vector<QualityReport> expected = expected_reports({frame}, ImageQualityConfig{});
+  auto h = holoscan::testing::create_operator_test<ImageQualityOp>(ImageQualityConfig{});
+  h.push("image", image_message(frame, false));
+  h.capture_snapshot<holoscan::Tensor>("metrics");
+  h.capture_snapshot<holoscan::Tensor>("flags");
+  const auto result = h.run();
+  VERIFY_MSG(result.ok(), result.describe_failure());
+  if (!result.ok()) return;
+  const auto metrics = result.snapshots<holoscan::Tensor>("metrics");
+  const auto flags = result.snapshots<holoscan::Tensor>("flags");
+  VERIFY(metrics.size() == 1 && flags.size() == 1);
+  if (metrics.size() != 1 || flags.size() != 1) return;
+  VERIFY(std::memcmp(metrics[0].bytes().data(), expected[0].metrics.data(),
+                     sizeof(expected[0].metrics)) == 0);
+  for (const auto* metadata : {&metrics[0].sample_metadata(), &flags[0].sample_metadata()}) {
+    VERIFY_MSG(
+        (metadata->flags & holoscan::SampleFlags::kDegraded) == holoscan::SampleFlags::kDegraded,
+        "an unstamped image's outputs are flagged degraded");
+    VERIFY_MSG(metadata->source_clock_id.valid(), "an unstamped image's outputs are stamped");
+  }
+}
+
+// A host tensor of zeros with this shape and element type, described as `encoding`.
+holoscan::schema::ImageT raw_image(const std::vector<std::int64_t>& shape, DLDataType dtype,
+                                   holoscan::schema::ImageEncoding encoding, int width,
+                                   int height) {
+  auto tensor =
+      holoscan::make_tensor(shape, dtype, std::nullopt, holoscan::MemoryStorageType::kHost,
+                            std::make_shared<holoscan::UnboundedAllocator>());
+  if (!tensor) throw std::runtime_error(tensor.error().message);
+  auto destination = tensor->mutable_data();
+  if (!destination) throw std::runtime_error(destination.error().message);
+  std::memset(*destination, 0, static_cast<std::size_t>(tensor->nbytes()));
+  holoscan::schema::ImageT message;
+  message.width = width;
+  message.height = height;
+  message.encoding = encoding;
+  message.data = std::make_shared<holoscan::Tensor>(std::move(*tensor));
+  return message;
+}
+
+// Images whose tensor does not match their description fail the run. The SDK
+// checks an ImageT's element type and rank against its encoding and size before
+// the operator sees it; the operator names what it rejects itself.
+void check_rejects_bad_images() {
+  constexpr DLDataType kUInt8{kDLUInt, 8, 1};
+  struct Case {
+    const char* what;
+    holoscan::schema::ImageT image;
+    // The operator's reason, or null where the SDK rejects the image first.
+    const char* reason;
+  };
+  const Case cases[] = {
+      {"16-bit pixels",
+       raw_image({kHeight, kWidth}, DLDataType{kDLUInt, 16, 1},
+                 holoscan::schema::ImageEncoding_MONO8, kWidth, kHeight),
+       nullptr},
+      {"four channels described as RGB8",
+       raw_image({kHeight, kWidth, 4}, kUInt8, holoscan::schema::ImageEncoding_RGB8, kWidth,
+                 kHeight),
+       "matching its encoding"},
+      {"a rank-2 color image",
+       raw_image({kHeight, kWidth}, kUInt8, holoscan::schema::ImageEncoding_RGB8, kWidth, kHeight),
+       nullptr},
+      {"a width other than the tensor's",
+       raw_image({kHeight, kWidth, 3}, kUInt8, holoscan::schema::ImageEncoding_RGB8, kWidth + 1,
+                 kHeight),
+       nullptr},
+  };
+  for (const Case& c : cases) {
+    auto h = holoscan::testing::create_operator_test<ImageQualityOp>(ImageQualityConfig{});
+    h.push("image", c.image);
+    h.capture_snapshot<holoscan::Tensor>("metrics");
+    h.capture_snapshot<holoscan::Tensor>("flags");
+    const auto result = h.run();
+    VERIFY_MSG(!result.ok(), std::string(c.what) + " is rejected");
+    if (c.reason != nullptr) {
+      VERIFY_MSG(result.describe_failure().find(c.reason) != std::string::npos,
+                 std::string(c.what) + ": " + result.describe_failure());
+    }
+  }
+}
+
 void check_rejects_unsupported_encoding() {
   auto h = holoscan::testing::create_operator_test<ImageQualityOp>(ImageQualityConfig{});
   holoscan::schema::ImageT image = image_message(render_scene(kWidth, kHeight, 0), false);
@@ -226,6 +319,10 @@ void check_rejects_config() {
   VERIFY(rejects([](ImageQualityConfig& c) { c.thresholds.obstruction_frames = 0; }));
   VERIFY(rejects([](ImageQualityConfig& c) { c.overlay_cell = 0; }));
   VERIFY(rejects([](ImageQualityConfig& c) { c.log_interval = std::chrono::milliseconds(-1); }));
+  VERIFY(rejects([](ImageQualityConfig& c) { c.reserve_width = 0; }));
+  VERIFY(rejects([](ImageQualityConfig& c) { c.reserve_height = 20000; }));
+  VERIFY(rejects([](ImageQualityConfig& c) { c.thresholds.max_obstructed_tile_fraction = 1; }));
+  VERIFY(!rejects([](ImageQualityConfig& c) { c.reserve_width = c.reserve_height = 0; }));
   VERIFY(!rejects([](ImageQualityConfig&) {}));
 }
 
@@ -249,7 +346,9 @@ int main() {
   cases.push_back({"frames with tiles and overlay device",
                    [] { iq::check_frames(PixelFormat::kRgba8, true, true); }});
   cases.push_back({"overlay colors", iq::check_overlay_colors});
+  cases.push_back({"unstamped image", iq::check_unstamped_image});
   cases.push_back({"rejects unsupported encoding", iq::check_rejects_unsupported_encoding});
+  cases.push_back({"rejects bad images", iq::check_rejects_bad_images});
   cases.push_back({"rejects config", iq::check_rejects_config});
   return holoscan::image_quality::test::run(cases);
 }
