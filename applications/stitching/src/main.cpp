@@ -3,12 +3,17 @@
 //
 // Stitching: four synthetic fisheye cameras on a rig that drives around a
 // checkered world; one StitchOp makes a bird's-eye surround view of the
-// ground, another a 360-degree panorama of the wall around the rig. HoloViz
-// shows the cameras and both outputs, in a window or rendered offscreen.
-// Headless and offscreen runs check every output against the ground truth
-// rendered directly from the world: PSNR and the checkerboards' corners.
+// ground, another a 360-degree panorama of the wall around the rig. Each
+// camera's calibration is written as a ROS camera_info file for the run and
+// sent by a CameraInfoSourceOp to both. HoloViz shows the cameras and both
+// outputs, in a window or rendered offscreen. Headless and offscreen runs
+// check every output against the ground truth rendered directly from the
+// world: PSNR and the checkerboards' corners.
+
+#include <stdlib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -35,6 +40,9 @@
 #include <holoscan/core/run.hpp>
 #include <holoscan/core/run_session.hpp>
 #include <holoscan/logger/logger.hpp>
+#include <holoscan/messages/camera_info_input.hpp>
+#include <holoscan/messages/camera_info_source_op.hpp>
+#include <holoscan/messages/camera_info_yaml.hpp>
 #include <holoscan/stitching/camera_rig.hpp>
 #include <holoscan/stitching/stitch_op.hpp>
 #include <holoscan/stitching/synthetic_world.hpp>
@@ -49,7 +57,9 @@
 namespace {
 
 using std::chrono_literals::operator""ms;
+namespace fs = std::filesystem;
 namespace app = stitching_app;
+namespace hm = holoscan::messages;
 namespace st = holoscan::stitching;
 
 constexpr std::string_view kAppName = "stitching";
@@ -62,7 +72,6 @@ constexpr int kTopHeight = 768;
 enum class Display { kAuto, kWindow, kOffscreen, kNone };
 
 struct Options {
-  std::filesystem::path rig_file;
   int camera_width{1280};
   int camera_height{720};
   int samples{3};
@@ -131,9 +140,7 @@ Options parse_args(int argc, char** argv) {
       throw std::invalid_argument("missing value for " + std::string(option));
     }
     const std::string_view value{argv[++i]};
-    if (option == "--rig") {
-      opts.rig_file = value;
-    } else if (option == "--camera-width") {
+    if (option == "--camera-width") {
       opts.camera_width = parse_number<int>(value, option);
     } else if (option == "--camera-height") {
       opts.camera_height = parse_number<int>(value, option);
@@ -191,14 +198,12 @@ void usage(const char* argv0) {
       << "Usage: " << argv0
       << " [options]\n"
          "Rig and world:\n"
-         "  --rig FILE                 A rig file (see the module's README) to render instead\n"
-         "                             of the built-in four-fisheye surround rig\n"
          "  --camera-width N --camera-height N\n"
-         "                             The built-in rig's image size (default: 1280x720)\n"
+         "                             The four fisheye cameras' image size (default: 1280x720)\n"
          "  --samples N                Rays per pixel along each side, 1..8 (default: 3)\n"
          "  --camera-gains G,G,...     Each camera's exposure (default: all 1)\n"
          "  --count N                  Frames, then stop (default: 60; with a window, until it\n"
-         "                             is closed)\n"
+         "                             is closed; offscreen, at least 2)\n"
          "  --period-ms N              The frame period, 1..1000 ms (default: 33)\n"
          "Stitching:\n"
          "  --panorama-width N --panorama-height N\n"
@@ -215,13 +220,10 @@ void usage(const char* argv0) {
          "                             auto is window with a display, else none\n"
          "  --image-dir DIR            With offscreen, also write each render as PPM there\n"
          "  --timeout-seconds N        Fail when no frame finishes for N seconds (default: 60)\n"
-         "  --compile-only true|false  Build and check the graph without running it\n";
+         "  --compile-only true|false  Build and check the graph, print its workers and exit\n";
 }
 
 st::CameraRig make_rig(const Options& opts) {
-  if (!opts.rig_file.empty()) {
-    return st::read_rig(opts.rig_file);
-  }
   return st::surround_rig(opts.camera_width, opts.camera_height);
 }
 
@@ -245,6 +247,14 @@ void validate(Options& opts) {
     if (*opts.count == 0) {
       throw std::invalid_argument("--count must be positive without a window");
     }
+    // HoloViz renders when the bird's-eye view arrives, with the newest of the
+    // other images; on one worker the panorama of the first frame comes after
+    // it, so the first render is the second frame's.
+    if (opts.display == Display::kOffscreen && *opts.count < 2) {
+      throw std::invalid_argument(
+          "--display offscreen needs --count 2 or more: HoloViz renders from the second frame "
+          "on, once every layer has had an image");
+    }
   }
   if (opts.timeout_seconds == 0) {
     throw std::invalid_argument("--timeout-seconds must be positive");
@@ -258,10 +268,11 @@ void validate(Options& opts) {
       throw std::invalid_argument("--image-dir is not a directory: " + opts.image_dir.string());
     }
   }
-  const st::CameraRig rig = make_rig(opts);
-  if (opts.display != Display::kNone && rig.cameras.size() > 6) {
-    throw std::invalid_argument("HoloViz shows up to 6 cameras with the two outputs");
+  if (opts.camera_width < 16 || opts.camera_height < 16 || opts.camera_width > 4096 ||
+      opts.camera_height > 4096) {
+    throw std::invalid_argument("the camera size must be 16x16 to 4096x4096");
   }
+  const st::CameraRig rig = make_rig(opts);
   app::validate_config(app::RigSourceConfig{.rig = rig,
                                             .gains = opts.camera_gains,
                                             .period = std::chrono::milliseconds(opts.period_ms),
@@ -296,18 +307,65 @@ app::Tile fit(int x, int y, int width, int height, double aspect) {
   const int cell_width = (kRenderWidth - kTopHeight) / 2;
   const int cell_height = kTopHeight / rows;
   for (int i = 0; i < n; ++i) {
-    const st::Camera& camera = rig.cameras[i];
+    const hm::CameraInfo& camera = rig.cameras[i].info;
     tiles.push_back(fit(kTopHeight + (i % 2) * cell_width, (i / 2) * cell_height, cell_width,
                         cell_height, static_cast<double>(camera.width) / camera.height));
   }
   return tiles;
 }
 
+// A folder for the camera_info files, which mkdtemp() names unpredictably
+// and makes private; removed with everything in it on every path out of the
+// run.
+class TemporaryFolder {
+ public:
+  TemporaryFolder() {
+    std::string pattern = (fs::temp_directory_path() / "holoscan_stitching_demo_XXXXXX").string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(),
+                              "cannot make a temporary folder for the camera_info files");
+    }
+    path_ = pattern;
+  }
+  ~TemporaryFolder() {
+    std::error_code ignored;
+    fs::remove_all(path_, ignored);
+  }
+  TemporaryFolder(const TemporaryFolder&) = delete;
+  TemporaryFolder& operator=(const TemporaryFolder&) = delete;
+  [[nodiscard]] const fs::path& path() const noexcept { return path_; }
+
+ private:
+  fs::path path_;
+};
+
 using SignalDomain = holoscan::expected<holoscan::ManagedShutdownSignals, holoscan::Error>;
+
+// Closes the signal domain, if there is one, on every way out of main().
+class CloseSignals {
+ public:
+  explicit CloseSignals(SignalDomain& signals) noexcept : signals_(signals) {}
+  ~CloseSignals() {
+    if (!signals_) return;
+    if (auto closed = signals_->close(); !closed) {
+      std::cerr << kAppName << ": warning: closing the signal domain failed: "
+                << holoscan::runtime_error_message(closed.error()) << '\n';
+    }
+  }
+  CloseSignals(const CloseSignals&) = delete;
+  CloseSignals& operator=(const CloseSignals&) = delete;
+
+ private:
+  SignalDomain& signals_;
+};
 
 int execute(const Options& opts, SignalDomain& signals) {
   holoscan::Graph graph{std::string(kAppName)};
+  // The synthetic rig renders the world. StitchOp gets its calibration only
+  // from the camera_info files written here, which the run reads again when
+  // it starts: they stay until it is over.
   const st::CameraRig rig = make_rig(opts);
+  const TemporaryFolder folder;
   const st::SyntheticWorld world;
   const st::OutputGeometry birds_eye =
       st::ground_view(opts.birds_eye_size, opts.birds_eye_size, opts.birds_eye_extent);
@@ -334,12 +392,16 @@ int execute(const Options& opts, SignalDomain& signals) {
   blend.mode = opts.blend;
   blend.feather_width = opts.feather_width;
   blend.exposure_compensation = opts.exposure;
+  std::vector<st::RigidTransform> poses;
+  for (const st::Camera& camera : rig.cameras) poses.push_back(camera.camera_from_rig);
   auto stitch_birds_eye = graph.op<st::StitchOp>(
       "birds_eye",
-      st::StitchConfig{.rig = rig, .output = birds_eye, .blend = blend, .frame_id = "rig"});
+      st::StitchConfig{
+          .camera_from_rig = poses, .output = birds_eye, .blend = blend, .frame_id = "rig"});
   auto stitch_panorama = graph.op<st::StitchOp>(
       "panorama",
-      st::StitchConfig{.rig = rig, .output = panorama, .blend = blend, .frame_id = "rig"});
+      st::StitchConfig{
+          .camera_from_rig = poses, .output = panorama, .blend = blend, .frame_id = "rig"});
 
   const holoscan::ConnectionOptions lossless{.queue_policy = holoscan::QueuePolicy::kBlocking};
   const holoscan::ConnectionOptions newest{.queue_policy = holoscan::QueuePolicy::kDropOldest,
@@ -348,6 +410,16 @@ int execute(const Options& opts, SignalDomain& signals) {
   for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
     graph.add_flow(source->images[c], stitch_birds_eye->images[c], edge);
     graph.add_flow(source->images[c], stitch_panorama->images[c], edge);
+    // Camera c's calibration, read from its camera_info file and sent to
+    // both stitchers once a second; they keep the newest.
+    const fs::path file = folder.path() / (rig.cameras[c].info.header.frame_id + ".yaml");
+    hm::write_camera_info_yaml(rig.cameras[c].info, file);
+    auto info = graph.op<hm::CameraInfoSourceOp>(
+        "camera_info_" + std::to_string(c), hm::CameraInfoSourceConfig{.camera_info_path = file});
+    graph.add_flow(info->camera_info, stitch_birds_eye->camera_info[c],
+                   hm::latest_camera_info_connection());
+    graph.add_flow(info->camera_info, stitch_panorama->camera_info[c],
+                   hm::latest_camera_info_connection());
   }
   if (!live) {
     auto check = graph.op<app::StitchCheckOp>(
@@ -374,8 +446,8 @@ int execute(const Options& opts, SignalDomain& signals) {
                                               .output_port = std::move(port),
                                               .device = holoscan::DeviceId{0}});
   };
-  for (const st::Camera& camera : rig.cameras) {
-    on_gpu("cameras", camera.name);
+  for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
+    on_gpu("cameras", "image_" + std::to_string(c));
   }
   on_gpu("birds_eye", "stitched");
   on_gpu("panorama", "stitched");
@@ -401,7 +473,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     add_layer("birds_eye", birds_eye.width, birds_eye.height, tiles[0]);
     add_layer("panorama", panorama.width, panorama.height, tiles[1]);
     for (std::size_t c = 0; c < rig.cameras.size(); ++c) {
-      add_layer(rig.cameras[c].name, rig.cameras[c].width, rig.cameras[c].height, tiles[2 + c]);
+      add_layer("camera_" + std::to_string(c), static_cast<int>(rig.cameras[c].info.width),
+                static_cast<int>(rig.cameras[c].info.height), tiles[2 + c]);
     }
     viz::SinkDesc sink = viz::WindowSinkDesc{
         .title = "Stitching", .width = kRenderWidth / 2, .height = kRenderHeight / 2};
@@ -431,6 +504,14 @@ int execute(const Options& opts, SignalDomain& signals) {
     }
   }
 #endif
+  // Lossless runs (every frame checked) on one worker: with a source per
+  // camera's calibration besides the cameras, the automatic partitioning
+  // would give each source, each stitcher, the check and HoloViz a worker,
+  // and a source could then find its consumers' queues or output pool full.
+  // A live window keeps the automatic partitioning and its newest-frame edges.
+  if (!live) {
+    graph.partition(std::string(kAppName)).include_all();
+  }
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   const auto plan = holoscan::compile(graph, std::move(compile_options));
@@ -441,7 +522,8 @@ int execute(const Options& opts, SignalDomain& signals) {
     return 1;
   }
   if (opts.compile_only) {
-    std::cout << kAppName << ": plan=OK\n";
+    // The workers the graph runs on: one per partition that runs operators.
+    std::cout << kAppName << ": plan=OK workers=" << plan.scheduler_plan().worker_count << '\n';
     return 0;
   }
   if (!signals) {
@@ -458,11 +540,13 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::this_thread::sleep_for(10ms);
     const auto now = std::chrono::steady_clock::now();
     if (!live && finished() >= frames) {
-      // HoloViz renders the last frames a little later: wait until the
-      // renders stop coming, for at most two seconds.
+      // HoloViz renders the last frames a little later (from the second frame
+      // on): wait until there is a render and they stop coming, for at most
+      // --timeout-seconds.
       if (offscreen) {
+        const auto give_up = now + std::chrono::seconds(opts.timeout_seconds);
         std::uint32_t renders = report->rendered.load();
-        for (int i = 0; i < 20; ++i) {
+        while (std::chrono::steady_clock::now() < give_up) {
           std::this_thread::sleep_for(100ms);
           const std::uint32_t now_rendered = report->rendered.load();
           if (now_rendered == renders && renders != 0) break;
@@ -493,12 +577,6 @@ int execute(const Options& opts, SignalDomain& signals) {
   if (!session.diagnostics().empty() && !sdk_reported && !all_checked) {
     std::cerr << holoscan::format_diagnostics(session.diagnostics(), plan.graph()) << '\n';
   }
-  if (signals) {
-    if (auto closed = signals->close(); !closed) {
-      std::cerr << kAppName << ": warning: closing the signal domain failed: "
-                << holoscan::runtime_error_message(closed.error()) << '\n';
-    }
-  }
 
   std::cout << kAppName << ": " << rig.cameras.size() << " cameras, birds_eye " << birds_eye.width
             << 'x' << birds_eye.height << ", " << st::projection_name(panorama.projection) << ' '
@@ -506,8 +584,13 @@ int execute(const Options& opts, SignalDomain& signals) {
             << st::blend_mode_name(opts.blend)
             << (opts.exposure ? " with exposure compensation" : "") << '\n';
   if (live) {
+    // Closed, interrupted, or done with --count: anything but a failure.
     const bool stopped = termination == holoscan::RunTermination::kStopped ||
-                         termination == holoscan::RunTermination::kRequestedCompleted;
+                         termination == holoscan::RunTermination::kRequestedCompleted ||
+                         termination == holoscan::RunTermination::kCompleted;
+    if (!stopped) {
+      std::cout << kAppName << ": failure: the run failed (see its diagnostics above)\n";
+    }
     std::cout << kAppName << ": verdict=" << (stopped ? "STOPPED" : "FAIL") << '\n';
     return stopped ? 0 : 1;
   }
@@ -531,6 +614,18 @@ int execute(const Options& opts, SignalDomain& signals) {
     std::cout << '\n';
     if (!report->first_failure.empty()) {
       std::cout << kAppName << ": first failure: " << report->first_failure << '\n';
+    } else if (!passed) {
+      // No check failed: say what else did.
+      std::cout << kAppName << ": failure: "
+                << (timed_out
+                        ? "no frame finished for " + std::to_string(opts.timeout_seconds) + " s"
+                    : termination == holoscan::RunTermination::kFailed
+                        ? std::string("the run failed (see its diagnostics above)")
+                    : !all_checked
+                        ? "the run ended after " + std::to_string(report->frames.load()) + " of " +
+                              std::to_string(frames) + " frames"
+                        : std::string("HoloViz rendered nothing"))
+                << '\n';
     }
   }
   std::cout << kAppName << ": verdict=" << (passed ? "PASS" : "FAIL") << '\n';
@@ -542,6 +637,7 @@ int execute(const Options& opts, SignalDomain& signals) {
 int main(int argc, char** argv) {
   // Before any other thread, so that the SDK can own SIGINT and SIGTERM.
   SignalDomain signals = holoscan::ManagedShutdownSignals::create();
+  const CloseSignals close_signals(signals);
   Options opts;
   try {
     opts = parse_args(argc, argv);

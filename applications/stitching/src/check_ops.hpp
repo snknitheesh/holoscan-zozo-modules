@@ -4,10 +4,13 @@
 // The demo's checks: StitchCheckOp compares each frame's bird's-eye view and
 // panorama with the ground truth rendered directly from the synthetic world
 // (PSNR and the checkerboards' corners); RenderCheckOp checks HoloViz's
-// offscreen renders and can write them as PPM.
+// offscreen renders and can write them as PPM. Each copies what it checks to
+// pinned host buffers made in start(), on the operator's CUDA stream, and
+// waits once per frame.
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -65,6 +68,8 @@ struct Thresholds {
 
 struct StitchCheckConfig {
   std::shared_ptr<Report> report;
+  // The rig the world was rendered with: where its cameras resolve the
+  // outputs well enough to place a corner.
   holoscan::stitching::CameraRig rig;
   holoscan::stitching::SyntheticWorld world;
   holoscan::stitching::OutputGeometry birds_eye;
@@ -77,9 +82,14 @@ struct StitchCheckConfig {
 class StitchCheckOp final : public holoscan::Operator<> {
  public:
   explicit StitchCheckOp(StitchCheckConfig config);
+  ~StitchCheckOp() override;
+  StitchCheckOp(const StitchCheckOp&) = delete;
+  StitchCheckOp& operator=(const StitchCheckOp&) = delete;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  // Allocates the buffers and computes where the cameras resolve the outputs.
+  void start() override;
   void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
@@ -88,9 +98,15 @@ class StitchCheckOp final : public holoscan::Operator<> {
   holoscan::Input<holoscan::schema::ImageT> panorama;
 
  private:
+  void release() noexcept;
+
   StitchCheckConfig config_;
-  void* truth_{};  // Device memory for the truth renders.
-  // resolution_map() of each output, made at the first frame.
+  // Per output (bird's-eye view, panorama): the truth in device memory, and
+  // the stitch and the truth in pinned host memory.
+  std::array<void*, 2> truth_device_{};
+  std::array<void*, 2> stitched_host_{};
+  std::array<void*, 2> truth_host_{};
+  // resolution_map() of each output.
   std::vector<float> birds_eye_resolution_;
   std::vector<float> panorama_resolution_;
 };
@@ -118,9 +134,14 @@ struct RenderCheckConfig {
 class RenderCheckOp final : public holoscan::Operator<> {
  public:
   explicit RenderCheckOp(RenderCheckConfig config);
+  ~RenderCheckOp() override;
+  RenderCheckOp(const RenderCheckOp&) = delete;
+  RenderCheckOp& operator=(const RenderCheckOp&) = delete;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  void start() override;
+  void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
@@ -128,6 +149,7 @@ class RenderCheckOp final : public holoscan::Operator<> {
 
  private:
   RenderCheckConfig config_;
+  void* pixels_{};  // Pinned host memory for a render.
 };
 
 }  // namespace stitching_app

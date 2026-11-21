@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 zozo
 # SPDX-License-Identifier: Apache-2.0
 
-# The stitching demo, built against the INSTALLED holoscan-stitching package, as any other
-# project would use it: put the module's install prefix on CMAKE_PREFIX_PATH.
+# The stitching demo, built against the INSTALLED holoscan-stitching and holoscan-messages
+# packages, as any other project would use them: put their install prefix on
+# CMAKE_PREFIX_PATH.
 cmake_minimum_required(VERSION 4.0)
 project(stitching_app LANGUAGES CXX)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -15,6 +16,7 @@ if(STITCHING_APP_ENABLE_VISUALIZATION)
   list(APPEND _holoscan_components visualization)
 endif()
 find_package(holoscan 5.0 REQUIRED CONFIG COMPONENTS ${_holoscan_components})
+find_package(holoscan-messages 1.0 REQUIRED CONFIG)
 find_package(holoscan-stitching 1.0 REQUIRED CONFIG)
 find_package(CUDAToolkit REQUIRED)
 
@@ -24,7 +26,7 @@ target_compile_features(stitching_app_ops PUBLIC cxx_std_20)
 target_include_directories(stitching_app_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   stitching_app_ops
-  PUBLIC holoscan::stitching holoscan::core holoscan::sensor_io CUDA::cudart
+  PUBLIC holoscan::stitching holoscan::messages holoscan::core holoscan::sensor_io CUDA::cudart
 )
 
 add_executable(stitching src/main.cpp)

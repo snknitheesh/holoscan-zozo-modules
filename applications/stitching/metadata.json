@@ -50,6 +50,9 @@
     "dependencies": {
       "modules": [
         {
+          "name": "messages"
+        },
+        {
           "name": "stitching"
         }
       ]

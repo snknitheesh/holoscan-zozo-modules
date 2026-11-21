@@ -37,15 +37,35 @@ stitching_app_test(stitching_app_rejects_blend 2 "^error: --blend" --blend multi
 stitching_app_test(stitching_app_rejects_gains 2 "^error: give one camera gain per camera"
   --camera-gains 1,1 --display none
 )
-stitching_app_test(stitching_app_rejects_missing_rig 2 "^error: .*cannot read"
-  --rig /nonexistent/rig.json --display none
+stitching_app_test(stitching_app_rejects_camera_size 2 "^error: the camera size"
+  --camera-width 8 --display none
 )
 stitching_app_test(stitching_app_rejects_zero_count 2 "^error: " --count 0 --display none)
+stitching_app_test(stitching_app_rejects_old_rig_option 2 "^error: unknown option: --rig"
+  --rig rig.json --display none
+)
+
+# Every frame is checked, so the headless graph runs on one worker.
+stitching_app_test(stitching_app_one_worker 0 "plan=OK workers=1"
+  --display none --compile-only true
+)
 
 if(STITCHING_APP_ENABLE_VISUALIZATION)
   # HoloViz renders offscreen into CUDA memory; every render is checked.
   stitching_app_test(stitching_app_offscreen 0 "renders=[1-9][0-9]*.*verdict=PASS"
     --count 10 --period-ms 5 --display offscreen
+  )
+  # Two frames, the fewest that render: the run waits for HoloViz's render.
+  stitching_app_test(stitching_app_offscreen_two_frames 0 "frames=2/2 .*renders=1.*verdict=PASS"
+    --count 2 --display offscreen
+  )
+  # One frame never renders, and is refused.
+  stitching_app_test(stitching_app_rejects_offscreen_one_frame 2
+    "^error: --display offscreen needs --count 2" --count 1 --display offscreen
+  )
+  # With HoloViz, still one worker.
+  stitching_app_test(stitching_app_offscreen_one_worker 0 "plan=OK workers=1"
+    --display offscreen --compile-only true
   )
   # The window graph compiles, with or without a display to run it.
   stitching_app_test(stitching_app_window_plan 0 "plan=OK"

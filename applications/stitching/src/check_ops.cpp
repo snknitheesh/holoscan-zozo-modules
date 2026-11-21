@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,23 +34,24 @@ holoscan::Error failure(const std::string& what) {
   return holoscan::Error{holoscan::ErrorCode::kFailure, "check: " + what};
 }
 
-// An image's bytes copied to the host, after checking its size.
-holoscan::expected<std::vector<std::uint8_t>, holoscan::Error> fetch(
-    const holoscan::schema::ImageT& image, int width, int height, int channels,
-    holoscan::ExecutionContext& context, const char* what) {
+// Queues the copy of an image's bytes to `host` on `stream`, after checking
+// its size.
+holoscan::expected<void, holoscan::Error> fetch(const holoscan::schema::ImageT& image, int width,
+                                                int height, int channels, void* host,
+                                                cudaStream_t stream, const char* what) {
   const std::size_t bytes = static_cast<std::size_t>(width) * height * channels;
-  if (!image.data || image.width != width || image.height != height ||
+  if (!image.data || image.width != static_cast<std::uint32_t>(width) ||
+      image.height != static_cast<std::uint32_t>(height) ||
       static_cast<std::size_t>(image.data->nbytes()) != bytes) {
     return holoscan::make_unexpected(failure(std::string("the ") + what + " image is not " +
                                              std::to_string(width) + "x" + std::to_string(height) +
                                              " packed"));
   }
-  std::vector<std::uint8_t> host(bytes);
-  if (auto copied = image.data->copy_to_host(host.data(), host.size(), context.cuda_stream());
-      !copied) {
-    return holoscan::make_unexpected(std::move(copied).error());
-  }
-  return host;
+  return image.data->copy_to_host_async(host, bytes, stream);
+}
+
+std::size_t rgba_bytes(const st::OutputGeometry& g) {
+  return static_cast<std::size_t>(g.width) * g.height * 4U;
 }
 
 void keep_worst(Worst& worst, const st::Comparison& c) {
@@ -71,6 +74,8 @@ std::string describe(const char* what, const st::Comparison& c) {
 
 StitchCheckOp::StitchCheckOp(StitchCheckConfig config) : config_(std::move(config)) {}
 
+StitchCheckOp::~StitchCheckOp() { release(); }
+
 void StitchCheckOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(birds_eye, "birds_eye").queue_depth(2U);
   spec.input(panorama, "panorama").queue_depth(2U);
@@ -86,12 +91,40 @@ holoscan::Contract StitchCheckOp::contract() const {
   return result;
 }
 
-void StitchCheckOp::stop() {
-  if (truth_ != nullptr) {
-    cudaFree(truth_);
-    truth_ = nullptr;
+void StitchCheckOp::release() noexcept {
+  for (std::size_t i = 0; i < 2; ++i) {
+    if (truth_device_[i] != nullptr) cudaFree(truth_device_[i]);
+    if (stitched_host_[i] != nullptr) cudaFreeHost(stitched_host_[i]);
+    if (truth_host_[i] != nullptr) cudaFreeHost(truth_host_[i]);
+    truth_device_[i] = stitched_host_[i] = truth_host_[i] = nullptr;
   }
 }
+
+void StitchCheckOp::start() {
+  release();
+  const std::array<const st::OutputGeometry*, 2> outputs{&config_.birds_eye, &config_.panorama};
+  for (std::size_t i = 0; i < 2; ++i) {
+    const std::size_t bytes = rgba_bytes(*outputs[i]);
+    if (cudaMalloc(&truth_device_[i], bytes) != cudaSuccess ||
+        cudaMallocHost(&stitched_host_[i], bytes) != cudaSuccess ||
+        cudaMallocHost(&truth_host_[i], bytes) != cudaSuccess) {
+      release();
+      throw std::runtime_error("StitchCheckOp: out of memory for the check's buffers");
+    }
+  }
+  // Where the cameras resolve the outputs well enough to place a corner: from
+  // the tables, built once on the GPU and released.
+  {
+    const st::Stitcher tables(config_.rig, config_.birds_eye, st::BlendSettings{});
+    birds_eye_resolution_ = st::resolution_map(tables.download_tables());
+  }
+  {
+    const st::Stitcher tables(config_.rig, config_.panorama, st::BlendSettings{});
+    panorama_resolution_ = st::resolution_map(tables.download_tables());
+  }
+}
+
+void StitchCheckOp::stop() { release(); }
 
 holoscan::expected<void, holoscan::Error> StitchCheckOp::compute(
     holoscan::ExecutionContext& context) {
@@ -106,23 +139,11 @@ holoscan::expected<void, holoscan::Error> StitchCheckOp::compute(
   if (bev->metadata.frame_id == 0 || bev->metadata.frame_id != pano->metadata.frame_id) {
     return holoscan::make_unexpected(failure("the two outputs are not of one frame"));
   }
+  if (truth_device_[0] == nullptr) {
+    return holoscan::make_unexpected(failure("compute() before start()"));
+  }
   const auto frame = static_cast<std::uint32_t>(bev->metadata.frame_id - 1U);
   const st::RigPose pose = frame_pose(frame);
-  const std::size_t largest =
-      std::max(static_cast<std::size_t>(config_.birds_eye.width) * config_.birds_eye.height,
-               static_cast<std::size_t>(config_.panorama.width) * config_.panorama.height) *
-      4U;
-  if (truth_ == nullptr && cudaMalloc(&truth_, largest) != cudaSuccess) {
-    truth_ = nullptr;
-    return holoscan::make_unexpected(failure("cudaMalloc failed"));
-  }
-  if (birds_eye_resolution_.empty()) {
-    // Where the cameras resolve the outputs well enough to place a corner.
-    const st::Stitcher bev_tables(config_.rig, config_.birds_eye, st::BlendSettings{});
-    const st::Stitcher pano_tables(config_.rig, config_.panorama, st::BlendSettings{});
-    birds_eye_resolution_ = st::resolution_map(bev_tables.download_tables());
-    panorama_resolution_ = st::resolution_map(pano_tables.download_tables());
-  }
   struct Output {
     const holoscan::schema::ImageT* image;
     const st::OutputGeometry* geometry;
@@ -131,28 +152,42 @@ holoscan::expected<void, holoscan::Error> StitchCheckOp::compute(
     const std::vector<float>* resolution;
   };
   const Thresholds& t = config_.thresholds;
-  std::string failed;
-  st::Comparison results[2];
-  int index = 0;
-  for (const Output& out : {Output{&bev->data, &config_.birds_eye, "birds_eye", t.birds_eye_psnr_db,
-                                   &birds_eye_resolution_},
-                            Output{&pano->data, &config_.panorama, "panorama", t.panorama_psnr_db,
-                                   &panorama_resolution_}}) {
-    const st::OutputGeometry& g = *out.geometry;
-    auto stitched = fetch(*out.image, g.width, g.height, 4, context, out.name);
-    if (!stitched) {
-      return holoscan::make_unexpected(std::move(stitched).error());
-    }
+  const std::array<Output, 2> outputs{Output{&bev->data, &config_.birds_eye, "birds_eye",
+                                             t.birds_eye_psnr_db, &birds_eye_resolution_},
+                                      Output{&pano->data, &config_.panorama, "panorama",
+                                             t.panorama_psnr_db, &panorama_resolution_}};
+  // Both outputs and their truths to the host on this operator's stream; one
+  // wait for all four copies.
+  cudaStream_t stream = context.cuda_stream().get();
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    const st::OutputGeometry& g = *outputs[i].geometry;
     const std::size_t pitch = static_cast<std::size_t>(g.width) * 4U;
-    std::vector<std::uint8_t> truth(pitch * g.height);
-    if (st::render_truth(config_.world, g, pose, truth_, pitch, 2, nullptr) != cudaSuccess ||
-        cudaMemcpy(truth.data(), truth_, truth.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (auto fetched = fetch(*outputs[i].image, g.width, g.height, 4, stitched_host_[i], stream,
+                             outputs[i].name);
+        !fetched) {
+      return fetched;
+    }
+    if (st::render_truth(config_.world, g, pose, truth_device_[i], pitch, 2, stream) !=
+            cudaSuccess ||
+        cudaMemcpyAsync(truth_host_[i], truth_device_[i], rgba_bytes(g), cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
       return holoscan::make_unexpected(failure("rendering the truth failed"));
     }
-    const st::Comparison c =
-        st::compare_with_truth(stitched->data(), pitch, truth.data(), pitch, g.width, g.height,
-                               st::checker_corners(config_.world, g, pose), 2, *out.resolution);
-    results[index++] = c;
+  }
+  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+    return holoscan::make_unexpected(failure(cudaGetErrorString(status)));
+  }
+  std::string failed;
+  std::array<st::Comparison, 2> results{};
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    const Output& out = outputs[i];
+    const st::OutputGeometry& g = *out.geometry;
+    const std::size_t pitch = static_cast<std::size_t>(g.width) * 4U;
+    const st::Comparison c = st::compare_with_truth(
+        static_cast<const std::uint8_t*>(stitched_host_[i]), pitch,
+        static_cast<const std::uint8_t*>(truth_host_[i]), pitch, g.width, g.height,
+        st::checker_corners(config_.world, g, pose), 2, *out.resolution);
+    results[i] = c;
     if (c.psnr_db < out.min_psnr || c.coverage < t.coverage ||
         c.max_corner_error > t.corner_error_px || std::abs(c.gain - 1.0) > t.gain_error ||
         c.corners < t.corners) {
@@ -176,6 +211,24 @@ holoscan::expected<void, holoscan::Error> StitchCheckOp::compute(
 
 RenderCheckOp::RenderCheckOp(RenderCheckConfig config) : config_(std::move(config)) {}
 
+RenderCheckOp::~RenderCheckOp() { stop(); }
+
+void RenderCheckOp::start() {
+  stop();
+  const std::size_t bytes = static_cast<std::size_t>(config_.width) * config_.height * 4U;
+  if (cudaMallocHost(&pixels_, bytes) != cudaSuccess) {
+    pixels_ = nullptr;
+    throw std::runtime_error("RenderCheckOp: out of memory for a render");
+  }
+}
+
+void RenderCheckOp::stop() {
+  if (pixels_ != nullptr) {
+    cudaFreeHost(pixels_);
+    pixels_ = nullptr;
+  }
+}
+
 void RenderCheckOp::setup(holoscan::OperatorSpec& spec) {
   spec.input(rendered, "rendered").queue_depth(1U);
 }
@@ -192,10 +245,21 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
   if (!render) {
     return holoscan::make_unexpected(std::move(render).error());
   }
-  auto pixels = fetch(render->data, config_.width, config_.height, 4, context, "render");
-  if (!pixels) {
-    return holoscan::make_unexpected(std::move(pixels).error());
+  if (pixels_ == nullptr) {
+    return holoscan::make_unexpected(failure("compute() before start()"));
   }
+  cudaStream_t stream = context.cuda_stream().get();
+  if (auto fetched =
+          fetch(render->data, config_.width, config_.height, 4, pixels_, stream, "render");
+      !fetched) {
+    return fetched;
+  }
+  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+    return holoscan::make_unexpected(failure(cudaGetErrorString(status)));
+  }
+  const std::span<const std::uint8_t> render_bytes(
+      static_cast<const std::uint8_t*>(pixels_),
+      static_cast<std::size_t>(config_.width) * config_.height * 4U);
   const std::uint32_t number = config_.report->rendered.load();
   // Every tile shows a picture: its luminance varies.
   std::string failed;
@@ -207,7 +271,7 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
     for (int y = tile.y + 2; y < tile.y + tile.height - 2; y += 2) {
       for (int x = tile.x + 2; x < tile.x + tile.width - 2; x += 2) {
         const std::uint8_t* p =
-            pixels->data() + (static_cast<std::size_t>(y) * config_.width + x) * 4U;
+            render_bytes.data() + (static_cast<std::size_t>(y) * config_.width + x) * 4U;
         const double l = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
         sum += l;
         squares += l * l;
@@ -225,8 +289,8 @@ holoscan::expected<void, holoscan::Error> RenderCheckOp::compute(
     std::snprintf(name, sizeof(name), "render_%06u.ppm", number);
     std::ofstream file(config_.image_dir / name, std::ios::binary);
     file << "P6\n" << config_.width << ' ' << config_.height << "\n255\n";
-    for (std::size_t i = 0; i < pixels->size(); i += 4) {
-      file.write(reinterpret_cast<const char*>(pixels->data() + i), 3);
+    for (std::size_t i = 0; i < render_bytes.size(); i += 4) {
+      file.write(reinterpret_cast<const char*>(render_bytes.data() + i), 3);
     }
     if (!file) {
       failed += (failed.empty() ? "" : "; ") + std::string("writing ") + name + " failed";
