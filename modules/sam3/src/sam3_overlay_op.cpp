@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <span>
@@ -16,6 +17,7 @@
 #include <holoscan/core/payload_options.hpp>
 #include <holoscan/core/tensor_contract.hpp>
 #include <holoscan/core/tensor_output_loan.hpp>
+#include <holoscan/logger/logger.hpp>
 #include <holoscan/sam3/kernels.hpp>
 #include <holoscan/sam3/sam3_overlay_op.hpp>
 #include <holoscan/sensor_io/provenance.hpp>
@@ -44,24 +46,24 @@ holoscan::Error cuda_failure(const char* what, cudaError_t status) {
                          std::string("Sam3OverlayOp: ") + what + ": " + cudaGetErrorString(status)};
 }
 
-// Copies a packed tensor of `shape` and element type T to `out`, waiting for
-// its producer.
+// Queues a copy of a packed tensor of `shape` and element type T to `out`
+// (pinned host memory) on `stream`, after its producer's work.
 template <typename T>
-Result fetch(const holoscan::Tensor& tensor, std::span<const std::int64_t> shape,
-             ::cuda::stream_ref stream, std::vector<T>& out) {
+Result fetch_async(const holoscan::Tensor& tensor, std::span<const std::int64_t> shape,
+                   cudaStream_t stream, T* out) {
   const DLDataType dtype = tensor.dtype();
   const DLDataTypeCode code = std::is_floating_point_v<T> ? kDLFloat : kDLInt;
   const std::span<const std::int64_t> actual = tensor.shape_span();
   if (dtype.code != code || dtype.bits != sizeof(T) * 8U || dtype.lanes != 1U ||
-      !std::equal(actual.begin(), actual.end(), shape.begin(), shape.end())) {
+      !std::equal(actual.begin(), actual.end(), shape.begin(), shape.end()) ||
+      !tensor.is_contiguous()) {
     return holoscan::make_unexpected(invalid("unexpected instance tensor type or shape"));
   }
   std::size_t elements = 1;
   for (const std::int64_t extent : shape) {
     elements *= static_cast<std::size_t>(extent);
   }
-  out.resize(elements);
-  return tensor.copy_to_host(out.data(), out.size() * sizeof(T), stream);
+  return tensor.copy_to_host_async(out, elements * sizeof(T), stream);
 }
 
 // Writes one text layer row: `text`, cut to fit, at (x, y) in framebuffer
@@ -85,10 +87,25 @@ Sam3OverlayOp::Sam3OverlayOp(Sam3OverlayConfig config) : config_(std::move(confi
   }
 }
 
+Sam3OverlayOp::~Sam3OverlayOp() {
+  if (host_ != nullptr) {
+    cudaFreeHost(host_);
+  }
+}
+
+void Sam3OverlayOp::start() { logged_drop_ = false; }
+
 void Sam3OverlayOp::setup(holoscan::OperatorSpec& spec) {
   // Two slots per input: one image's instances in compute() while the next
   // arrive.
-  spec.input(labels, "labels").queue_depth(2U);
+  spec.input(labels, "labels")
+      .queue_depth(2U)
+      .expects_tensor(
+          holoscan::TensorInputSpec{.representation = holoscan::TensorRepresentation{
+                                        .memory_kind = holoscan::MemoryKind::kCudaDevice,
+                                        .dtype = DLDataType{kDLUInt, 16U, 1U},
+                                        .rank = 2U,
+                                    }});
   spec.input(scores, "scores").queue_depth(2U);
   spec.input(boxes, "boxes").queue_depth(2U);
   spec.input(prompt_ids, "prompt_ids").queue_depth(2U);
@@ -173,67 +190,105 @@ holoscan::expected<void, holoscan::Error> Sam3OverlayOp::compute(
     return holoscan::make_unexpected(invalid("the label image must be packed"));
   }
 
-  // One small copy each to the host, at most max_instances rows.
+  cudaStream_t stream = context.cuda_stream().get();
+  if (stream == nullptr) {
+    return holoscan::make_unexpected(
+        holoscan::Error{holoscan::ErrorCode::kFailure, "Sam3OverlayOp: no CUDA stream"});
+  }
+  // The outputs first: in real time, instances that find them all held are
+  // skipped before anything is copied.
   const std::int64_t capacity = config_.max_instances;
+  const std::array<std::int64_t, 2> text_shape{2 * capacity, kLabelRowBytes};
+  auto text_loan =
+      text.allocate_tensor(holoscan::TensorLoanRequest{.shape = text_shape, .dtype = kUInt8});
+  const std::array<std::int64_t, 3> overlay_shape{height, width, 4};
+  auto overlay_loan =
+      overlay.allocate_tensor(holoscan::TensorLoanRequest{.shape = overlay_shape, .dtype = kUInt8});
+  for (auto* loan : {&text_loan, &overlay_loan}) {
+    if (*loan) {
+      continue;
+    }
+    if (config_.drop_when_busy && loan->error().code == holoscan::ErrorCode::kResourceExhausted) {
+      if (config_.dropped) {
+        config_.dropped->fetch_add(1U, std::memory_order_relaxed);
+      }
+      if (!logged_drop_) {
+        logged_drop_ = true;
+        HOLOSCAN_LOG_WARN(
+            "Sam3OverlayOp: skipping images while the overlays of earlier ones are still in use; "
+            "this is logged once per run");
+      }
+      return {};
+    }
+    return holoscan::make_unexpected(std::move(*loan).error());
+  }
+
+  // The count, scores, boxes and prompt ids to pinned host memory on the
+  // stream, and one wait for all four.
+  if (host_ == nullptr) {
+    void* pinned = nullptr;
+    if (const cudaError_t status = cudaMallocHost(
+            &pinned, sizeof(std::int32_t) + static_cast<std::size_t>(capacity) * 6U * 4U);
+        status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaMallocHost", status));
+    }
+    host_ = static_cast<std::byte*>(pinned);
+  }
+  auto* counted = reinterpret_cast<std::int32_t*>(host_);
+  auto* scores_host = reinterpret_cast<float*>(counted + 1);
+  auto* boxes_host = scores_host + capacity;
+  auto* prompt_ids_host = reinterpret_cast<std::int32_t*>(boxes_host + 4 * capacity);
   const std::array<std::int64_t, 1> one{1};
   const std::array<std::int64_t, 2> box_shape{capacity, 4};
   const std::array<std::int64_t, 1> row_shape{capacity};
-  std::vector<std::int32_t> counted;
-  for (auto fetched :
-       {fetch(count_sample->data, one, context.cuda_stream(), counted),
-        fetch(scores_sample->data, row_shape, context.cuda_stream(), scores_),
-        fetch(boxes_sample->data, box_shape, context.cuda_stream(), boxes_),
-        fetch(prompt_ids_sample->data, row_shape, context.cuda_stream(), prompt_ids_)}) {
+  for (auto fetched : {fetch_async(count_sample->data, one, stream, counted),
+                       fetch_async(scores_sample->data, row_shape, stream, scores_host),
+                       fetch_async(boxes_sample->data, box_shape, stream, boxes_host),
+                       fetch_async(prompt_ids_sample->data, row_shape, stream, prompt_ids_host)}) {
     if (!fetched) {
       return fetched;
     }
   }
-  const std::int32_t n = counted.front();
+  if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
+    return holoscan::make_unexpected(cuda_failure("cudaStreamSynchronize", status));
+  }
+  const std::int32_t n = *counted;
   if (n < 0 || n > capacity) {
     return holoscan::make_unexpected(invalid("instance count out of range"));
   }
 
   // The image's capture time and frame id, so HoloViz draws these layers over
-  // their own image; unstamped instances are stamped now, since HoloViz
-  // selects layers by capture time.
-  holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*count_sample);
-  if (!count_sample->metadata.source_clock_id.valid()) {
-    emit.capture_time = context.activation_time();
-  }
+  // their own image. The inputs have a capture time: OnAligned pairs them by
+  // it.
+  const holoscan::EmitOptions emit = holoscan::sensor_io::derive_from(*count_sample);
 
-  // The names of the prompts these instances are likely from: a control's
-  // newest, which the segmenter takes from its next image on.
+  // The names of the prompts these instances are from: those the segmenter
+  // recorded for this image, once it has taken any from the control.
   std::vector<std::string> names = config_.prompt_names;
   if (config_.prompt_control) {
-    auto [generation, prompts] = config_.prompt_control->latest();
-    if (generation != 0) {
+    if (auto prompts =
+            config_.prompt_control->prompts_at(count_sample->metadata.capture_timestamp_ns)) {
       names.clear();
-      for (const Sam3Prompt& prompt : prompts) {
+      for (const Sam3Prompt& prompt : *prompts) {
         names.push_back(display_name(prompt));
       }
     }
-  }
-  const std::array<std::int64_t, 2> text_shape{2 * capacity, kLabelRowBytes};
-  auto text_loan =
-      text.allocate_tensor(holoscan::TensorLoanRequest{.shape = text_shape, .dtype = kUInt8});
-  if (!text_loan) {
-    return holoscan::make_unexpected(std::move(text_loan).error());
   }
   auto written = text_loan->write_host_and_commit(
       [&](const holoscan::TensorOutputWriteGuard& writer) -> Result {
         std::uint8_t* out = writer.data_as<std::uint8_t>();
         std::memset(out, 0, static_cast<std::size_t>(2 * capacity) * kLabelRowBytes);
         for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i) {
-          const std::int32_t id = prompt_ids_[i];
+          const std::int32_t id = prompt_ids_host[i];
           std::string label = id >= 0 && static_cast<std::size_t>(id) < names.size()
                                   ? names[static_cast<std::size_t>(id)]
                                   : "prompt " + std::to_string(id);
           char score[16];
-          std::snprintf(score, sizeof(score), " %.2f", scores_[i]);
+          std::snprintf(score, sizeof(score), " %.2f", scores_host[i]);
           label += score;
           // Above the box, or just inside it when there is no room above.
-          const float x1 = boxes_[4 * i];
-          const float y1 = boxes_[4 * i + 1];
+          const float x1 = boxes_host[4 * i];
+          const float y1 = boxes_host[4 * i + 1];
           const float top = y1 >= kLabelSizePx + 2.0F ? y1 - kLabelSizePx - 2.0F : y1 + 2.0F;
           std::uint8_t rgb[3];
           overlay_color(static_cast<int>(i), rgb);
@@ -253,17 +308,6 @@ holoscan::expected<void, holoscan::Error> Sam3OverlayOp::compute(
     return written;
   }
 
-  cudaStream_t stream = context.cuda_stream().get();
-  if (stream == nullptr) {
-    return holoscan::make_unexpected(
-        holoscan::Error{holoscan::ErrorCode::kFailure, "Sam3OverlayOp: no CUDA stream"});
-  }
-  const std::array<std::int64_t, 3> overlay_shape{height, width, 4};
-  auto overlay_loan =
-      overlay.allocate_tensor(holoscan::TensorLoanRequest{.shape = overlay_shape, .dtype = kUInt8});
-  if (!overlay_loan) {
-    return holoscan::make_unexpected(std::move(overlay_loan).error());
-  }
   auto writer = overlay_loan->write(stream);
   if (!writer) {
     return holoscan::make_unexpected(std::move(writer).error());

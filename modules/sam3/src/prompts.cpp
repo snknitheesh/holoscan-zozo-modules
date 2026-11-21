@@ -234,6 +234,11 @@ Sam3PromptControl::Sam3PromptControl(PromptTable table) : table_(std::move(table
 void Sam3PromptControl::set(std::vector<Sam3Prompt> prompts) {
   validate_prompts(prompts, table_);
   const std::lock_guard<std::mutex> lock(mutex_);
+  if (max_boxes_ >= 0) {
+    for (const Sam3Prompt& prompt : prompts) {
+      (void)make_decoder_prompt(prompt, table_, max_boxes_);
+    }
+  }
   prompts_ = std::move(prompts);
   ++generation_;
 }
@@ -241,6 +246,32 @@ void Sam3PromptControl::set(std::vector<Sam3Prompt> prompts) {
 std::pair<std::uint64_t, std::vector<Sam3Prompt>> Sam3PromptControl::latest() const {
   const std::lock_guard<std::mutex> lock(mutex_);
   return {generation_, prompts_};
+}
+
+std::optional<std::vector<Sam3Prompt>> Sam3PromptControl::prompts_at(
+    std::int64_t capture_ns) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  // Newest first: after a restart the clock may begin again, and the newest
+  // record is the current run's.
+  for (auto use = uses_.rbegin(); use != uses_.rend(); ++use) {
+    if (use->capture_ns <= capture_ns) {
+      return use->prompts;
+    }
+  }
+  return std::nullopt;
+}
+
+void Sam3PromptControl::limit_boxes(int max_boxes) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  max_boxes_ = max_boxes;
+}
+
+void Sam3PromptControl::record_use(std::int64_t capture_ns, std::vector<Sam3Prompt> prompts) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  uses_.push_back(Use{.capture_ns = capture_ns, .prompts = std::move(prompts)});
+  while (uses_.size() > kRecordedUses) {
+    uses_.pop_front();
+  }
 }
 
 }  // namespace holoscan::sam3

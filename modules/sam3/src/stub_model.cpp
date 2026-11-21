@@ -176,7 +176,24 @@ std::string model(std::string_view name, const std::vector<Message>& initializer
   return result.str();
 }
 
-// Writes `bytes` to `path` unless it already holds them, atomically.
+// Removes the TensorRT engines HoloInfer cached for the model at `path`
+// (<stem>.<gpu and versions>.engine.<precision> beside it), which no longer
+// fit it once it changes: HoloInfer does not key its cache on the model's
+// contents.
+void remove_cached_engines(const std::filesystem::path& path) {
+  const std::string prefix = path.stem().string() + ".";
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error)) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with(prefix) && name.find(".engine") != std::string::npos) {
+      std::error_code ignored;
+      std::filesystem::remove(entry.path(), ignored);
+    }
+  }
+}
+
+// Writes `bytes` to `path` unless it already holds them, atomically, and
+// removes the engines cached for what it held.
 void write_if_changed(const std::filesystem::path& path, const std::string& bytes) {
   {
     std::ifstream existing(path, std::ios::binary);
@@ -207,6 +224,7 @@ void write_if_changed(const std::filesystem::path& path, const std::string& byte
     std::filesystem::remove(temporary, error);
     throw std::runtime_error("cannot write the stub model to " + path.string());
   }
+  remove_cached_engines(path);
 }
 
 std::string shape_tag(const StubShape& s) {

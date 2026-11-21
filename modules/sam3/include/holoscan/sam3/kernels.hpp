@@ -15,6 +15,12 @@
 //
 // Sam3SegmentationOp and Sam3OverlayOp run them. The per-pixel arithmetic is
 // in pixel_math.hpp, and host references in reference.hpp.
+//
+// Each launcher returns cudaErrorInvalidValue, and launches nothing, for a
+// required pointer that is null, a size below 1 or above kMaxImageSide (an
+// image) or kMaxModelSide (the model's input and masks), a pitch shorter than
+// a row, or more than 65535 slots per prompt. The memory behind the pointers
+// is not checked.
 
 #pragma once
 

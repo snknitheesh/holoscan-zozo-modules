@@ -263,6 +263,19 @@ void check_stub() {
   const auto written = std::filesystem::last_write_time(files.encoder);
   (void)write_stub_model(g_directory, shape);
   VERIFY(std::filesystem::last_write_time(files.encoder) == written);
+  // A model that changed is written again, and the engines cached for what
+  // it held are removed; another model's stay.
+  const std::filesystem::path stale =
+      files.encoder.parent_path() / (files.encoder.stem().string() + ".gpu.trt.engine.fp16");
+  const std::filesystem::path other =
+      files.decoder.parent_path() / (files.decoder.stem().string() + ".gpu.trt.engine.fp16");
+  std::ofstream(stale) << "engine";
+  std::ofstream(other) << "engine";
+  std::ofstream(files.encoder, std::ios::trunc) << "changed";
+  (void)write_stub_model(g_directory, shape);
+  VERIFY(read_file(files.encoder) == encoder && !std::filesystem::exists(stale) &&
+         std::filesystem::exists(other));
+  std::filesystem::remove(other);
   const PromptTable table = read_prompt_table(files.prompt_table);
   VERIFY(table.tokens == shape.tokens && table.dim == shape.dim);
   VERIFY(table.find("red") && table.find("blue") && table.find(kVisualPrompt));

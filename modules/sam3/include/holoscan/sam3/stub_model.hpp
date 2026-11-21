@@ -83,7 +83,7 @@ struct StubModel {
 // to `directory`, each unless the file already holds it, and returns their
 // paths. Files are replaced atomically, so concurrent runs can share the
 // directory, and TensorRT engines cached beside the models stay valid as long
-// as they do not change.
+// as they do not change; a model that changes has its cached engines removed.
 // @throws std::runtime_error if a file cannot be written.
 StubModel write_stub_model(const std::filesystem::path& directory, const StubShape& shape = {});
 

@@ -31,6 +31,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -125,28 +126,56 @@ struct DecoderPrompt {
 // Sam3SegmentationConfig::prompt_control and keep it: set() replaces the
 // prompts from the operator's next image on. The runtime may construct the
 // operator more than once; every copy shares the control. Thread-safe.
+//
+// The operator records which prompts it segments each image with, so that a
+// consumer of its outputs (Sam3OverlayOp, for one) names an image's
+// instances by the prompts that found them, also while images segmented
+// before a change are still on their way: prompts_at() with the image's
+// capture time.
 class Sam3PromptControl {
  public:
   // Checks prompts against `table`, the operator's prompt table.
   explicit Sam3PromptControl(PromptTable table);
 
   // @throws std::invalid_argument for an empty or too long list, an invalid
-  // prompt or a text that is not in the table; the prompts stay as they were.
-  // A prompt with more boxes than the decoder takes is refused by the
-  // operator, which then keeps its prompts and logs a warning.
+  // prompt, a text that is not in the table, or, once the operator has
+  // started, a prompt with more boxes than its decoder takes; the prompts
+  // stay as they were.
   void set(std::vector<Sam3Prompt> prompts);
 
   // The prompts set last and how many times set() has succeeded; 0 and no
   // prompts before the first.
   [[nodiscard]] std::pair<std::uint64_t, std::vector<Sam3Prompt>> latest() const;
 
+  // The prompts the operator segmented the image captured at `capture_ns`
+  // with (its capture timestamp, SampleMetadata::capture_timestamp_ns): those
+  // it recorded last at or before that time. None before its first record,
+  // when the configured prompts apply.
+  [[nodiscard]] std::optional<std::vector<Sam3Prompt>> prompts_at(std::int64_t capture_ns) const;
+
   [[nodiscard]] const PromptTable& table() const noexcept { return table_; }
 
+  // For the operator: the most boxes its decoder takes per prompt, which
+  // set() enforces from then on.
+  void limit_boxes(int max_boxes);
+  // For the operator: it segments the images captured at `capture_ns` and
+  // later with `prompts`. The last kRecordedUses records are kept.
+  void record_use(std::int64_t capture_ns, std::vector<Sam3Prompt> prompts);
+
+  static constexpr std::size_t kRecordedUses = 32;
+
  private:
+  struct Use {
+    std::int64_t capture_ns{};
+    std::vector<Sam3Prompt> prompts;
+  };
+
   const PromptTable table_;
   mutable std::mutex mutex_;
   std::uint64_t generation_{};
   std::vector<Sam3Prompt> prompts_;
+  int max_boxes_{-1};
+  std::deque<Use> uses_;
 };
 
 // @throws std::invalid_argument for 0 or more than kMaxPrompts prompts, an

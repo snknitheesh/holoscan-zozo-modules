@@ -451,8 +451,18 @@ void check_rejects_settings() {
 }
 
 #if HOLOSCAN_SAM3_TEST_OVERLAY
+// What Sam3OverlayOp gets in a test, as a reference frame's instances; the
+// fields tests change to make them unusable.
+struct OverlayInputs {
+  std::int32_t count_offset{};
+  std::int64_t score_slots{};
+  int label_width{};
+  std::shared_ptr<Sam3PromptControl> control;
+};
+
 // Sam3OverlayOp on a reference frame's instances: the overlay is the
-// reference's, and each instance has its label row.
+// reference's, each instance has its label row, named by its prompt, and both
+// outputs carry the input's capture time; unusable instances fail the run.
 void check_overlay() {
   namespace viz = holoscan::visualization;
   const int width = 320;
@@ -462,66 +472,74 @@ void check_overlay() {
   const ReferenceInstances expected =
       expected_instances(config, g_shape, pixels, PixelFormat::kRgb8, width, height);
   const std::int64_t capacity = config.max_instances;
-
-  auto h = holoscan::testing::create_operator_test<Sam3OverlayOp>(
-      Sam3OverlayConfig{.max_width = width,
-                        .max_height = height,
-                        .max_instances = config.max_instances,
-                        .prompt_names = {"red", "blue"},
-                        .fill_alpha = 90});
-  const auto host_tensor = [](auto values, std::vector<std::int64_t> shape, DLDataType dtype) {
-    using T = typename decltype(values)::value_type;
-    auto tensor = holoscan::make_tensor(std::span<const std::int64_t>(shape), dtype, std::nullopt,
-                                        holoscan::MemoryStorageType::kHost,
-                                        std::make_shared<holoscan::UnboundedAllocator>());
-    if (!tensor) throw std::runtime_error(tensor.error().message);
-    std::memcpy(*tensor->mutable_data(), values.data(), values.size() * sizeof(T));
-    return std::move(*tensor);
-  };
-  const std::vector<std::int64_t> label_shape{height, width};
-  auto labels = holoscan::make_tensor(label_shape, DLDataType{kDLUInt, 16, 1}, std::nullopt,
-                                      holoscan::MemoryStorageType::kDevice,
-                                      std::make_shared<holoscan::UnboundedAllocator>());
-  if (!labels || cudaMemcpy(*labels->mutable_data(), expected.labels.data(),
-                            expected.labels.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
-    throw std::runtime_error("cannot stage the label image");
-  }
   const auto at = std::chrono::milliseconds(5);
-  h.template push_samples<holoscan::Tensor>(
-      "labels", {holoscan::testing::TestSample<holoscan::Tensor>{.data = std::move(*labels),
-                                                                 .capture_coordinate = at}});
-  h.template push_samples<holoscan::Tensor>(
-      "scores", {{.data = host_tensor(expected.scores, {capacity}, DLDataType{kDLFloat, 32, 1}),
-                  .capture_coordinate = at}});
-  h.template push_samples<holoscan::Tensor>(
-      "boxes", {{.data = host_tensor(expected.boxes, {capacity, 4}, DLDataType{kDLFloat, 32, 1}),
-                 .capture_coordinate = at}});
-  h.template push_samples<holoscan::Tensor>(
-      "prompt_ids",
-      {{.data = host_tensor(expected.prompt_ids, {capacity}, DLDataType{kDLInt, 32, 1}),
-        .capture_coordinate = at}});
-  h.template push_samples<holoscan::Tensor>(
-      "count", {{.data = host_tensor(std::vector<std::int32_t>{expected.count}, {1},
-                                     DLDataType{kDLInt, 32, 1}),
-                 .capture_coordinate = at}});
-  // The label image comes from GPU memory, as the segmenter gives it.
-  h.input_source_tensor_spec(
-      "labels", holoscan::TensorOutputSpec{
-                    .representation =
-                        holoscan::TensorRepresentation{
-                            .memory_kind = holoscan::MemoryKind::kCudaDevice,
-                            .dtype = DLDataType{kDLUInt, 16, 1},
-                            .rank = 2U,
-                            .strides = holoscan::TensorStridePolicy::kContiguousOnly,
-                        },
-                    .bounds = holoscan::tensor_bounds(std::uint64_t{2} * width * height),
-                    .storage = holoscan::TensorOutputStorage::kRuntimePool,
-                });
-  h.input_source_device("labels", holoscan::DeviceId{0});
-  h.output_device("overlay", holoscan::DeviceId{0});
-  h.template capture_snapshot<holoscan::schema::ImageT>("overlay", 2);
-  h.template capture_snapshot<holoscan::Tensor>("text", 2);
-  const auto result = h.run();
+
+  const auto run = [&](const OverlayInputs& in) {
+    auto h = holoscan::testing::create_operator_test<Sam3OverlayOp>(
+        Sam3OverlayConfig{.max_width = 300,
+                          .max_height = height,
+                          .max_instances = config.max_instances,
+                          .prompt_names = {"red", "blue"},
+                          .prompt_control = in.control,
+                          .fill_alpha = 90});
+    const auto host_tensor = [](auto values, std::vector<std::int64_t> shape, DLDataType dtype) {
+      using T = typename decltype(values)::value_type;
+      auto tensor = holoscan::make_tensor(std::span<const std::int64_t>(shape), dtype, std::nullopt,
+                                          holoscan::MemoryStorageType::kHost,
+                                          std::make_shared<holoscan::UnboundedAllocator>());
+      if (!tensor) throw std::runtime_error(tensor.error().message);
+      std::memcpy(*tensor->mutable_data(), values.data(),
+                  std::min<std::size_t>(values.size(), tensor->size()) * sizeof(T));
+      return std::move(*tensor);
+    };
+    // The label image at `label_width` columns: the reference's, cut or
+    // padded with zeros.
+    std::vector<std::uint16_t> label_values(static_cast<std::size_t>(in.label_width) * height);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < std::min(width, in.label_width); ++x) {
+        label_values[static_cast<std::size_t>(y) * in.label_width + x] =
+            expected.labels[static_cast<std::size_t>(y) * width + x];
+      }
+    }
+    const std::vector<std::int64_t> label_shape{height, in.label_width};
+    auto labels = holoscan::make_tensor(label_shape, DLDataType{kDLUInt, 16, 1}, std::nullopt,
+                                        holoscan::MemoryStorageType::kDevice,
+                                        std::make_shared<holoscan::UnboundedAllocator>());
+    if (!labels || cudaMemcpy(*labels->mutable_data(), label_values.data(), label_values.size() * 2,
+                              cudaMemcpyHostToDevice) != cudaSuccess) {
+      throw std::runtime_error("cannot stage the label image");
+    }
+    std::vector<float> scores = expected.scores;
+    scores.resize(static_cast<std::size_t>(in.score_slots));
+    h.template push_samples<holoscan::Tensor>(
+        "labels", {holoscan::testing::TestSample<holoscan::Tensor>{.data = std::move(*labels),
+                                                                   .capture_coordinate = at}});
+    h.template push_samples<holoscan::Tensor>(
+        "scores", {{.data = host_tensor(scores, {in.score_slots}, DLDataType{kDLFloat, 32, 1}),
+                    .capture_coordinate = at}});
+    h.template push_samples<holoscan::Tensor>(
+        "boxes", {{.data = host_tensor(expected.boxes, {capacity, 4}, DLDataType{kDLFloat, 32, 1}),
+                   .capture_coordinate = at}});
+    h.template push_samples<holoscan::Tensor>(
+        "prompt_ids",
+        {{.data = host_tensor(expected.prompt_ids, {capacity}, DLDataType{kDLInt, 32, 1}),
+          .capture_coordinate = at}});
+    h.template push_samples<holoscan::Tensor>(
+        "count", {{.data = host_tensor(std::vector<std::int32_t>{expected.count + in.count_offset},
+                                       {1}, DLDataType{kDLInt, 32, 1}),
+                   .capture_coordinate = at}});
+    // The label image comes from GPU memory, as the overlay's input declares
+    // (expects_tensor), which the harness's source follows.
+    h.input_source_device("labels", holoscan::DeviceId{0});
+    h.output_device("overlay", holoscan::DeviceId{0});
+    h.template capture_snapshot<holoscan::schema::ImageT>("overlay", 2);
+    h.template capture_snapshot<holoscan::Tensor>("text", 2);
+    return h.run();
+  };
+  const int fits = 300;
+  const OverlayInputs usable{.score_slots = capacity, .label_width = fits};
+
+  const auto result = run(usable);
   VERIFY_MSG(result.ok(), result.describe_failure());
   if (!result.ok()) return;
   const auto overlays = result.template snapshots<holoscan::schema::ImageT>("overlay");
@@ -530,26 +548,71 @@ void check_overlay() {
   if (overlays.size() != 1 || texts.size() != 1) return;
   const auto& image = overlays[0].tensor(holoscan::schema::ImageTensorFields::data);
   VERIFY(overlays[0].metadata().encoding == holoscan::schema::ImageEncoding_RGBA8);
-  VERIFY(image.shape() == (std::vector<std::int64_t>{height, width, 4}));
-  VERIFY_MSG(values<std::uint8_t>(image) == reference_overlay(expected.labels, width, height, 90),
+  VERIFY(image.shape() == (std::vector<std::int64_t>{height, fits, 4}));
+  std::vector<std::uint16_t> cut(static_cast<std::size_t>(fits) * height);
+  for (int y = 0; y < height; ++y) {
+    std::copy_n(expected.labels.begin() + static_cast<std::ptrdiff_t>(y) * width, fits,
+                cut.begin() + static_cast<std::ptrdiff_t>(y) * fits);
+  }
+  VERIFY_MSG(values<std::uint8_t>(image) == reference_overlay(cut, fits, height, 90),
              "the overlay differs from the reference");
-  // Both layers carry one capture time, so HoloViz draws them together.
-  VERIFY(overlays[0].sample_metadata().capture_timestamp_ns ==
-         texts[0].sample_metadata().capture_timestamp_ns);
+  // Both layers carry the input's capture time, so HoloViz draws them over
+  // their own image.
+  const auto stamp = std::chrono::nanoseconds(at).count();
+  VERIFY(overlays[0].sample_metadata().capture_timestamp_ns == stamp);
+  VERIFY(texts[0].sample_metadata().capture_timestamp_ns == stamp);
   // Rows 2k and 2k + 1 are instance k's shadow and label; the third instance's
   // prompt has no name.
-  const std::vector<std::uint8_t> text = values<std::uint8_t>(texts[0]);
   const std::size_t row = viz::kTextRunHeaderBytes + kOverlayLabelBytes;
-  const auto label = [&](std::size_t index) {
+  const auto label_of = [&](const std::vector<std::uint8_t>& text, std::size_t index) {
     const char* start =
         reinterpret_cast<const char*>(text.data() + index * row + viz::kTextRunHeaderBytes);
     return std::string(start, strnlen(start, kOverlayLabelBytes));
   };
+  const std::vector<std::uint8_t> text = values<std::uint8_t>(texts[0]);
   VERIFY(expected.count == 3);
-  VERIFY_MSG(label(1) == "red 0.90" && label(0) == label(1), label(1));
-  VERIFY_MSG(label(3) == "blue 0.80", label(3));
-  VERIFY_MSG(label(5) == "prompt 2 0.70", label(5));
-  VERIFY(label(7).empty());
+  VERIFY_MSG(label_of(text, 1) == "red 0.90" && label_of(text, 0) == label_of(text, 1),
+             label_of(text, 1));
+  VERIFY_MSG(label_of(text, 3) == "blue 0.80", label_of(text, 3));
+  VERIFY_MSG(label_of(text, 5) == "prompt 2 0.70", label_of(text, 5));
+  VERIFY(label_of(text, 7).empty());
+
+  // With a control, the prompts the segmenter recorded for the image's
+  // capture time name its instances, not those recorded later.
+  OverlayInputs named = usable;
+  named.control = std::make_shared<Sam3PromptControl>(read_prompt_table(config.prompt_table));
+  named.control->record_use(stamp - 1, {{.text = "blue"}, {.text = "red"}, {.text = "visual"}});
+  named.control->record_use(stamp + 1, {{.text = "red"}});
+  const auto renamed = run(named);
+  VERIFY_MSG(renamed.ok(), renamed.describe_failure());
+  if (renamed.ok()) {
+    const auto renamed_texts = renamed.template snapshots<holoscan::Tensor>("text");
+    VERIFY(renamed_texts.size() == 1);
+    if (renamed_texts.size() == 1) {
+      const std::vector<std::uint8_t> names = values<std::uint8_t>(renamed_texts[0]);
+      VERIFY_MSG(label_of(names, 1) == "blue 0.90", label_of(names, 1));
+      VERIFY_MSG(label_of(names, 3) == "red 0.80", label_of(names, 3));
+      VERIFY_MSG(label_of(names, 5) == "visual 0.70", label_of(names, 5));
+    }
+  }
+
+  // Unusable instances fail the run, naming the problem.
+  const auto fails = [&](const OverlayInputs& in, const std::string& reason) {
+    const auto failed = run(in);
+    VERIFY_MSG(!failed.ok() && failed.describe_failure().find(reason) != std::string::npos,
+               reason + ": " + failed.describe_failure());
+  };
+  OverlayInputs too_many = usable;
+  too_many.count_offset = static_cast<std::int32_t>(capacity);
+  fails(too_many, "instance count out of range");
+  OverlayInputs short_scores = usable;
+  short_scores.score_slots = capacity - 1;
+  fails(short_scores, "unexpected instance tensor type or shape");
+  OverlayInputs wide = usable;
+  wide.label_width = width;
+  fails(wide, "at most max_width x max_height");
+  VERIFY(test::throws<std::invalid_argument>(
+      [] { Sam3OverlayOp op(Sam3OverlayConfig{.max_width = 0}); }));
 }
 #endif
 
@@ -609,6 +672,14 @@ int main(int argc, char** argv) {
          config.prompt_control->set(
              {{.boxes = {s3::PromptBox{.xyxy = {0.3F, 0.55F, 0.7F, 0.95F}}}}, {.text = "blue"}});
          s3::check_frames(config, PixelFormat::kRgb8, Memory::kDevice, {{640, 480}});
+         // The operator recorded the prompts it took for the image, and from
+         // then on the control refuses more boxes than the decoder takes (2).
+         const auto used = config.prompt_control->prompts_at(s3::capture_time(0).count());
+         VERIFY(used && used->size() == 2 && used->at(1).text == "blue");
+         VERIFY(!config.prompt_control->prompts_at(s3::capture_time(0).count() - 1));
+         const s3::PromptBox box{.xyxy = {0.1F, 0.1F, 0.2F, 0.2F}};
+         VERIFY(s3::test::throws<std::invalid_argument>(
+             [&] { config.prompt_control->set({{.boxes = {box, box, box}}}); }));
        }},
       {"FP16 engines",
        [] {

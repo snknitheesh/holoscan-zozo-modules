@@ -22,6 +22,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -268,6 +269,17 @@ class PrepareModelTest(unittest.TestCase):
         (self.root / "token").write_text("saved\n")
         with mock.patch.dict(os.environ, {"HF_TOKEN": ""}):
             self.assertEqual(prepare_model.find_token(None), "saved")
+
+    def test_token_stays_on_its_host(self) -> None:
+        handler = prepare_model.SameHostAuthorizationRedirect()
+        for target, kept in (
+            ("https://huggingface.co/other/path", True),
+            ("https://cdn-lfs.huggingface.co/file", False),
+        ):
+            request = urllib.request.Request("https://huggingface.co/facebook/sam3/resolve/x")
+            request.add_header("Authorization", "Bearer secret")
+            redirected = handler.redirect_request(request, None, 302, "Found", {}, target)
+            self.assertEqual(redirected.has_header("Authorization"), kept, target)
 
     def test_rejects_a_wrong_digest(self) -> None:
         files = dict(self.checkpoint.files, **{"model.safetensors": "0" * 64})

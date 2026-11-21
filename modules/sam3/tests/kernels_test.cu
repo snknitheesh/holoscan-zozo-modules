@@ -235,6 +235,49 @@ void check_overlay(int width, int height) {
   VERIFY(transparent && inside && outline);
 }
 
+// Unusable arguments are refused before anything is launched.
+void check_rejections() {
+  Device<float> f(64);
+  Device<std::int32_t> i(64);
+  Device<std::uint16_t> labels(64);
+  Device<std::uint8_t> bytes(256);
+  const Candidates c{.scores = f.get(),
+                     .boxes = f.get(),
+                     .queries = i.get(),
+                     .logits = f.get(),
+                     .counts = i.get()};
+  const ImageView image{.data = bytes.get(), .pitch = 12, .width = 4, .height = 4};
+  VERIFY(launch_preprocess(image, 4, 4, Normalization{}, nullptr, nullptr) ==
+         cudaErrorInvalidValue);
+  VERIFY(launch_preprocess(ImageView{.data = bytes.get(), .pitch = 11, .width = 4, .height = 4}, 4,
+                           4, Normalization{}, f.get(), nullptr) == cudaErrorInvalidValue);
+  VERIFY(launch_preprocess(image, 0, 4, Normalization{}, f.get(), nullptr) ==
+         cudaErrorInvalidValue);
+  const SelectParams select{.queries = 2, .capacity = 1, .mask_width = 2, .mask_height = 2};
+  VERIFY(launch_select(nullptr, f.get(), f.get(), select, c, nullptr) == cudaErrorInvalidValue);
+  VERIFY(launch_select(f.get(), f.get(), f.get(), SelectParams{.queries = 2, .capacity = 0}, c,
+                       nullptr) == cudaErrorInvalidValue);
+  VERIFY(launch_select(f.get(), f.get(), f.get(), select, Candidates{}, nullptr) ==
+         cudaErrorInvalidValue);
+  const FinalizeParams finalize{
+      .prompts = 1, .capacity = 1, .mask_width = 2, .mask_height = 2, .width = 4, .height = 4};
+  const Instances out{.labels = labels.get(),
+                      .scores = f.get(),
+                      .boxes = f.get(),
+                      .prompt_ids = i.get(),
+                      .count = i.get(),
+                      .order = i.get()};
+  VERIFY(launch_finalize(c, finalize, Instances{}, nullptr) == cudaErrorInvalidValue);
+  FinalizeParams no_prompts = finalize;
+  no_prompts.prompts = 0;
+  VERIFY(launch_finalize(c, no_prompts, out, nullptr) == cudaErrorInvalidValue);
+  VERIFY(launch_overlay(nullptr, 4, 4, 110, bytes.get(), nullptr) == cudaErrorInvalidValue);
+  VERIFY(launch_overlay(labels.get(), 4, kMaxImageSide + 1, 110, bytes.get(), nullptr) ==
+         cudaErrorInvalidValue);
+  // Nothing was launched, so no error is left behind.
+  VERIFY(cudaGetLastError() == cudaSuccess);
+}
+
 }  // namespace
 }  // namespace holoscan::sam3
 
@@ -257,5 +300,6 @@ int main() {
       {"instances, none pass", [] { s3::check_instances(2, 50, 8, 32, 64, 48, true, 0.99F); }},
       {"overlay", [] { s3::check_overlay(640, 480); }},
       {"overlay, odd size", [] { s3::check_overlay(37, 91); }},
+      {"unusable arguments", [] { s3::check_rejections(); }},
   });
 }

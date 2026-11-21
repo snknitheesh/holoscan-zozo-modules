@@ -518,6 +518,11 @@ void Sam3SegmentationOp::start() {
       config_.fp16 && (is_onnx(config_.encoder) || is_onnx(config_.decoder)) ? ", FP16 allowed"
                                                                              : "");
   engines_ = std::move(engines);
+  if (config_.prompt_control) {
+    config_.prompt_control->limit_boxes(engines_->max_boxes);
+  }
+  logged_staging_ = false;
+  logged_drop_ = false;
   // The prompts are uploaded by the first compute(): those of the last run,
   // or the control's newest.
   pending_ = active_;
@@ -574,9 +579,15 @@ void Sam3SegmentationOp::release() noexcept {
     staging_ = nullptr;
     staging_bytes_ = 0;
   }
+  if (prompt_upload_ != nullptr) {
+    cudaFreeHost(prompt_upload_);
+    prompt_upload_ = nullptr;
+    prompt_upload_floats_ = 0;
+  }
 }
 
-holoscan::expected<void, holoscan::Error> Sam3SegmentationOp::load_prompts(cudaStream_t stream) {
+holoscan::expected<void, holoscan::Error> Sam3SegmentationOp::load_prompts(
+    cudaStream_t stream, std::int64_t capture_ns) {
   poll_control();
   std::optional<std::vector<Sam3Prompt>> prompts;
   prompts.swap(pending_);
@@ -624,13 +635,35 @@ holoscan::expected<void, holoscan::Error> Sam3SegmentationOp::load_prompts(cudaS
   } catch (const std::runtime_error& error) {
     return holoscan::make_unexpected(failure(error.what()));
   }
-  if (const cudaError_t status = cudaMemcpy(e.prompts.get(), host.data(),
-                                            host.size() * sizeof(float), cudaMemcpyHostToDevice);
+  // Uploaded on the image's stream, before the decoder reads it, from pinned
+  // memory that stays as it is until the next change, which waits for the
+  // stream first (above).
+  if (host.size() > prompt_upload_floats_) {
+    if (prompt_upload_ != nullptr) {
+      cudaFreeHost(prompt_upload_);
+      prompt_upload_ = nullptr;
+      prompt_upload_floats_ = 0;
+    }
+    void* pinned = nullptr;
+    if (const cudaError_t status = cudaMallocHost(&pinned, host.size() * sizeof(float));
+        status != cudaSuccess) {
+      return holoscan::make_unexpected(cuda_failure("cudaMallocHost", status));
+    }
+    prompt_upload_ = static_cast<float*>(pinned);
+    prompt_upload_floats_ = host.size();
+  }
+  std::copy(host.begin(), host.end(), prompt_upload_);
+  if (const cudaError_t status =
+          cudaMemcpyAsync(e.prompts.get(), prompt_upload_, host.size() * sizeof(float),
+                          cudaMemcpyHostToDevice, stream);
       status != cudaSuccess) {
-    return holoscan::make_unexpected(cuda_failure("cudaMemcpy", status));
+    return holoscan::make_unexpected(cuda_failure("cudaMemcpyAsync", status));
   }
   e.prompt_count = std::max(e.prompt_count, count);
   active_ = std::move(*prompts);
+  if (config_.prompt_control) {
+    config_.prompt_control->record_use(capture_ns, active_);
+  }
   return {};
 }
 
@@ -654,6 +687,9 @@ holoscan::expected<const std::uint8_t*, holoscan::Error> Sam3SegmentationOp::sta
       return holoscan::make_unexpected(cuda_failure("cudaMalloc", status));
     }
     staging_bytes_ = grown;
+  }
+  if (!logged_staging_) {
+    logged_staging_ = true;
     HOLOSCAN_LOG_INFO(
         "Sam3SegmentationOp: host images are copied to the GPU first; give it GPU images to save "
         "the copy");
@@ -774,7 +810,38 @@ holoscan::expected<void, holoscan::Error> Sam3SegmentationOp::compute(
   if (where.device_type == kDLCUDA && where.device_id != device) {
     return holoscan::make_unexpected(invalid("the image is on another GPU than the operator"));
   }
-  if (auto loaded = load_prompts(stream); !loaded) {
+  // The outputs first: in real time, an image that finds them all held is
+  // skipped before any work is queued for it.
+  const std::int64_t capacity = config_.max_instances;
+  std::optional<holoscan::expected<holoscan::TensorOutputLoan, holoscan::Error>> masks_loan;
+  if (config_.output_masks) {
+    masks_loan.emplace(allocate<3>(masks, {capacity, height, width}, kUInt8));
+  }
+  auto labels_loan = allocate<2>(labels, {height, width}, kUInt16);
+  auto scores_loan = allocate<1>(scores, {capacity}, kFloat32);
+  auto boxes_loan = allocate<2>(boxes, {capacity, 4}, kFloat32);
+  auto prompt_ids_loan = allocate<1>(prompt_ids, {capacity}, kInt32);
+  auto count_loan = allocate<1>(count, {1}, kInt32);
+  for (const auto* loan : {masks_loan ? &*masks_loan : &labels_loan, &labels_loan, &scores_loan,
+                           &boxes_loan, &prompt_ids_loan, &count_loan}) {
+    if (*loan) {
+      continue;
+    }
+    if (config_.drop_when_busy && loan->error().code == holoscan::ErrorCode::kResourceExhausted) {
+      if (config_.dropped) {
+        config_.dropped->fetch_add(1U, std::memory_order_relaxed);
+      }
+      if (!logged_drop_) {
+        logged_drop_ = true;
+        HOLOSCAN_LOG_WARN(
+            "Sam3SegmentationOp: skipping images while the outputs of earlier ones are still in "
+            "use (the GPU or a consumer is behind the source); this is logged once per run");
+      }
+      return {};
+    }
+    return holoscan::make_unexpected(loan->error());
+  }
+  if (auto loaded = load_prompts(stream, sample->metadata.capture_timestamp_ns); !loaded) {
     return loaded;
   }
   const auto pitch = static_cast<std::size_t>(strides[0]);
@@ -853,25 +920,6 @@ holoscan::expected<void, holoscan::Error> Sam3SegmentationOp::compute(
   }
   passed_prompts_ = prompt_count;
 
-  const std::int64_t capacity = config_.max_instances;
-  std::optional<holoscan::expected<holoscan::TensorOutputLoan, holoscan::Error>> masks_loan;
-  if (config_.output_masks) {
-    masks_loan.emplace(allocate<3>(masks, {capacity, height, width}, kUInt8));
-  }
-  auto labels_loan = allocate<2>(labels, {height, width}, kUInt16);
-  auto scores_loan = allocate<1>(scores, {capacity}, kFloat32);
-  auto boxes_loan = allocate<2>(boxes, {capacity, 4}, kFloat32);
-  auto prompt_ids_loan = allocate<1>(prompt_ids, {capacity}, kInt32);
-  auto count_loan = allocate<1>(count, {1}, kInt32);
-  if (masks_loan && !*masks_loan) {
-    return holoscan::make_unexpected(masks_loan->error());
-  }
-  for (const auto* loan :
-       {&labels_loan, &scores_loan, &boxes_loan, &prompt_ids_loan, &count_loan}) {
-    if (!*loan) {
-      return holoscan::make_unexpected(loan->error());
-    }
-  }
   std::optional<holoscan::expected<holoscan::TensorOutputWriteGuard, holoscan::Error>> masks_writer;
   if (masks_loan) {
     masks_writer.emplace((*masks_loan)->write(stream));

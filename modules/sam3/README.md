@@ -71,6 +71,8 @@ through a staging buffer, which the operator says once.
 | `fp16` | `true` | Build the engines with FP16 kernels allowed |
 | `cuda_graphs` | `true` | Let HoloInfer replay the inference as CUDA graphs |
 | `build_workspace_bytes` | 1 GiB | TensorRT's workspace limit while it builds an engine; SAM 3's FP32 encoder needs 4 GiB |
+| `drop_when_busy` | `false` | Real time: skip an image, rather than fail the run, when an output finds every slot of its pool still held (see [Lossless or real time](#lossless-or-real-time)) |
+| `dropped` | none | A counter of the images `drop_when_busy` skipped; the first skip of a run is also logged |
 
 The configuration is fixed when the operator is constructed: it has no parameters to set later
 (only the prompts change at run time, through `prompt_control`), and the constructor refuses an
@@ -113,8 +115,12 @@ In the `holoscan::sam3_overlay` target, which needs the SDK's Visualization comp
 | `max_width`, `max_height` | `1920`, `1080` | The largest image |
 | `max_instances` | `16` | The segmenter's `max_instances` |
 | `prompt_names` | none | The prompts' names by index (`display_name()`); others show as `prompt N` |
-| `prompt_control` | none | The segmenter's control, whose prompts then name the instances |
+| `prompt_control` | none | The segmenter's control: the prompts the segmenter recorded for each image then name its instances |
 | `fill_alpha` | `110` | The opacity of an instance's inside |
+| `drop_when_busy`, `dropped` | `false`, none | As for `Sam3SegmentationConfig` |
+
+The inputs are paired by capture time (`OnAligned`), so the images the segmenter takes need one
+(`EmitOptions::capture_time`).
 
 ## Prompts
 
@@ -140,6 +146,17 @@ control->set({{.text = "cup"}, {.text = "bottle"}});   // Throws for a phrase no
 ```
 
 The operator takes the new prompts from its next image on; `prompt_ids` then index the new list.
+`set()` refuses prompts the operator could not use, also, once the operator has started, a prompt
+with more boxes than its decoder takes. The operator records which prompts it segmented each image
+with: `control->prompts_at(capture_timestamp_ns)` gives them for an image's instances, also for
+images still on their way when the prompts changed, and `Sam3OverlayOp` names instances by them.
+
+### CPU waits and copies per image
+
+| Operator | Waits | Copies |
+| --- | --- | --- |
+| `Sam3SegmentationOp` | None for images in GPU memory. Pinned host images: none, or one `cudaStreamSynchronize` when their memory cannot be held by the stream. Pageable host images: one wait for their producer | Host images: one copy to the GPU through a staging buffer, logged once per run. At the first image and at each prompt change: one `cudaStreamSynchronize` and one upload of the prompts, from pinned memory on the image's stream |
+| `Sam3OverlayOp` | One `cudaStreamSynchronize` | The count, scores, boxes and prompt ids to pinned host memory, about 25 bytes per instance slot |
 
 ## What it computes
 
@@ -205,6 +222,7 @@ for (const char* port : {"masks", "labels", "scores", "boxes", "prompt_ids", "co
   options.deployment.bind_tensor_output_device(holoscan::TensorOutputDevicePlacement{
       .operator_path = "sam3", .output_port = port, .device = holoscan::DeviceId{0}});
 }
+graph.partition("my_app").include_all();   // A lossless graph: one worker (see below).
 const auto plan = holoscan::compile(graph, std::move(options));
 s3::prepare_engines(config);   // Before the run: see above.
 const int status = holoscan::run(plan);   // Adopts `signals`.
@@ -214,12 +232,23 @@ const int status = holoscan::run(plan);   // Adopts `signals`.
 
 `add_flow()` without options gives a blocking edge: every image is segmented and its instances
 delivered, in order, at the queue depth the input declares (two). When a consumer is still busy
-with earlier images, `emit()` returns `kBackpressured` with nothing delivered, and the operator
-cannot send that image's outputs again, so the run fails: a lossless graph paces its source to
-what its consumers keep up with, as the demo's test modes do. For a live source, connect the input
-and every output as a depth-1 drop-oldest edge
-(`{.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 1U}`): the operator then
-never waits for a slower consumer, and takes the newest image. The demo shows the HoloViz wiring.
+with earlier images, `emit()` returns `kBackpressured` with nothing delivered, and the operator,
+which has already taken its image, cannot send that image's outputs again, so the run fails. Keep
+a lossless graph on one worker, as in the example above and in the demo's lossless modes:
+`graph.partition("my_app").include_all()` runs its operators one at a time, so the segmenter's
+consumers have run before it gets its next image (holoscan-messages' README, "Run a graph on one
+worker", has what was measured across workers). Check it with
+`plan.scheduler_plan().worker_count == 1`. A source in such a graph sends a refused image again on
+its next tick, on `kBackpressured` from `emit()` and on `kResourceExhausted` from
+`allocate_tensor()` alike.
+
+For a live source, connect the input and every output as a depth-1 drop-oldest edge
+(`{.queue_policy = holoscan::QueuePolicy::kDropOldest, .queue_depth = 1U}`) and leave the graph to
+the automatic partitioning, so that its stages overlap: the operator then never waits for a slower
+consumer, and takes the newest image. Set `drop_when_busy` too: when the GPU falls behind, the
+outputs of dropped samples hold their memory until the GPU work on them is done, and with every
+output slot still held, the operator skips the image, logs that once and counts it in `dropped`,
+instead of failing the run. `Sam3OverlayOp` takes the same two settings. The demo shows the HoloViz wiring.
 
 The kernels need no Holoscan graph: `<holoscan/sam3/kernels.hpp>` has `launch_preprocess()`,
 `launch_select()`, `launch_finalize()` and `launch_overlay()`. For tests,
@@ -300,14 +329,14 @@ cmake --install build/sam3 --prefix "$PWD/install"
 | `BUILD_TESTING` | `OFF` | Build the tests, when the module is the top-level project |
 | `HOLOSCAN_SAM3_BUILD_TESTING` | `OFF` | Build the tests when another project includes the module |
 | `HOLOSCAN_SAM3_BUILD_OVERLAY` | `ON` (`OFF` when the including project asks only for `Sam3SegmentationOp`) | Build `Sam3OverlayOp`, which needs Visualization |
-| `HOLOSCAN_SAM3_MODEL_DIR` | `data/sam3` | The export the real-model test uses |
+| `HOLOSCAN_SAM3_MODEL_DIR` | `$HOLOSCAN_TEST_DATA/sam3` when that is set, else `data/sam3` | The export the real-model test uses |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (`all-major` for the package) | GPUs to compile for |
 
 | Test | Needs | Checks |
 | --- | --- | --- |
 | `sam3_kernels` | GPU | The kernels against the host references, bit for bit: the preprocessing in every encoding, down- and upscaled, with padded rows; the selection and finalization of made-up decoder outputs at SAM 3's sizes and others, with tied and NaN scores, more instances than fit, prompts with none, overlapping masks, with and without the masks output; the overlay |
 | `sam3_operators` | GPU | Both operators through the SDK's operator test harness, with the stub model and TensorRT, every output against the host reference of the whole pipeline: every encoding, from GPU, host and pinned memory, text and box prompts, more instances than fit, other thresholds, without masks, changing image sizes, prompts from a control, FP16 engines, provenance on every output, unusable images, settings, prompts and models; the overlay's image and labels |
-| `sam3_real_model` | GPU, the export; skipped without it | SAM 3 in FP16 on the synthetic scene: "circle", "blue rectangle" and "triangle" each find their shape, and an exemplar box around the circle finds it, with a mask IoU of at least 0.9 |
+| `sam3_real_model` | GPU, the export; skipped without it, as on every CI lane | SAM 3 in FP16 on the synthetic scene: "circle", "blue rectangle" and "triangle" each find their shape, and an exemplar box around the circle finds it, with a mask IoU of at least 0.9 |
 | `sam3_host` | Nothing | Prompts and the prompt table file; a prompt's decoder inputs; the mask sampling, ranking and box arithmetic against direct evaluations; the instance and overlay references; the synthetic scene; the stub model files, and each stub prompt finding its shape |
 | `sam3_prepare_model` | Python | `prepare_model.py` without PyTorch or the network: the license and token requirements, pinned digests, a wrong digest, the cache, exports of another shape, a failed or missing exporter, prompts added to an existing export, and reuse of prepared files |
 
@@ -349,7 +378,9 @@ SAM 3 segments real scenes, for which see the SAM 3 paper.
 ## Performance
 
 SAM 3 at 1008x1008, measured with SDK 5.0.0, CUDA 13.2 and TensorRT 10.16 in the repository's CI
-image:
+image. `trtexec` warms up before it measures (its default); the capture-to-instances figures are
+the demo's, over every frame of a run, the first included, with no warm-up left out. The Jetson
+Orin's power mode was not recorded.
 
 | | RTX 5090 (x86_64) | Jetson Orin (JetPack 7.2) |
 | --- | --- | --- |

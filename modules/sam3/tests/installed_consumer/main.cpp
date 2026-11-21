@@ -89,7 +89,10 @@ class SceneSourceOp final : public holoscan::Operator<> {
     const std::array<std::int64_t, 3> shape{kHeight, kWidth, 3};
     auto loan = image.allocate_tensor(holoscan::TensorLoanRequest{.shape = shape, .dtype = kUInt8});
     if (!loan) {
-      return holoscan::make_unexpected(std::move(loan).error());
+      // Every slot still held by consumers: send the frame on the next tick.
+      return loan.error().code == holoscan::ErrorCode::kResourceExhausted
+                 ? holoscan::expected<void, holoscan::Error>{}
+                 : holoscan::make_unexpected(std::move(loan).error());
     }
     const std::vector<std::uint8_t> pixels = scene_pixels(emitted_);
     auto written = loan->write_host_and_commit([&](const holoscan::TensorOutputWriteGuard& writer)
@@ -269,6 +272,10 @@ int main() try {
   graph.add_flow(segmenter->count, overlay->count, lossless);
   graph.add_flow(overlay->overlay, sink->overlay, lossless);
   graph.add_flow(overlay->text, sink->text, lossless);
+  // Lossless, so one worker for the whole graph: across workers a producer
+  // runs while its consumer's lossless queue is full, and an operator in the
+  // middle of the chain fails on the refused emit (the module's README).
+  graph.partition("sam3_consumer").include_all();
   graph.set_default_clock(graph.add_clock<holoscan::RealtimeClock>("clock"));
 
   // The segmenter's outputs and the overlay are in GPU memory, on device 0.
@@ -282,6 +289,12 @@ int main() try {
   const holoscan::ExecutionPlan plan = holoscan::compile(graph, std::move(options));
   if (!plan.ok()) {
     std::cerr << plan.json() << '\n';
+    return 1;
+  }
+  const std::uint32_t workers = plan.scheduler_plan().worker_count;
+  std::cout << "sam3_consumer: workers=" << workers << '\n';
+  if (workers != 1U) {
+    std::cerr << "sam3_consumer: the lossless graph must run on one worker\n";
     return 1;
   }
   // Build the TensorRT engines before the run, as the operator asks; the run adopts the

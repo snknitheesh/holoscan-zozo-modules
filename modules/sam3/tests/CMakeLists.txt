@@ -2,12 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The module's full suite. The kernel and operator tests need the SDK, CUDA and a GPU;
-# none needs a download: the stub model stands in for SAM 3. The real-model test runs
-# when HOLOSCAN_SAM3_MODEL_DIR holds an export of tools/prepare_model.py, and is skipped
-# otherwise.
+# none needs a download: the stub model stands in for SAM 3, on every CI lane. The
+# real-model test runs when HOLOSCAN_SAM3_MODEL_DIR holds an export of
+# tools/prepare_model.py, and is skipped otherwise; it defaults to the sam3 folder of the
+# test data ($HOLOSCAN_TEST_DATA) when that is set, and to data/sam3 otherwise.
+if(NOT "$ENV{HOLOSCAN_TEST_DATA}" STREQUAL "")
+  set(_sam3_model_dir "$ENV{HOLOSCAN_TEST_DATA}/sam3")
+else()
+  set(_sam3_model_dir "${PROJECT_SOURCE_DIR}/../../data/sam3")
+endif()
 set(
   HOLOSCAN_SAM3_MODEL_DIR
-  "${PROJECT_SOURCE_DIR}/../../data/sam3"
+  "${_sam3_model_dir}"
   CACHE PATH
   "A folder with tools/prepare_model.py's SAM 3 export, for the real-model test"
 )

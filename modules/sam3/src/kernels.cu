@@ -188,11 +188,28 @@ __global__ void overlay_kernel(const std::uint16_t* labels, int width, int heigh
                 rgba + 4 * (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + x));
 }
 
+bool side_in(int side, int most) { return side >= 1 && side <= most; }
+
+// The most slots per prompt: a grid's y extent.
+constexpr int kMaxSlots = 65535;
+
+bool candidates_given(const Candidates& c) {
+  return c.scores != nullptr && c.boxes != nullptr && c.queries != nullptr && c.logits != nullptr &&
+         c.counts != nullptr;
+}
+
 }  // namespace
 
 cudaError_t launch_preprocess(const ImageView& image, int input_width, int input_height,
                               const Normalization& normalization, float* input,
                               cudaStream_t stream) {
+  if (image.data == nullptr || input == nullptr || !side_in(image.width, kMaxImageSide) ||
+      !side_in(image.height, kMaxImageSide) || !side_in(input_width, kMaxModelSide) ||
+      !side_in(input_height, kMaxModelSide) ||
+      image.pitch < static_cast<std::size_t>(image.width) *
+                        static_cast<std::size_t>(channels(image.format))) {
+    return cudaErrorInvalidValue;
+  }
   const PreprocessParams p =
       make_preprocess_params(image.width, image.height, image.format, image.pitch, input_width,
                              input_height, normalization);
@@ -204,6 +221,11 @@ cudaError_t launch_preprocess(const ImageView& image, int input_width, int input
 cudaError_t launch_select(const float* scores, const float* boxes, const float* masks,
                           const SelectParams& params, const Candidates& candidates,
                           cudaStream_t stream) {
+  if (scores == nullptr || boxes == nullptr || masks == nullptr || !candidates_given(candidates) ||
+      params.prompt < 0 || params.queries < 1 || !side_in(params.capacity, kMaxSlots) ||
+      !side_in(params.mask_width, kMaxModelSide) || !side_in(params.mask_height, kMaxModelSide)) {
+    return cudaErrorInvalidValue;
+  }
   select_kernel<<<1, kRankThreads, 0, stream>>>(params, scores, boxes, candidates);
   if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
     return status;
@@ -218,6 +240,13 @@ cudaError_t launch_select(const float* scores, const float* boxes, const float* 
 
 cudaError_t launch_finalize(const Candidates& candidates, const FinalizeParams& params,
                             const Instances& instances, cudaStream_t stream) {
+  if (!candidates_given(candidates) || instances.labels == nullptr || instances.scores == nullptr ||
+      instances.boxes == nullptr || instances.prompt_ids == nullptr || instances.count == nullptr ||
+      instances.order == nullptr || params.prompts < 1 || !side_in(params.capacity, kMaxSlots) ||
+      !side_in(params.mask_width, kMaxModelSide) || !side_in(params.mask_height, kMaxModelSide) ||
+      !side_in(params.width, kMaxImageSide) || !side_in(params.height, kMaxImageSide)) {
+    return cudaErrorInvalidValue;
+  }
   rank_kernel<<<1, kRankThreads, 0, stream>>>(params, candidates, instances);
   if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
     return status;
@@ -229,6 +258,10 @@ cudaError_t launch_finalize(const Candidates& candidates, const FinalizeParams& 
 
 cudaError_t launch_overlay(const std::uint16_t* labels, int width, int height,
                            std::uint8_t fill_alpha, std::uint8_t* rgba, cudaStream_t stream) {
+  if (labels == nullptr || rgba == nullptr || !side_in(width, kMaxImageSide) ||
+      !side_in(height, kMaxImageSide)) {
+    return cudaErrorInvalidValue;
+  }
   overlay_kernel<<<grid_for(width, height), dim3(kBlockX, kBlockY), 0, stream>>>(
       labels, width, height, fill_alpha, rgba);
   return cudaGetLastError();

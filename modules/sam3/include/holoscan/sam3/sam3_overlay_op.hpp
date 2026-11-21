@@ -6,9 +6,17 @@
 // translucent in its own color with an opaque outline, on a transparent RGBA8
 // image; and a "<prompt> 0.87" label at each instance's box. Both carry the
 // image's capture time, so HoloViz draws them over their own frame.
+//
+// The inputs are paired by capture time (OnAligned), so they need one: give
+// the segmenter stamped images (EmitOptions::capture_time), as every source
+// that keeps its frames' capture time does. Per image the operator copies
+// the count, scores, boxes and prompt ids to the host on its stream, about
+// 25 bytes per instance slot, and waits for them once.
 
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -38,25 +46,39 @@ struct Sam3OverlayConfig {
   // Names of the prompts by index (display_name()); others show as
   // "prompt N".
   std::vector<std::string> prompt_names;
-  // Optional: the segmenter's prompt control, whose prompts, once set, name
-  // the instances instead.
+  // Optional: the segmenter's prompt control. Once the segmenter has taken
+  // prompts from it, the prompts each image was segmented with name its
+  // instances (Sam3PromptControl::prompts_at()).
   std::shared_ptr<Sam3PromptControl> prompt_control;
   // The opacity of an instance's inside; its outline is opaque.
   std::uint8_t fill_alpha{110};
+  // Real time: skip an image's instances, rather than fail the run, when an
+  // output finds every slot of its pool still held (kResourceExhausted), as
+  // Sam3SegmentationConfig::drop_when_busy does. Leave it off in a lossless
+  // graph.
+  bool drop_when_busy{false};
+  // Optional: counts the images skipped by drop_when_busy; the first skip of
+  // a run is also logged.
+  std::shared_ptr<std::atomic<std::uint64_t>> dropped;
 };
 
 class Sam3OverlayOp final : public holoscan::Operator<> {
  public:
   // @throws std::invalid_argument for a non-positive size or capacity.
   explicit Sam3OverlayOp(Sam3OverlayConfig config);
+  ~Sam3OverlayOp() override;
+  Sam3OverlayOp(const Sam3OverlayOp&) = delete;
+  Sam3OverlayOp& operator=(const Sam3OverlayOp&) = delete;
 
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
+  void start() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(
       holoscan::ExecutionContext& context) override;
 
-  // Sam3SegmentationOp's outputs: the label image in GPU memory, the others
-  // in GPU or host memory.
+  // Sam3SegmentationOp's outputs, stamped with their image's capture time:
+  // the label image in GPU memory (declared, so a host producer is refused
+  // when the graph compiles), the others in GPU or host memory.
   holoscan::Input<holoscan::Tensor> labels;
   holoscan::Input<holoscan::Tensor> scores;
   holoscan::Input<holoscan::Tensor> boxes;
@@ -71,9 +93,11 @@ class Sam3OverlayOp final : public holoscan::Operator<> {
 
  private:
   Sam3OverlayConfig config_;
-  std::vector<float> scores_;
-  std::vector<float> boxes_;
-  std::vector<std::int32_t> prompt_ids_;
+  // Pinned host memory the count, scores, boxes and prompt ids are copied to:
+  // int32 count, then max_instances floats, 4 x max_instances floats and
+  // max_instances int32s. Allocated at the first image.
+  std::byte* host_{};
+  bool logged_drop_{};
 };
 
 }  // namespace holoscan::sam3

@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -440,15 +441,32 @@ def find_token(explicit: str | None) -> str | None:
     return saved or None
 
 
+class SameHostAuthorizationRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows redirects, keeping the access token only on the host it was given for.
+
+    urllib copies a request's headers to the redirected request; Hugging Face redirects
+    downloads to its CDN, another host, which must not receive the token.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and (
+            urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(req.full_url).hostname
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 def download(url: str, sha256: str, destination: Path, token: str | None) -> None:
     """Download url to destination, which appears only when its digest matches."""
     partial = destination.with_name(destination.name + ".partial")
     request = urllib.request.Request(url)
     if token and url.startswith("https:"):
         request.add_header("Authorization", f"Bearer {token}")
+    opener = urllib.request.build_opener(SameHostAuthorizationRedirect)
     try:
         with (
-            urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response,
+            opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response,
             partial.open("wb") as file,
         ):
             shutil.copyfileobj(response, file)

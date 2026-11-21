@@ -36,12 +36,15 @@
 // (OnAligned), as Sam3OverlayOp does.
 //
 // On a blocking edge, an output a busy consumer has no room for is such a
-// failure (kBackpressured): a lossless graph paces its source to what its
-// consumers keep up with. For a live source, connect the input and every
-// output with holoscan::ConnectionOptions{.queue_policy =
-// holoscan::QueuePolicy::kDropOldest, .queue_depth = 1}: a full queue then
-// drops its oldest sample, so the operator never waits for a slower consumer
-// and takes the newest image.
+// failure (kBackpressured): run a lossless graph on one worker
+// (graph.partition(name).include_all()), so that the operator's consumers
+// have run before it takes its next image. For a live source, connect the
+// input and every output with holoscan::ConnectionOptions{.queue_policy =
+// holoscan::QueuePolicy::kDropOldest, .queue_depth = 1} and set
+// drop_when_busy: a full queue then drops its oldest sample, so the operator
+// never waits for a slower consumer and takes the newest image, and an image
+// that finds every output slot still held is skipped rather than failing the
+// run.
 //
 // The operator segments images one at a time; video tracking, which carries
 // instances from frame to frame with SAM 3's memory, is a separate operator's
@@ -51,6 +54,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -106,6 +110,15 @@ struct Sam3SegmentationConfig {
   bool cuda_graphs{true};
   // TensorRT's workspace limit while it builds an engine.
   std::size_t build_workspace_bytes{std::size_t{1} << 30U};
+  // Real time: skip an image, rather than fail the run, when an output finds
+  // every slot of its pool still held (kResourceExhausted). On drop-oldest
+  // edges a dropped sample's slot comes back only once the GPU work on it is
+  // done, so a GPU that falls behind the source runs out of slots. Leave it
+  // off in a lossless graph, where every image must arrive.
+  bool drop_when_busy{false};
+  // Optional: counts the images skipped by drop_when_busy. The first skip of
+  // a run is also logged.
+  std::shared_ptr<std::atomic<std::uint64_t>> dropped;
 };
 
 // @throws std::invalid_argument naming the first unusable field, prompts
@@ -174,7 +187,10 @@ class Sam3SegmentationOp final : public holoscan::Operator<> {
       const holoscan::Tensor& tensor, int width, int height, int channels, std::size_t pitch,
       cudaStream_t stream);
   // Uploads the prompts' decoder inputs, if they changed.
-  [[nodiscard]] holoscan::expected<void, holoscan::Error> load_prompts(cudaStream_t stream);
+  // Records with the control which prompts the images from `capture_ns` on
+  // are segmented with.
+  [[nodiscard]] holoscan::expected<void, holoscan::Error> load_prompts(cudaStream_t stream,
+                                                                       std::int64_t capture_ns);
   // Prompts newer than the active ones, from the control.
   void poll_control();
   void release() noexcept;
@@ -191,9 +207,16 @@ class Sam3SegmentationOp final : public holoscan::Operator<> {
   std::vector<Sam3Prompt> active_;
   std::uint64_t control_generation_{};
   std::unique_ptr<Engines> engines_;
-  // A GPU copy of host images, grown as needed.
+  // A GPU copy of host images, grown as needed; logged once per run.
   void* staging_{};
   std::size_t staging_bytes_{};
+  bool logged_staging_{};
+  // Pinned host memory the prompts' decoder inputs are uploaded from,
+  // asynchronously on the image's stream; grown as needed.
+  float* prompt_upload_{};
+  std::size_t prompt_upload_floats_{};
+  // Whether a skipped image has been logged this run.
+  bool logged_drop_{};
   // Recorded after each image's work. The models' buffers, the candidates and
   // `staging_` are reused by every image, but the runtime may give each
   // activation another stream, so the next image's stream waits for it before

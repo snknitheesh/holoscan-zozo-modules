@@ -7,7 +7,8 @@
 // box around a shape (no text) finds that shape, each with a mask whose
 // intersection over union with the truth is at least kMinIou. The engines are
 // FP16, as by default. Skipped (exit status 77) unless the folder holds the
-// export; CI runs it only when its nightly job provides the model.
+// export. No CI lane has the model, so every lane skips it; run it where you
+// have exported the model (see tests/CMakeLists.txt for the folder).
 //
 // Usage: sam3_real_model_test DIR (with sam3_encoder.onnx, sam3_decoder.onnx
 // and sam3_prompts.bin)
