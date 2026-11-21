@@ -3,6 +3,8 @@
 //
 // The nvcodec encoder: NVENC through the Video Codec SDK, reading NV12 straight from CUDA device
 // memory. One frame in, one access unit out: synchronous, no B-frames, IDRs placed by the caller.
+// NVENC reads the frame after the work queued on the caller's CUDA stream (nvEncSetIOCudaStreams),
+// so the CPU waits only once per frame, in nvEncLockBitstream.
 
 #include <cuda.h>
 
@@ -257,7 +259,8 @@ class NvcodecEncoder final : public EncoderBackend {
     }
   }
 
-  std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool keyframe) override {
+  std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool keyframe,
+                                   cudaStream_t stream) override {
     if (frame.width != width_ || frame.height != height_ ||
         frame.luma_pitch != frame.chroma_pitch ||
         frame.chroma != frame.luma + frame.luma_pitch * static_cast<std::size_t>(frame.height)) {
@@ -268,6 +271,7 @@ class NvcodecEncoder final : public EncoderBackend {
     const auto& api = nvenc_library().api;
     void* encoder = session_.get();
     register_input(frame);
+    read_after(stream);
 
     NV_ENC_MAP_INPUT_RESOURCE map{};
     map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
@@ -305,6 +309,25 @@ class NvcodecEncoder final : public EncoderBackend {
   }
 
  private:
+  // Makes NVENC read its input after the work queued on `stream`. Where the driver does not take
+  // the stream, the CPU waits for it instead.
+  void read_after(cudaStream_t stream) {
+    if (io_streams_ && io_stream_set_ && io_stream_ == reinterpret_cast<CUstream>(stream)) {
+      return;
+    }
+    if (io_streams_) {
+      // NVENC keeps the pointer: io_stream_ outlives the session's use of it.
+      io_stream_ = reinterpret_cast<CUstream>(stream);
+      if (nvenc_library().api.nvEncSetIOCudaStreams(session_.get(), &io_stream_, &io_stream_) ==
+          NV_ENC_SUCCESS) {
+        io_stream_set_ = true;
+        return;
+      }
+      io_streams_ = false;
+    }
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+
   // Registers the frame's memory with NVENC, once per buffer.
   void register_input(const Nv12Frame& frame) {
     if (registered_ != nullptr && registered_luma_ == frame.luma &&
@@ -342,6 +365,10 @@ class NvcodecEncoder final : public EncoderBackend {
   const std::uint8_t* registered_luma_{};
   std::size_t registered_pitch_{};
   std::uint64_t frames_{};
+  // Whether NVENC takes the caller's stream, and the one it was given.
+  bool io_streams_{true};
+  bool io_stream_set_{};
+  CUstream io_stream_{};
 };
 
 }  // namespace

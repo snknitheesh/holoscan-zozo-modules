@@ -4,11 +4,18 @@
 // The nvcodec decoder: NVDEC through the Video Codec SDK's parser and decoder. Each frame is
 // mapped in device memory, handed to the sink, and unmapped once the sink's work on the stream is
 // done. The parser shows each frame as soon as it is decoded (no display delay).
+//
+// Each frame is tagged with the id of the access unit it was decoded from by its decode surface:
+// the parser decodes an access unit's picture while that access unit is parsed, and shows the
+// surface later, in display order. The packet timestamps cannot tag it: with B-frames the parser
+// shows a frame with another access unit's timestamp (codec_test's reordered streams).
 
 #include <cuda.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
+#include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -75,12 +82,15 @@ class NvcodecDecoder final : public DecoderBackend {
   void decode(std::span<const std::uint8_t> access_unit, std::uint64_t id, cudaStream_t stream,
               const FrameSink& sink) override {
     CUVIDSOURCEDATAPACKET packet{};
-    packet.flags = CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE;
+    packet.flags = CUVID_PKT_ENDOFPICTURE;
     packet.payload_size = static_cast<unsigned long>(access_unit.size());  // NOLINT(runtime/int)
     packet.payload = access_unit.data();
-    packet.timestamp = static_cast<CUvideotimestamp>(id);
+    parsing_ = id;
     parse(packet, stream, sink);
   }
+
+  // Tagged by decode surface (see the top of this file).
+  [[nodiscard]] bool exact_ids() const noexcept override { return true; }
 
   void flush(cudaStream_t stream, const FrameSink& sink) override {
     CUVIDSOURCEDATAPACKET packet{};
@@ -94,8 +104,13 @@ class NvcodecDecoder final : public DecoderBackend {
     stream_ = stream;
     sink_ = &sink;
     error_.clear();
+    sink_error_ = nullptr;
     const CUresult status = cuvid_library().parse_video_data(parser_, &packet);
     sink_ = nullptr;
+    if (sink_error_) {
+      // The sink's own exception, unchanged, so that its caller can tell what failed.
+      std::rethrow_exception(std::exchange(sink_error_, nullptr));
+    }
     if (!error_.empty()) {
       throw std::runtime_error("nvcodec decoder: " + error_);
     }
@@ -176,6 +191,8 @@ class NvcodecDecoder final : public DecoderBackend {
       error_ = "a picture came before its sequence";
       return 0;
     }
+    // The access unit being parsed is this picture's, until the surface is decoded again.
+    surface_ids_[picture->CurrPicIdx] = parsing_;
     if (const CUresult status = cuvid_library().decode_picture(decoder_, picture);
         status != CUDA_SUCCESS) {
       const char* name = nullptr;
@@ -217,15 +234,19 @@ class NvcodecDecoder final : public DecoderBackend {
         .width = width_,
         .height = height_,
     };
+    const auto id = surface_ids_.find(shown->picture_index);
     try {
-      (*sink_)(frame, static_cast<std::uint64_t>(shown->timestamp));
-      // The frame is unmapped next, so whatever the sink queued on the stream must finish first.
-      check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
-    } catch (const std::exception& error) {
-      error_ = error.what();
+      (*sink_)(frame, id != surface_ids_.end() ? id->second : parsing_);
+    } catch (...) {
+      sink_error_ = std::current_exception();
+    }
+    // The frame is unmapped next, so whatever the sink queued on the stream must finish first.
+    if (const cudaError_t synced = cudaStreamSynchronize(stream_);
+        synced != cudaSuccess && error_.empty()) {
+      error_ = std::string("cudaStreamSynchronize: ") + cudaGetErrorString(synced);
     }
     library.unmap_video_frame(decoder_, pointer);
-    return error_.empty() ? 1 : 0;
+    return error_.empty() && !sink_error_ ? 1 : 0;
   }
 
   static int CUDAAPI on_sequence(void* self, CUVIDEOFORMAT* format) {
@@ -246,10 +267,15 @@ class NvcodecDecoder final : public DecoderBackend {
   unsigned coded_height_{};
   int width_{};
   int height_{};
+  // The id of the access unit being parsed, and of the one each decode surface was decoded from.
+  std::uint64_t parsing_{};
+  std::map<int, std::uint64_t> surface_ids_;
   // Set while a packet is parsed, for the callbacks.
   cudaStream_t stream_{};
   const FrameSink* sink_{};
   std::string error_;
+  // What the sink threw, rethrown once the parser returns.
+  std::exception_ptr sink_error_;
 };
 
 }  // namespace

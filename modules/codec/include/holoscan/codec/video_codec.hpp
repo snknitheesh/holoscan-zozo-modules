@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -79,39 +80,52 @@ class VideoEncoder {
   [[nodiscard]] const EncoderSettings& settings() const noexcept;
   // The backend in use: never kAuto.
   [[nodiscard]] Backend backend() const noexcept;
-  // What the backend runs on, for logs: "NVENC on NVIDIA GeForce RTX 5090", ...
+  // What the backend runs on, for logs: "NVENC on <the GPU's name>", ...
   [[nodiscard]] const std::string& backend_detail() const noexcept;
 
   // Encodes one image and returns its access unit. The first image, and the first of a new size,
   // start a new stream: the hardware session is (re)built and frame numbering starts again at 0.
   // The image is read on `stream` (after whatever is queued on it), and is no longer needed when
-  // this returns.
+  // this returns. The CPU waits once, for the access unit (see the README's "CPU waits and
+  // copies per frame").
   // @throws std::invalid_argument for an image the encoder cannot take (format, size).
   // @throws std::runtime_error on a hardware or driver failure.
   [[nodiscard]] EncodedFrame encode(const DeviceImage& image, std::int64_t pts,
                                     cudaStream_t stream);
+  // Ends the stream: the next encode() starts a new one, with an IDR keyframe and its parameter
+  // sets, numbered 0, as after a change of size. Cheap: the hardware session is kept.
+  void end_stream() noexcept;
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-// One decoded frame: NV12 in device memory owned by the decoder, valid until its next decode() or
-// flush().
+// One decoded frame: NV12 in device memory owned by the decoder.
 struct DecodedFrame {
   DeviceImage image;
-  // The pts given with the access unit this frame was decoded from.
+  // The pts given with the access unit this frame was decoded from, whatever the order the frames
+  // come out in (a stream with B-frames is decoded in another order than it is shown). The v4l2
+  // decoder without low latency does not say which access unit a frame came from: there each
+  // frame takes the smallest pts still waiting, which is its own when the pts increase in the
+  // order the stream shows its frames, as presentation times do.
   std::int64_t pts{};
 };
+
+// Called for each frame a decode() or flush() completes, in display order, with the frame in the
+// decoder's own memory: queue the work that reads it on the `stream` given to that call, and
+// return. The decoder waits for the stream before it reuses the memory, so nothing is copied.
+using DecodedFrameSink = std::function<void(const DecodedFrame& frame)>;
 
 class VideoDecoder {
  public:
   // With `low_latency`, each frame comes out of the decode() of its own access unit. That needs a
   // stream with one reference frame and no reordering, which VideoEncoder makes in low-latency
-  // mode; turn it off for other streams, whose frames then come out some access units later (on
-  // Jetson's V4L2 decoder; NVDEC only runs ahead a little).
+  // mode; turn it off for other streams, such as those with B-frames, whose frames then come out
+  // some access units later, in display order (on Jetson's V4L2 decoder; NVDEC only runs ahead a
+  // little), and the rest at flush().
   // @throws std::runtime_error when the backend is not available, saying why.
-  explicit VideoDecoder(Codec codec, Backend backend = Backend::kAuto, bool low_latency = true);
+  explicit VideoDecoder(Codec codec, Backend backend = Backend::kNvcodec, bool low_latency = true);
   ~VideoDecoder();
   VideoDecoder(const VideoDecoder&) = delete;
   VideoDecoder& operator=(const VideoDecoder&) = delete;
@@ -120,13 +134,21 @@ class VideoDecoder {
   [[nodiscard]] Backend backend() const noexcept;
   [[nodiscard]] const std::string& backend_detail() const noexcept;
 
-  // Decodes one access unit and returns the frames it completed, in display order. Access units
-  // before the first keyframe cannot be decoded and give nothing; so does an empty one. Frames are
-  // written on `stream`: wait on it before reading them.
+  // Decodes one access unit and hands `sink` the frames it completed, in display order. Access
+  // units before the first keyframe cannot be decoded and give nothing; so does an empty one. An
+  // exception from `sink` stops the decoding and comes out of this call.
   // @throws std::runtime_error on a hardware or driver failure.
+  void decode(std::span<const std::uint8_t> access_unit, std::int64_t pts, cudaStream_t stream,
+              const DecodedFrameSink& sink);
+  // Ends the stream: hands `sink` every frame the decoder still holds. The next access unit must
+  // be a keyframe.
+  void flush(cudaStream_t stream, const DecodedFrameSink& sink);
+
+  // The same, returning the frames as copies in memory of the decoder's that stays valid until
+  // the next decode() or flush(). They are written on `stream`: wait on it before reading them,
+  // and finish reading them (on whatever stream) before the next call, which reuses the memory.
   [[nodiscard]] std::vector<DecodedFrame> decode(std::span<const std::uint8_t> access_unit,
                                                  std::int64_t pts, cudaStream_t stream);
-  // Returns the frames the decoder still holds; the next access unit must be a keyframe.
   [[nodiscard]] std::vector<DecodedFrame> flush(cudaStream_t stream);
   // Access units given before the first keyframe, which were dropped.
   [[nodiscard]] std::uint64_t skipped() const noexcept;

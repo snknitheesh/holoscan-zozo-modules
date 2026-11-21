@@ -37,6 +37,11 @@ struct VideoEncoderConfig {
   // On a change of image size, start a new stream at the new size (a keyframe with new parameter
   // sets); when false, fail the frame instead.
   bool allow_resolution_change{true};
+  // 0: one stream for the whole run. Otherwise each stream ends after this many frames: the last
+  // one's access unit carries end_of_stream, on which VideoDecoderOp hands out every frame it
+  // still holds, and the next image starts a new stream with a keyframe. A finite source sets it
+  // to its frame count, so that a decoder without low latency gives every frame back.
+  std::uint32_t frames_per_stream{0};
 };
 
 // @throws std::invalid_argument naming the first unusable field.
@@ -53,7 +58,9 @@ class VideoEncoderOp final : public holoscan::Operator<> {
   void setup(holoscan::OperatorSpec& spec) override;
   [[nodiscard]] holoscan::Contract contract() const override;
   // Chooses the backend (for kAuto, the first that works here), logging which and why once, and
-  // opens the output file. Fails when no backend can encode the codec.
+  // opens the output file.
+  // @throws std::runtime_error when no backend can encode the codec or the file cannot be
+  //         written, which fails the run at startup.
   void start() override;
   void stop() override;
   [[nodiscard]] holoscan::expected<void, holoscan::Error> compute(

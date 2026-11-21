@@ -38,10 +38,12 @@ class EncoderBackend {
   EncoderBackend(const EncoderBackend&) = delete;
   EncoderBackend& operator=(const EncoderBackend&) = delete;
 
-  // Encodes `frame`, of the size the backend was built for and ready to read, into one access
-  // unit. With `keyframe`, an IDR picture with its parameter sets.
+  // Encodes `frame`, of the size the backend was built for, into one access unit, reading it
+  // after the work queued on `stream` (which writes it). With `keyframe`, an IDR picture with its
+  // parameter sets. Returns once the frame is no longer read.
   // @throws std::runtime_error on failure.
-  [[nodiscard]] virtual std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool keyframe) = 0;
+  [[nodiscard]] virtual std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool keyframe,
+                                                         cudaStream_t stream) = 0;
 
  protected:
   EncoderBackend() = default;
@@ -64,6 +66,9 @@ class DecoderBackend {
                       cudaStream_t stream, const FrameSink& sink) = 0;
   // Ends the stream: calls `sink` for every frame still held. The backend is not used after it.
   virtual void flush(cudaStream_t stream, const FrameSink& sink) = 0;
+  // Whether each frame comes with the id of its own access unit. Otherwise the ids come in the
+  // order the access units went in, which is the frames' own only when nothing is reordered.
+  [[nodiscard]] virtual bool exact_ids() const noexcept = 0;
 
  protected:
   DecoderBackend() = default;

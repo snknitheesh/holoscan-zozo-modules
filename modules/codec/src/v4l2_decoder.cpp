@@ -192,6 +192,10 @@ class V4l2Decoder final : public DecoderBackend {
     }
   }
 
+  // The decoder hands its frames the input buffers' timestamps in the order the buffers went in,
+  // so with B-frames, frame and timestamp differ. With low latency the stream has none.
+  [[nodiscard]] bool exact_ids() const noexcept override { return low_latency_; }
+
   void flush(cudaStream_t stream, const FrameSink& sink) override {
     // An empty input buffer ends the stream; the decoder then returns every frame it holds, and
     // an empty frame buffer after the last one.

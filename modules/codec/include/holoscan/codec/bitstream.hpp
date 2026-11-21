@@ -36,7 +36,11 @@ struct AccessUnitInfo {
   bool pps{};
   // An IDR picture (H.264 type 5; H.265 IDR_W_RADL or IDR_N_LP), where decoding may start.
   bool idr{};
-  // An intra random access point: an IDR, or for H.265 also a CRA or BLA picture.
+  // An H.264 recovery point SEI message: decoding may start here, and shows the right picture
+  // after the frames the message names (intra refresh, or an open GOP's I picture).
+  bool recovery_point{};
+  // Where decoding may start: an IDR; for H.264 also a picture with a recovery point; for H.265
+  // also a CRA or BLA picture.
   bool random_access{};
   // Slices of any picture.
   std::size_t slices{};

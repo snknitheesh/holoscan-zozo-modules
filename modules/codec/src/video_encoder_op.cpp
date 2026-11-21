@@ -66,8 +66,6 @@ struct VideoEncoderOp::State {
 
   std::atomic<Backend> resolved{Backend::kAuto};
   std::unique_ptr<VideoEncoder> encoder;
-  // Why start() could not set up, which every compute() then reports.
-  std::string start_error;
   std::ofstream file;
   // For activations without a runtime CUDA stream (host images); made on first use.
   std::unique_ptr<CUstream_st, StreamDestroy> own_stream;
@@ -77,6 +75,8 @@ struct VideoEncoderOp::State {
   int height{};
   std::uint64_t frames{};
   std::uint64_t bytes{};
+  // Frames in the current stream, for frames_per_stream.
+  std::uint32_t stream_frames{};
 };
 
 void validate_config(const VideoEncoderConfig& config) {
@@ -126,22 +126,23 @@ holoscan::Contract VideoEncoderOp::contract() const {
 
 void VideoEncoderOp::start() {
   State& state = *state_;
-  state.start_error.clear();
   state.frames = 0;
   state.bytes = 0;
   state.width = 0;
   state.height = 0;
+  state.stream_frames = 0;
+  // A failure here fails the run before any frame, rather than at the first frame (which a graph
+  // that never delivers one would never reach).
   try {
     state.encoder = std::make_unique<VideoEncoder>(config_.settings);
   } catch (const std::exception& error) {
-    state.start_error = error.what();
-    HOLOSCAN_LOG_ERROR("VideoEncoderOp: {}", state.start_error);
-    return;
+    throw std::runtime_error(std::string("VideoEncoderOp: ") + error.what());
   }
   state.resolved = state.encoder->backend();
   const EncoderSettings& s = config_.settings;
   HOLOSCAN_LOG_INFO(
-      "VideoEncoderOp: {} on the {} backend ({}){}; {} {}, gop {}, preset {}, {}",
+      "VideoEncoderOp: {} on the {} backend ({}){}; {} {}, gop {}, preset {}, {}; the CPU waits "
+      "for each frame's access unit, which is copied to the output in host memory",
       codec_name(s.codec), backend_name(state.encoder->backend()), state.encoder->backend_detail(),
       s.backend == Backend::kAuto ? ", which auto chose as the first backend that works here" : "",
       rate_control_name(s.rate_control),
@@ -151,8 +152,8 @@ void VideoEncoderOp::start() {
   if (!config_.output_path.empty()) {
     state.file.open(config_.output_path, std::ios::binary | std::ios::trunc);
     if (!state.file) {
-      state.start_error = "cannot write " + config_.output_path.string();
-      HOLOSCAN_LOG_ERROR("VideoEncoderOp: {}", state.start_error);
+      state.encoder.reset();
+      throw std::runtime_error("VideoEncoderOp: cannot write " + config_.output_path.string());
     }
   }
 }
@@ -181,8 +182,8 @@ holoscan::expected<void, holoscan::Error> VideoEncoderOp::compute(
     return holoscan::make_unexpected(std::move(sample).error());
   }
   State& state = *state_;
-  if (!state.start_error.empty() || !state.encoder) {
-    return holoscan::make_unexpected(failure(state.start_error));
+  if (!state.encoder) {
+    return holoscan::make_unexpected(failure("not started"));
   }
   const holoscan::schema::ImageT& input = sample->data;
   auto view = detail::view_image(input);
@@ -245,7 +246,9 @@ holoscan::expected<void, holoscan::Error> VideoEncoderOp::compute(
         state.copy_logged = true;
         HOLOSCAN_LOG_INFO(
             "VideoEncoderOp: the images are in host memory, so each one is copied to the device "
-            "before encoding ({} bytes per {}x{} frame); send CUDA device images to avoid it",
+            "before encoding ({} bytes per {}x{} frame), and the CPU waits for the copy, as the "
+            "image's memory may be reused once compute() returns; send CUDA device images to "
+            "avoid both",
             detail::image_bytes(view->image), view->image.width, view->image.height);
       }
       device_image = state.staging.to_device(view->image, stream);
@@ -258,6 +261,13 @@ holoscan::expected<void, holoscan::Error> VideoEncoderOp::compute(
   }
   state.width = view->image.width;
   state.height = view->image.height;
+  // A change of size started a new stream inside the encoder.
+  state.stream_frames = encoded.index == 0 ? 1U : state.stream_frames + 1U;
+  const bool end_of_stream =
+      config_.frames_per_stream != 0 && state.stream_frames >= config_.frames_per_stream;
+  if (end_of_stream) {
+    state.encoder->end_stream();
+  }
 
   if (encoded.data.size() > max_access_unit_bytes(config_)) {
     return holoscan::make_unexpected(
@@ -298,6 +308,7 @@ holoscan::expected<void, holoscan::Error> VideoEncoderOp::compute(
   descriptor.pts = encoded.pts;
   descriptor.keyframe = encoded.keyframe;
   descriptor.frame_index = encoded.index;
+  descriptor.end_of_stream = end_of_stream;
   ++state.frames;
   state.bytes += encoded.data.size();
   return bitstream.emit_tensor(std::move(*loan), descriptor,

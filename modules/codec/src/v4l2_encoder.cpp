@@ -125,7 +125,8 @@ class V4l2Encoder final : public EncoderBackend {
     device_.release_buffers(kCoded, coded_buffers_);
   }
 
-  std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool /*keyframe*/) override {
+  std::vector<std::uint8_t> encode(const Nv12Frame& frame, bool /*keyframe*/,
+                                   cudaStream_t stream) override {
     // Keyframes: the device's IDR interval is the GOP and every stream starts at frame 0, so it
     // places them where VideoEncoder asks for them.
     if (frame.width != width_ || frame.height != height_) {
@@ -142,18 +143,23 @@ class V4l2Encoder final : public EncoderBackend {
     for (const V4l2Buffer::Plane& plane : buffer.planes) {
       sync_dmabuf(plane.dmabuf, DMA_BUF_SYNC_START);
     }
+    // On the caller's stream, after the work that wrote the frame; one wait for both copies.
     const cudaError_t luma =
-        cudaMemcpy2D(buffer.planes[0].data, luma_pitch_, frame.luma, frame.luma_pitch,
-                     static_cast<std::size_t>(width_), static_cast<std::size_t>(height_),
-                     cudaMemcpyDeviceToHost);
+        cudaMemcpy2DAsync(buffer.planes[0].data, luma_pitch_, frame.luma, frame.luma_pitch,
+                          static_cast<std::size_t>(width_), static_cast<std::size_t>(height_),
+                          cudaMemcpyDeviceToHost, stream);
     const cudaError_t chroma =
-        cudaMemcpy2D(buffer.planes[1].data, chroma_pitch_, frame.chroma, frame.chroma_pitch,
-                     static_cast<std::size_t>(width_), static_cast<std::size_t>(height_ / 2),
-                     cudaMemcpyDeviceToHost);
+        cudaMemcpy2DAsync(buffer.planes[1].data, chroma_pitch_, frame.chroma, frame.chroma_pitch,
+                          static_cast<std::size_t>(width_), static_cast<std::size_t>(height_ / 2),
+                          cudaMemcpyDeviceToHost, stream);
+    const cudaError_t copied = cudaStreamSynchronize(stream);
     for (const V4l2Buffer::Plane& plane : buffer.planes) {
       sync_dmabuf(plane.dmabuf, DMA_BUF_SYNC_END);
     }
-    check_cuda(luma != cudaSuccess ? luma : chroma, "v4l2 encoder: copying the frame");
+    check_cuda(luma != cudaSuccess     ? luma
+               : chroma != cudaSuccess ? chroma
+                                       : copied,
+               "v4l2 encoder: copying the frame");
     device_.queue(
         kRaw, index,
         {static_cast<std::uint32_t>(luma_pitch_ * static_cast<std::size_t>(height_)),

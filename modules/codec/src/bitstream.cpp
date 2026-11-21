@@ -14,6 +14,7 @@ namespace {
 // H.264 nal_unit_type values (ITU-T H.264 table 7-1).
 constexpr int kH264NonIdrSlice = 1;
 constexpr int kH264IdrSlice = 5;
+constexpr int kH264Sei = 6;
 constexpr int kH264Sps = 7;
 constexpr int kH264Pps = 8;
 
@@ -51,6 +52,39 @@ StartCode find_start_code(std::span<const std::uint8_t> stream, std::size_t from
 
 int nal_type(Codec codec, std::uint8_t first_byte) {
   return codec == Codec::kH264 ? first_byte & 0x1F : (first_byte >> 1) & 0x3F;
+}
+
+// Whether an H.264 SEI NAL unit (`nal`, its header byte first) holds a recovery point message
+// (payloadType 6, ITU-T H.264 D.1.8).
+bool has_recovery_point(std::span<const std::uint8_t> nal) {
+  constexpr int kRecoveryPoint = 6;
+  // The payload without its emulation prevention bytes (00 00 03 -> 00 00).
+  std::vector<std::uint8_t> rbsp;
+  rbsp.reserve(nal.size());
+  int zeros = 0;
+  for (std::size_t i = 1; i < nal.size(); ++i) {
+    if (zeros >= 2 && nal[i] == 3) {
+      zeros = 0;
+      continue;
+    }
+    zeros = nal[i] == 0 ? zeros + 1 : 0;
+    rbsp.push_back(nal[i]);
+  }
+  std::size_t at = 0;
+  // Messages until the rbsp trailing bits (0x80).
+  while (at < rbsp.size() && rbsp[at] != 0x80) {
+    std::size_t type = 0;
+    while (at < rbsp.size() && rbsp[at] == 0xFF) type += rbsp[at++];
+    if (at >= rbsp.size()) return false;
+    type += rbsp[at++];
+    std::size_t size = 0;
+    while (at < rbsp.size() && rbsp[at] == 0xFF) size += rbsp[at++];
+    if (at >= rbsp.size()) return false;
+    size += rbsp[at++];
+    if (type == kRecoveryPoint) return true;
+    at += size;
+  }
+  return false;
 }
 
 bool is_parameter_set(Codec codec, int type) {
@@ -93,6 +127,10 @@ AccessUnitInfo analyze_access_unit(Codec codec, std::span<const std::uint8_t> au
       }
       if (type == kH264IdrSlice) {
         info.idr = true;
+        info.random_access = true;
+      }
+      if (type == kH264Sei && has_recovery_point(au.subspan(unit.offset, unit.size))) {
+        info.recovery_point = true;
         info.random_access = true;
       }
     } else {

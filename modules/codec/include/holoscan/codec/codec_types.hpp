@@ -21,11 +21,12 @@ enum class Codec : std::uint8_t {
 // Which hardware path encodes and decodes.
 enum class Backend : std::uint8_t {
   // NVIDIA Video Codec SDK (NVENC / NVDEC through libnvidia-encode and libnvcuvid): discrete
-  // GPUs, and Jetson Thor.
+  // GPUs, and Jetson Thor. The default.
   kNvcodec,
   // Jetson Multimedia V4L2 devices (/dev/v4l2-nvenc, /dev/v4l2-nvdec): Jetson Orin.
   kV4l2,
-  // The first of the above that works on this machine, chosen once: see probe_backends().
+  // Opt-in: the first of the above that works on this machine, chosen once (see
+  // probe_encoder_backends()).
   kAuto,
 };
 
@@ -70,7 +71,7 @@ enum class PixelFormat : std::uint8_t {
 // How a VideoEncoder compresses.
 struct EncoderSettings {
   Codec codec{Codec::kH264};
-  Backend backend{Backend::kAuto};
+  Backend backend{Backend::kNvcodec};
   RateControl rate_control{RateControl::kVbr};
   // Target bits per second, for kCbr and kVbr.
   std::uint32_t bitrate{8'000'000};

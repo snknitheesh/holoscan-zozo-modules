@@ -5,9 +5,9 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -114,8 +114,13 @@ std::vector<BackendStatus> probe_cached(bool encoder, Codec codec) {
 std::pair<Backend, std::string> choose_backend(bool encoder, Codec codec, Backend wanted) {
   const std::vector<BackendStatus> statuses = probe_cached(encoder, codec);
   std::string reasons;
+  std::string others;
   for (const BackendStatus& status : statuses) {
     if (wanted != Backend::kAuto && status.backend != wanted) {
+      if (status.available) {
+        others +=
+            std::string(others.empty() ? "" : ", ") + std::string(backend_name(status.backend));
+      }
       continue;
     }
     if (status.available) {
@@ -123,6 +128,9 @@ std::pair<Backend, std::string> choose_backend(bool encoder, Codec codec, Backen
     }
     reasons += (reasons.empty() ? "" : "; ") + std::string(backend_name(status.backend)) + ": " +
                status.detail;
+  }
+  if (!others.empty()) {
+    reasons += "; " + others + " works here: choose it, or auto";
   }
   throw std::runtime_error(std::string("no ") + (encoder ? "encoder" : "decoder") + " for " +
                            std::string(codec_name(codec)) + " (" +
@@ -205,7 +213,7 @@ EncodedFrame VideoEncoder::encode(const DeviceImage& image, std::int64_t pts, cu
   check_cuda(detail::launch_to_nv12(image, impl.nv12.data, impl.nv12.pitch, chroma, impl.nv12.pitch,
                                     width, height, stream),
              "converting the image to NV12");
-  check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  // The backend reads the frame after the conversion queued on `stream`, and returns once it has.
 
   const Codec codec = impl.settings.codec;
   const bool keyframe = impl.index % impl.settings.gop == 0;
@@ -216,7 +224,7 @@ EncodedFrame VideoEncoder::encode(const DeviceImage& image, std::int64_t pts, cu
                                              .chroma_pitch = impl.nv12.pitch,
                                              .width = width,
                                              .height = height},
-                           keyframe);
+                           keyframe, stream);
   const AccessUnitInfo info = analyze_access_unit(codec, access_unit);
   if (info.sps) {
     impl.parameter_sets = parameter_sets(codec, access_unit);
@@ -232,6 +240,19 @@ EncodedFrame VideoEncoder::encode(const DeviceImage& image, std::int64_t pts, cu
                       .height = image.height};
 }
 
+void VideoEncoder::end_stream() noexcept {
+  impl_->index = 0;
+  if (impl_->backend == Backend::kV4l2) {
+    // The V4L2 encoder places IDRs by its own frame count: a new session starts at frame 0.
+    impl_->session.reset();
+  }
+}
+
+// Access units whose frame has not come out yet are kept by id up to this many: more than any
+// stream holds back (H.264 and H.265 keep at most 16 frames for reordering), so an id dropped
+// for room belongs to an access unit that gave no frame.
+constexpr std::size_t kMaxPendingIds = 64;
+
 struct VideoDecoder::Impl {
   Codec codec{};
   Backend backend{};
@@ -241,40 +262,66 @@ struct VideoDecoder::Impl {
   std::uint64_t next_id{};
   std::map<std::uint64_t, std::int64_t> pts_of;
   std::uint64_t skipped{};
-  // The decoded frames handed out by the latest decode() or flush(), and their memory.
+  // The copies the vector-returning decode() and flush() hand out, and their memory.
   std::vector<PitchedBuffer> pool;
 
-  std::vector<DecodedFrame> run(cudaStream_t stream,
-                                const std::function<void(const detail::FrameSink&)>& step) {
-    std::vector<DecodedFrame> frames;
-    const detail::FrameSink sink = [&](const detail::Nv12Frame& frame, std::uint64_t id) {
+  // Runs `step` with a backend sink that hands each frame to `sink` with the pts of its own
+  // access unit. The backends tag access units with ids in decode order; a stream with B-frames
+  // shows them in another order. Where the backend gives each frame its own id, that id is looked
+  // up; otherwise the frame takes the smallest pts still waiting, as a decoder shows a stream's
+  // frames in increasing presentation time.
+  void run(const DecodedFrameSink& sink,
+           const std::function<void(const detail::FrameSink&)>& step) {
+    const bool exact = session->exact_ids();
+    const detail::FrameSink backend_sink = [&](const detail::Nv12Frame& frame, std::uint64_t id) {
+      auto found = pts_of.find(id);
+      if (!exact) {
+        found = std::min_element(pts_of.begin(), pts_of.end(),
+                                 [](const auto& a, const auto& b) { return a.second < b.second; });
+      }
+      std::int64_t pts = 0;
+      if (found != pts_of.end()) {
+        pts = found->second;
+        pts_of.erase(found);
+      }
+      sink(DecodedFrame{.image = DeviceImage{.data = frame.luma,
+                                             .pitch = frame.luma_pitch,
+                                             .chroma = frame.chroma,
+                                             .chroma_pitch = frame.chroma_pitch,
+                                             .width = frame.width,
+                                             .height = frame.height,
+                                             .format = PixelFormat::kNv12},
+                        .pts = pts});
+    };
+    step(backend_sink);
+  }
+
+  // A sink that copies each frame into the pool, for the vector-returning calls.
+  DecodedFrameSink copy_into(std::vector<DecodedFrame>& frames, cudaStream_t stream) {
+    return [this, &frames, stream](const DecodedFrame& frame) {
       if (pool.size() <= frames.size()) {
         pool.emplace_back();
       }
       PitchedBuffer& buffer = pool[frames.size()];
-      const auto rows = static_cast<std::size_t>(frame.height);
-      buffer.reserve(static_cast<std::size_t>(frame.width), rows * 3 / 2);
-      check_cuda(detail::launch_from_nv12(frame, PixelFormat::kNv12, buffer.data, buffer.pitch,
-                                          frame.width, frame.height, stream),
-                 "copying a decoded frame");
-      std::int64_t pts = 0;
-      if (const auto found = pts_of.find(id); found != pts_of.end()) {
-        pts = found->second;
-        // Frames come out in order, so the ids before this one are done too.
-        pts_of.erase(pts_of.begin(), std::next(found));
-      }
-      frames.push_back(
-          DecodedFrame{.image = DeviceImage{.data = buffer.data,
-                                            .pitch = buffer.pitch,
-                                            .chroma = buffer.data + buffer.pitch * rows,
-                                            .chroma_pitch = buffer.pitch,
-                                            .width = frame.width,
-                                            .height = frame.height,
-                                            .format = PixelFormat::kNv12},
-                       .pts = pts});
+      const auto rows = static_cast<std::size_t>(frame.image.height);
+      buffer.reserve(static_cast<std::size_t>(frame.image.width), rows * 3 / 2);
+      check_cuda(
+          detail::launch_from_nv12(detail::Nv12Frame{.luma = frame.image.data,
+                                                     .luma_pitch = frame.image.pitch,
+                                                     .chroma = frame.image.chroma,
+                                                     .chroma_pitch = frame.image.chroma_pitch,
+                                                     .width = frame.image.width,
+                                                     .height = frame.image.height},
+                                   PixelFormat::kNv12, buffer.data, buffer.pitch, frame.image.width,
+                                   frame.image.height, stream),
+          "copying a decoded frame");
+      DecodedFrame copy = frame;
+      copy.image.data = buffer.data;
+      copy.image.pitch = buffer.pitch;
+      copy.image.chroma = buffer.data + buffer.pitch * rows;
+      copy.image.chroma_pitch = buffer.pitch;
+      frames.push_back(copy);
     };
-    step(sink);
-    return frames;
   }
 };
 
@@ -295,16 +342,16 @@ Backend VideoDecoder::backend() const noexcept { return impl_->backend; }
 const std::string& VideoDecoder::backend_detail() const noexcept { return impl_->detail; }
 std::uint64_t VideoDecoder::skipped() const noexcept { return impl_->skipped; }
 
-std::vector<DecodedFrame> VideoDecoder::decode(std::span<const std::uint8_t> access_unit,
-                                               std::int64_t pts, cudaStream_t stream) {
+void VideoDecoder::decode(std::span<const std::uint8_t> access_unit, std::int64_t pts,
+                          cudaStream_t stream, const DecodedFrameSink& sink) {
   Impl& impl = *impl_;
   if (access_unit.empty()) {
-    return {};
+    return;
   }
   if (!impl.session) {
     if (!is_keyframe(impl.codec, access_unit)) {
       ++impl.skipped;
-      return {};
+      return;
     }
     impl.session = impl.backend == Backend::kNvcodec
                        ? detail::create_nvcodec_decoder(impl.codec, impl.low_latency)
@@ -312,20 +359,42 @@ std::vector<DecodedFrame> VideoDecoder::decode(std::span<const std::uint8_t> acc
   }
   const std::uint64_t id = impl.next_id++;
   impl.pts_of.emplace(id, pts);
-  return impl.run(stream, [&](const detail::FrameSink& sink) {
-    impl.session->decode(access_unit, id, stream, sink);
+  while (impl.pts_of.size() > kMaxPendingIds) {
+    impl.pts_of.erase(impl.pts_of.begin());
+  }
+  impl.run(sink, [&](const detail::FrameSink& backend_sink) {
+    impl.session->decode(access_unit, id, stream, backend_sink);
   });
 }
 
-std::vector<DecodedFrame> VideoDecoder::flush(cudaStream_t stream) {
+void VideoDecoder::flush(cudaStream_t stream, const DecodedFrameSink& sink) {
   Impl& impl = *impl_;
   if (!impl.session) {
-    return {};
+    return;
   }
-  auto frames =
-      impl.run(stream, [&](const detail::FrameSink& sink) { impl.session->flush(stream, sink); });
-  impl.session.reset();
-  impl.pts_of.clear();
+  // The session ends whatever happens: the next access unit must be a keyframe.
+  struct End {
+    Impl& impl;
+    ~End() {
+      impl.session.reset();
+      impl.pts_of.clear();
+    }
+  } end{impl};
+  impl.run(sink, [&](const detail::FrameSink& backend_sink) {
+    impl.session->flush(stream, backend_sink);
+  });
+}
+
+std::vector<DecodedFrame> VideoDecoder::decode(std::span<const std::uint8_t> access_unit,
+                                               std::int64_t pts, cudaStream_t stream) {
+  std::vector<DecodedFrame> frames;
+  decode(access_unit, pts, stream, impl_->copy_into(frames, stream));
+  return frames;
+}
+
+std::vector<DecodedFrame> VideoDecoder::flush(cudaStream_t stream) {
+  std::vector<DecodedFrame> frames;
+  flush(stream, impl_->copy_into(frames, stream));
   return frames;
 }
 
